@@ -1,0 +1,20 @@
+[package]
+name = "vulcans-trials"
+version = "0.1.0"
+edition = "2021"
+authors = ["Alastair D'Silva <alastair@d-silva.org>"]
+license = "GPL-3.0-only"
+description = "Vulcan's Trials — Vulkan GPU & Multi-Core CPU Autoplacer and Autorouter for KiCad"
+repository = "https://github.com/InfernoEmbedded/vulcans-trials"
+
+[dependencies]
+bytemuck = { version = "1.25", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
+eframe = "0.31.1"
+egui = "0.31.1"
+pollster = "0.4"
+rand = "0.8"
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+wgpu = "24.0.5"

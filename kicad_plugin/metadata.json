@@ -1,0 +1,25 @@
+{
+    "$schema": "https://go.kicad.org/pcm/schemas/v1",
+    "name": "Vulcan's Trials",
+    "description": "Vulkan GPU + Multithreaded CPU Auto-Placer and Auto-Router for KiCad",
+    "description_full": "Vulcan's Trials combines schematic-aware Parallel Tempering Simulated Annealing auto-placement with a Vulkan GPU-accelerated, negotiated-congestion, dynamic-nudge multi-layer autorouter.",
+    "identifier": "com.infernoembedded.vulcans-trials",
+    "type": "plugin",
+    "author": {
+        "name": "InfernoEmbedded",
+        "contact": {
+            "web": "https://github.com/InfernoEmbedded"
+        }
+    },
+    "license": "GPL-3.0",
+    "resources": {
+        "homepage": "https://github.com/InfernoEmbedded/vulcans-trials"
+    },
+    "versions": [
+        {
+            "version": "0.1.0",
+            "status": "stable",
+            "kicad_version": "8.0"
+        }
+    ]
+}
