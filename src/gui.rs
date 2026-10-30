@@ -1670,6 +1670,7 @@ mod tests {
             height: 25.5,
             courtyards: decomposed_courtyards,
             perimeters: vec![t_perimeter],
+            escape_margin: 0.0,
             at_span: None,
             fp_span: None,
         };

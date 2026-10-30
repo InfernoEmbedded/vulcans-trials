@@ -5,41 +5,21 @@
 import hashlib
 import json
 import os
-import struct
 import time
 import zipfile
-import zlib
 
 PLUGIN_DIR = os.path.dirname(os.path.realpath(__file__))
 PCM_DIR = os.path.join(PLUGIN_DIR, "pcm")
 
 
-def make_icon_png() -> bytes:
-    """Generate a valid 64x64 RGBA PNG icon (orange/gold Vulkan flame motif)."""
-    w, h = 64, 64
-    raw = bytearray()
-    for y in range(h):
-        raw.append(0)  # Filter type 0 (None)
-        for x in range(w):
-            dx, dy = x - 32, y - 32
-            r2 = dx * dx + dy * dy
-            if r2 < 180:
-                raw.extend((255, 165, 30, 255))
-            elif r2 < 780:
-                raw.extend((210, 65, 20, 255))
-            else:
-                raw.extend((24, 26, 32, 255))
-
-    def chunk(tag: bytes, data: bytes) -> bytes:
-        return (
-            struct.pack(">I", len(data))
-            + tag
-            + data
-            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-        )
-
-    ihdr = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)
-    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b"")
+def get_icon_bytes() -> bytes:
+    """Return RGBA PNG icon bytes from icon.png, generating if missing."""
+    icon_path = os.path.join(PLUGIN_DIR, "icon.png")
+    if not os.path.exists(icon_path):
+        from generate_icon import generate_icons
+        generate_icons(PLUGIN_DIR)
+    with open(icon_path, "rb") as f:
+        return f.read()
 
 
 def sha256_file(path: str) -> str:
@@ -53,18 +33,21 @@ def build_pcm() -> None:
     os.makedirs(PCM_DIR, exist_ok=True)
     meta_path = os.path.join(PLUGIN_DIR, "metadata.json")
     init_path = os.path.join(PLUGIN_DIR, "__init__.py")
+    icon_path = os.path.join(PLUGIN_DIR, "icon.png")
+
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
     identifier = meta["identifier"]
     version = meta["versions"][0]["version"]
-    icon_bytes = make_icon_png()
+    icon_bytes = get_icon_bytes()
 
     zip_name = f"{identifier}_v{version}_pcm.zip"
     zip_path = os.path.join(PCM_DIR, zip_name)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.write(meta_path, "metadata.json")
         zf.write(init_path, "plugins/__init__.py")
+        zf.write(icon_path, "plugins/icon.png")
         zf.writestr("resources/icon.png", icon_bytes)
 
     install_size = os.path.getsize(meta_path) + os.path.getsize(init_path) + len(icon_bytes)

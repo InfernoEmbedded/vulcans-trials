@@ -10,12 +10,11 @@ import wx
 
 class VulcansTrialsPlugin(pcbnew.ActionPlugin):
     def defaults(self):
-        self.name = "Vulcan's Trials (Auto-Placer & Auto-Router)"
-        self.category = "Modify PCB"
-        self.description = (
-            "Vulkan GPU + Multithreaded CPU Auto-Placer and Auto-Router by InfernoEmbedded (GPLv3)"
-        )
+        self.name = "Vulcan's Trials"
+        self.category = "Auto-Place & Auto-Route"
+        self.description = "Launch Vulcan's Trials GPU-accelerated auto-placer and auto-router"
         self.show_toolbar_button = True
+        self.icon_file_name = os.path.join(os.path.dirname(__file__), "icon.png")
 
     def Run(self):
         board = pcbnew.GetBoard()
@@ -33,6 +32,9 @@ class VulcansTrialsPlugin(pcbnew.ActionPlugin):
             shutil.which("vulcans-trials"),
             os.path.abspath(os.path.join(plugin_dir, "..", "target", "release", "vulcans-trials")),
             os.path.expanduser("~/watt-home/src/vulcans-trials/target/release/vulcans-trials"),
+            os.path.expanduser("~/.cargo/bin/vulcans-trials"),
+            "/usr/local/bin/vulcans-trials",
+            "/usr/bin/vulcans-trials",
         ]
         binary = next((c for c in candidates if c and os.path.isfile(c) and os.access(c, os.X_OK)), None)
 
@@ -48,4 +50,8 @@ class VulcansTrialsPlugin(pcbnew.ActionPlugin):
         subprocess.Popen([binary, "--input", board_path, "--output", out_path])
 
 
-VulcansTrialsPlugin().register()
+try:
+    VulcansTrialsPlugin().register()
+except Exception:
+    # Allows safe importing in headless/unit-test environments where KiCad's GUI program is not initialized
+    pass

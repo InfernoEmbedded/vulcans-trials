@@ -2,3 +2,5 @@
 *.kicad_pcb
 *.ses
 kicad_plugin/pcm/
+__pycache__/
+*.pyc

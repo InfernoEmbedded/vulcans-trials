@@ -423,6 +423,8 @@ pub struct Footprint {
     pub courtyards: Vec<Polygon>,
     #[serde(default)]
     pub perimeters: Vec<Polygon>,
+    #[serde(default)]
+    pub escape_margin: f64,
     pub at_span: Option<(usize, usize)>,
     pub fp_span: Option<(usize, usize)>,
 }
@@ -546,6 +548,85 @@ impl Footprint {
                 }
             })
             .collect()
+    }
+
+    /// Computes the minimum center-to-center pitch between distinct pads (filtering out coincident/thermal sub-pads).
+    pub fn min_pad_pitch(&self) -> f64 {
+        if self.pads.len() < 2 {
+            return f64::INFINITY;
+        }
+        let mut min_pitch = f64::INFINITY;
+        for i in 0..self.pads.len() {
+            let p1 = &self.pads[i];
+            for j in (i + 1)..self.pads.len() {
+                let p2 = &self.pads[j];
+                let dx = p1.offset_x - p2.offset_x;
+                let dy = p1.offset_y - p2.offset_y;
+                let dist = dx.hypot(dy);
+                if dist > 0.10 && dist < min_pitch {
+                    min_pitch = dist;
+                }
+            }
+        }
+        min_pitch
+    }
+
+    /// Computes the pad density (pads per mm² of footprint courtyard area).
+    pub fn pad_density(&self) -> f64 {
+        let area = (self.width * self.height).max(1.0);
+        self.pads.len() as f64 / area
+    }
+
+    /// Computes the dedicated routing escape clearance (halo) around dense or fine-pitch components.
+    /// - High pin-count packages (>= 16 pads) with fine pitch (<= 0.50mm) or high density: 1.20mm
+    /// - Fine-pitch packages (>= 16 pads, pitch <= 0.65mm): 1.00mm
+    /// - Medium pin-count packages (>= 8 pads, pitch <= 0.65mm or high density): 0.90mm
+    /// - Small dense ICs (>= 6 pads, pitch <= 1.00mm, e.g. SOT-23-6 BUCK IC): 0.75mm
+    /// - Standard passives (0603/0805, 2 pads): 0.0mm (standard clearance)
+    pub fn compute_escape_margin(&self) -> f64 {
+        let pad_count = self.pads.len();
+        if pad_count < 6 {
+            return 0.0;
+        }
+        let pitch = self.min_pad_pitch();
+        let density = self.pad_density();
+
+        if pad_count >= 16 {
+            if pitch <= 0.50 || density >= 1.0 {
+                1.20
+            } else if pitch <= 0.65 {
+                1.00
+            } else {
+                0.70
+            }
+        } else if pad_count >= 8 {
+            if pitch <= 0.65 || density >= 0.8 {
+                0.90
+            } else if pitch <= 1.0 {
+                0.70
+            } else {
+                0.40
+            }
+        } else if pad_count >= 6 {
+            if pitch <= 1.0 {
+                0.75
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        }
+    }
+
+    /// Computes the effective placement spacing required for this component:
+    /// base courtyard spacing plus twice the component's escape clearance margin.
+    pub fn placement_spacing(&self, base_spacing: f64) -> f64 {
+        let margin = if self.escape_margin > 0.0 {
+            self.escape_margin
+        } else {
+            self.compute_escape_margin()
+        };
+        base_spacing + 2.0 * margin
     }
 }
 
@@ -1874,7 +1955,7 @@ fn parse_footprint(
         max_cy = max_cy.max(a.max_y);
     }
 
-    Some(Footprint {
+    let mut fp = Footprint {
         reference,
         value,
         x: pos_x,
@@ -1888,9 +1969,12 @@ fn parse_footprint(
         height: (max_cy - min_cy).max(1.0),
         courtyards,
         perimeters,
+        escape_margin: 0.0,
         at_span,
         fp_span: Some((fp_byte_offset, fp_byte_offset + fp_str.len())),
-    })
+    };
+    fp.escape_margin = fp.compute_escape_margin();
+    Some(fp)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2129,6 +2213,7 @@ mod tests {
                 Point::new(-2.0, 2.0),
             ])],
             perimeters: Vec::new(),
+            escape_margin: 0.0,
             at_span: None,
             fp_span: None,
         };

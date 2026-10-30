@@ -25,6 +25,8 @@ pub struct PlacementConfig {
     pub decoupling_affinity_weight: f64,
     pub decoupling_max_dist: f64,
     pub allow_layer_flip: bool,
+    pub enable_escape_clearance: bool,
+    pub escape_margin_mult: f64,
     pub vulkan: Option<Arc<VulkanEngine>>,
 }
 
@@ -43,7 +45,20 @@ impl Default for PlacementConfig {
             decoupling_affinity_weight: 250.0,
             decoupling_max_dist: 2.0,
             allow_layer_flip: false,
+            enable_escape_clearance: true,
+            escape_margin_mult: 1.0,
             vulkan: None,
+        }
+    }
+}
+
+impl crate::board::Footprint {
+    /// Computes the effective courtyard placement spacing for this footprint given config.
+    pub fn effective_spacing(&self, config: &PlacementConfig) -> f64 {
+        if config.enable_escape_clearance {
+            config.min_spacing_mm + 2.0 * self.escape_margin * config.escape_margin_mult
+        } else {
+            config.min_spacing_mm
         }
     }
 }
@@ -308,7 +323,8 @@ impl PlacementState {
             positions.push(pos);
             rotations.push(rot);
             layers.push(layer);
-            let polys = fp.transformed_courtyards_layered(pos, rot, layer, config.min_spacing_mm);
+            let spacing = fp.effective_spacing(config);
+            let polys = fp.transformed_courtyards_layered(pos, rot, layer, spacing);
             cached_bounds.push(union_aabb(&polys, pos));
             cached_courtyards.push(polys);
             let pads = (0..fp.pads.len())
@@ -339,7 +355,8 @@ impl PlacementState {
         let pos = self.positions[idx];
         let rot = self.rotations[idx];
         let layer = self.layers[idx];
-        let polys = fp.transformed_courtyards_layered(pos, rot, layer, config.min_spacing_mm);
+        let spacing = fp.effective_spacing(config);
+        let polys = fp.transformed_courtyards_layered(pos, rot, layer, spacing);
         self.cached_bounds[idx] = union_aabb(&polys, pos);
         self.cached_courtyards[idx] = polys;
         for pi in 0..fp.pads.len() {
@@ -449,15 +466,20 @@ impl PlacementState {
         for tie in ties {
             let p_pt = self.cached_pads[tie.passive_idx][tie.passive_pad_idx];
             let a_pt = self.cached_pads[tie.anchor_idx][tie.anchor_pad_idx];
+            let anchor_escape = if config.enable_escape_clearance {
+                board.footprints[tie.anchor_idx].escape_margin * config.escape_margin_mult
+            } else {
+                0.0
+            };
             let d = p_pt.distance_to(&a_pt);
             let (max_d, weight) = if tie.is_decoupling {
                 (
-                    config.decoupling_max_dist,
+                    config.decoupling_max_dist + anchor_escape,
                     config.decoupling_affinity_weight * tie.weight_mult,
                 )
             } else {
                 (
-                    config.passive_max_dist,
+                    config.passive_max_dist + anchor_escape * 0.5,
                     config.passive_affinity_weight * tie.weight_mult,
                 )
             };
@@ -528,7 +550,8 @@ fn build_gpu_sa_descriptors(
 ) -> (Vec<[f32; 4]>, Vec<[f32; 4]>) {
     let mut fp_descs = Vec::with_capacity(board.footprints.len());
     for fp in &board.footprints {
-        let polys = fp.transformed_courtyards(Point::new(0.0, 0.0), 0.0, config.min_spacing_mm);
+        let spacing = fp.effective_spacing(config);
+        let polys = fp.transformed_courtyards(Point::new(0.0, 0.0), 0.0, spacing);
         let b = union_aabb(&polys, Point::new(0.0, 0.0));
         let hw = ((b.max_x - b.min_x) * 0.5).max(0.4) as f32;
         let hh = ((b.max_y - b.min_y) * 0.5).max(0.4) as f32;
@@ -981,20 +1004,26 @@ pub fn prioritize_and_position_initial_components(
                     Point::new(fp.x, fp.y),
                     fp.rotation,
                     fp.layer,
-                    config.min_spacing_mm,
+                    fp.effective_spacing(config),
                 ));
             }
         }
 
         let mut best_cand: Option<(f64, f64, f64, f64)> = None;
 
-        let dist_steps = [0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.3, 2.6, 3.0];
+        let dist_steps = [0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.3, 2.6, 3.0, 3.5, 4.0];
         let angle_deltas = [
             0.0, 0.20, -0.20, 0.40, -0.40, 0.60, -0.60, 0.80, -0.80, 1.0, -1.0, 1.2, -1.2, 1.4, -1.4,
         ];
         let rotations = [0.0, 90.0, 180.0, 270.0];
 
         let cap = &board.footprints[cap_idx];
+        let cap_spacing = cap.effective_spacing(config);
+        let anchor_escape = if config.enable_escape_clearance {
+            dev.escape_margin * config.escape_margin_mult
+        } else {
+            0.0
+        };
 
         'search: for &d in &dist_steps {
             for &da in &angle_deltas {
@@ -1010,7 +1039,7 @@ pub fn prioritize_and_position_initial_components(
                 let c_pos = Point::new(cx, cy);
 
                 for &rot in &rotations {
-                    let polys = cap.transformed_courtyards_layered(c_pos, rot, cap.layer, config.min_spacing_mm);
+                    let polys = cap.transformed_courtyards_layered(c_pos, rot, cap.layer, cap_spacing);
                     let mut collides = false;
                     'check: for group in &placed_courtyards {
                         for p_placed in group {
@@ -1027,7 +1056,7 @@ pub fn prioritize_and_position_initial_components(
                         let pad_dist = cap_pad_world.distance_to(&pin_pt);
                         if best_cand.is_none_or(|b| pad_dist < b.0) {
                             best_cand = Some((pad_dist, cx, cy, rot));
-                            if pad_dist <= 1.2 {
+                            if pad_dist <= 1.0 + anchor_escape {
                                 break 'search;
                             }
                         }
@@ -1062,11 +1091,13 @@ pub fn is_placement_legal(
     layer: usize,
     min_spacing_mm: f64,
 ) -> bool {
-    let cand_polys = fp.transformed_courtyards_layered(pos, rot, layer, min_spacing_mm);
+    let cand_spacing = fp.placement_spacing(min_spacing_mm);
+    let cand_polys = fp.transformed_courtyards_layered(pos, rot, layer, cand_spacing);
     let boundary = board.boundary_aabb();
 
     // 1. Must be entirely inside the board outline (both courtyards AND copper pads/legs)
-    for poly in &cand_polys {
+    let raw_polys = fp.transformed_courtyards_layered(pos, rot, layer, min_spacing_mm);
+    for poly in &raw_polys {
         for v in &poly.vertices {
             if !boundary.contains_point(v) {
                 return false;
@@ -1100,24 +1131,28 @@ pub fn is_placement_legal(
     // 2. Must not overlap any keepout zones
     for ko in &board.keepouts {
         let ko_aabb = AABB::new(ko.min_x, ko.min_y, ko.max_x, ko.max_y);
-        for poly in &cand_polys {
+        for poly in &raw_polys {
             if poly.aabb().overlaps(&ko_aabb) {
                 return false;
             }
         }
     }
 
-    // 3. Must not collide with any already placed footprints
+    // 3. Must not collide with any already placed footprints (honoring escape clearances)
     for placed_fp in &board.footprints {
+        if placed_fp.reference == fp.reference {
+            continue;
+        }
         // Two SMD-only footprints on opposite layers do not collide
         if layer != placed_fp.layer && fp.is_smd_only() && placed_fp.is_smd_only() {
             continue;
         }
+        let placed_spacing = placed_fp.placement_spacing(min_spacing_mm);
         let placed_polys = placed_fp.transformed_courtyards_layered(
             Point::new(placed_fp.x, placed_fp.y),
             placed_fp.rotation,
             placed_fp.layer,
-            min_spacing_mm,
+            placed_spacing,
         );
         for pa in &cand_polys {
             for pb in &placed_polys {
@@ -1616,7 +1651,14 @@ pub fn run_auto_placer(
                                     let outward_angle = (anchor_pt.y - anchor_center.y)
                                         .atan2(anchor_pt.x - anchor_center.x);
                                     let theta = outward_angle + rng.gen_range(-1.2..=1.2);
-                                    let r = rng.gen_range(1.1..=2.2);
+                                    let anchor_escape = if config.enable_escape_clearance {
+                                        board.footprints[tie.anchor_idx].escape_margin * config.escape_margin_mult
+                                    } else {
+                                        0.0
+                                    };
+                                    let min_r = 1.1 + anchor_escape;
+                                    let max_r = 2.2 + anchor_escape * 1.5;
+                                    let r = rng.gen_range(min_r..=max_r);
                                     let nx = snap_to_grid(
                                         (anchor_pt.x + r * theta.cos())
                                             .clamp(boundary.min_x + 1.2, boundary.max_x - 1.2),
@@ -1764,6 +1806,7 @@ mod tests {
                 Point::new(-1.0, 1.0),
             ])],
             perimeters: Vec::new(),
+            escape_margin: 0.0,
             at_span: None,
             fp_span: None,
         }
@@ -2538,6 +2581,214 @@ mod tests {
         // Verify zero courtyard collisions across all components!
         let st = PlacementState::from_board(&board, &cfg);
         assert_eq!(st.overlaps, 0, "All components including U4, C14, C15 must have 0 courtyard collisions");
+
+        let _ = fs::remove_file(pcb_path);
+    }
+
+    #[test]
+    fn test_pin_density_courtyard_expansion_heuristic() {
+        // 1. Dense 24-QFN (e.g. MAX22088: 24 pins around 4x4mm, 0.50mm pitch)
+        let mut qfn_pads = Vec::new();
+        // 6 pads per side, 0.50mm pitch
+        for i in 0..6 {
+            let offset = -1.25 + (i as f64) * 0.50;
+            qfn_pads.push(Pad::new(&format!("{}", i + 1), offset, -1.9, 0.25, 0.6, 1, "SIG", false));
+            qfn_pads.push(Pad::new(&format!("{}", i + 7), 1.9, offset, 0.6, 0.25, 1, "SIG", false));
+            qfn_pads.push(Pad::new(&format!("{}", i + 13), -offset, 1.9, 0.25, 0.6, 1, "SIG", false));
+            qfn_pads.push(Pad::new(&format!("{}", i + 19), -1.9, -offset, 0.6, 0.25, 1, "SIG", false));
+        }
+        let qfn = Footprint {
+            reference: "U1".to_string(),
+            value: "MAX22088".to_string(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: qfn_pads,
+            width: 4.0,
+            height: 4.0,
+            courtyards: vec![Polygon::new(vec![
+                Point::new(-2.2, -2.2),
+                Point::new(2.2, -2.2),
+                Point::new(2.2, 2.2),
+                Point::new(-2.2, 2.2),
+            ])],
+            perimeters: Vec::new(),
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+        assert!((qfn.min_pad_pitch() - 0.50).abs() < 1e-4, "QFN pitch must be 0.50mm");
+        assert!(qfn.pad_density() > 1.0, "QFN pad density must be > 1.0 pads/mm²");
+        let qfn_escape = qfn.compute_escape_margin();
+        assert_eq!(qfn_escape, 1.20, "Dense 0.50mm QFN must receive 1.20mm escape margin");
+        assert_eq!(qfn.placement_spacing(0.25), 0.25 + 2.0 * 1.20);
+
+        // 2. ESP32 RF module (31 pads, 0.55mm pitch, 18x25.5mm package)
+        let mut esp_pads = Vec::new();
+        for i in 0..31 {
+            esp_pads.push(Pad::new(&format!("{}", i + 1), -8.75 + (i as f64) * 0.55, 6.0, 0.35, 1.0, 1, "SIG", false));
+        }
+        let esp32 = Footprint {
+            reference: "U4".to_string(),
+            value: "ESP32-C3-WROOM-02".to_string(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: esp_pads,
+            width: 18.0,
+            height: 25.5,
+            courtyards: vec![Polygon::new(vec![
+                Point::new(-9.0, -12.75),
+                Point::new(9.0, -12.75),
+                Point::new(9.0, 12.75),
+                Point::new(-9.0, 12.75),
+            ])],
+            perimeters: Vec::new(),
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+        assert!((esp32.min_pad_pitch() - 0.55).abs() < 1e-4);
+        assert_eq!(esp32.compute_escape_margin(), 1.00, "ESP32 module must receive 1.00mm escape margin");
+
+        // 3. SOT-23-6 BUCK IC (6 pads, 0.95mm pitch)
+        let mut sot_pads = Vec::new();
+        for i in 0..3 {
+            sot_pads.push(Pad::new(&format!("{}", i + 1), -0.95 + (i as f64) * 0.95, -1.3, 0.45, 0.6, 1, "SIG", false));
+            sot_pads.push(Pad::new(&format!("{}", i + 4), 0.95 - (i as f64) * 0.95, 1.3, 0.45, 0.6, 1, "SIG", false));
+        }
+        let sot23_6 = Footprint {
+            reference: "U2".to_string(),
+            value: "BUCK_IC".to_string(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: sot_pads,
+            width: 3.0,
+            height: 3.0,
+            courtyards: vec![Polygon::new(vec![
+                Point::new(-1.6, -1.6),
+                Point::new(1.6, -1.6),
+                Point::new(1.6, 1.6),
+                Point::new(-1.6, 1.6),
+            ])],
+            perimeters: Vec::new(),
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+        assert!((sot23_6.min_pad_pitch() - 0.95).abs() < 1e-4);
+        assert_eq!(sot23_6.compute_escape_margin(), 0.75, "SOT-23-6 BUCK IC must receive 0.75mm escape margin");
+
+        // 4. Standard 0603 passive (2 pads, 1.60mm pitch)
+        let r0603 = Footprint {
+            reference: "R1".to_string(),
+            value: "10k".to_string(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: vec![
+                Pad::new("1", -0.8, 0.0, 0.6, 0.7, 1, "SIG", false),
+                Pad::new("2", 0.8, 0.0, 0.6, 0.7, 1, "SIG", false),
+            ],
+            width: 2.2,
+            height: 1.2,
+            courtyards: vec![Polygon::new(vec![
+                Point::new(-1.1, -0.6),
+                Point::new(1.1, -0.6),
+                Point::new(1.1, 0.6),
+                Point::new(-1.1, 0.6),
+            ])],
+            perimeters: Vec::new(),
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+        assert_eq!(r0603.compute_escape_margin(), 0.0, "0603 passive must receive 0.0mm escape margin (standard clearance)");
+        assert_eq!(r0603.placement_spacing(0.25), 0.25);
+    }
+
+    #[test]
+    fn test_escape_clearance_enforcement_in_placement_and_legalization() {
+        let pcb_path = "/tmp/vulcan_escape_clearance_test.kicad_pcb";
+        // Board with QFN-24 (locked at 100, 100) and an unlocked 0603 capacitor initially placed too close
+        let content = r#"(kicad_pcb (version 20240108)
+          (net 0 "") (net 1 "GND") (net 2 "+3.3V")
+          (gr_rect (start 80.0 80.0) (end 130.0 130.0) (layer "Edge.Cuts"))
+          (footprint "Package_DFN_QFN:QFN-24" (at 100.0 100.0) (property "Reference" "U1") (locked yes)
+            (fp_rect (start -2.0 -2.0) (end 2.0 2.0) (layer "F.CrtYd"))
+            (pad "1" smd rect (at -1.8 -1.25) (size 0.5 0.25) (net 2 "+3.3V"))
+            (pad "2" smd rect (at -1.8 -0.75) (size 0.5 0.25) (net 1 "GND"))
+            (pad "3" smd rect (at -1.8 -0.25) (size 0.5 0.25) (net 1 "GND"))
+            (pad "4" smd rect (at -1.8 0.25) (size 0.5 0.25) (net 1 "GND"))
+            (pad "5" smd rect (at -1.8 0.75) (size 0.5 0.25) (net 1 "GND"))
+            (pad "6" smd rect (at -1.8 1.25) (size 0.5 0.25) (net 1 "GND"))
+            (pad "7" smd rect (at -1.25 1.8) (size 0.25 0.5) (net 1 "GND"))
+            (pad "8" smd rect (at -0.75 1.8) (size 0.25 0.5) (net 1 "GND"))
+            (pad "9" smd rect (at -0.25 1.8) (size 0.25 0.5) (net 1 "GND"))
+            (pad "10" smd rect (at 0.25 1.8) (size 0.25 0.5) (net 1 "GND"))
+            (pad "11" smd rect (at 0.75 1.8) (size 0.25 0.5) (net 1 "GND"))
+            (pad "12" smd rect (at 1.25 1.8) (size 0.25 0.5) (net 1 "GND"))
+            (pad "13" smd rect (at 1.8 1.25) (size 0.5 0.25) (net 1 "GND"))
+            (pad "14" smd rect (at 1.8 0.75) (size 0.5 0.25) (net 1 "GND"))
+            (pad "15" smd rect (at 1.8 0.25) (size 0.5 0.25) (net 1 "GND"))
+            (pad "16" smd rect (at 1.8 -0.25) (size 0.5 0.25) (net 1 "GND"))
+            (pad "17" smd rect (at 1.8 -0.75) (size 0.5 0.25) (net 1 "GND"))
+            (pad "18" smd rect (at 1.8 -1.25) (size 0.5 0.25) (net 1 "GND"))
+            (pad "19" smd rect (at 1.25 -1.8) (size 0.25 0.5) (net 1 "GND"))
+            (pad "20" smd rect (at 0.75 -1.8) (size 0.25 0.5) (net 1 "GND"))
+            (pad "21" smd rect (at 0.25 -1.8) (size 0.25 0.5) (net 1 "GND"))
+            (pad "22" smd rect (at -0.25 -1.8) (size 0.25 0.5) (net 1 "GND"))
+            (pad "23" smd rect (at -0.75 -1.8) (size 0.25 0.5) (net 1 "GND"))
+            (pad "24" smd rect (at -1.25 -1.8) (size 0.25 0.5) (net 1 "GND")))
+          (footprint "Capacitor_SMD:C_0603" (at 103.5 100.0) (property "Reference" "C1")
+            (fp_rect (start -1.0 -0.6) (end 1.0 0.6) (layer "F.CrtYd"))
+            (pad "1" smd rect (at -0.7 0.0) (size 0.6 0.6) (net 2 "+3.3V"))
+            (pad "2" smd rect (at 0.7 0.0) (size 0.6 0.6) (net 1 "GND")))
+        )"#;
+        fs::write(pcb_path, content).unwrap();
+
+        let mut board = Board::load(pcb_path, &HashSet::new()).unwrap();
+        let cfg = PlacementConfig {
+            grid_step_mm: 0.1,
+            ..PlacementConfig::default()
+        };
+
+        // U1 has 24 pads with 0.50mm pitch -> 1.20mm escape margin
+        let u1 = &board.footprints[0];
+        assert_eq!(u1.escape_margin, 1.20);
+
+        // At x = 103.5, C1 is 3.5mm from U1 center (2.0mm QFN half + 1.0mm C1 half = 3.0mm,
+        // distance between raw courtyards is only 0.5mm, which violates the 1.20mm escape corridor!)
+        let c1 = &board.footprints[1];
+        assert!(!is_placement_legal(&board, c1, Point::new(103.5, 100.0), 0.0, 0, cfg.min_spacing_mm),
+            "C1 at 103.5mm sits inside the 1.20mm escape halo of U1 and must be deemed illegal");
+
+        // At x = 104.5, C1 is outside the 1.20mm escape halo and is legal
+        assert!(is_placement_legal(&board, c1, Point::new(104.5, 100.0), 0.0, 0, cfg.min_spacing_mm),
+            "C1 at 104.5mm sits outside the escape halo and must be legal");
+
+        // Verify that legalization resolves initial overlap by pushing C1 outside the escape halo
+        let initial_st = PlacementState::from_board(&board, &cfg);
+        assert!(initial_st.overlaps > 0, "Initial placement must detect escape corridor overlap");
+        let legalized_st = legalize_placement(&mut board, &cfg, initial_st, None);
+        assert_eq!(legalized_st.overlaps, 0, "Legalizer must resolve escape corridor overlap");
+        let c1_legal_x = legalized_st.positions[1].x;
+        let c1_legal_y = legalized_st.positions[1].y;
+        let dist_to_u1 = (c1_legal_x - 100.0).hypot(c1_legal_y - 100.0);
+        assert!(dist_to_u1 >= 4.2, "Legalized C1 must maintain at least 4.2mm distance (2.0 + 1.0 + 1.2), got {:.2}mm", dist_to_u1);
 
         let _ = fs::remove_file(pcb_path);
     }
