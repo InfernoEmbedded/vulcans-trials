@@ -1226,71 +1226,33 @@ impl Board {
                 continue;
             }
             let n = pts.len();
-            let topo = self.get_net_topology(net_id);
-            match topo {
-                NetTopology::StarPoint => {
-                    for i in 1..n {
-                        segments.push(Segment { p1: pts[0], p2: pts[i], net_id });
+            // Ratsnest always joins each pad to its closest same-net pad (Prim's Euclidean MST),
+            // independent of routing topology constraints.
+            let mut in_mst = vec![false; n];
+            let mut min_dist = vec![f64::INFINITY; n];
+            let mut parent = vec![0usize; n];
+            in_mst[0] = true;
+            for i in 1..n {
+                min_dist[i] = pts[0].distance_to(&pts[i]);
+            }
+            for _ in 1..n {
+                let mut best = None;
+                let mut best_d = f64::INFINITY;
+                for i in 1..n {
+                    if !in_mst[i] && min_dist[i] < best_d {
+                        best_d = min_dist[i];
+                        best = Some(i);
                     }
                 }
-                NetTopology::DaisyChain | NetTopology::FlyBy => {
-                    let mut chain = Vec::with_capacity(n);
-                    chain.push(0);
-                    let mut visited = vec![false; n];
-                    visited[0] = true;
-                    while chain.len() < n {
-                        let curr = *chain.last().unwrap();
-                        let mut best = None;
-                        let mut best_d = f64::INFINITY;
-                        for j in 0..n {
-                            if !visited[j] {
-                                let d = pts[curr].distance_to(&pts[j]);
-                                if d < best_d {
-                                    best_d = d;
-                                    best = Some(j);
-                                }
-                            }
-                        }
-                        if let Some(next) = best {
-                            visited[next] = true;
-                            chain.push(next);
-                        } else {
-                            break;
-                        }
-                    }
-                    for w in chain.windows(2) {
-                        segments.push(Segment { p1: pts[w[0]], p2: pts[w[1]], net_id });
-                    }
-                }
-                _ => {
-                    // Prim's Euclidean MST (for EuclideanMst and TBranch base segments)
-                    let mut in_mst = vec![false; n];
-                    let mut min_dist = vec![f64::INFINITY; n];
-                    let mut parent = vec![0usize; n];
-                    in_mst[0] = true;
-                    for i in 1..n {
-                        min_dist[i] = pts[0].distance_to(&pts[i]);
-                    }
-                    for _ in 1..n {
-                        let mut best = None;
-                        let mut best_d = f64::INFINITY;
-                        for i in 1..n {
-                            if !in_mst[i] && min_dist[i] < best_d {
-                                best_d = min_dist[i];
-                                best = Some(i);
-                            }
-                        }
-                        if let Some(u) = best {
-                            in_mst[u] = true;
-                            segments.push(Segment { p1: pts[parent[u]], p2: pts[u], net_id });
-                            for v in 1..n {
-                                if !in_mst[v] {
-                                    let d = pts[u].distance_to(&pts[v]);
-                                    if d < min_dist[v] {
-                                        min_dist[v] = d;
-                                        parent[v] = u;
-                                    }
-                                }
+                if let Some(u) = best {
+                    in_mst[u] = true;
+                    segments.push(Segment { p1: pts[parent[u]], p2: pts[u], net_id });
+                    for v in 1..n {
+                        if !in_mst[v] {
+                            let d = pts[u].distance_to(&pts[v]);
+                            if d < min_dist[v] {
+                                min_dist[v] = d;
+                                parent[v] = u;
                             }
                         }
                     }
