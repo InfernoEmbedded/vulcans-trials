@@ -403,7 +403,7 @@ impl RoutingGrid {
     }
 }
 
-fn dist_to_segment(px: f64, py: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
+pub fn dist_to_segment(px: f64, py: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
     let dx = x2 - x1;
     let dy = y2 - y1;
     let len_sq = dx * dx + dy * dy;
@@ -413,6 +413,29 @@ fn dist_to_segment(px: f64, py: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> f64 
         let t = (((px - x1) * dx + (py - y1) * dy) / len_sq).clamp(0.0, 1.0);
         (px - (x1 + t * dx)).hypot(py - (y1 + t * dy))
     }
+}
+
+pub fn segments_intersect(p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), p4: (f64, f64)) -> bool {
+    fn ccw(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
+        (c.1 - a.1) * (b.0 - a.0) - (b.1 - a.1) * (c.0 - a.0)
+    }
+    let d1 = ccw(p3, p4, p1);
+    let d2 = ccw(p3, p4, p2);
+    let d3 = ccw(p1, p2, p3);
+    let d4 = ccw(p1, p2, p4);
+
+    ((d1 > 1e-9 && d2 < -1e-9) || (d1 < -1e-9 && d2 > 1e-9))
+        && ((d3 > 1e-9 && d4 < -1e-9) || (d3 < -1e-9 && d4 > 1e-9))
+}
+
+pub fn dist_segment_to_segment(p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), p4: (f64, f64)) -> f64 {
+    if segments_intersect(p1, p2, p3, p4) {
+        return 0.0;
+    }
+    dist_to_segment(p1.0, p1.1, p3.0, p3.1, p4.0, p4.1)
+        .min(dist_to_segment(p2.0, p2.1, p3.0, p3.1, p4.0, p4.1))
+        .min(dist_to_segment(p3.0, p3.1, p1.0, p1.1, p2.0, p2.1))
+        .min(dist_to_segment(p4.0, p4.1, p1.0, p1.1, p2.0, p2.1))
 }
 
 pub struct NudgeEngine {
@@ -1949,6 +1972,9 @@ impl AutoRouter {
         }
         let completed_count = routed_paths.iter().filter(|p| p.is_some()).count();
         self.reconstruct_tracks_and_vias(board, grid, &connections, &routed_paths, &escape_stubs);
+
+        // Phase 3: Post-Route Glossing Pass (rubber-band straightening, stair-step elimination, 45-deg mitering)
+        self.gloss_tracks(board, grid);
 
         // Phase 2: Coupled Diff Pair Precision Alignment and Intra-Pair Phase Matching
         for follower_idx in 0..total_conns {
@@ -3521,6 +3547,10 @@ impl AutoRouter {
     ) -> bool {
         tune_net_length(board, grid, net_id, target_length_mm, max_amplitude_mm)
     }
+
+    pub fn gloss_tracks(&self, board: &mut Board, grid: &RoutingGrid) {
+        gloss_tracks(board, grid);
+    }
 }
 
 pub fn enforce_coupled_diff_pair_spacing(
@@ -4164,6 +4194,591 @@ pub fn tune_net_length(
 
     current_len = calc_net_len(&board.tracks);
     current_len >= target_length_mm - 0.05 || modified
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackChain {
+    pub net_id: usize,
+    pub layer: usize,
+    pub width: f64,
+    pub points: Vec<(f64, f64)>,
+}
+
+fn quant_point(p: (f64, f64)) -> (i64, i64) {
+    ((p.0 * 10000.0).round() as i64, (p.1 * 10000.0).round() as i64)
+}
+
+pub fn extract_track_chains(tracks: &[TrackSegment]) -> Vec<TrackChain> {
+    if tracks.is_empty() {
+        return Vec::new();
+    }
+
+    let mut groups: HashMap<(usize, i64), Vec<&TrackSegment>> = HashMap::new();
+    for trk in tracks {
+        let w_key = (trk.width * 1000.0).round() as i64;
+        groups.entry((trk.layer, w_key)).or_default().push(trk);
+    }
+
+    let mut all_chains = Vec::new();
+
+    for ((layer, _), segs) in groups {
+        let net_id = segs[0].net_id;
+        let width = segs[0].width;
+
+        let mut adj: HashMap<(i64, i64), Vec<(usize, (i64, i64))>> = HashMap::new();
+        let mut pt_coords: HashMap<(i64, i64), (f64, f64)> = HashMap::new();
+
+        for (idx, seg) in segs.iter().enumerate() {
+            let q1 = quant_point(seg.start);
+            let q2 = quant_point(seg.end);
+            if q1 == q2 {
+                continue;
+            }
+            pt_coords.entry(q1).or_insert(seg.start);
+            pt_coords.entry(q2).or_insert(seg.end);
+            adj.entry(q1).or_default().push((idx, q2));
+            adj.entry(q2).or_default().push((idx, q1));
+        }
+
+        let mut visited_segs = vec![false; segs.len()];
+
+        let mut start_nodes: Vec<(i64, i64)> = adj
+            .iter()
+            .filter(|(_, edges)| edges.len() != 2)
+            .map(|(&pt, _)| pt)
+            .collect();
+        start_nodes.sort_unstable();
+
+        for start_pt in start_nodes {
+            let edges = adj.get(&start_pt).cloned().unwrap_or_default();
+            for (seg_idx, nxt_pt) in edges {
+                if visited_segs[seg_idx] {
+                    continue;
+                }
+                visited_segs[seg_idx] = true;
+
+                let mut chain_pts = vec![pt_coords[&start_pt], pt_coords[&nxt_pt]];
+                let mut curr_pt = nxt_pt;
+
+                while let Some(curr_edges) = adj.get(&curr_pt) {
+                    if curr_edges.len() != 2 {
+                        break;
+                    }
+                    let next_edge = curr_edges.iter().find(|(e_idx, _)| !visited_segs[*e_idx]);
+                    if let Some(&(nxt_seg, next_next_pt)) = next_edge {
+                        visited_segs[nxt_seg] = true;
+                        chain_pts.push(pt_coords[&next_next_pt]);
+                        curr_pt = next_next_pt;
+                    } else {
+                        break;
+                    }
+                }
+
+                if chain_pts.len() >= 2 {
+                    all_chains.push(TrackChain {
+                        net_id,
+                        layer,
+                        width,
+                        points: chain_pts,
+                    });
+                }
+            }
+        }
+
+        for idx in 0..segs.len() {
+            if visited_segs[idx] {
+                continue;
+            }
+            let seg = segs[idx];
+            let q1 = quant_point(seg.start);
+            let q2 = quant_point(seg.end);
+            if q1 == q2 {
+                continue;
+            }
+            visited_segs[idx] = true;
+            let mut chain_pts = vec![pt_coords[&q1], pt_coords[&q2]];
+            let mut curr_pt = q2;
+
+            while let Some(curr_edges) = adj.get(&curr_pt) {
+                let next_edge = curr_edges.iter().find(|(e_idx, _)| !visited_segs[*e_idx]);
+                if let Some(&(nxt_seg, next_next_pt)) = next_edge {
+                    visited_segs[nxt_seg] = true;
+                    chain_pts.push(pt_coords[&next_next_pt]);
+                    curr_pt = next_next_pt;
+                    if curr_pt == q1 {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if chain_pts.len() >= 2 {
+                all_chains.push(TrackChain {
+                    net_id,
+                    layer,
+                    width,
+                    points: chain_pts,
+                });
+            }
+        }
+    }
+
+    all_chains
+}
+
+pub fn merge_collinear_points(pts: &mut Vec<(f64, f64)>) {
+    if pts.len() < 3 {
+        return;
+    }
+    let mut cleaned = Vec::with_capacity(pts.len());
+    cleaned.push(pts[0]);
+    for i in 1..pts.len() - 1 {
+        let prev = *cleaned.last().unwrap();
+        let curr = pts[i];
+        let next = pts[i + 1];
+
+        let d_prev_curr = (curr.0 - prev.0).hypot(curr.1 - prev.1);
+        let d_curr_next = (next.0 - curr.0).hypot(next.1 - curr.1);
+        let d_prev_next = (next.0 - prev.0).hypot(next.1 - prev.1);
+
+        if d_prev_curr < 1e-4 || d_curr_next < 1e-4 {
+            continue;
+        }
+
+        let cross = (curr.0 - prev.0) * (next.1 - prev.1) - (curr.1 - prev.1) * (next.0 - prev.0);
+        let dot = (curr.0 - prev.0) * (next.0 - curr.0) + (curr.1 - prev.1) * (next.1 - curr.1);
+        let is_collinear = cross.abs() < 1e-5 && dot > 0.0 && (d_prev_curr + d_curr_next - d_prev_next).abs() < 1e-4;
+
+        if !is_collinear {
+            cleaned.push(curr);
+        }
+    }
+    cleaned.push(*pts.last().unwrap());
+    *pts = cleaned;
+}
+
+pub fn count_chain_bends(pts: &[(f64, f64)]) -> usize {
+    if pts.len() < 3 {
+        return 0;
+    }
+    let mut bends = 0;
+    for k in 1..pts.len() - 1 {
+        let dx1 = pts[k].0 - pts[k - 1].0;
+        let dy1 = pts[k].1 - pts[k - 1].1;
+        let dx2 = pts[k + 1].0 - pts[k].0;
+        let dy2 = pts[k + 1].1 - pts[k].1;
+        let len1 = dx1.hypot(dy1);
+        let len2 = dx2.hypot(dy2);
+        if len1 < 1e-6 || len2 < 1e-6 {
+            continue;
+        }
+        let dot = (dx1 * dx2 + dy1 * dy2) / (len1 * len2);
+        if dot < 0.9999 {
+            bends += 1;
+        }
+    }
+    bends
+}
+
+pub fn is_segment_clear(
+    board: &Board,
+    grid: Option<&RoutingGrid>,
+    p1: (f64, f64),
+    p2: (f64, f64),
+    layer: usize,
+    net_id: usize,
+    width: f64,
+) -> bool {
+    let clearance = board.get_netclass_for_net(net_id).clearance;
+    let half_w = width * 0.5;
+    let margin = half_w + clearance;
+
+    // 1. Board bounds check
+    let min_x = p1.0.min(p2.0) - margin;
+    let max_x = p1.0.max(p2.0) + margin;
+    let min_y = p1.1.min(p2.1) - margin;
+    let max_y = p1.1.max(p2.1) + margin;
+
+    if board.max_x > board.min_x && board.max_y > board.min_y {
+        if min_x < board.min_x || max_x > board.max_x || min_y < board.min_y || max_y > board.max_y {
+            return false;
+        }
+    }
+
+    // 2. Keepouts
+    for ko in &board.keepouts {
+        if ko.layers.contains(&layer) {
+            let k_min_x = ko.min_x - margin;
+            let k_max_x = ko.max_x + margin;
+            let k_min_y = ko.min_y - margin;
+            let k_max_y = ko.max_y + margin;
+
+            if (p1.0 >= k_min_x && p1.0 <= k_max_x && p1.1 >= k_min_y && p1.1 <= k_max_y)
+                || (p2.0 >= k_min_x && p2.0 <= k_max_x && p2.1 >= k_min_y && p2.1 <= k_max_y)
+            {
+                return false;
+            }
+
+            let corners = [
+                (ko.min_x, ko.min_y),
+                (ko.max_x, ko.min_y),
+                (ko.max_x, ko.max_y),
+                (ko.min_x, ko.max_y),
+            ];
+            for k in 0..4 {
+                let e1 = corners[k];
+                let e2 = corners[(k + 1) % 4];
+                if dist_segment_to_segment(p1, p2, e1, e2) < margin - 1e-4 {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // 3. Foreign Pads
+    for fp in &board.footprints {
+        let pad_layer = fp.layer;
+        for pad in &fp.pads {
+            if pad.net_id != net_id {
+                if pad.is_through_hole || pad_layer == layer {
+                    let (px, py) = fp.pad_absolute_position(pad);
+                    let (pw, ph) = fp.pad_world_size(pad);
+                    let pad_rad = pw.max(ph) * 0.5;
+                    let pad_clr = board.get_netclass_for_net(pad.net_id).clearance;
+                    let req_clr = clearance.max(pad_clr);
+                    let required_dist = half_w + pad_rad + req_clr;
+                    if dist_to_segment(px, py, p1.0, p1.1, p2.0, p2.1) < required_dist - 1e-4 {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Foreign Vias
+    for via in &board.vias {
+        if via.net_id != net_id {
+            let via_rad = via.size * 0.5;
+            let via_clr = board.get_netclass_for_net(via.net_id).clearance;
+            let req_clr = clearance.max(via_clr);
+            let required_dist = half_w + via_rad + req_clr;
+            if dist_to_segment(via.position.0, via.position.1, p1.0, p1.1, p2.0, p2.1) < required_dist - 1e-4 {
+                return false;
+            }
+        }
+    }
+
+    // 5. Foreign Tracks
+    for trk in &board.tracks {
+        if trk.net_id != net_id && trk.layer == layer {
+            let trk_clr = board.get_netclass_for_net(trk.net_id).clearance;
+            let req_clr = clearance.max(trk_clr);
+            let required_dist = half_w + (trk.width * 0.5) + req_clr;
+            if dist_segment_to_segment(p1, p2, trk.start, trk.end) < required_dist - 1e-4 {
+                return false;
+            }
+        }
+    }
+
+    // 6. RoutingGrid rasterized obstacles (sampling)
+    if let Some(g) = grid {
+        let seg_len = (p1.0 - p2.0).hypot(p1.1 - p2.1);
+        let step = (g.res * 0.5).max(0.02);
+        let n_steps = (seg_len / step).ceil() as usize;
+        let n_steps = n_steps.max(1);
+        for s in 0..=n_steps {
+            let t = s as f64 / n_steps as f64;
+            let x = p1.0 + t * (p2.0 - p1.0);
+            let y = p1.1 + t * (p2.1 - p1.1);
+            if let Some((gx, gy)) = g.world_to_grid(x, y) {
+                let idx = g.idx(gx, gy, layer);
+                let cell_net = g.obstacle_net_ids[idx];
+                if cell_net != FREE_NET && cell_net != net_id as i32 {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
+pub fn rubber_band_straighten(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
+    if chain.points.len() < 3 {
+        return;
+    }
+    let mut changed = true;
+    let mut pass = 0;
+    while changed && pass < 4 {
+        changed = false;
+        pass += 1;
+        let mut new_points = Vec::with_capacity(chain.points.len());
+        let mut i = 0;
+        new_points.push(chain.points[0]);
+
+        while i + 1 < chain.points.len() {
+            let mut best_j = None;
+            for j in (i + 2..chain.points.len()).rev() {
+                let p1 = chain.points[i];
+                let p2 = chain.points[j];
+                let dx = p2.0 - p1.0;
+                let dy = p2.1 - p1.1;
+                let is_octilinear = dx.abs() < 1e-4 || dy.abs() < 1e-4 || (dx.abs() - dy.abs()).abs() < 1e-4;
+                if is_octilinear && is_segment_clear(board, Some(grid), p1, p2, chain.layer, chain.net_id, chain.width) {
+                    best_j = Some(j);
+                    break;
+                }
+            }
+
+            if let Some(j) = best_j {
+                new_points.push(chain.points[j]);
+                i = j;
+                changed = true;
+            } else {
+                i += 1;
+                new_points.push(chain.points[i]);
+            }
+        }
+        chain.points = new_points;
+        merge_collinear_points(&mut chain.points);
+    }
+}
+
+pub fn eliminate_stair_steps(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
+    if chain.points.len() < 4 {
+        return;
+    }
+    let mut changed = true;
+    let mut pass = 0;
+    while changed && pass < 4 {
+        changed = false;
+        pass += 1;
+        let mut i = 0;
+        while i + 2 < chain.points.len() {
+            let max_j = (i + 16).min(chain.points.len() - 1);
+            let mut best_replacement = None;
+
+            for j in (i + 2..=max_j).rev() {
+                let existing_bends = count_chain_bends(&chain.points[i..=j]);
+                if existing_bends < 2 && j - i < 3 {
+                    continue;
+                }
+
+                let p_i = chain.points[i];
+                let p_j = chain.points[j];
+                let dx = p_j.0 - p_i.0;
+                let dy = p_j.1 - p_i.1;
+
+                if dx.abs() < 1e-4 || dy.abs() < 1e-4 || (dx.abs() - dy.abs()).abs() < 1e-4 {
+                    if is_segment_clear(board, Some(grid), p_i, p_j, chain.layer, chain.net_id, chain.width) {
+                        best_replacement = Some((j, vec![p_i, p_j]));
+                        break;
+                    }
+                }
+
+                let s = dx.abs().min(dy.abs());
+                if s > 1e-4 {
+                    let sx = s * dx.signum();
+                    let sy = s * dy.signum();
+
+                    let c_a = (p_i.0 + sx, p_i.1 + sy);
+                    let clear_a = is_segment_clear(board, Some(grid), p_i, c_a, chain.layer, chain.net_id, chain.width)
+                        && is_segment_clear(board, Some(grid), c_a, p_j, chain.layer, chain.net_id, chain.width);
+
+                    let c_b = (p_j.0 - sx, p_j.1 - sy);
+                    let clear_b = is_segment_clear(board, Some(grid), p_i, c_b, chain.layer, chain.net_id, chain.width)
+                        && is_segment_clear(board, Some(grid), c_b, p_j, chain.layer, chain.net_id, chain.width);
+
+                    if clear_a && clear_b {
+                        let orig_cx: f64 = chain.points[i..=j].iter().map(|p| p.0).sum::<f64>() / (j - i + 1) as f64;
+                        let orig_cy: f64 = chain.points[i..=j].iter().map(|p| p.1).sum::<f64>() / (j - i + 1) as f64;
+                        let dist_a = (c_a.0 - orig_cx).hypot(c_a.1 - orig_cy);
+                        let dist_b = (c_b.0 - orig_cx).hypot(c_b.1 - orig_cy);
+                        let chosen_c = if dist_a <= dist_b { c_a } else { c_b };
+                        best_replacement = Some((j, vec![p_i, chosen_c, p_j]));
+                        break;
+                    } else if clear_a {
+                        best_replacement = Some((j, vec![p_i, c_a, p_j]));
+                        break;
+                    } else if clear_b {
+                        best_replacement = Some((j, vec![p_i, c_b, p_j]));
+                        break;
+                    }
+                }
+            }
+
+            if let Some((j, repl)) = best_replacement {
+                let mut new_points = Vec::with_capacity(chain.points.len());
+                new_points.extend_from_slice(&chain.points[..i]);
+                new_points.extend(repl);
+                new_points.extend_from_slice(&chain.points[j + 1..]);
+                chain.points = new_points;
+                merge_collinear_points(&mut chain.points);
+                changed = true;
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+pub fn reduce_jogs(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
+    if chain.points.len() < 4 {
+        return;
+    }
+    let mut changed = true;
+    let mut pass = 0;
+    let max_jog_offset = (2.0 * chain.width).max(0.30);
+
+    let is_oct = |a: (f64, f64), b: (f64, f64)| -> bool {
+        let dx = b.0 - a.0;
+        let dy = b.1 - a.1;
+        dx.abs() < 1e-4 || dy.abs() < 1e-4 || (dx.abs() - dy.abs()).abs() < 1e-4
+    };
+
+    while changed && pass < 4 {
+        changed = false;
+        pass += 1;
+        let mut i = 0;
+        while i + 3 < chain.points.len() {
+            let p0 = chain.points[i];
+            let p1 = chain.points[i + 1];
+            let p2 = chain.points[i + 2];
+            let p3 = chain.points[i + 3];
+
+            let jog_len = (p2.0 - p1.0).hypot(p2.1 - p1.1);
+            let lat_offset = dist_to_segment(p2.0, p2.1, p0.0, p0.1, p1.0, p1.1);
+
+            let is_micro_jog = jog_len <= max_jog_offset || lat_offset <= max_jog_offset;
+
+            if is_micro_jog {
+                if is_oct(p0, p3) && is_segment_clear(board, Some(grid), p0, p3, chain.layer, chain.net_id, chain.width) {
+                    chain.points.remove(i + 2);
+                    chain.points.remove(i + 1);
+                    merge_collinear_points(&mut chain.points);
+                    changed = true;
+                    continue;
+                }
+
+                if is_oct(p0, p2) && is_segment_clear(board, Some(grid), p0, p2, chain.layer, chain.net_id, chain.width) {
+                    chain.points.remove(i + 1);
+                    merge_collinear_points(&mut chain.points);
+                    changed = true;
+                    continue;
+                }
+
+                if is_oct(p1, p3) && is_segment_clear(board, Some(grid), p1, p3, chain.layer, chain.net_id, chain.width) {
+                    chain.points.remove(i + 2);
+                    merge_collinear_points(&mut chain.points);
+                    changed = true;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
+pub fn smooth_45_miters(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
+    if chain.points.len() < 3 {
+        return;
+    }
+    let mut new_points = Vec::with_capacity(chain.points.len() * 2);
+    new_points.push(chain.points[0]);
+
+    for i in 1..chain.points.len() - 1 {
+        let prev = *new_points.last().unwrap();
+        let curr = chain.points[i];
+        let next = chain.points[i + 1];
+
+        let v1 = (curr.0 - prev.0, curr.1 - prev.1);
+        let v2 = (next.0 - curr.0, next.1 - curr.1);
+        let l1 = v1.0.hypot(v1.1);
+        let l2 = v2.0.hypot(v2.1);
+
+        if l1 < 1e-4 || l2 < 1e-4 {
+            new_points.push(curr);
+            continue;
+        }
+
+        let dot = (v1.0 * v2.0 + v1.1 * v2.1) / (l1 * l2);
+        let cross = (v1.0 * v2.1 - v1.1 * v2.0) / (l1 * l2);
+
+        let is_90_deg = dot.abs() < 0.05 && cross.abs() > 0.95;
+
+        if is_90_deg {
+            let setback = (1.5 * chain.width).min(0.35 * l1).min(0.35 * l2);
+            if setback > 0.03 {
+                let m1 = (curr.0 - setback * (v1.0 / l1), curr.1 - setback * (v1.1 / l1));
+                let m2 = (curr.0 + setback * (v2.0 / l2), curr.1 + setback * (v2.1 / l2));
+
+                if is_segment_clear(board, Some(grid), m1, m2, chain.layer, chain.net_id, chain.width) {
+                    new_points.push(m1);
+                    new_points.push(m2);
+                    continue;
+                }
+            }
+        }
+
+        new_points.push(curr);
+    }
+
+    new_points.push(*chain.points.last().unwrap());
+    chain.points = new_points;
+}
+
+pub fn gloss_tracks(board: &mut Board, grid: &RoutingGrid) {
+    let mut net_ids: Vec<usize> = board
+        .tracks
+        .iter()
+        .filter(|t| !t.is_locked)
+        .map(|t| t.net_id)
+        .collect();
+    net_ids.sort_unstable();
+    net_ids.dedup();
+
+    for net_id in net_ids {
+        let net_tracks: Vec<TrackSegment> = board
+            .tracks
+            .iter()
+            .filter(|t| t.net_id == net_id && !t.is_locked)
+            .cloned()
+            .collect();
+        if net_tracks.is_empty() {
+            continue;
+        }
+
+        board.tracks.retain(|t| t.net_id != net_id || t.is_locked);
+
+        let mut chains = extract_track_chains(&net_tracks);
+        for chain in &mut chains {
+            merge_collinear_points(&mut chain.points);
+            rubber_band_straighten(chain, board, grid);
+            eliminate_stair_steps(chain, board, grid);
+            reduce_jogs(chain, board, grid);
+            smooth_45_miters(chain, board, grid);
+            merge_collinear_points(&mut chain.points);
+        }
+
+        for chain in chains {
+            for k in 0..chain.points.len().saturating_sub(1) {
+                let p1 = chain.points[k];
+                let p2 = chain.points[k + 1];
+                if (p1.0 - p2.0).hypot(p1.1 - p2.1) > 1e-5 {
+                    board.tracks.push(TrackSegment {
+                        start: p1,
+                        end: p2,
+                        width: chain.width,
+                        layer: chain.layer,
+                        net_id: chain.net_id,
+                        is_locked: false,
+                    });
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5006,6 +5621,216 @@ mod tests {
         // Verify explicit setting overrides heuristic
         nc.topology = NetTopology::StarPoint;
         assert_eq!(nc.resolve_topology("SYS_CLK"), NetTopology::StarPoint);
+    }
+
+    #[test]
+    fn test_post_route_glossing_straightens_rubber_band() {
+        let nets = vec!["".to_string(), "SIG1".to_string()];
+        let mut net_name_to_id = HashMap::new();
+        net_name_to_id.insert("SIG1".to_string(), 1);
+        let mut netclasses = HashMap::new();
+        netclasses.insert("Default".to_string(), NetClass::default());
+        let mut net_to_class = HashMap::new();
+        net_to_class.insert("SIG1".to_string(), "Default".to_string());
+
+        // A track on SIG1 with an unnecessary V-shaped detour in open space:
+        // (10.0, 10.0) -> (15.0, 15.0) -> (20.0, 10.0)
+        let mut board = Board {
+            file_path: String::new(),
+            raw_content: String::new(),
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 100.0,
+            max_y: 100.0,
+            footprints: Vec::new(),
+            holding_palette: Vec::new(),
+            nets,
+            net_name_to_id,
+            netclasses,
+            net_to_class,
+            keepouts: Vec::new(),
+            tracks: vec![
+                TrackSegment {
+                    start: (10.0, 10.0),
+                    end: (15.0, 15.0),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+                TrackSegment {
+                    start: (15.0, 15.0),
+                    end: (20.0, 10.0),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+            ],
+            vias: Vec::new(),
+            clusters: Vec::new(),
+            schematic_positions: HashMap::new(),
+        };
+
+        let grid = RoutingGrid::new(&board, 0.20, None);
+        let router = AutoRouter::new(3);
+
+        let initial_len: f64 = board.tracks.iter().map(|t| (t.end.0 - t.start.0).hypot(t.end.1 - t.start.1)).sum();
+        assert!((initial_len - 14.142).abs() < 0.05);
+
+        router.gloss_tracks(&mut board, &grid);
+
+        let glossed_len: f64 = board.tracks.iter().map(|t| (t.end.0 - t.start.0).hypot(t.end.1 - t.start.1)).sum();
+        assert_eq!(board.tracks.len(), 1, "Rubber-band straightening should collapse 2 detour segments into 1 direct segment");
+        assert!((glossed_len - 10.0).abs() < 1e-4, "Straightened length must equal direct horizontal distance (10.0 mm)");
+        assert_eq!(board.tracks[0].start, (10.0, 10.0));
+        assert_eq!(board.tracks[0].end, (20.0, 10.0));
+    }
+
+    #[test]
+    fn test_post_route_glossing_eliminates_stair_steps() {
+        let nets = vec!["".to_string(), "SIG1".to_string()];
+        let mut net_name_to_id = HashMap::new();
+        net_name_to_id.insert("SIG1".to_string(), 1);
+        let mut netclasses = HashMap::new();
+        netclasses.insert("Default".to_string(), NetClass::default());
+        let mut net_to_class = HashMap::new();
+        net_to_class.insert("SIG1".to_string(), "Default".to_string());
+
+        // Staircase zig-zag: (10, 10) -> (12, 10) -> (12, 12) -> (14, 12) -> (14, 14) -> (16, 14) -> (16, 16) -> (20, 16)
+        let pts = [
+            (10.0, 10.0),
+            (12.0, 10.0),
+            (12.0, 12.0),
+            (14.0, 12.0),
+            (14.0, 14.0),
+            (16.0, 14.0),
+            (16.0, 16.0),
+            (20.0, 16.0),
+        ];
+        let mut tracks = Vec::new();
+        for i in 0..pts.len() - 1 {
+            tracks.push(TrackSegment {
+                start: pts[i],
+                end: pts[i + 1],
+                width: 0.25,
+                layer: 0,
+                net_id: 1,
+                is_locked: false,
+            });
+        }
+
+        let mut board = Board {
+            file_path: String::new(),
+            raw_content: String::new(),
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 100.0,
+            max_y: 100.0,
+            footprints: Vec::new(),
+            holding_palette: Vec::new(),
+            nets,
+            net_name_to_id,
+            netclasses,
+            net_to_class,
+            keepouts: Vec::new(),
+            tracks,
+            vias: Vec::new(),
+            clusters: Vec::new(),
+            schematic_positions: HashMap::new(),
+        };
+
+        let grid = RoutingGrid::new(&board, 0.20, None);
+        let router = AutoRouter::new(3);
+
+        let initial_len: f64 = board.tracks.iter().map(|t| (t.end.0 - t.start.0).hypot(t.end.1 - t.start.1)).sum();
+        let initial_bends = board.tracks.len().saturating_sub(1);
+        assert_eq!(initial_bends, 6);
+
+        router.gloss_tracks(&mut board, &grid);
+
+        let glossed_len: f64 = board.tracks.iter().map(|t| (t.end.0 - t.start.0).hypot(t.end.1 - t.start.1)).sum();
+        assert!(
+            board.tracks.len() <= 3,
+            "Staircase elimination must collapse 7 segments into <= 3 canonical segments, got {}",
+            board.tracks.len()
+        );
+        assert!(
+            glossed_len < initial_len - 1.5,
+            "Glossed path length ({:.3}) must be shorter than staircase ({:.3})",
+            glossed_len,
+            initial_len
+        );
+    }
+
+    #[test]
+    fn test_post_route_glossing_preserves_clearance() {
+        let nets = vec!["".to_string(), "SIG1".to_string(), "BLOCKER".to_string()];
+        let mut net_name_to_id = HashMap::new();
+        net_name_to_id.insert("SIG1".to_string(), 1);
+        net_name_to_id.insert("BLOCKER".to_string(), 2);
+        let mut netclasses = HashMap::new();
+        netclasses.insert("Default".to_string(), NetClass::default());
+        let mut net_to_class = HashMap::new();
+        net_to_class.insert("SIG1".to_string(), "Default".to_string());
+        net_to_class.insert("BLOCKER".to_string(), "Default".to_string());
+
+        let blocker_fp = make_fp("U_BLOCK", 12.0, 12.0, true, vec![
+            Pad::new("1", 0.0, 0.0, 2.0, 2.0, 2, "BLOCKER", false),
+        ]);
+
+        let mut board = Board {
+            file_path: String::new(),
+            raw_content: String::new(),
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 100.0,
+            max_y: 100.0,
+            footprints: vec![blocker_fp],
+            holding_palette: Vec::new(),
+            nets,
+            net_name_to_id,
+            netclasses,
+            net_to_class,
+            keepouts: Vec::new(),
+            tracks: vec![
+                TrackSegment {
+                    start: (10.0, 10.0),
+                    end: (10.0, 20.0),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+                TrackSegment {
+                    start: (10.0, 20.0),
+                    end: (20.0, 20.0),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+            ],
+            vias: Vec::new(),
+            clusters: Vec::new(),
+            schematic_positions: HashMap::new(),
+        };
+
+        let mut grid = RoutingGrid::new(&board, 0.20, None);
+        grid.rasterize_obstacles(&board);
+        let router = AutoRouter::new(3);
+
+        router.gloss_tracks(&mut board, &grid);
+
+        for trk in &board.tracks {
+            let dist = dist_to_segment(12.0, 12.0, trk.start.0, trk.start.1, trk.end.0, trk.end.1);
+            let req_clearance = 0.20 + 0.25 / 2.0 + 1.0; // pad_rad + track_half_w + clearance
+            assert!(
+                dist >= req_clearance - 0.05,
+                "Track segment from ({:.2}, {:.2}) to ({:.2}, {:.2}) encroaches on blocker at (12, 12) with dist {:.3} < {:.3}",
+                trk.start.0, trk.start.1, trk.end.0, trk.end.1, dist, req_clearance
+            );
+        }
     }
 }
 

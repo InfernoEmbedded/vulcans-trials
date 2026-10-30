@@ -57,7 +57,7 @@ Below is a comprehensive breakdown of features offered by flagship commercial PC
 - [x] **Net Topology Constraints:** Daisy-chain, fly-by, T-branch, and star-point routing rules per net.
 
 ### Phase 3: v0.3 — Glossing, Via Optimization & Any-Angle Topological Routing
-- [ ] **Post-Route Glossing Pass:** Rubber-band trace straightening, stair-step elimination, and $45^\circ$ / arc corner smoothing.
+- [x] **Post-Route Glossing Pass:** Rubber-band trace straightening, stair-step elimination, and $45^\circ$ / arc corner smoothing.
 - [ ] **Via Reduction Pass:** Iterative layer-reassignment pass that removes redundant layer transitions when a single-layer detour is within length budget.
 - [ ] **Track Push-and-Shove (Continuous Coordinates):** Off-grid continuous shove engine allowing existing tracks to flex smoothly around newly routed nets.
 - [ ] **TopoR-Style Any-Angle Mode:** Delaunay triangulation + rubber-band topological routing for ultra-compact boards and curved enclosures.
