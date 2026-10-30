@@ -42,6 +42,18 @@ pub struct VulcansTrialsApp {
     pub show_refs: bool,
     pub show_holding_palette: bool,
     pub selected_net: Option<String>,
+    pub moving_footprint: Option<MovingFootprint>,
+    pub hovered_footprint: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MovingFootprint {
+    pub fp_index: usize,
+    pub reference: String,
+    pub original_x: f64,
+    pub original_y: f64,
+    pub original_rotation: f64,
+    pub original_layer: usize,
 }
 
 impl VulcansTrialsApp {
@@ -76,6 +88,8 @@ impl VulcansTrialsApp {
             show_refs: true,
             show_holding_palette: true,
             selected_net: None,
+            moving_footprint: None,
+            hovered_footprint: None,
         }
     }
 
@@ -411,6 +425,177 @@ impl VulcansTrialsApp {
         } else {
             None
         }
+    }
+
+    /// Picks up an unlocked component at `pos` to begin manual movement.
+    pub fn pick_up_component_at(&mut self, rect: Rect, pos: Pos2) -> bool {
+        if self.worker_running.load(Ordering::Relaxed) {
+            return false;
+        }
+        let snap = self.live.lock().unwrap().clone();
+        let b = &snap.board;
+        let mut best_idx: Option<(usize, f32, f32)> = None;
+        for (idx, fp) in b.footprints.iter().enumerate() {
+            let fp_rect = self.footprint_screen_rect(b, rect, fp);
+            if fp_rect.contains(pos) {
+                let area = fp_rect.width() * fp_rect.height();
+                let dist = fp_rect.center().distance(pos);
+                if best_idx.map_or(true, |(_, best_area, best_dist)| {
+                    area < best_area - 1.0 || ((area - best_area).abs() <= 1.0 && dist < best_dist)
+                }) {
+                    best_idx = Some((idx, area, dist));
+                }
+            }
+        }
+        if let Some((idx, _, _)) = best_idx {
+            let fp = &b.footprints[idx];
+            if fp.is_locked {
+                let mut g = self.live.lock().unwrap();
+                g.push_log(format!("[Move] {} is locked and cannot be moved", fp.reference));
+                return false;
+            }
+            self.moving_footprint = Some(MovingFootprint {
+                fp_index: idx,
+                reference: fp.reference.clone(),
+                original_x: fp.x,
+                original_y: fp.y,
+                original_rotation: fp.rotation,
+                original_layer: fp.layer,
+            });
+            let mut g = self.live.lock().unwrap();
+            g.push_log(format!(
+                "[Move] Picked up {} at ({:.2}, {:.2}). Move mouse to position, 'r' to rotate, 'f' to flip, Click to place.",
+                fp.reference, fp.x, fp.y
+            ));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Updates the position of the currently moving component to track cursor position.
+    pub fn update_moving_component_pos(&mut self, rect: Rect, pos: Pos2) {
+        if let Some(ref mf) = self.moving_footprint {
+            let mut g = self.live.lock().unwrap();
+            let world_pt = self.screen_to_board(&g.board, rect, pos);
+            if mf.fp_index < g.board.footprints.len() {
+                g.board.footprints[mf.fp_index].x = world_pt.x;
+                g.board.footprints[mf.fp_index].y = world_pt.y;
+                g.refresh_ratsnest();
+            }
+        }
+    }
+
+    /// Rotates the active component (moving component or hovered component) by 90 degrees.
+    pub fn rotate_active_component(&mut self) -> bool {
+        if self.worker_running.load(Ordering::Relaxed) {
+            return false;
+        }
+        let target_idx = if let Some(ref mf) = self.moving_footprint {
+            Some(mf.fp_index)
+        } else if let Some(h_idx) = self.hovered_footprint {
+            let snap = self.live.lock().unwrap();
+            if h_idx < snap.board.footprints.len() && !snap.board.footprints[h_idx].is_locked {
+                Some(h_idx)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(idx) = target_idx {
+            let mut g = self.live.lock().unwrap();
+            if idx < g.board.footprints.len() {
+                let fp = &mut g.board.footprints[idx];
+                fp.rotation = (fp.rotation + 90.0) % 360.0;
+                let ref_des = fp.reference.clone();
+                let rot = fp.rotation;
+                g.refresh_ratsnest();
+                g.push_log(format!("[Rotate] Rotated {} by 90° to {:.0}°", ref_des, rot));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Flips the active component (moving component or hovered component) to the other board side.
+    pub fn flip_active_component(&mut self) -> bool {
+        if self.worker_running.load(Ordering::Relaxed) {
+            return false;
+        }
+        let target_idx = if let Some(ref mf) = self.moving_footprint {
+            Some(mf.fp_index)
+        } else if let Some(h_idx) = self.hovered_footprint {
+            let snap = self.live.lock().unwrap();
+            if h_idx < snap.board.footprints.len() && !snap.board.footprints[h_idx].is_locked {
+                Some(h_idx)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(idx) = target_idx {
+            let mut g = self.live.lock().unwrap();
+            if idx < g.board.footprints.len() {
+                let fp = &mut g.board.footprints[idx];
+                fp.layer = 1 - fp.layer;
+                let ref_des = fp.reference.clone();
+                let layer_str = if fp.layer == 1 { "B.Cu (Bottom)" } else { "F.Cu (Top)" };
+                g.refresh_ratsnest();
+                g.push_log(format!("[Flip] Flipped {} to {}", ref_des, layer_str));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Places the moving component at its current position, shoving other unlocked components if needed.
+    pub fn place_moving_component(&mut self) -> Option<usize> {
+        if self.worker_running.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mf = self.moving_footprint.take()?;
+        let shoved_count = {
+            let mut g = self.live.lock().unwrap();
+            let count = crate::placer::shove_overlapping_components(&mut g.board, mf.fp_index, self.min_spacing_mm);
+            g.refresh_ratsnest();
+            if mf.fp_index < g.board.footprints.len() {
+                let ref_des = g.board.footprints[mf.fp_index].reference.clone();
+                let (px, py) = (g.board.footprints[mf.fp_index].x, g.board.footprints[mf.fp_index].y);
+                if count > 0 {
+                    g.push_log(format!(
+                        "[Place] Placed {} at ({:.2}, {:.2}) and shoved {} overlapping component{}",
+                        ref_des, px, py, count, if count == 1 { "" } else { "s" }
+                    ));
+                } else {
+                    g.push_log(format!("[Place] Placed {} at ({:.2}, {:.2})", ref_des, px, py));
+                }
+            }
+            count
+        };
+        Some(shoved_count)
+    }
+
+    /// Cancels moving the active component and restores its original coordinates, rotation, and layer.
+    pub fn cancel_moving_component(&mut self) -> bool {
+        if let Some(mf) = self.moving_footprint.take() {
+            let mut g = self.live.lock().unwrap();
+            if mf.fp_index < g.board.footprints.len() {
+                let fp = &mut g.board.footprints[mf.fp_index];
+                fp.x = mf.original_x;
+                fp.y = mf.original_y;
+                fp.rotation = mf.original_rotation;
+                fp.layer = mf.original_layer;
+                let ref_des = fp.reference.clone();
+                g.refresh_ratsnest();
+                g.push_log(format!("[Move] Cancelled move for {}", ref_des));
+                return true;
+            }
+        }
+        false
     }
 
     pub fn render_ui(&mut self, ctx: &egui::Context) {
@@ -784,18 +969,91 @@ impl VulcansTrialsApp {
             let rect = response.rect;
             painter.rect_filled(rect, 0.0, Color32::from_rgb(16, 20, 24));
 
+            let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+
+            // Track hovered footprint under cursor
+            if !is_running {
+                if let Some(pos) = pointer_pos {
+                    if rect.contains(pos) {
+                        let snap = self.live.lock().unwrap().clone();
+                        let b = &snap.board;
+                        let mut best_idx: Option<(usize, f32, f32)> = None;
+                        for (idx, fp) in b.footprints.iter().enumerate() {
+                            let fp_rect = self.footprint_screen_rect(b, rect, fp);
+                            if fp_rect.contains(pos) {
+                                let area = fp_rect.width() * fp_rect.height();
+                                let dist = fp_rect.center().distance(pos);
+                                if best_idx.map_or(true, |(_, best_area, best_dist)| {
+                                    area < best_area - 1.0 || ((area - best_area).abs() <= 1.0 && dist < best_dist)
+                                }) {
+                                    best_idx = Some((idx, area, dist));
+                                }
+                            }
+                        }
+                        self.hovered_footprint = best_idx.map(|(i, _, _)| i);
+                    } else {
+                        self.hovered_footprint = None;
+                    }
+                } else {
+                    self.hovered_footprint = None;
+                }
+            }
+
+            // Keyboard shortcuts: 'm' (pick up/move), 'r' (rotate 90°), 'f' (flip layer), 'Escape' (cancel move)
+            if !ctx.wants_keyboard_input() && !is_running {
+                if ctx.input(|i| i.key_pressed(egui::Key::M)) {
+                    if self.moving_footprint.is_none() {
+                        if let Some(pos) = pointer_pos {
+                            if rect.contains(pos) {
+                                self.pick_up_component_at(rect, pos);
+                            }
+                        }
+                    }
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::R)) {
+                    self.rotate_active_component();
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::F)) {
+                    self.flip_active_component();
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.cancel_moving_component();
+                }
+            }
+
+            // If a footprint is actively being moved, update its position to follow the cursor
+            if self.moving_footprint.is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                if let Some(pos) = pointer_pos {
+                    if rect.contains(pos) {
+                        self.update_moving_component_pos(rect, pos);
+                    }
+                }
+            } else if let Some(h_idx) = self.hovered_footprint {
+                let snap = self.live.lock().unwrap();
+                if h_idx < snap.board.footprints.len() && !snap.board.footprints[h_idx].is_locked {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+            }
+
             if response.clicked() {
-                if let Some(click_pos) = response.interact_pointer_pos() {
+                if self.moving_footprint.is_some() {
+                    self.place_moving_component();
+                } else if let Some(click_pos) = response.interact_pointer_pos() {
                     self.handle_canvas_click_at(rect, click_pos);
                 }
             }
             if response.secondary_clicked() {
-                if let Some(click_pos) = response.interact_pointer_pos() {
+                if self.moving_footprint.is_some() {
+                    self.cancel_moving_component();
+                } else if let Some(click_pos) = response.interact_pointer_pos() {
                     self.handle_canvas_secondary_click_at(rect, click_pos);
                 }
             }
             if response.dragged() {
-                self.pan_offset += response.drag_delta();
+                if self.moving_footprint.is_none() {
+                    self.pan_offset += response.drag_delta();
+                }
             }
             if rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default())) {
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -893,22 +1151,30 @@ impl VulcansTrialsApp {
             }
 
             // 7. Draw Footprints, Courtyards, Rotated Pads, and Lock Icons
-            for fp in &b.footprints {
+            for (idx, fp) in b.footprints.iter().enumerate() {
                 let fp_rect = self.footprint_screen_rect(b, rect, fp);
+                let is_moving = self.moving_footprint.as_ref().map_or(false, |m| m.fp_index == idx);
+                let is_hovered = self.hovered_footprint == Some(idx) && !is_moving;
+
                 if self.show_courtyards {
-                    let stroke_col = if fp.is_locked {
+                    let stroke_col = if is_moving {
+                        Color32::from_rgb(255, 230, 80)
+                    } else if is_hovered {
+                        Color32::from_rgb(255, 255, 255)
+                    } else if fp.is_locked {
                         Color32::from_rgb(240, 175, 50)
                     } else if fp.layer == 1 {
                         Color32::from_rgb(80, 170, 255)
                     } else {
                         Color32::from_rgb(70, 210, 160)
                     };
+                    let stroke_w = if is_moving { 2.4_f32 } else if is_hovered { 1.8_f32 } else { 1.2_f32 };
                     let polys = fp.transformed_perimeters_layered(Point::new(fp.x, fp.y), fp.rotation, fp.layer, 0.0);
                     for poly in polys {
                         if poly.vertices.len() >= 3 {
                             let pts: Vec<Pos2> = poly.vertices.iter().map(|v| to_screen(v.x, v.y)).collect();
                             for i in 0..pts.len() {
-                                painter.line_segment([pts[i], pts[(i + 1) % pts.len()]], Stroke::new(1.2_f32, stroke_col));
+                                painter.line_segment([pts[i], pts[(i + 1) % pts.len()]], Stroke::new(stroke_w, stroke_col));
                             }
                         }
                     }
@@ -979,6 +1245,25 @@ impl VulcansTrialsApp {
                         egui::FontId::monospace(10.5),
                         Color32::WHITE,
                     );
+                }
+
+                if is_moving {
+                    let label_pos = Pos2::new(fp_rect.center().x, fp_rect.top() - 14.0);
+                    let side_str = if fp.layer == 1 { "B.Cu" } else { "F.Cu" };
+                    let hint = format!("Moving {} [{}] {:.0}° · 'r' rotate · 'f' flip · click place", fp.reference, side_str, fp.rotation);
+                    let galley = painter.layout_no_wrap(hint, egui::FontId::proportional(11.0), Color32::from_rgb(255, 235, 120));
+                    let bg_rect = Rect::from_center_size(label_pos, galley.size() + Vec2::new(8.0, 4.0));
+                    painter.rect_filled(bg_rect, 3.0, Color32::from_rgba_unmultiplied(20, 24, 30, 220));
+                    painter.rect_stroke(bg_rect, 3.0, Stroke::new(1.0_f32, Color32::from_rgb(255, 215, 60)), egui::StrokeKind::Middle);
+                    painter.galley(Pos2::new(bg_rect.left() + 4.0, bg_rect.top() + 2.0), galley, Color32::from_rgb(255, 235, 120));
+                } else if is_hovered && !fp.is_locked {
+                    let label_pos = Pos2::new(fp_rect.center().x, fp_rect.top() - 12.0);
+                    let hint = format!("[m] Move {}", fp.reference);
+                    let galley = painter.layout_no_wrap(hint, egui::FontId::proportional(10.5), Color32::WHITE);
+                    let bg_rect = Rect::from_center_size(label_pos, galley.size() + Vec2::new(6.0, 3.0));
+                    painter.rect_filled(bg_rect, 2.0, Color32::from_rgba_unmultiplied(25, 30, 38, 200));
+                    painter.rect_stroke(bg_rect, 2.0, Stroke::new(0.8_f32, Color32::from_rgb(100, 180, 255)), egui::StrokeKind::Middle);
+                    painter.galley(Pos2::new(bg_rect.left() + 3.0, bg_rect.top() + 1.5), galley, Color32::WHITE);
                 }
             }
 
@@ -1700,6 +1985,219 @@ mod tests {
                 draw_mini_footprint(ui, fp, Vec2::new(100.0, 100.0));
             });
         });
+
+        let _ = fs::remove_file(in_path);
+    }
+
+    #[test]
+    fn test_manual_refine_pick_up_move_rotate_flip_and_cancel() {
+        let in_path = "/tmp/vulcan_gui_manual_refine_in.kicad_pcb";
+        let mut board = make_gui_test_board(in_path);
+        // J1 locked at 140.0, 115.0; R10 unlocked at 120.0, 115.0
+        board.footprints[0].is_locked = true;
+        board.footprints[1].is_locked = false;
+
+        let mut app = VulcansTrialsApp::new(in_path.to_string(), String::new(), board.clone(), None);
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 600.0));
+
+        // 1. Trying to pick up locked J1 fails
+        let (j1_screen, _) = app.board_to_screen(&board, rect, 140.0, 115.0);
+        assert!(!app.pick_up_component_at(rect, j1_screen));
+        assert!(app.moving_footprint.is_none());
+
+        // 2. Picking up unlocked R10 succeeds
+        let (r10_screen, _) = app.board_to_screen(&board, rect, 120.0, 115.0);
+        assert!(app.pick_up_component_at(rect, r10_screen));
+        assert!(app.moving_footprint.is_some());
+        assert_eq!(app.moving_footprint.as_ref().unwrap().reference, "R10");
+
+        // 3. Move cursor to new world coordinate (110.0, 105.0)
+        let (new_screen, _) = app.board_to_screen(&board, rect, 110.0, 105.0);
+        app.update_moving_component_pos(rect, new_screen);
+        {
+            let g = app.live.lock().unwrap();
+            let fp = &g.board.footprints[1];
+            assert!((fp.x - 110.0).abs() < 1e-4);
+            assert!((fp.y - 105.0).abs() < 1e-4);
+        }
+
+        // 4. Rotate active component with 'r'
+        assert!(app.rotate_active_component());
+        assert_eq!(app.live.lock().unwrap().board.footprints[1].rotation, 90.0);
+        assert!(app.rotate_active_component());
+        assert_eq!(app.live.lock().unwrap().board.footprints[1].rotation, 180.0);
+
+        // 5. Flip active component with 'f'
+        assert_eq!(app.live.lock().unwrap().board.footprints[1].layer, 0); // F.Cu
+        assert!(app.flip_active_component());
+        assert_eq!(app.live.lock().unwrap().board.footprints[1].layer, 1); // B.Cu
+        assert!(app.flip_active_component());
+        assert_eq!(app.live.lock().unwrap().board.footprints[1].layer, 0); // F.Cu
+
+        // 6. Cancel move: restores original position (120.0, 115.0), rotation 0, layer 0
+        assert!(app.cancel_moving_component());
+        assert!(app.moving_footprint.is_none());
+        {
+            let g = app.live.lock().unwrap();
+            let fp = &g.board.footprints[1];
+            assert!((fp.x - 120.0).abs() < 1e-4);
+            assert!((fp.y - 115.0).abs() < 1e-4);
+            assert_eq!(fp.rotation, 0.0);
+            assert_eq!(fp.layer, 0);
+        }
+
+        let _ = fs::remove_file(in_path);
+    }
+
+    #[test]
+    fn test_manual_refine_place_shoves_overlapping_component() {
+        let in_path = "/tmp/vulcan_gui_shove_place_in.kicad_pcb";
+        let mut board = make_gui_test_board(in_path);
+        // Add a second unlocked footprint R11 at (115.0, 115.0)
+        let mut r11 = board.footprints[1].clone();
+        r11.reference = "R11".to_string();
+        r11.x = 115.0;
+        r11.y = 115.0;
+        r11.is_locked = false;
+        board.footprints.push(r11);
+
+        let mut app = VulcansTrialsApp::new(in_path.to_string(), String::new(), board.clone(), None);
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 600.0));
+
+        // Pick up R10 (at 120.0, 115.0)
+        let (r10_screen, _) = app.board_to_screen(&board, rect, 120.0, 115.0);
+        assert!(app.pick_up_component_at(rect, r10_screen));
+
+        // Move R10 directly onto R11's position at (115.0, 115.0)
+        let (r11_screen, _) = app.board_to_screen(&board, rect, 115.0, 115.0);
+        app.update_moving_component_pos(rect, r11_screen);
+
+        // Click to place R10: must shove R11 out of the way!
+        let shoved = app.place_moving_component();
+        assert!(shoved.is_some());
+        assert!(shoved.unwrap() >= 1, "Must shove overlapping R11");
+        assert!(app.moving_footprint.is_none());
+
+        // Verify R10 remained at target position (115.0, 115.0)
+        let g = app.live.lock().unwrap();
+        let r10 = &g.board.footprints[1];
+        let r11_new = &g.board.footprints[2];
+        assert_eq!(r10.reference, "R10");
+        assert!((r10.x - 115.0).abs() < 1e-4);
+        assert!((r10.y - 115.0).abs() < 1e-4);
+
+        // Verify R11 was moved away and does NOT overlap with R10
+        assert_eq!(r11_new.reference, "R11");
+        let r10_cy = r10.transformed_courtyards(Point::new(r10.x, r10.y), r10.rotation, 0.20);
+        let r11_cy = r11_new.transformed_courtyards(Point::new(r11_new.x, r11_new.y), r11_new.rotation, 0.20);
+        let mut overlaps = false;
+        for pa in &r10_cy {
+            for pb in &r11_cy {
+                if pa.intersects_convex(pb) {
+                    overlaps = true;
+                }
+            }
+        }
+        assert!(!overlaps, "R11 must be cleanly shoved without courtyard overlap");
+
+        let _ = fs::remove_file(in_path);
+    }
+
+    #[test]
+    fn test_manual_refine_keyboard_events_in_render_ui() {
+        let in_path = "/tmp/vulcan_gui_keyboard_events_in.kicad_pcb";
+        let mut board = make_gui_test_board(in_path);
+        board.footprints[0].is_locked = true;
+        board.footprints[1].is_locked = false; // R10 at (120.0, 115.0)
+
+        let mut app = VulcansTrialsApp::new(in_path.to_string(), String::new(), board.clone(), None);
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 600.0));
+
+        // Frame 0: Warm-up layout to compute panel margins
+        let mut warmup = egui::RawInput::default();
+        warmup.screen_rect = Some(rect);
+        let _ = ctx.run(warmup, |ctx| {
+            app.render_ui(ctx);
+        });
+
+        // The CentralPanel canvas occupies remaining space after top bar and left panel
+        let canvas_rect = Rect::from_min_max(Pos2::new(318.0, 67.0), Pos2::new(792.0, 592.0));
+        let (r10_screen, _) = app.board_to_screen(&board, canvas_rect, 120.0, 115.0);
+
+        // Frame 1: Hover mouse over R10 and press 'm' -> picks up R10
+        let mut input1 = egui::RawInput::default();
+        input1.screen_rect = Some(rect);
+        input1.events.push(egui::Event::PointerMoved(r10_screen));
+        input1.events.push(egui::Event::Key {
+            key: egui::Key::M,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input1, |ctx| {
+            app.render_ui(ctx);
+        });
+        assert!(app.moving_footprint.is_some(), "Pressing 'm' over R10 must pick it up");
+        assert_eq!(app.moving_footprint.as_ref().unwrap().reference, "R10");
+
+        // Frame 2: Press 'r' -> rotates moving footprint 90°
+        let mut input2 = egui::RawInput::default();
+        input2.screen_rect = Some(rect);
+        input2.events.push(egui::Event::Key {
+            key: egui::Key::R,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input2, |ctx| {
+            app.render_ui(ctx);
+        });
+        assert_eq!(app.live.lock().unwrap().board.footprints[1].rotation, 90.0);
+
+        // Frame 3: Press 'f' -> flips moving footprint to B.Cu
+        let mut input3 = egui::RawInput::default();
+        input3.screen_rect = Some(rect);
+        input3.events.push(egui::Event::Key {
+            key: egui::Key::F,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input3, |ctx| {
+            app.render_ui(ctx);
+        });
+        assert_eq!(app.live.lock().unwrap().board.footprints[1].layer, 1);
+
+        // Frame 4: Move mouse to target position and click -> places footprint
+        let (target_screen, _) = app.board_to_screen(&board, canvas_rect, 110.0, 105.0);
+        let mut input4 = egui::RawInput::default();
+        input4.screen_rect = Some(rect);
+        input4.events.push(egui::Event::PointerMoved(target_screen));
+        input4.events.push(egui::Event::PointerButton {
+            pos: target_screen,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        input4.events.push(egui::Event::PointerButton {
+            pos: target_screen,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input4, |ctx| {
+            app.render_ui(ctx);
+        });
+        assert!(app.moving_footprint.is_none(), "Clicking must place the moving component");
+        let g = app.live.lock().unwrap();
+        let r10 = &g.board.footprints[1];
+        assert_eq!(r10.reference, "R10");
+        assert_eq!(r10.rotation, 90.0);
+        assert_eq!(r10.layer, 1);
 
         let _ = fs::remove_file(in_path);
     }

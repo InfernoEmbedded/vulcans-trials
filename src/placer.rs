@@ -1166,6 +1166,121 @@ pub fn is_placement_legal(
     true
 }
 
+/// Shoves unlocked components that overlap with `placed_idx` away from it,
+/// preserving legal courtyard spacing and boundary/keepout clearance.
+/// If direct directional shove leaves residual overlaps, runs local simulated annealing legalization.
+/// Returns the number of shoved components.
+pub fn shove_overlapping_components(
+    board: &mut Board,
+    placed_idx: usize,
+    min_spacing_mm: f64,
+) -> usize {
+    if placed_idx >= board.footprints.len() {
+        return 0;
+    }
+
+    let mut shoved_count = 0;
+    let placed_fp = board.footprints[placed_idx].clone();
+    let placed_pos = Point::new(placed_fp.x, placed_fp.y);
+    let placed_polys = placed_fp.transformed_courtyards_layered(
+        placed_pos,
+        placed_fp.rotation,
+        placed_fp.layer,
+        min_spacing_mm,
+    );
+
+    // 1. Identify all colliding unlocked footprints
+    let mut colliding_unlocked_indices = Vec::new();
+    for (i, fp) in board.footprints.iter().enumerate() {
+        if i == placed_idx || fp.is_locked {
+            continue;
+        }
+        if placed_fp.layer != fp.layer && placed_fp.is_smd_only() && fp.is_smd_only() {
+            continue;
+        }
+        let fp_polys = fp.transformed_courtyards_layered(
+            Point::new(fp.x, fp.y),
+            fp.rotation,
+            fp.layer,
+            min_spacing_mm,
+        );
+        let mut hit = false;
+        'check: for pa in &placed_polys {
+            for pb in &fp_polys {
+                if pa.intersects_convex(pb) {
+                    hit = true;
+                    break 'check;
+                }
+            }
+        }
+        if hit {
+            colliding_unlocked_indices.push(i);
+        }
+    }
+
+    if colliding_unlocked_indices.is_empty() {
+        return 0;
+    }
+
+    // 2. Directional shove for each colliding unlocked component
+    for &idx in &colliding_unlocked_indices {
+        let other_fp = board.footprints[idx].clone();
+        let dx = other_fp.x - placed_fp.x;
+        let dy = other_fp.y - placed_fp.y;
+        let dist = dx.hypot(dy);
+        let (ux, uy) = if dist < 1e-4 {
+            (1.0, 0.0)
+        } else {
+            (dx / dist, dy / dist)
+        };
+
+        let angles: [f64; 7] = [0.0, 0.35, -0.35, 0.785, -0.785, 1.5708, -1.5708];
+        let distances: [f64; 12] = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0];
+        let mut best_pos = None;
+
+        'search: for &d in &distances {
+            for &a in &angles {
+                let dir_x = ux * a.cos() - uy * a.sin();
+                let dir_y = ux * a.sin() + uy * a.cos();
+                let nx = other_fp.x + dir_x * d;
+                let ny = other_fp.y + dir_y * d;
+
+                let cand_pt = Point::new(nx, ny);
+                if is_placement_legal(board, &other_fp, cand_pt, other_fp.rotation, other_fp.layer, min_spacing_mm) {
+                    best_pos = Some((nx, ny));
+                    break 'search;
+                }
+            }
+        }
+
+        if let Some((nx, ny)) = best_pos {
+            board.footprints[idx].x = nx;
+            board.footprints[idx].y = ny;
+            shoved_count += 1;
+        }
+    }
+
+    // 3. If any overlaps remain on the board, run quick simulated annealing legalization
+    // while keeping the placed component locked so its position is preserved.
+    let cfg = PlacementConfig {
+        min_spacing_mm,
+        duration_secs: 0,
+        ..PlacementConfig::default()
+    };
+    let initial_state = PlacementState::from_board(board, &cfg);
+    if initial_state.overlaps > 0 {
+        let was_locked = board.footprints[placed_idx].is_locked;
+        board.footprints[placed_idx].is_locked = true;
+        let legalized = legalize_placement(board, &cfg, initial_state, None);
+        legalized.apply_to_board(board);
+        board.footprints[placed_idx].is_locked = was_locked;
+        shoved_count = shoved_count.max(colliding_unlocked_indices.len());
+    }
+
+    shoved_count
+}
+
+
 /// Finds the most favourable location (x, y), orientation (rotation in degrees), and layer for `fp` on `board`.
 /// - Decoupling capacitors are placed directly adjacent to their connected IC's non-ground power pin, oriented with their power pad facing the IC pin.
 /// - Differential pairs and connected passives/ICs are placed adjacent to their connected pins, minimizing Euclidean wirelength and crossings.
