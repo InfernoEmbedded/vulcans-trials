@@ -463,10 +463,18 @@ pub struct GpuSaParams {
     pub base_temp: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuBackendKind {
+    Vulkan,
+    CudaPtx,
+}
+
 pub struct VulkanEngine {
     pub device_name: String,
     pub backend_name: String,
     pub driver_info: String,
+    pub backend_kind: GpuBackendKind,
+    pub cuda_engine: Option<Arc<crate::cuda::CudaEngine>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
@@ -485,13 +493,22 @@ impl std::fmt::Debug for VulkanEngine {
         f.debug_struct("VulkanEngine")
             .field("device_name", &self.device_name)
             .field("backend_name", &self.backend_name)
+            .field("backend_kind", &self.backend_kind)
             .finish()
     }
 }
 
 impl VulkanEngine {
     pub fn new() -> Option<Arc<Self>> {
-        pollster::block_on(Self::init_async()).map(Arc::new)
+        pollster::block_on(Self::init_async(false)).map(Arc::new)
+    }
+
+    pub fn new_vulkan_only() -> Option<Arc<Self>> {
+        pollster::block_on(Self::init_async(true)).map(Arc::new)
+    }
+
+    pub fn is_cuda_active(&self) -> bool {
+        self.backend_kind == GpuBackendKind::CudaPtx
     }
 
     pub fn all_engines(self: &Arc<Self>) -> Vec<Arc<Self>> {
@@ -503,7 +520,7 @@ impl VulkanEngine {
         list
     }
 
-    async fn init_async() -> Option<Self> {
+    async fn init_async(force_vulkan: bool) -> Option<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..Default::default()
@@ -545,21 +562,22 @@ impl VulkanEngine {
                 continue;
             }
             seen_names.push(c_info.name.clone());
-            if let Some(eng) = Self::from_adapter(cand, Arc::clone(&busy_ns), Vec::new()).await {
+            if let Some(eng) = Self::from_adapter(cand, Arc::clone(&busy_ns), Vec::new(), force_vulkan).await {
                 extra_devices.push(Arc::new(eng));
             }
         }
 
-        Self::from_adapter(primary, busy_ns, extra_devices).await
+        Self::from_adapter(primary, busy_ns, extra_devices, force_vulkan).await
     }
 
     async fn from_adapter(
         adapter: wgpu::Adapter,
         compute_busy_ns: Arc<AtomicU64>,
         extra_devices: Vec<Arc<VulkanEngine>>,
+        force_vulkan_arg: bool,
     ) -> Option<Self> {
         let info = adapter.get_info();
-        let device_name = if extra_devices.is_empty() {
+        let mut device_name = if extra_devices.is_empty() {
             info.name.clone()
         } else {
             let mut names = vec![info.name.clone()];
@@ -568,8 +586,8 @@ impl VulkanEngine {
             }
             names.join(" + ")
         };
-        let backend_name = format!("{:?}", info.backend);
-        let driver_info = if info.driver_info.is_empty() {
+        let mut backend_name = format!("{:?}", info.backend);
+        let mut driver_info = if info.driver_info.is_empty() {
             info.driver.clone()
         } else {
             format!("{} ({})", info.driver, info.driver_info)
@@ -786,10 +804,37 @@ impl VulkanEngine {
             cache: None,
         });
 
+        let mut cuda_engine = None;
+        let mut backend_kind = GpuBackendKind::Vulkan;
+
+        let force_vulkan = force_vulkan_arg
+            || std::env::var("VULCANS_FORCE_VULKAN")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+            || std::env::var("VULCANS_GPU_BACKEND")
+                .map(|v| v.eq_ignore_ascii_case("vulkan"))
+                .unwrap_or(false);
+
+        if !force_vulkan {
+            if let Some(cuda) = crate::cuda::CudaEngine::new() {
+                // Quick startup probe: run 16x16 distance field test to verify CUDA functionality
+                let test_obs = vec![0u32; 16 * 16];
+                if cuda.compute_distance_field(&test_obs, 16, 16, 4).is_some() {
+                    backend_kind = GpuBackendKind::CudaPtx;
+                    backend_name = "CUDA PTX (NVIDIA bare-metal) [Vulkan fallback ready]".to_string();
+                    device_name = cuda.device_name.clone();
+                    driver_info = format!("{} / Vulkan {}", cuda.driver_info, driver_info);
+                    cuda_engine = Some(cuda);
+                }
+            }
+        }
+
         Some(Self {
             device_name,
             backend_name,
             driver_info,
+            backend_kind,
+            cuda_engine,
             device,
             queue,
             pipeline,
@@ -809,6 +854,19 @@ impl VulkanEngine {
         if obstacles.len() != total || total == 0 {
             return None;
         }
+
+        if self.backend_kind == GpuBackendKind::CudaPtx {
+            if let Some(cuda) = &self.cuda_engine {
+                if let Some(res) = cuda
+                    .compute_distance_field_ampere(obstacles, width, height, radius, true)
+                    .or_else(|| cuda.compute_distance_field(obstacles, width, height, radius))
+                {
+                    self.compute_busy_ns.fetch_add(cuda.compute_busy_ns.load(Ordering::Relaxed), Ordering::Relaxed);
+                    return Some(res);
+                }
+            }
+        }
+
         let _guard = self.dispatch_lock.lock().ok()?;
         let byte_size = (total * std::mem::size_of::<f32>()) as u64;
 
@@ -929,6 +987,19 @@ impl VulkanEngine {
         if nc == 0 || nf == 0 || boxes.len() != nc * nf || segs.len() != nc * ns {
             return None;
         }
+
+        if self.backend_kind == GpuBackendKind::CudaPtx {
+            if let Some(cuda) = &self.cuda_engine {
+                if let Some(res) = cuda
+                    .evaluate_placement_ampere(boxes, segs, params)
+                    .or_else(|| cuda.evaluate_placement_batch(boxes, segs, params))
+                {
+                    self.compute_busy_ns.fetch_add(cuda.compute_busy_ns.load(Ordering::Relaxed), Ordering::Relaxed);
+                    return Some(res);
+                }
+            }
+        }
+
         let _guard = self.dispatch_lock.lock().ok()?;
         let out_byte_size = (nc * std::mem::size_of::<f32>()) as u64;
 
@@ -1050,6 +1121,16 @@ impl VulkanEngine {
         if nc == 0 || nf == 0 || fp_descs.len() != nf || edges.len() != ne * 2 || init_poses.len() != nc * nf {
             return None;
         }
+
+        if self.backend_kind == GpuBackendKind::CudaPtx {
+            if let Some(cuda) = &self.cuda_engine {
+                if let Some(res) = cuda.run_gpu_sa_placer_chains(fp_descs, edges, init_poses, params, num_passes) {
+                    self.compute_busy_ns.fetch_add(cuda.compute_busy_ns.load(Ordering::Relaxed), Ordering::Relaxed);
+                    return Some(res);
+                }
+            }
+        }
+
         let _guard = self.dispatch_lock.lock().ok()?;
 
         let mut full_poses = Vec::with_capacity(nc * nf * 2);

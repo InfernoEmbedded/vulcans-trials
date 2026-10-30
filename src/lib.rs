@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
 pub mod board;
+pub mod cuda;
 pub mod gui;
 pub mod placer;
 pub mod router;

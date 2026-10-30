@@ -1,0 +1,493 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
+
+.version 7.1
+.target sm_86
+.address_size 64
+
+.extern .shared .align 16 .b8 smem_raw[];
+
+// =============================================================================
+// 1. Hand-Crafted Ampere Distance Field Kernel (Direct, 15 Registers)
+// =============================================================================
+
+.visible .entry distance_field_ampere(
+    .param .u64 param_obstacles,
+    .param .u64 param_dist_out,
+    .param .u32 param_width,
+    .param .u32 param_height,
+    .param .s32 param_radius
+)
+{
+    .reg .pred      %p_out, %p_obs, %p_ny_valid, %p_nx_valid, %p_nobs, %p_dy_loop, %p_dx_loop;
+    .reg .b32       %r_tid_x, %r_ctaid_x, %r_ntid_x, %r_x;
+    .reg .b32       %r_tid_y, %r_ctaid_y, %r_ntid_y, %r_y;
+    .reg .b32       %w, %h, %radius, %idx, %obs_val;
+    .reg .b32       %dy, %dx, %ny, %nx, %nidx, %d2_i, %dy2;
+    .reg .f32       %min_d2, %d2_f, %dist;
+    .reg .b64       %obs_base, %dist_base, %offset, %addr;
+
+    ld.param.u64    %obs_base, [param_obstacles];
+    ld.param.u64    %dist_base, [param_dist_out];
+    ld.param.u32    %w, [param_width];
+    ld.param.u32    %h, [param_height];
+    ld.param.s32    %radius, [param_radius];
+
+    mov.u32         %r_tid_x, %tid.x;
+    mov.u32         %r_ctaid_x, %ctaid.x;
+    mov.u32         %r_ntid_x, %ntid.x;
+    mad.lo.s32      %r_x, %r_ctaid_x, %r_ntid_x, %r_tid_x;
+
+    mov.u32         %r_tid_y, %tid.y;
+    mov.u32         %r_ctaid_y, %ctaid.y;
+    mov.u32         %r_ntid_y, %ntid.y;
+    mad.lo.s32      %r_y, %r_ctaid_y, %r_ntid_y, %r_tid_y;
+
+    setp.ge.u32     %p_out, %r_x, %w;
+    @%p_out ret;
+    setp.ge.u32     %p_out, %r_y, %h;
+    @%p_out ret;
+
+    mad.lo.s32      %idx, %r_y, %w, %r_x;
+    mul.wide.u32    %offset, %idx, 4;
+    add.s64         %addr, %obs_base, %offset;
+
+    ld.global.nc.u32 %obs_val, [%addr];
+    setp.ne.u32     %p_obs, %obs_val, 0;
+
+    add.s64         %addr, %dist_base, %offset;
+    @%p_obs st.global.f32 [%addr], 0.0;
+    @%p_obs ret;
+
+    mul.lo.s32      %d2_i, %radius, %radius;
+    add.s32         %d2_i, %d2_i, 1;
+    cvt.rn.f32.s32  %min_d2, %d2_i;
+
+    neg.s32         %dy, %radius;
+
+LOOP_DY:
+    add.s32         %ny, %r_y, %dy;
+    setp.ge.s32     %p_ny_valid, %ny, 0;
+    setp.lt.s32     %p_out, %ny, %h;
+    and.pred        %p_ny_valid, %p_ny_valid, %p_out;
+    @!%p_ny_valid bra NEXT_DY;
+
+    mul.lo.s32      %dy2, %dy, %dy;
+    neg.s32         %dx, %radius;
+
+LOOP_DX:
+    add.s32         %nx, %r_x, %dx;
+    setp.ge.s32     %p_nx_valid, %nx, 0;
+    setp.lt.s32     %p_out, %nx, %w;
+    and.pred        %p_nx_valid, %p_nx_valid, %p_out;
+    @!%p_nx_valid bra NEXT_DX;
+
+    mad.lo.s32      %nidx, %ny, %w, %nx;
+    mul.wide.u32    %offset, %nidx, 4;
+    add.s64         %addr, %obs_base, %offset;
+    ld.global.nc.u32 %obs_val, [%addr];
+
+    setp.ne.u32     %p_nobs, %obs_val, 0;
+    @!%p_nobs bra NEXT_DX;
+
+    mad.lo.s32      %d2_i, %dx, %dx, %dy2;
+    cvt.rn.f32.s32  %d2_f, %d2_i;
+    min.f32         %min_d2, %min_d2, %d2_f;
+
+NEXT_DX:
+    add.s32         %dx, %dx, 1;
+    setp.le.s32     %p_dx_loop, %dx, %radius;
+    @%p_dx_loop bra LOOP_DX;
+
+NEXT_DY:
+    add.s32         %dy, %dy, 1;
+    setp.le.s32     %p_dy_loop, %dy, %radius;
+    @%p_dy_loop bra LOOP_DY;
+
+    sqrt.rn.f32     %dist, %min_d2;
+    mul.wide.u32    %offset, %idx, 4;
+    add.s64         %addr, %dist_base, %offset;
+    st.global.f32   [%addr], %dist;
+    ret;
+}
+
+// =============================================================================
+// 2. Hand-Crafted Ampere Tiled Distance Field Kernel (Shared Memory Tiling)
+// =============================================================================
+
+.visible .entry distance_field_ampere_tiled(
+    .param .u64 param_obstacles,
+    .param .u64 param_dist_out,
+    .param .u32 param_width,
+    .param .u32 param_height,
+    .param .s32 param_radius
+)
+{
+    .reg .pred      %p_out, %p_in_bounds, %p_obs, %p_dy_loop, %p_dx_loop;
+    .reg .b32       %w, %h, %radius, %tile_w, %tile_h, %total_elems;
+    .reg .b32       %r_bx, %r_by, %r_tx, %r_ty, %r_tid, %r_num_threads;
+    .reg .b32       %r_ntid_x, %r_ntid_y, %r_ctaid_x, %r_ctaid_y;
+    .reg .b32       %r_gx, %r_gy, %idx, %i, %smem_y, %smem_x, %g_load_x, %g_load_y;
+    .reg .b32       %load_val, %center_idx, %center_val;
+    .reg .b32       %dy, %dx, %row_base, %elem_idx, %obs_val, %dy2, %d2_i;
+    .reg .f32       %min_d2, %d2_f, %dist;
+    .reg .b64       %obs_base, %dist_base, %offset, %addr;
+    .reg .b32       %smem_base, %smem_addr, %smem_offset;
+
+    ld.param.u64    %obs_base, [param_obstacles];
+    ld.param.u64    %dist_base, [param_dist_out];
+    ld.param.u32    %w, [param_width];
+    ld.param.u32    %h, [param_height];
+    ld.param.s32    %radius, [param_radius];
+
+    mov.u32         %smem_base, smem_raw;
+
+    mov.u32         %r_tx, %tid.x;
+    mov.u32         %r_ty, %tid.y;
+    mov.u32         %r_ntid_x, %ntid.x;
+    mov.u32         %r_ntid_y, %ntid.y;
+    mov.u32         %r_ctaid_x, %ctaid.x;
+    mov.u32         %r_ctaid_y, %ctaid.y;
+
+    mul.lo.s32      %r_bx, %r_ctaid_x, %r_ntid_x;
+    mul.lo.s32      %r_by, %r_ctaid_y, %r_ntid_y;
+
+    mad.lo.s32      %r_tid, %r_ty, %r_ntid_x, %r_tx;
+    mul.lo.s32      %r_num_threads, %r_ntid_x, %r_ntid_y;
+
+    shl.b32         %tile_w, %radius, 1;
+    add.s32         %tile_w, %tile_w, %r_ntid_x;
+    shl.b32         %tile_h, %radius, 1;
+    add.s32         %tile_h, %tile_h, %r_ntid_y;
+    mul.lo.s32      %total_elems, %tile_w, %tile_h;
+
+    mov.u32         %i, %r_tid;
+
+LOAD_TILE_LOOP:
+    setp.ge.u32     %p_out, %i, %total_elems;
+    @%p_out bra LOAD_TILE_DONE;
+
+    div.u32         %smem_y, %i, %tile_w;
+    rem.u32         %smem_x, %i, %tile_w;
+
+    add.s32         %g_load_x, %r_bx, %smem_x;
+    sub.s32         %g_load_x, %g_load_x, %radius;
+
+    add.s32         %g_load_y, %r_by, %smem_y;
+    sub.s32         %g_load_y, %g_load_y, %radius;
+
+    setp.ge.s32     %p_in_bounds, %g_load_x, 0;
+    setp.lt.s32     %p_out, %g_load_x, %w;
+    and.pred        %p_in_bounds, %p_in_bounds, %p_out;
+    setp.ge.s32     %p_out, %g_load_y, 0;
+    and.pred        %p_in_bounds, %p_in_bounds, %p_out;
+    setp.lt.s32     %p_out, %g_load_y, %h;
+    and.pred        %p_in_bounds, %p_in_bounds, %p_out;
+
+    mov.u32         %load_val, 0;
+    @!%p_in_bounds bra STORE_SMEM;
+
+    mad.lo.s32      %idx, %g_load_y, %w, %g_load_x;
+    mul.wide.u32    %offset, %idx, 4;
+    add.s64         %addr, %obs_base, %offset;
+    ld.global.nc.u32 %load_val, [%addr];
+
+STORE_SMEM:
+    shl.b32         %smem_offset, %i, 2;
+    add.u32         %smem_addr, %smem_base, %smem_offset;
+    st.shared.u32   [%smem_addr], %load_val;
+
+    add.u32         %i, %i, %r_num_threads;
+    bra LOAD_TILE_LOOP;
+
+LOAD_TILE_DONE:
+    bar.sync        0;
+
+    add.s32         %r_gx, %r_bx, %r_tx;
+    add.s32         %r_gy, %r_by, %r_ty;
+
+    setp.ge.u32     %p_out, %r_gx, %w;
+    @%p_out ret;
+    setp.ge.u32     %p_out, %r_gy, %h;
+    @%p_out ret;
+
+    mad.lo.s32      %idx, %r_gy, %w, %r_gx;
+    mul.wide.u32    %offset, %idx, 4;
+    add.s64         %addr, %dist_base, %offset;
+
+    add.s32         %center_idx, %r_ty, %radius;
+    mul.lo.s32      %center_idx, %center_idx, %tile_w;
+    add.s32         %center_idx, %center_idx, %r_tx;
+    add.s32         %center_idx, %center_idx, %radius;
+
+    shl.b32         %smem_offset, %center_idx, 2;
+    add.u32         %smem_addr, %smem_base, %smem_offset;
+    ld.shared.u32   %center_val, [%smem_addr];
+    setp.ne.u32     %p_obs, %center_val, 0;
+
+    @%p_obs st.global.f32 [%addr], 0.0;
+    @%p_obs ret;
+
+    mul.lo.s32      %d2_i, %radius, %radius;
+    add.s32         %d2_i, %d2_i, 1;
+    cvt.rn.f32.s32  %min_d2, %d2_i;
+
+    neg.s32         %dy, %radius;
+
+TILED_LOOP_DY:
+    mul.lo.s32      %dy2, %dy, %dy;
+    add.s32         %row_base, %r_ty, %radius;
+    add.s32         %row_base, %row_base, %dy;
+    mul.lo.s32      %row_base, %row_base, %tile_w;
+    add.s32         %row_base, %row_base, %r_tx;
+    add.s32         %row_base, %row_base, %radius;
+
+    neg.s32         %dx, %radius;
+
+TILED_LOOP_DX:
+    add.s32         %elem_idx, %row_base, %dx;
+    shl.b32         %smem_offset, %elem_idx, 2;
+    add.u32         %smem_addr, %smem_base, %smem_offset;
+    ld.shared.u32   %obs_val, [%smem_addr];
+
+    setp.ne.u32     %p_obs, %obs_val, 0;
+    @!%p_obs bra TILED_NEXT_DX;
+
+    mad.lo.s32      %d2_i, %dx, %dx, %dy2;
+    cvt.rn.f32.s32  %d2_f, %d2_i;
+    min.f32         %min_d2, %min_d2, %d2_f;
+
+TILED_NEXT_DX:
+    add.s32         %dx, %dx, 1;
+    setp.le.s32     %p_dx_loop, %dx, %radius;
+    @%p_dx_loop bra TILED_LOOP_DX;
+
+    add.s32         %dy, %dy, 1;
+    setp.le.s32     %p_dy_loop, %dy, %radius;
+    @%p_dy_loop bra TILED_LOOP_DY;
+
+    sqrt.rn.f32     %dist, %min_d2;
+    st.global.f32   [%addr], %dist;
+    ret;
+}
+
+// =============================================================================
+// 3. Hand-Crafted Ampere Batch Placement Evaluation Kernel (128-bit Vectorized)
+// =============================================================================
+
+.visible .entry batch_placement_ampere(
+    .param .u64 param_boxes,
+    .param .u64 param_segs,
+    .param .u64 param_costs_out,
+    .param .align 4 .b8 param_struct[48]
+)
+{
+    .reg .pred      %p_out, %p_cross, %p_overlap;
+    .reg .b32       %c, %nc, %nf, %ns, %b_base, %s_base, %i, %j;
+    .reg .b32       %crossings, %r_ctaid_x, %r_ntid_x, %r_tid_x;
+    .reg .u32       %seg_offset_idx, %box_offset_idx;
+    .reg .f32       %b_min_x, %b_min_y, %b_max_x, %b_max_y;
+    .reg .f32       %w_wl, %w_cr, %w_ov, %w_bd;
+    .reg .f32       %wl, %overlap_cost, %boundary_cost, %total_cost;
+    .reg .f32       %s1_x, %s1_y, %s1_z, %s1_w;
+    .reg .f32       %s2_x, %s2_y, %s2_z, %s2_w;
+    .reg .f32       %dx, %dy, %len;
+    .reg .f32       %d1, %d2, %d3, %d4, %p1, %p2, %f_cross;
+    .reg .f32       %bi_x, %bi_y, %bi_z, %bi_w;
+    .reg .f32       %bj_x, %bj_y, %bj_z, %bj_w;
+    .reg .f32       %out_x, %out_y, %ox, %oy, %t1, %t2, %term;
+    .reg .b64       %boxes_base, %segs_base, %costs_base, %offset, %addr;
+
+    mov.u32         %r_ctaid_x, %ctaid.x;
+    mov.u32         %r_ntid_x, %ntid.x;
+    mov.u32         %r_tid_x, %tid.x;
+    mad.lo.s32      %c, %r_ctaid_x, %r_ntid_x, %r_tid_x;
+
+    ld.param.u32    %nc, [param_struct+0];
+    setp.ge.u32     %p_out, %c, %nc;
+    @%p_out ret;
+
+    ld.param.u64    %boxes_base, [param_boxes];
+    ld.param.u64    %segs_base, [param_segs];
+    ld.param.u64    %costs_base, [param_costs_out];
+
+    ld.param.u32    %nf, [param_struct+4];
+    ld.param.u32    %ns, [param_struct+8];
+    ld.param.f32    %b_min_x, [param_struct+16];
+    ld.param.f32    %b_min_y, [param_struct+20];
+    ld.param.f32    %b_max_x, [param_struct+24];
+    ld.param.f32    %b_max_y, [param_struct+28];
+    ld.param.f32    %w_wl, [param_struct+32];
+    ld.param.f32    %w_cr, [param_struct+36];
+    ld.param.f32    %w_ov, [param_struct+40];
+    ld.param.f32    %w_bd, [param_struct+44];
+
+    mul.lo.s32      %b_base, %c, %nf;
+    mul.lo.s32      %s_base, %c, %ns;
+
+    mov.f32         %wl, 0.0;
+    mov.u32         %crossings, 0;
+
+    mov.u32         %i, 0;
+
+SEGS_OUTER:
+    setp.ge.u32     %p_out, %i, %ns;
+    @%p_out bra SEGS_DONE;
+
+    add.s32         %seg_offset_idx, %s_base, %i;
+    mul.wide.u32    %offset, %seg_offset_idx, 16;
+    add.s64         %addr, %segs_base, %offset;
+    ld.global.nc.v4.f32 {%s1_x, %s1_y, %s1_z, %s1_w}, [%addr];
+
+    sub.f32         %dx, %s1_z, %s1_x;
+    sub.f32         %dy, %s1_w, %s1_y;
+    mul.f32         %len, %dx, %dx;
+    fma.rn.f32      %len, %dy, %dy, %len;
+    sqrt.rn.f32     %len, %len;
+    add.f32         %wl, %wl, %len;
+
+    add.s32         %j, %i, 1;
+
+SEGS_INNER:
+    setp.ge.u32     %p_out, %j, %ns;
+    @%p_out bra SEGS_INNER_DONE;
+
+    add.s32         %seg_offset_idx, %s_base, %j;
+    mul.wide.u32    %offset, %seg_offset_idx, 16;
+    add.s64         %addr, %segs_base, %offset;
+    ld.global.nc.v4.f32 {%s2_x, %s2_y, %s2_z, %s2_w}, [%addr];
+
+    // d1 = (s1.z - s1.x)*(s2.y - s1.y) - (s1.w - s1.y)*(s2.x - s1.x)
+    sub.f32         %dx, %s1_z, %s1_x;
+    sub.f32         %dy, %s2_y, %s1_y;
+    sub.f32         %t1, %s1_w, %s1_y;
+    sub.f32         %t2, %s2_x, %s1_x;
+    mul.f32         %d1, %dx, %dy;
+    mul.f32         %term, %t1, %t2;
+    sub.f32         %d1, %d1, %term;
+
+    // d2 = (s1.z - s1.x)*(s2.w - s1.y) - (s1.w - s1.y)*(s2.z - s1.x)
+    sub.f32         %dy, %s2_w, %s1_y;
+    sub.f32         %t2, %s2_z, %s1_x;
+    mul.f32         %d2, %dx, %dy;
+    mul.f32         %term, %t1, %t2;
+    sub.f32         %d2, %d2, %term;
+
+    // d3 = (s2.z - s2.x)*(s1.y - s2.y) - (s2.w - s2.y)*(s1.x - s2.x)
+    sub.f32         %dx, %s2_z, %s2_x;
+    sub.f32         %dy, %s1_y, %s2_y;
+    sub.f32         %t1, %s2_w, %s2_y;
+    sub.f32         %t2, %s1_x, %s2_x;
+    mul.f32         %d3, %dx, %dy;
+    mul.f32         %term, %t1, %t2;
+    sub.f32         %d3, %d3, %term;
+
+    // d4 = (s2.z - s2.x)*(s1.w - s2.y) - (s2.w - s2.y)*(s1.z - s2.x)
+    sub.f32         %dy, %s1_w, %s2_y;
+    sub.f32         %t2, %s1_z, %s2_x;
+    mul.f32         %d4, %dx, %dy;
+    mul.f32         %term, %t1, %t2;
+    sub.f32         %d4, %d4, %term;
+
+    mul.f32         %p1, %d1, %d2;
+    mul.f32         %p2, %d3, %d4;
+    setp.lt.f32     %p_cross, %p1, 0.0;
+    setp.lt.f32     %p_out, %p2, 0.0;
+    and.pred        %p_cross, %p_cross, %p_out;
+
+    @%p_cross add.u32 %crossings, %crossings, 1;
+
+    add.s32         %j, %j, 1;
+    bra SEGS_INNER;
+
+SEGS_INNER_DONE:
+    add.s32         %i, %i, 1;
+    bra SEGS_OUTER;
+
+SEGS_DONE:
+    mov.f32         %overlap_cost, 0.0;
+    mov.f32         %boundary_cost, 0.0;
+
+    mov.u32         %i, 0;
+
+BOXES_OUTER:
+    setp.ge.u32     %p_out, %i, %nf;
+    @%p_out bra BOXES_DONE;
+
+    add.s32         %box_offset_idx, %b_base, %i;
+    mul.wide.u32    %offset, %box_offset_idx, 16;
+    add.s64         %addr, %boxes_base, %offset;
+    ld.global.nc.v4.f32 {%bi_x, %bi_y, %bi_z, %bi_w}, [%addr];
+
+    sub.f32         %t1, %b_min_x, %bi_x;
+    max.f32         %out_x, %t1, 0.0;
+    sub.f32         %t2, %bi_z, %b_max_x;
+    max.f32         %t2, %t2, 0.0;
+    add.f32         %out_x, %out_x, %t2;
+
+    sub.f32         %t1, %b_min_y, %bi_y;
+    max.f32         %out_y, %t1, 0.0;
+    sub.f32         %t2, %bi_w, %b_max_y;
+    max.f32         %t2, %t2, 0.0;
+    add.f32         %out_y, %out_y, %t2;
+
+    add.f32         %t1, %out_x, %out_y;
+    setp.gt.f32     %p_out, %t1, 0.0;
+    add.f32         %t2, %t1, 1.0;
+    @%p_out fma.rn.f32 %boundary_cost, %w_bd, %t2, %boundary_cost;
+
+    add.s32         %j, %i, 1;
+
+BOXES_INNER:
+    setp.ge.u32     %p_out, %j, %nf;
+    @%p_out bra BOXES_INNER_DONE;
+
+    add.s32         %box_offset_idx, %b_base, %j;
+    mul.wide.u32    %offset, %box_offset_idx, 16;
+    add.s64         %addr, %boxes_base, %offset;
+    ld.global.nc.v4.f32 {%bj_x, %bj_y, %bj_z, %bj_w}, [%addr];
+
+    setp.gt.f32     %p_overlap, %bi_z, %bj_x;
+    setp.lt.f32     %p_out, %bi_x, %bj_z;
+    and.pred        %p_overlap, %p_overlap, %p_out;
+    setp.gt.f32     %p_out, %bi_w, %bj_y;
+    and.pred        %p_overlap, %p_overlap, %p_out;
+    setp.lt.f32     %p_out, %bi_y, %bj_w;
+    and.pred        %p_overlap, %p_overlap, %p_out;
+
+    @!%p_overlap bra BOXES_NEXT_J;
+
+    min.f32         %t1, %bi_z, %bj_z;
+    max.f32         %t2, %bi_x, %bj_x;
+    sub.f32         %ox, %t1, %t2;
+    max.f32         %ox, %ox, 0.1;
+
+    min.f32         %t1, %bi_w, %bj_w;
+    max.f32         %t2, %bi_y, %bj_y;
+    sub.f32         %oy, %t1, %t2;
+    max.f32         %oy, %oy, 0.1;
+
+    mul.f32         %t1, %ox, %oy;
+    add.f32         %t1, %t1, 1.0;
+    fma.rn.f32      %overlap_cost, %w_ov, %t1, %overlap_cost;
+
+BOXES_NEXT_J:
+    add.s32         %j, %j, 1;
+    bra BOXES_INNER;
+
+BOXES_INNER_DONE:
+    add.s32         %i, %i, 1;
+    bra BOXES_OUTER;
+
+BOXES_DONE:
+    cvt.rn.f32.u32  %f_cross, %crossings;
+    mul.f32         %total_cost, %wl, %w_wl;
+    fma.rn.f32      %total_cost, %f_cross, %w_cr, %total_cost;
+    add.f32         %total_cost, %total_cost, %overlap_cost;
+    add.f32         %total_cost, %total_cost, %boundary_cost;
+
+    mul.wide.u32    %offset, %c, 4;
+    add.s64         %addr, %costs_base, %offset;
+    st.global.f32   [%addr], %total_cost;
+    ret;
+}
