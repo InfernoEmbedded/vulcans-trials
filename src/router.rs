@@ -719,6 +719,414 @@ impl NudgeEngine {
         }
         false
     }
+
+    /// Shoves an unlocked track segment continuously away from an intruder segment,
+    /// inserting 45-degree transition elbows to preserve original endpoint connectivity.
+    /// Supports cascading shove into adjacent unlocked tracks up to 3 recursion hops.
+    pub fn try_continuous_shove_track(
+        &self,
+        board: &mut Board,
+        track_idx: usize,
+        intruder_p1: (f64, f64),
+        intruder_p2: (f64, f64),
+        intruder_width: f64,
+        intruder_net_id: usize,
+        grid: Option<&RoutingGrid>,
+    ) -> bool {
+        let mut shoved_nets = std::collections::HashSet::new();
+        shoved_nets.insert(intruder_net_id);
+        let mut total_shoves = 0;
+        self.try_continuous_shove_recursive(
+            board,
+            track_idx,
+            intruder_p1,
+            intruder_p2,
+            intruder_width,
+            intruder_net_id,
+            grid,
+            0,
+            &mut shoved_nets,
+            &mut total_shoves,
+        )
+    }
+
+    /// Shoves an unlocked track segment with a specific lateral offset (in mm) along its perpendicular normal,
+    /// inserting 45-degree transition elbows and cascading into neighbors if needed.
+    pub fn try_continuous_shove_deflect(
+        &self,
+        board: &mut Board,
+        track_idx: usize,
+        offset_mm: f64,
+        grid: Option<&RoutingGrid>,
+    ) -> bool {
+        if track_idx >= board.tracks.len() || board.tracks[track_idx].is_locked {
+            return false;
+        }
+        let t = board.tracks[track_idx].clone();
+        let vx = t.end.0 - t.start.0;
+        let vy = t.end.1 - t.start.1;
+        let len = vx.hypot(vy);
+        if len < 1e-4 {
+            return false;
+        }
+        let u = (vx / len, vy / len);
+        let n = (-u.1, u.0);
+        let normal = if offset_mm >= 0.0 { n } else { (-n.0, -n.1) };
+        let mut shoved_nets = std::collections::HashSet::new();
+        let mut total_shoves = 0;
+        self.execute_continuous_deflection(
+            board,
+            track_idx,
+            normal,
+            offset_mm.abs(),
+            grid,
+            0,
+            t.net_id,
+            &mut shoved_nets,
+            &mut total_shoves,
+        )
+    }
+
+    pub fn try_continuous_shove_recursive(
+        &self,
+        board: &mut Board,
+        track_idx: usize,
+        intruder_p1: (f64, f64),
+        intruder_p2: (f64, f64),
+        intruder_width: f64,
+        intruder_net_id: usize,
+        grid: Option<&RoutingGrid>,
+        depth: usize,
+        shoved_nets: &mut std::collections::HashSet<usize>,
+        total_shoves: &mut usize,
+    ) -> bool {
+        const MAX_DEPTH: usize = 3;
+        const MAX_TOTAL_SHOVES: usize = 8;
+
+        if depth >= MAX_DEPTH || *total_shoves >= MAX_TOTAL_SHOVES {
+            return false;
+        }
+        if track_idx >= board.tracks.len() || board.tracks[track_idx].is_locked {
+            return false;
+        }
+
+        let t = board.tracks[track_idx].clone();
+        if shoved_nets.contains(&t.net_id) {
+            return false;
+        }
+
+        let vx = t.end.0 - t.start.0;
+        let vy = t.end.1 - t.start.1;
+        let len = vx.hypot(vy);
+        if len < 1e-4 {
+            return false;
+        }
+
+        let dist = dist_segment_to_segment(t.start, t.end, intruder_p1, intruder_p2);
+        let clr_t = board.get_netclass_for_net(t.net_id).clearance;
+        let clr_i = board.get_netclass_for_net(intruder_net_id).clearance;
+        let req_dist = (t.width + intruder_width) * 0.5 + clr_t.max(clr_i);
+
+        if dist >= req_dist - 1e-4 {
+            return true;
+        }
+
+        let penetration = req_dist - dist;
+        let offset = (penetration + 0.05).max(0.10);
+
+        let u = (vx / len, vy / len);
+        let n = (-u.1, u.0);
+
+        let mid_t = ((t.start.0 + t.end.0) * 0.5, (t.start.1 + t.end.1) * 0.5);
+        let mid_i = ((intruder_p1.0 + intruder_p2.0) * 0.5, (intruder_p1.1 + intruder_p2.1) * 0.5);
+        let w = (mid_t.0 - mid_i.0, mid_t.1 - mid_i.1);
+        let dot = w.0 * n.0 + w.1 * n.1;
+
+        let primary_dir = if dot >= 0.0 { n } else { (-n.0, -n.1) };
+        let secondary_dir = (-primary_dir.0, -primary_dir.1);
+
+        let snapshot_shoved = shoved_nets.clone();
+        let snapshot_count = *total_shoves;
+        if self.execute_continuous_deflection(
+            board,
+            track_idx,
+            primary_dir,
+            offset,
+            grid,
+            depth,
+            intruder_net_id,
+            shoved_nets,
+            total_shoves,
+        ) {
+            return true;
+        }
+
+        if dot.abs() < 1e-4 {
+            *shoved_nets = snapshot_shoved;
+            *total_shoves = snapshot_count;
+            if self.execute_continuous_deflection(
+                board,
+                track_idx,
+                secondary_dir,
+                offset,
+                grid,
+                depth,
+                intruder_net_id,
+                shoved_nets,
+                total_shoves,
+            ) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn execute_continuous_deflection(
+        &self,
+        board: &mut Board,
+        track_idx: usize,
+        dir_normal: (f64, f64),
+        offset_mm: f64,
+        grid: Option<&RoutingGrid>,
+        depth: usize,
+        intruder_net_id: usize,
+        shoved_nets: &mut std::collections::HashSet<usize>,
+        total_shoves: &mut usize,
+    ) -> bool {
+        if track_idx >= board.tracks.len() || board.tracks[track_idx].is_locked {
+            return false;
+        }
+
+        let orig_track = board.tracks[track_idx].clone();
+        let a = orig_track.start;
+        let b = orig_track.end;
+        let vx = b.0 - a.0;
+        let vy = b.1 - a.1;
+        let len = vx.hypot(vy);
+        if len < 1e-4 {
+            return false;
+        }
+
+        let u = (vx / len, vy / len);
+        let d = (dir_normal.0 * offset_mm, dir_normal.1 * offset_mm);
+
+        let candidate_segments: Vec<((f64, f64), (f64, f64))> = if len > 2.0 * offset_mm {
+            let s = offset_mm;
+            let j1 = (a.0 + s * u.0 + d.0, a.1 + s * u.1 + d.1);
+            let j2 = (b.0 - s * u.0 + d.0, b.1 - s * u.1 + d.1);
+            vec![(a, j1), (j1, j2), (j2, b)]
+        } else {
+            let m = ((a.0 + b.0) * 0.5 + d.0, (a.1 + b.1) * 0.5 + d.1);
+            vec![(a, m), (m, b)]
+        };
+
+        let backup_tracks = board.tracks.clone();
+
+        // 1. Guard against board boundary
+        let boundary = board.boundary_aabb();
+        for &(p1, p2) in &candidate_segments {
+            if !boundary.contains_point(&Point::new(p1.0, p1.1))
+                || !boundary.contains_point(&Point::new(p2.0, p2.1))
+            {
+                return false;
+            }
+        }
+
+        let clr_t = board.get_netclass_for_net(orig_track.net_id).clearance;
+        let half_w = orig_track.width * 0.5;
+
+        // 2. Guard against keepouts
+        for &(p1, p2) in &candidate_segments {
+            for ko in &board.keepouts {
+                if ko.layers.contains(&orig_track.layer) {
+                    let margin = half_w + clr_t;
+                    let k_min_x = ko.min_x - margin;
+                    let k_max_x = ko.max_x + margin;
+                    let k_min_y = ko.min_y - margin;
+                    let k_max_y = ko.max_y + margin;
+
+                    if (p1.0 >= k_min_x && p1.0 <= k_max_x && p1.1 >= k_min_y && p1.1 <= k_max_y)
+                        || (p2.0 >= k_min_x && p2.0 <= k_max_x && p2.1 >= k_min_y && p2.1 <= k_max_y)
+                    {
+                        return false;
+                    }
+
+                    let corners = [
+                        (ko.min_x, ko.min_y),
+                        (ko.max_x, ko.min_y),
+                        (ko.max_x, ko.max_y),
+                        (ko.min_x, ko.max_y),
+                    ];
+                    for k in 0..4 {
+                        let e1 = corners[k];
+                        let e2 = corners[(k + 1) % 4];
+                        if dist_segment_to_segment(p1, p2, e1, e2) < margin - 1e-4 {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Guard against foreign pads
+        for &(p1, p2) in &candidate_segments {
+            for fp in &board.footprints {
+                if fp.layer != orig_track.layer {
+                    continue;
+                }
+                for pad in &fp.pads {
+                    if pad.net_id != orig_track.net_id {
+                        let (px, py) = fp.pad_absolute_position(pad);
+                        let (pw, ph) = fp.pad_world_size(pad);
+                        let pad_rad = pw.max(ph) * 0.5;
+                        let pad_clr = board.get_netclass_for_net(pad.net_id).clearance;
+                        let req_clr = clr_t.max(pad_clr);
+                        if dist_to_segment(px, py, p1.0, p1.1, p2.0, p2.1) < half_w + pad_rad + req_clr - 1e-4 {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Guard against foreign vias
+        for &(p1, p2) in &candidate_segments {
+            for via in &board.vias {
+                if via.net_id != orig_track.net_id {
+                    let via_rad = via.size * 0.5;
+                    let via_clr = board.get_netclass_for_net(via.net_id).clearance;
+                    let req_clr = clr_t.max(via_clr);
+                    if dist_to_segment(via.position.0, via.position.1, p1.0, p1.1, p2.0, p2.1) < half_w + via_rad + req_clr - 1e-4 {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // Mark orig_track's net as shoved
+        shoved_nets.insert(orig_track.net_id);
+        *total_shoves += 1;
+
+        // 5. Guard against locked foreign tracks
+        for &(p1, p2) in &candidate_segments {
+            for (idx, trk) in board.tracks.iter().enumerate() {
+                if idx == track_idx
+                    || trk.net_id == orig_track.net_id
+                    || trk.net_id == intruder_net_id
+                    || trk.layer != orig_track.layer
+                {
+                    continue;
+                }
+                if trk.is_locked {
+                    let trk_clr = board.get_netclass_for_net(trk.net_id).clearance;
+                    let req_dist = half_w + trk.width * 0.5 + clr_t.max(trk_clr);
+                    if dist_segment_to_segment(p1, p2, trk.start, trk.end) < req_dist - 1e-4 {
+                        board.tracks = backup_tracks;
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // 6. Cascading shove into unlocked foreign tracks
+        // Snapshot existing track count to avoid unbounded iteration on newly appended tracks
+        let initial_track_count = board.tracks.len();
+        for &(p1, p2) in &candidate_segments {
+            for o_idx in 0..initial_track_count {
+                if o_idx >= board.tracks.len() {
+                    break;
+                }
+                let o_trk = board.tracks[o_idx].clone();
+                if o_idx == track_idx
+                    || o_trk.is_locked
+                    || o_trk.net_id == orig_track.net_id
+                    || o_trk.net_id == intruder_net_id
+                    || o_trk.layer != orig_track.layer
+                    || shoved_nets.contains(&o_trk.net_id)
+                {
+                    continue;
+                }
+
+                let o_clr = board.get_netclass_for_net(o_trk.net_id).clearance;
+                let req_dist = half_w + o_trk.width * 0.5 + clr_t.max(o_clr);
+                let d_curr = dist_segment_to_segment(p1, p2, o_trk.start, o_trk.end);
+
+                if d_curr < req_dist - 1e-4 {
+                    if depth >= 3 || *total_shoves >= 8 {
+                        board.tracks = backup_tracks;
+                        return false;
+                    }
+                    if !self.try_continuous_shove_recursive(
+                        board,
+                        o_idx,
+                        p1,
+                        p2,
+                        orig_track.width,
+                        orig_track.net_id,
+                        grid,
+                        depth + 1,
+                        shoved_nets,
+                        total_shoves,
+                    ) {
+                        board.tracks = backup_tracks;
+                        return false;
+                    }
+                }
+            }
+        }
+
+        let pos = board.tracks.iter().position(|t| {
+            t.net_id == orig_track.net_id
+                && t.layer == orig_track.layer
+                && (t.start.0 - a.0).hypot(t.start.1 - a.1) < 1e-4
+                && (t.end.0 - b.0).hypot(t.end.1 - b.1) < 1e-4
+        });
+
+        if let Some(p_idx) = pos {
+            board.tracks.remove(p_idx);
+        } else if track_idx < board.tracks.len() {
+            board.tracks.remove(track_idx);
+        }
+
+        let insert_start = board.tracks.len();
+        for &(p1, p2) in &candidate_segments {
+            if (p1.0 - p2.0).hypot(p1.1 - p2.1) > 1e-5 {
+                board.tracks.push(TrackSegment {
+                    start: p1,
+                    end: p2,
+                    width: orig_track.width,
+                    layer: orig_track.layer,
+                    net_id: orig_track.net_id,
+                    is_locked: false,
+                });
+            }
+        }
+        let insert_end = board.tracks.len();
+
+        // 7. Verify DRC clearance of newly placed segments against remaining tracks
+        for ni in insert_start..insert_end {
+            let seg = &board.tracks[ni];
+            for oi in 0..board.tracks.len() {
+                if oi >= insert_start && oi < insert_end {
+                    continue;
+                }
+                let oth = &board.tracks[oi];
+                if oth.layer != seg.layer || oth.net_id == seg.net_id || oth.net_id == intruder_net_id {
+                    continue;
+                }
+                let clr_o = board.get_netclass_for_net(oth.net_id).clearance;
+                let req = (seg.width + oth.width) * 0.5 + clr_t.max(clr_o);
+                let d = dist_segment_to_segment(seg.start, seg.end, oth.start, oth.end);
+                if d < req - 1e-4 {
+                    board.tracks = backup_tracks;
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -6415,6 +6823,198 @@ mod tests {
             2,
             "Vias must be preserved when detour exceeds length budget or is blocked"
         );
+    }
+
+    #[test]
+    fn test_continuous_track_shove_deflects_with_45_degree_transitions() {
+        let mut board = Board {
+            file_path: String::new(),
+            raw_content: String::new(),
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 100.0,
+            max_y: 100.0,
+            footprints: Vec::new(),
+            holding_palette: Vec::new(),
+            nets: vec!["".to_string(), "SIG1".to_string(), "INTRUDER".to_string()],
+            net_name_to_id: [("SIG1".to_string(), 1), ("INTRUDER".to_string(), 2)].into_iter().collect(),
+            netclasses: [("Default".to_string(), NetClass::default())].into_iter().collect(),
+            net_to_class: [("SIG1".to_string(), "Default".to_string()), ("INTRUDER".to_string(), "Default".to_string())].into_iter().collect(),
+            keepouts: Vec::new(),
+            tracks: vec![
+                TrackSegment {
+                    start: (10.0, 10.0),
+                    end: (30.0, 10.0),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+            ],
+            vias: Vec::new(),
+            clusters: Vec::new(),
+            schematic_positions: HashMap::new(),
+        };
+
+        let nudge = NudgeEngine::new();
+        // Intruder on net 2 from (18.0, 10.20) to (22.0, 10.20), width 0.25
+        let shoved = nudge.try_continuous_shove_track(
+            &mut board,
+            0,
+            (18.0, 10.20),
+            (22.0, 10.20),
+            0.25,
+            2,
+            None,
+        );
+
+        assert!(shoved, "Continuous track shove must succeed in open space");
+
+        let has_start = board.tracks.iter().any(|t| (t.start.0 - 10.0).hypot(t.start.1 - 10.0) < 1e-4 || (t.end.0 - 10.0).hypot(t.end.1 - 10.0) < 1e-4);
+        let has_end = board.tracks.iter().any(|t| (t.start.0 - 30.0).hypot(t.start.1 - 10.0) < 1e-4 || (t.end.0 - 30.0).hypot(t.end.1 - 10.0) < 1e-4);
+        assert!(has_start, "Start endpoint (10, 10) must be preserved");
+        assert!(has_end, "End endpoint (30, 10) must be preserved");
+
+        assert_eq!(board.tracks.len(), 3, "Shoved track must produce 3 segments (lead-in, deflected middle, lead-out)");
+
+        let lead_in = board.tracks.iter().find(|t| (t.start.0 - 10.0).hypot(t.start.1 - 10.0) < 1e-4 || (t.end.0 - 10.0).hypot(t.end.1 - 10.0) < 1e-4).unwrap();
+        let dx = (lead_in.end.0 - lead_in.start.0).abs();
+        let dy = (lead_in.end.1 - lead_in.start.1).abs();
+        assert!((dx - dy).abs() < 1e-4, "Lead-in transition must be at 45 degrees (dx == dy), got dx={:.3}, dy={:.3}", dx, dy);
+
+        for t in &board.tracks {
+            let dist = dist_segment_to_segment(t.start, t.end, (18.0, 10.20), (22.0, 10.20));
+            assert!(dist >= 0.45 - 1e-4, "All deflected segments must maintain required clearance >= 0.45mm, got {:.3}", dist);
+        }
+    }
+
+    #[test]
+    fn test_continuous_track_shove_cascades_multiple_tracks() {
+        let mut board = Board {
+            file_path: String::new(),
+            raw_content: String::new(),
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 100.0,
+            max_y: 100.0,
+            footprints: Vec::new(),
+            holding_palette: Vec::new(),
+            nets: vec!["".to_string(), "SIG1".to_string(), "SIG2".to_string(), "INTRUDER".to_string()],
+            net_name_to_id: [("SIG1".to_string(), 1), ("SIG2".to_string(), 2), ("INTRUDER".to_string(), 3)].into_iter().collect(),
+            netclasses: [("Default".to_string(), NetClass::default())].into_iter().collect(),
+            net_to_class: [
+                ("SIG1".to_string(), "Default".to_string()),
+                ("SIG2".to_string(), "Default".to_string()),
+                ("INTRUDER".to_string(), "Default".to_string()),
+            ].into_iter().collect(),
+            keepouts: Vec::new(),
+            tracks: vec![
+                TrackSegment {
+                    start: (10.0, 10.0),
+                    end: (30.0, 10.0),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+                TrackSegment {
+                    start: (10.0, 9.35),
+                    end: (30.0, 9.35),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 2,
+                    is_locked: false,
+                },
+            ],
+            vias: Vec::new(),
+            clusters: Vec::new(),
+            schematic_positions: HashMap::new(),
+        };
+
+        let nudge = NudgeEngine::new();
+        let shoved = nudge.try_continuous_shove_track(
+            &mut board,
+            0,
+            (18.0, 10.20),
+            (22.0, 10.20),
+            0.25,
+            3,
+            None,
+        );
+
+        assert!(shoved, "Cascading continuous shove across multiple tracks must succeed");
+
+        for t1 in board.tracks.iter().filter(|t| t.net_id == 1) {
+            let dist_to_intruder = dist_segment_to_segment(t1.start, t1.end, (18.0, 10.20), (22.0, 10.20));
+            assert!(dist_to_intruder >= 0.45 - 1e-4, "Net 1 must be clear of intruder");
+
+            for t2 in board.tracks.iter().filter(|t| t.net_id == 2) {
+                let dist_between = dist_segment_to_segment(t1.start, t1.end, t2.start, t2.end);
+                assert!(dist_between >= 0.45 - 1e-4, "Cascaded Net 2 must be clear of shoved Net 1, got {:.3}", dist_between);
+            }
+        }
+    }
+
+    #[test]
+    fn test_continuous_track_shove_rejects_on_locked_or_keepout() {
+        let mut board = Board {
+            file_path: String::new(),
+            raw_content: String::new(),
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 100.0,
+            max_y: 100.0,
+            footprints: Vec::new(),
+            holding_palette: Vec::new(),
+            nets: vec!["".to_string(), "SIG1".to_string(), "LOCKED".to_string(), "INTRUDER".to_string()],
+            net_name_to_id: [("SIG1".to_string(), 1), ("LOCKED".to_string(), 2), ("INTRUDER".to_string(), 3)].into_iter().collect(),
+            netclasses: [("Default".to_string(), NetClass::default())].into_iter().collect(),
+            net_to_class: [
+                ("SIG1".to_string(), "Default".to_string()),
+                ("LOCKED".to_string(), "Default".to_string()),
+                ("INTRUDER".to_string(), "Default".to_string()),
+            ].into_iter().collect(),
+            keepouts: Vec::new(),
+            tracks: vec![
+                TrackSegment {
+                    start: (10.0, 10.0),
+                    end: (30.0, 10.0),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+                TrackSegment {
+                    start: (10.0, 9.35),
+                    end: (30.0, 9.35),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 2,
+                    is_locked: true,
+                },
+            ],
+            vias: Vec::new(),
+            clusters: Vec::new(),
+            schematic_positions: HashMap::new(),
+        };
+
+        let orig_tracks = board.tracks.clone();
+        let nudge = NudgeEngine::new();
+
+        let shoved = nudge.try_continuous_shove_track(
+            &mut board,
+            0,
+            (18.0, 10.20),
+            (22.0, 10.20),
+            0.25,
+            3,
+            None,
+        );
+
+        assert!(!shoved, "Continuous shove must safely abort when blocked by a locked track");
+        assert_eq!(board.tracks.len(), 2, "Tracks must not be altered when shove fails");
+        assert_eq!(board.tracks[0].start, orig_tracks[0].start);
+        assert_eq!(board.tracks[0].end, orig_tracks[0].end);
     }
 }
 
