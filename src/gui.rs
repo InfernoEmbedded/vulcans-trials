@@ -12,6 +12,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+// KiCad default colour theme (KiCad 8/9/10 "default"; pcbnew builtin scheme, inner layers per user spec).
+// ponytail: values transcribed, not read from an installed theme file (none shipped in /usr/share/kicad).
+pub const COL_F_CU: Color32 = Color32::from_rgb(0xC8, 0x34, 0x34);
+pub const COL_B_CU: Color32 = Color32::from_rgb(0x4D, 0x7F, 0xC4);
+pub const COL_IN1_CU: Color32 = Color32::from_rgb(0xC2, 0xC2, 0x00);
+pub const COL_IN2_CU: Color32 = Color32::from_rgb(0xC2, 0x00, 0xC2);
+pub const COL_PAD_TH: Color32 = Color32::from_rgb(0xE3, 0xB7, 0x2E);
+pub const COL_VIA: Color32 = Color32::from_rgb(0xEC, 0xEC, 0xEC);
+pub const COL_F_CRTYD: Color32 = Color32::from_rgb(0xFF, 0x26, 0xE2);
+pub const COL_B_CRTYD: Color32 = Color32::from_rgb(0x26, 0xE2, 0xFF);
+pub const COL_EDGE_CUTS: Color32 = Color32::from_rgb(0xD0, 0xD2, 0xCD);
+pub const COL_RATSNEST: Color32 = Color32::from_rgb(0x00, 0xF8, 0xFF);
+pub const COL_KEEPOUT: Color32 = Color32::from_rgb(200, 70, 70);
+/// Canvas copper draw order, bottom to top (KiCad: B.Cu, inner layers, F.Cu).
+pub const COPPER_DRAW_ORDER: [&str; 4] = ["B.Cu", "In2.Cu", "In1.Cu", "F.Cu"];
+
 pub struct VulcansTrialsApp {
     pub input_path: String,
     pub output_path: String,
@@ -70,7 +86,7 @@ impl VulcansTrialsApp {
             telemetry,
             stop_flag: Arc::new(AtomicBool::new(false)),
             worker_running: Arc::new(AtomicBool::new(false)),
-            place_duration_secs: 15,
+            place_duration_secs: 120,
             min_spacing_mm: 0.25,
             grid_res_mm: 0.10,
             max_ripup_passes: 15,
@@ -783,13 +799,14 @@ impl VulcansTrialsApp {
                         &mut self.show_holding_palette,
                         format!("Holding Palette ({})", snap.board.holding_palette.len()),
                     );
-                    ui.checkbox(&mut self.show_courtyards, "Courtyards");
-                    ui.checkbox(&mut self.show_ratsnest, "Ratsnest");
-                    ui.checkbox(&mut self.show_f_cu, "F.Cu (Top)");
-                    ui.checkbox(&mut self.show_b_cu, "B.Cu (Bottom)");
-                    ui.checkbox(&mut self.show_in1_cu, in1_txt);
-                    ui.checkbox(&mut self.show_in2_cu, in2_txt);
-                    ui.checkbox(&mut self.show_vias, "Vias");
+                    // KiCad layer order with colour swatches (text tinted to the canvas colour)
+                    ui.checkbox(&mut self.show_f_cu, egui::RichText::new("F.Cu (Top)").color(COL_F_CU));
+                    ui.checkbox(&mut self.show_in1_cu, egui::RichText::new(in1_txt).color(COL_IN1_CU));
+                    ui.checkbox(&mut self.show_in2_cu, egui::RichText::new(in2_txt).color(COL_IN2_CU));
+                    ui.checkbox(&mut self.show_b_cu, egui::RichText::new("B.Cu (Bottom)").color(COL_B_CU));
+                    ui.checkbox(&mut self.show_vias, egui::RichText::new("Vias").color(COL_VIA));
+                    ui.checkbox(&mut self.show_ratsnest, egui::RichText::new("Ratsnest").color(COL_RATSNEST));
+                    ui.checkbox(&mut self.show_courtyards, egui::RichText::new("Courtyards").color(COL_F_CRTYD));
                     ui.checkbox(&mut self.show_refs, "References");
                 });
                 if ui.button("🔍 Reset Camera View").clicked() {
@@ -1074,7 +1091,7 @@ impl VulcansTrialsApp {
             painter.rect_stroke(
                 Rect::from_min_max(edge_min, edge_max),
                 0.0,
-                Stroke::new(2.0_f32, Color32::from_rgb(220, 200, 60)),
+                Stroke::new(2.0_f32, COL_EDGE_CUTS),
                 egui::StrokeKind::Middle,
             );
 
@@ -1087,19 +1104,30 @@ impl VulcansTrialsApp {
                 painter.rect_stroke(
                     krect,
                     0.0,
-                    Stroke::new(1.2_f32, Color32::from_rgb(200, 70, 70)),
+                    Stroke::new(1.2_f32, COL_KEEPOUT),
                     egui::StrokeKind::Middle,
                 );
             }
 
-            // 3. Draw Inner Copper Layers (In2.Cu Purple, In1.Cu Green)
+            // 3. Draw Copper Layers bottom-up like KiCad (B.Cu, In2.Cu, In1.Cu, F.Cu)
+            if self.show_b_cu {
+                for tr in &b.tracks {
+                    if tr.layer == 1 {
+                        let p1 = to_screen(tr.start.0, tr.start.1);
+                        let p2 = to_screen(tr.end.0, tr.end.1);
+                        let w = ((tr.width as f32) * scale).max(1.5);
+                        draw_track_segment(&painter, p1, p2, w, COL_B_CU);
+                    }
+                }
+            }
+
             if self.show_in2_cu {
                 for tr in &b.tracks {
                     if tr.layer == 3 {
                         let p1 = to_screen(tr.start.0, tr.start.1);
                         let p2 = to_screen(tr.end.0, tr.end.1);
                         let w = ((tr.width as f32) * scale).max(1.5);
-                        draw_track_segment(&painter, p1, p2, w, Color32::from_rgb(195, 95, 245));
+                        draw_track_segment(&painter, p1, p2, w, COL_IN2_CU);
                     }
                 }
             }
@@ -1109,19 +1137,7 @@ impl VulcansTrialsApp {
                         let p1 = to_screen(tr.start.0, tr.start.1);
                         let p2 = to_screen(tr.end.0, tr.end.1);
                         let w = ((tr.width as f32) * scale).max(1.5);
-                        draw_track_segment(&painter, p1, p2, w, Color32::from_rgb(60, 200, 95));
-                    }
-                }
-            }
-
-            // 4. Draw B.Cu Tracks (Blue)
-            if self.show_b_cu {
-                for tr in &b.tracks {
-                    if tr.layer == 1 {
-                        let p1 = to_screen(tr.start.0, tr.start.1);
-                        let p2 = to_screen(tr.end.0, tr.end.1);
-                        let w = ((tr.width as f32) * scale).max(1.5);
-                        draw_track_segment(&painter, p1, p2, w, Color32::from_rgb(50, 130, 255));
+                        draw_track_segment(&painter, p1, p2, w, COL_IN1_CU);
                     }
                 }
             }
@@ -1133,20 +1149,8 @@ impl VulcansTrialsApp {
                         let p1 = to_screen(tr.start.0, tr.start.1);
                         let p2 = to_screen(tr.end.0, tr.end.1);
                         let w = ((tr.width as f32) * scale).max(1.5);
-                        draw_track_segment(&painter, p1, p2, w, Color32::from_rgb(235, 65, 55));
+                        draw_track_segment(&painter, p1, p2, w, COL_F_CU);
                     }
-                }
-            }
-
-            // 6. Draw Ratsnest
-            if self.show_ratsnest {
-                for seg in &snap.ratsnest {
-                    let p1 = to_screen(seg.p1.x, seg.p1.y);
-                    let p2 = to_screen(seg.p2.x, seg.p2.y);
-                    painter.line_segment(
-                        [p1, p2],
-                        Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(180, 210, 255, 85)),
-                    );
                 }
             }
 
@@ -1155,30 +1159,6 @@ impl VulcansTrialsApp {
                 let fp_rect = self.footprint_screen_rect(b, rect, fp);
                 let is_moving = self.moving_footprint.as_ref().map_or(false, |m| m.fp_index == idx);
                 let is_hovered = self.hovered_footprint == Some(idx) && !is_moving;
-
-                if self.show_courtyards {
-                    let stroke_col = if is_moving {
-                        Color32::from_rgb(255, 230, 80)
-                    } else if is_hovered {
-                        Color32::from_rgb(255, 255, 255)
-                    } else if fp.is_locked {
-                        Color32::from_rgb(240, 175, 50)
-                    } else if fp.layer == 1 {
-                        Color32::from_rgb(80, 170, 255)
-                    } else {
-                        Color32::from_rgb(70, 210, 160)
-                    };
-                    let stroke_w = if is_moving { 2.4_f32 } else if is_hovered { 1.8_f32 } else { 1.2_f32 };
-                    let polys = fp.transformed_perimeters_layered(Point::new(fp.x, fp.y), fp.rotation, fp.layer, 0.0);
-                    for poly in polys {
-                        if poly.vertices.len() >= 3 {
-                            let pts: Vec<Pos2> = poly.vertices.iter().map(|v| to_screen(v.x, v.y)).collect();
-                            for i in 0..pts.len() {
-                                painter.line_segment([pts[i], pts[(i + 1) % pts.len()]], Stroke::new(stroke_w, stroke_col));
-                            }
-                        }
-                    }
-                }
 
                 for pad in &fp.pads {
                     let is_highlighted = self
@@ -1191,13 +1171,11 @@ impl VulcansTrialsApp {
                     let pad_col = if is_highlighted {
                         Color32::from_rgb(255, 245, 140)
                     } else if pad.is_through_hole {
-                        Color32::from_rgb(215, 185, 80)
-                    } else if pad.net_name == "GND" {
-                        Color32::from_rgb(90, 165, 110)
+                        COL_PAD_TH
                     } else if fp.layer == 1 {
-                        Color32::from_rgb(85, 145, 235)
+                        COL_B_CU
                     } else {
-                        Color32::from_rgb(200, 90, 90)
+                        COL_F_CU
                     };
 
                     if pad.shape == "circle" {
@@ -1273,9 +1251,51 @@ impl VulcansTrialsApp {
                     let c = to_screen(v.position.0, v.position.1);
                     let outer_r = ((v.size as f32) * 0.5 * scale).max(2.5);
                     let inner_r = ((v.drill as f32) * 0.5 * scale).max(1.0);
-                    painter.circle_filled(c, outer_r, Color32::from_rgb(210, 195, 120));
+                    painter.circle_filled(c, outer_r, COL_VIA);
                     painter.circle_filled(c, inner_r, Color32::from_rgb(25, 30, 35));
                 }
+            }
+
+            // 6. Draw Ratsnest
+            if self.show_ratsnest {
+                for seg in &snap.ratsnest {
+                    let p1 = to_screen(seg.p1.x, seg.p1.y);
+                    let p2 = to_screen(seg.p2.x, seg.p2.y);
+                    painter.line_segment(
+                        [p1, p2],
+                        Stroke::new(0.8_f32, COL_RATSNEST),
+                    );
+                }
+            }
+
+            // 9. Draw Courtyards on top (KiCad draws F.CrtYd/B.CrtYd above copper)
+            for (idx, fp) in b.footprints.iter().enumerate() {
+                let is_moving = self.moving_footprint.as_ref().map_or(false, |m| m.fp_index == idx);
+                let is_hovered = self.hovered_footprint == Some(idx) && !is_moving;
+                if self.show_courtyards {
+                    let stroke_col = if is_moving {
+                        Color32::from_rgb(255, 230, 80)
+                    } else if is_hovered {
+                        Color32::from_rgb(255, 255, 255)
+                    } else if fp.is_locked {
+                        Color32::from_rgb(240, 175, 50)
+                    } else if fp.layer == 1 {
+                        COL_B_CRTYD
+                    } else {
+                        COL_F_CRTYD
+                    };
+                    let stroke_w = if is_moving { 2.4_f32 } else if is_hovered { 1.8_f32 } else { 1.2_f32 };
+                    let polys = fp.transformed_perimeters_layered(Point::new(fp.x, fp.y), fp.rotation, fp.layer, 0.0);
+                    for poly in polys {
+                        if poly.vertices.len() >= 3 {
+                            let pts: Vec<Pos2> = poly.vertices.iter().map(|v| to_screen(v.x, v.y)).collect();
+                            for i in 0..pts.len() {
+                                painter.line_segment([pts[i], pts[(i + 1) % pts.len()]], Stroke::new(stroke_w, stroke_col));
+                            }
+                        }
+                    }
+                }
+
             }
 
             // 9. Draw Color Legend Overlay
@@ -1498,20 +1518,19 @@ pub fn draw_color_legend(painter: &egui::Painter, canvas_rect: Rect, board: &Boa
     };
 
     let items: &[(&str, Color32)] = &[
-        ("Edge.Cuts Outline", Color32::from_rgb(220, 200, 60)),
-        ("Keepout Zone", Color32::from_rgb(200, 70, 70)),
-        (&f_label, Color32::from_rgb(235, 65, 55)),
-        (&b_label, Color32::from_rgb(50, 130, 255)),
-        (&in1_label, Color32::from_rgb(60, 200, 95)),
-        (&in2_label, Color32::from_rgb(195, 95, 245)),
-        ("Ratsnest (Unrouted)", Color32::from_rgba_unmultiplied(180, 210, 255, 180)),
-        ("Courtyard (F.Cu Top)", Color32::from_rgb(70, 210, 160)),
-        ("Courtyard (B.Cu Bottom)", Color32::from_rgb(80, 170, 255)),
+        (&f_label, COL_F_CU),
+        (&in1_label, COL_IN1_CU),
+        (&in2_label, COL_IN2_CU),
+        (&b_label, COL_B_CU),
+        ("Edge.Cuts Outline", COL_EDGE_CUTS),
+        ("Keepout Zone", COL_KEEPOUT),
+        ("Ratsnest (Unrouted)", COL_RATSNEST),
+        ("Courtyard (F.Cu Top)", COL_F_CRTYD),
+        ("Courtyard (B.Cu Bottom)", COL_B_CRTYD),
         ("Courtyard (Locked 🔒)", Color32::from_rgb(240, 175, 50)),
-        ("SMD Signal Pad", Color32::from_rgb(200, 90, 90)),
-        ("SMD GND Pad", Color32::from_rgb(90, 165, 110)),
-        ("Through-Hole Pad", Color32::from_rgb(215, 185, 80)),
-        ("Via Annular Ring", Color32::from_rgb(210, 195, 120)),
+        ("SMD Pad (F.Cu / B.Cu colour)", COL_F_CU),
+        ("Through-Hole Pad", COL_PAD_TH),
+        ("Via Annular Ring", COL_VIA),
     ];
 
     let row_h = 15.0_f32;
@@ -1584,6 +1603,18 @@ mod tests {
     use crate::board::{Footprint, KeepoutZone, Polygon, TrackSegment, Via};
     use std::fs;
     use std::time::Duration;
+
+    #[test]
+    fn test_kicad_layer_colours_and_order() {
+        assert_eq!(COL_F_CU, Color32::from_rgb(0xC8, 0x34, 0x34));
+        assert_eq!(COL_B_CU, Color32::from_rgb(0x4D, 0x7F, 0xC4));
+        assert_eq!(COL_IN1_CU, Color32::from_rgb(0xC2, 0xC2, 0x00));
+        assert_eq!(COL_IN2_CU, Color32::from_rgb(0xC2, 0x00, 0xC2));
+        assert_eq!(COL_F_CRTYD, Color32::from_rgb(0xFF, 0x26, 0xE2));
+        assert_eq!(COL_B_CRTYD, Color32::from_rgb(0x26, 0xE2, 0xFF));
+        assert_eq!(COL_EDGE_CUTS, Color32::from_rgb(0xD0, 0xD2, 0xCD));
+        assert_eq!(COPPER_DRAW_ORDER, ["B.Cu", "In2.Cu", "In1.Cu", "F.Cu"]);
+    }
 
     fn make_gui_test_board(pcb_path: &str) -> Board {
         let content = r#"(kicad_pcb
