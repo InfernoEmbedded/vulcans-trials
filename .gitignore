@@ -1,3 +1,4 @@
 /target/
 *.kicad_pcb
 *.ses
+kicad_plugin/pcm/

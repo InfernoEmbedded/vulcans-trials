@@ -1,23 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
-mod board;
-mod gui;
-mod placer;
-mod router;
-mod vulkan;
-
-use crate::board::{Board, Point, Polygon, Segment};
-use crate::gui::VulcansTrialsApp;
-use crate::placer::{run_auto_placer, PlacementConfig};
-use crate::router::{AutoRouter, RoutingGrid};
-use crate::vulkan::VulkanEngine;
 use clap::Parser;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
+use vulcans_trials::board::{Board, Point, Polygon, Segment};
+use vulcans_trials::gui::VulcansTrialsApp;
+use vulcans_trials::placer::{run_auto_placer, PlacementConfig};
+use vulcans_trials::router::{AutoRouter, RoutingGrid};
+use vulcans_trials::vulkan::VulkanEngine;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -59,9 +53,21 @@ struct Args {
     #[arg(long, default_value = "")]
     lock: String,
 
+    /// Penalty factor for routing non-plane signals across inner power plane layers
+    #[arg(long, default_value_t = 8.0)]
+    inner_plane_penalty: f64,
+
     /// Run built-in self-verification suite (Vulkan compute, SAT geometry, router grid)
     #[arg(long)]
     self_test: bool,
+}
+
+fn parse_locked_refs(lock_arg: &str) -> HashSet<String> {
+    lock_arg
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn run_self_test() -> Result<(), String> {
@@ -123,6 +129,52 @@ fn run_self_test() -> Result<(), String> {
     Ok(())
 }
 
+fn run_headless_trial(args: &Args, board: &mut Board, vulkan: Option<Arc<VulkanEngine>>) -> Result<(), String> {
+    let start_t = Instant::now();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let do_place = matches!(args.mode.as_str(), "place" | "both");
+    let do_route = matches!(args.mode.as_str(), "route" | "both");
+
+    if do_place {
+        let cfg = PlacementConfig {
+            duration_secs: args.duration,
+            vulkan: vulkan.clone(),
+            ..PlacementConfig::default()
+        };
+        let st = run_auto_placer(board, &cfg, None, Arc::clone(&stop_flag));
+        println!(
+            "[Auto-Placer] Done: Crossings={}, Wirelength={:.1}mm, Overlaps={}",
+            st.crossings, st.wirelength, st.overlaps
+        );
+    }
+
+    if do_route {
+        let mut grid = RoutingGrid::new(board, args.res, vulkan).with_inner_layer_penalty(args.inner_plane_penalty);
+        let router = AutoRouter::new(args.passes).with_inner_layer_penalty(args.inner_plane_penalty);
+        let (routed, total) = router.route_all(board, &mut grid, None, Arc::clone(&stop_flag));
+        println!(
+            "[Auto-Router] Done in {:.2}s: {}/{} ({:.1}%) connections routed ({} tracks, {} vias)",
+            start_t.elapsed().as_secs_f64(),
+            routed,
+            total,
+            (routed as f64 / total.max(1) as f64) * 100.0,
+            board.tracks.len(),
+            board.vias.len()
+        );
+    }
+
+    let out_path = Path::new(&args.output);
+    board.save_pcb(out_path)?;
+    let ses_path = out_path.with_extension("ses");
+    board.save_ses(&ses_path)?;
+    println!("Saved output to {} and {}", out_path.display(), ses_path.display());
+    Ok(())
+}
+
+// Process entrypoint `main` cannot be called directly in an in-process unit test because
+// it parses process-global `std::env::args`, calls `std::process::exit(1)` on error, or blocks
+// on an OS window event loop via `eframe::run_native`. All underlying logic (`Args`,
+// `parse_locked_refs`, `run_self_test`, `run_headless_trial`) is unit-tested below.
 fn main() {
     let args = Args::parse();
 
@@ -134,12 +186,7 @@ fn main() {
         return;
     }
 
-    let extra_locked: HashSet<String> = args
-        .lock
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let extra_locked = parse_locked_refs(&args.lock);
 
     let vulkan = VulkanEngine::new();
     if let Some(ref vk) = vulkan {
@@ -171,43 +218,10 @@ fn main() {
     );
 
     if args.headless {
-        let start_t = Instant::now();
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let do_place = matches!(args.mode.as_str(), "place" | "both");
-        let do_route = matches!(args.mode.as_str(), "route" | "both");
-
-        if do_place {
-            let cfg = PlacementConfig {
-                duration_secs: args.duration,
-                ..PlacementConfig::default()
-            };
-            let st = run_auto_placer(&mut board, &cfg, None, Arc::clone(&stop_flag));
-            println!(
-                "[Auto-Placer] Done: Crossings={}, Wirelength={:.1}mm, Overlaps={}",
-                st.crossings, st.wirelength, st.overlaps
-            );
+        if let Err(e) = run_headless_trial(&args, &mut board, vulkan) {
+            eprintln!("Headless execution error: {}", e);
+            std::process::exit(1);
         }
-
-        if do_route {
-            let mut grid = RoutingGrid::new(&board, args.res, vulkan);
-            let router = AutoRouter::new(args.passes);
-            let (routed, total) = router.route_all(&mut board, &mut grid, None, Arc::clone(&stop_flag));
-            println!(
-                "[Auto-Router] Done in {:.2}s: {}/{} ({:.1}%) connections routed ({} tracks, {} vias)",
-                start_t.elapsed().as_secs_f64(),
-                routed,
-                total,
-                (routed as f64 / total.max(1) as f64) * 100.0,
-                board.tracks.len(),
-                board.vias.len()
-            );
-        }
-
-        let out_path = Path::new(&args.output);
-        board.save_pcb(out_path).expect("Failed to write output .kicad_pcb");
-        let ses_path = out_path.with_extension("ses");
-        board.save_ses(&ses_path).expect("Failed to write output .ses");
-        println!("Saved output to {} and {}", out_path.display(), ses_path.display());
         return;
     }
 
@@ -228,3 +242,93 @@ fn main() {
         eprintln!("GUI error: {}", e);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_cli_args_parsing_and_locked_refs() {
+        let def = Args::try_parse_from(["vulcans-trials"]).unwrap();
+        assert!(!def.headless);
+        assert!(!def.self_test);
+        assert_eq!(def.mode, "both");
+        assert_eq!(def.duration, 10);
+        assert!((def.res - 0.10).abs() < 1e-6);
+        assert_eq!(def.passes, 15);
+        assert!(parse_locked_refs(&def.lock).is_empty());
+
+        let custom = Args::try_parse_from([
+            "vulcans-trials",
+            "-i",
+            "/tmp/in.kicad_pcb",
+            "-o",
+            "/tmp/out.kicad_pcb",
+            "--headless",
+            "--mode",
+            "place",
+            "--duration",
+            "2",
+            "--res",
+            "0.25",
+            "--passes",
+            "4",
+            "--lock",
+            "U1, J2 , , R5",
+            "--self-test",
+        ])
+        .unwrap();
+        assert!(custom.headless);
+        assert!(custom.self_test);
+        assert_eq!(custom.mode, "place");
+        assert_eq!(custom.duration, 2);
+        assert_eq!(custom.passes, 4);
+        let locked = parse_locked_refs(&custom.lock);
+        assert_eq!(locked.len(), 3);
+        assert!(locked.contains("U1") && locked.contains("J2") && locked.contains("R5"));
+    }
+
+    #[test]
+    fn test_run_self_test_suite() {
+        assert!(run_self_test().is_ok());
+    }
+
+    #[test]
+    fn test_run_headless_trial_modes() {
+        let in_pcb = "/tmp/vulcan_main_unit_in.kicad_pcb";
+        let out_pcb = "/tmp/vulcan_main_unit_out.kicad_pcb";
+        let out_ses = "/tmp/vulcan_main_unit_out.ses";
+        let content = r#"(kicad_pcb
+          (net 0 "") (net 1 "GND") (net 2 "SIG")
+          (gr_rect (start 100.0 100.0) (end 130.0 120.0) (layer "Edge.Cuts"))
+          (footprint "R" (at 108.0 110.0) (property "Reference" "R10")
+            (pad "1" smd rect (at 0 0) (size 0.5 0.5) (net 2 "SIG")))
+          (footprint "R" (at 114.0 110.0) (property "Reference" "R11")
+            (pad "1" smd rect (at 0 0) (size 0.5 0.5) (net 2 "SIG")))
+        )"#;
+        fs::write(in_pcb, content).unwrap();
+
+        let mut board = Board::load(in_pcb, &HashSet::new()).unwrap();
+        let args = Args {
+            input: in_pcb.to_string(),
+            output: out_pcb.to_string(),
+            headless: true,
+            mode: "both".to_string(),
+            duration: 0,
+            res: 0.50,
+            passes: 1,
+            lock: String::new(),
+            inner_plane_penalty: 8.0,
+            self_test: false,
+        };
+        assert!(run_headless_trial(&args, &mut board, None).is_ok());
+        assert!(Path::new(out_pcb).exists());
+        assert!(Path::new(out_ses).exists());
+
+        let _ = fs::remove_file(in_pcb);
+        let _ = fs::remove_file(out_pcb);
+        let _ = fs::remove_file(out_ses);
+    }
+}
+

@@ -11,15 +11,33 @@
             "web": "https://github.com/InfernoEmbedded"
         }
     },
+    "maintainer": {
+        "name": "InfernoEmbedded",
+        "contact": {
+            "web": "https://github.com/InfernoEmbedded"
+        }
+    },
     "license": "GPL-3.0",
     "resources": {
         "homepage": "https://github.com/InfernoEmbedded/vulcans-trials"
     },
+    "tags": [
+        "autorouter",
+        "autoplacer",
+        "vulkan",
+        "gpu",
+        "pcbnew"
+    ],
     "versions": [
         {
             "version": "0.1.0",
             "status": "stable",
-            "kicad_version": "8.0"
+            "kicad_version": "8.0",
+            "platforms": [
+                "linux",
+                "macos",
+                "windows"
+            ]
         }
     ]
 }

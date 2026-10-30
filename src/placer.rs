@@ -2,10 +2,11 @@
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
 use crate::board::{Board, LiveTrialState, Point, Polygon, TrialPhase, AABB};
+use crate::vulkan::{GpuSaParams, VulkanEngine};
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,6 +22,10 @@ pub struct PlacementConfig {
     pub boundary_penalty: f64,
     pub passive_affinity_weight: f64,
     pub passive_max_dist: f64,
+    pub decoupling_affinity_weight: f64,
+    pub decoupling_max_dist: f64,
+    pub allow_layer_flip: bool,
+    pub vulkan: Option<Arc<VulkanEngine>>,
 }
 
 impl Default for PlacementConfig {
@@ -35,6 +40,10 @@ impl Default for PlacementConfig {
             boundary_penalty: 50000.0,
             passive_affinity_weight: 80.0,
             passive_max_dist: 3.5,
+            decoupling_affinity_weight: 250.0,
+            decoupling_max_dist: 2.0,
+            allow_layer_flip: false,
+            vulkan: None,
         }
     }
 }
@@ -43,6 +52,7 @@ impl Default for PlacementConfig {
 pub struct PlacementState {
     pub positions: Vec<Point>,
     pub rotations: Vec<f64>,
+    pub layers: Vec<usize>,
     pub cached_courtyards: Vec<Vec<Polygon>>,
     pub cached_bounds: Vec<AABB>,
     pub cached_pads: Vec<Vec<Point>>,
@@ -52,26 +62,93 @@ pub struct PlacementState {
     pub overlaps: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PassiveTie {
-    passive_idx: usize,
-    passive_pad_idx: usize,
-    anchor_idx: usize,
-    anchor_pad_idx: usize,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PassiveTie {
+    pub passive_idx: usize,
+    pub passive_pad_idx: usize,
+    pub anchor_idx: usize,
+    pub anchor_pad_idx: usize,
+    pub max_dist: f64,
+    pub weight_mult: f64,
+    pub is_decoupling: bool,
 }
 
-fn build_passive_ties(board: &Board) -> Vec<PassiveTie> {
+pub fn is_ground_net(name: &str) -> bool {
+    let s = name.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let u = s.to_ascii_uppercase();
+    u == "GND"
+        || u == "/GND"
+        || u == "GROUND"
+        || u.starts_with("GND_")
+        || u.ends_with("_GND")
+        || u.contains("AGND")
+        || u.contains("DGND")
+        || u.contains("PGND")
+}
+
+pub fn is_power_net(name: &str) -> bool {
+    let s = name.trim();
+    if s.is_empty() || is_ground_net(s) {
+        return false;
+    }
+    let u = s.to_ascii_uppercase();
+    u.starts_with('+')
+        || u.starts_with("VCC")
+        || u.starts_with("VDD")
+        || u.starts_with("VBUS")
+        || u.starts_with("VRAW")
+        || u.starts_with("VIN")
+        || u.starts_with("VBAT")
+        || u.starts_with("VOUT")
+        || u.contains("3V3")
+        || u.contains("5V")
+        || u.contains("12V")
+        || u.contains("BUCK_VIN")
+        || u.contains("POWER")
+}
+
+pub fn build_passive_ties(board: &Board) -> Vec<PassiveTie> {
+    // 1. Map of non-power, non-ground signal nets -> Vec<(fp_idx, pad_idx)>
     let mut net_pads: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
     for (fp_idx, fp) in board.footprints.iter().enumerate() {
         for (pad_idx, pad) in fp.pads.iter().enumerate() {
-            if pad.net_id == 0 || pad.net_name.is_empty() || pad.net_name == "GND" {
+            if pad.net_id == 0
+                || pad.net_name.is_empty()
+                || is_ground_net(&pad.net_name)
+                || is_power_net(&pad.net_name)
+            {
                 continue;
             }
             net_pads.entry(pad.net_id).or_default().push((fp_idx, pad_idx));
         }
     }
 
+    // 2. Map of power net_id -> Vec<(active_device_idx, pad_idx)>
+    let mut power_net_device_pads: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    for (fp_idx, fp) in board.footprints.iter().enumerate() {
+        let is_active = fp.reference.starts_with('U')
+            || fp.reference.starts_with('Q')
+            || fp.reference.starts_with('J')
+            || fp.reference.starts_with('M');
+        if !is_active {
+            continue;
+        }
+        for (pad_idx, pad) in fp.pads.iter().enumerate() {
+            if pad.net_id != 0 && is_power_net(&pad.net_name) {
+                power_net_device_pads
+                    .entry(pad.net_id)
+                    .or_default()
+                    .push((fp_idx, pad_idx));
+            }
+        }
+    }
+
+    let mut pin_usage: HashMap<(usize, usize), usize> = HashMap::new();
     let mut ties = Vec::new();
+
     for (fp_idx, fp) in board.footprints.iter().enumerate() {
         let is_passive = fp.reference.starts_with('R')
             || fp.reference.starts_with('C')
@@ -81,12 +158,103 @@ fn build_passive_ties(board: &Board) -> Vec<PassiveTie> {
         if !is_passive || fp.is_locked {
             continue;
         }
+
+        // Check if fp is a 2-pin decoupling capacitor: one pin on GND, one pin on a power net
+        let is_2pin_cap = fp.reference.starts_with('C') && fp.pads.len() == 2;
+        let mut gnd_pin = None;
+        let mut pwr_pin = None;
+        if is_2pin_cap {
+            for (p_idx, pad) in fp.pads.iter().enumerate() {
+                if is_ground_net(&pad.net_name) && gnd_pin.is_none() {
+                    gnd_pin = Some(p_idx);
+                } else if is_power_net(&pad.net_name) && pwr_pin.is_none() {
+                    pwr_pin = Some(p_idx);
+                }
+            }
+        }
+
+        if let (Some(_gnd_idx), Some(pwr_pad_idx)) = (gnd_pin, pwr_pin) {
+            let pwr_net_id = fp.pads[pwr_pad_idx].net_id;
+            if let Some(candidate_pads) = power_net_device_pads.get(&pwr_net_id) {
+                let mut best_candidate: Option<(usize, usize, f64)> = None;
+
+                for &(dev_idx, dev_pad_idx) in candidate_pads {
+                    if dev_idx == fp_idx {
+                        continue;
+                    }
+                    let dev = &board.footprints[dev_idx];
+                    let dev_ref = &dev.reference;
+                    let type_tier = if dev_ref.starts_with('U') {
+                        3.0
+                    } else if dev_ref.starts_with('Q') {
+                        2.0
+                    } else {
+                        1.0
+                    };
+
+                    let mut score = 0.0;
+                    if let (Some(fp_sch), Some(dev_sch)) = (
+                        board.schematic_positions.get(&fp.reference),
+                        board.schematic_positions.get(dev_ref),
+                    ) {
+                        let d_sch = (fp_sch.0 - dev_sch.0).hypot(fp_sch.1 - dev_sch.1);
+                        score += d_sch;
+                    } else {
+                        let d_phys = (fp.x - dev.x).hypot(fp.y - dev.y);
+                        score += d_phys * 2.0;
+
+                        let fp_num: f64 = fp
+                            .reference
+                            .trim_start_matches(|c: char| !c.is_ascii_digit())
+                            .parse()
+                            .unwrap_or(0.0);
+                        let dev_num: f64 = dev_ref
+                            .trim_start_matches(|c: char| !c.is_ascii_digit())
+                            .parse()
+                            .unwrap_or(0.0);
+                        score += (fp_num - dev_num).abs() * 0.5;
+                    }
+
+                    for cl in &board.clusters {
+                        if cl.member_indices.contains(&fp_idx) && cl.member_indices.contains(&dev_idx) {
+                            score -= 200.0;
+                            break;
+                        }
+                    }
+
+                    score -= type_tier * 50.0;
+
+                    let usage = *pin_usage.get(&(dev_idx, dev_pad_idx)).unwrap_or(&0);
+                    score += (usage as f64) * 15.0;
+
+                    if best_candidate.is_none_or(|b| score < b.2) {
+                        best_candidate = Some((dev_idx, dev_pad_idx, score));
+                    }
+                }
+
+                if let Some((best_dev, best_pad, _)) = best_candidate {
+                    *pin_usage.entry((best_dev, best_pad)).or_insert(0) += 1;
+                    ties.push(PassiveTie {
+                        passive_idx: fp_idx,
+                        passive_pad_idx: pwr_pad_idx,
+                        anchor_idx: best_dev,
+                        anchor_pad_idx: best_pad,
+                        max_dist: 2.0,
+                        weight_mult: 3.5,
+                        is_decoupling: true,
+                    });
+                    continue;
+                }
+            }
+        }
+
+        // Non-decoupling passive (e.g. pullups, termination resistors, signal caps)
         let mut best: Option<(usize, usize, usize, usize)> = None;
         for (pad_idx, pad) in fp.pads.iter().enumerate() {
-            if matches!(
-                pad.net_name.as_str(),
-                "" | "GND" | "+3.3V" | "VRAW" | "VCC_5V" | "VBUS" | "/BUCK_VIN"
-            ) {
+            if pad.net_name.is_empty()
+                || is_ground_net(&pad.net_name)
+                || is_power_net(&pad.net_name)
+            {
                 continue;
             }
             if let Some(peers) = net_pads.get(&pad.net_id) {
@@ -114,6 +282,9 @@ fn build_passive_ties(board: &Board) -> Vec<PassiveTie> {
                 passive_pad_idx: p_pad,
                 anchor_idx: a_fp,
                 anchor_pad_idx: a_pad,
+                max_dist: 3.5,
+                weight_mult: 1.0,
+                is_decoupling: false,
             });
         }
     }
@@ -125,6 +296,7 @@ impl PlacementState {
         let n = board.footprints.len();
         let mut positions = Vec::with_capacity(n);
         let mut rotations = Vec::with_capacity(n);
+        let mut layers = Vec::with_capacity(n);
         let mut cached_courtyards = Vec::with_capacity(n);
         let mut cached_bounds = Vec::with_capacity(n);
         let mut cached_pads = Vec::with_capacity(n);
@@ -132,13 +304,15 @@ impl PlacementState {
         for fp in &board.footprints {
             let pos = Point::new(fp.x, fp.y);
             let rot = fp.rotation;
+            let layer = fp.layer;
             positions.push(pos);
             rotations.push(rot);
-            let polys = fp.transformed_courtyards(pos, rot, config.min_spacing_mm);
+            layers.push(layer);
+            let polys = fp.transformed_courtyards_layered(pos, rot, layer, config.min_spacing_mm);
             cached_bounds.push(union_aabb(&polys, pos));
             cached_courtyards.push(polys);
             let pads = (0..fp.pads.len())
-                .map(|pi| fp.pad_world_point(pi, pos, rot))
+                .map(|pi| fp.pad_world_point_layered(pi, pos, rot, layer))
                 .collect();
             cached_pads.push(pads);
         }
@@ -146,6 +320,7 @@ impl PlacementState {
         let mut st = Self {
             positions,
             rotations,
+            layers,
             cached_courtyards,
             cached_bounds,
             cached_pads,
@@ -163,11 +338,12 @@ impl PlacementState {
         let fp = &board.footprints[idx];
         let pos = self.positions[idx];
         let rot = self.rotations[idx];
-        let polys = fp.transformed_courtyards(pos, rot, config.min_spacing_mm);
+        let layer = self.layers[idx];
+        let polys = fp.transformed_courtyards_layered(pos, rot, layer, config.min_spacing_mm);
         self.cached_bounds[idx] = union_aabb(&polys, pos);
         self.cached_courtyards[idx] = polys;
         for pi in 0..fp.pads.len() {
-            self.cached_pads[idx][pi] = fp.pad_world_point(pi, pos, rot);
+            self.cached_pads[idx][pi] = fp.pad_world_point_layered(pi, pos, rot, layer);
         }
     }
 
@@ -189,6 +365,13 @@ impl PlacementState {
         for i in 0..n {
             for j in (i + 1)..n {
                 if board.footprints[i].is_locked && board.footprints[j].is_locked {
+                    continue;
+                }
+                // Two SMD-only footprints on opposite board sides (F.Cu vs B.Cu) do not collide
+                if self.layers[i] != self.layers[j]
+                    && board.footprints[i].is_smd_only()
+                    && board.footprints[j].is_smd_only()
+                {
                     continue;
                 }
                 if !self.cached_bounds[i].overlaps(&self.cached_bounds[j]) {
@@ -218,9 +401,13 @@ impl PlacementState {
 
         let boundary = board.boundary_aabb();
         let mut boundary_cost = 0.0;
+        let mut flip_cost = 0.0;
         for i in 0..n {
             if board.footprints[i].is_locked {
                 continue;
+            }
+            if self.layers[i] != board.footprints[i].orig_layer {
+                flip_cost += 3.5;
             }
             for poly in &self.cached_courtyards[i] {
                 for v in &poly.vertices {
@@ -263,11 +450,22 @@ impl PlacementState {
             let p_pt = self.cached_pads[tie.passive_idx][tie.passive_pad_idx];
             let a_pt = self.cached_pads[tie.anchor_idx][tie.anchor_pad_idx];
             let d = p_pt.distance_to(&a_pt);
-            if d > config.passive_max_dist {
-                let ex = d - config.passive_max_dist;
-                affinity_cost += config.passive_affinity_weight * (d + ex * ex * 2.5);
+            let (max_d, weight) = if tie.is_decoupling {
+                (
+                    config.decoupling_max_dist,
+                    config.decoupling_affinity_weight * tie.weight_mult,
+                )
             } else {
-                affinity_cost += config.passive_affinity_weight * 0.25 * d;
+                (
+                    config.passive_max_dist,
+                    config.passive_affinity_weight * tie.weight_mult,
+                )
+            };
+            if d > max_d {
+                let ex = d - max_d;
+                affinity_cost += weight * (d + ex * ex * 3.0);
+            } else {
+                affinity_cost += weight * 0.25 * d;
             }
         }
 
@@ -279,7 +477,8 @@ impl PlacementState {
             + overlap_area_cost
             + boundary_cost
             + cluster_cost
-            + affinity_cost;
+            + affinity_cost
+            + flip_cost;
     }
 
     pub fn apply_to_board(&self, board: &mut Board) {
@@ -288,6 +487,7 @@ impl PlacementState {
                 fp.x = self.positions[i].x;
                 fp.y = self.positions[i].y;
                 fp.rotation = self.rotations[i];
+                fp.layer = self.layers[i];
             }
         }
     }
@@ -320,21 +520,209 @@ fn snap_to_grid(v: f64, step: f64) -> f64 {
     }
 }
 
+fn build_gpu_sa_descriptors(
+    board: &Board,
+    config: &PlacementConfig,
+    ties: &[PassiveTie],
+    base: &PlacementState,
+) -> (Vec<[f32; 4]>, Vec<[f32; 4]>) {
+    let mut fp_descs = Vec::with_capacity(board.footprints.len());
+    for fp in &board.footprints {
+        let polys = fp.transformed_courtyards(Point::new(0.0, 0.0), 0.0, config.min_spacing_mm);
+        let b = union_aabb(&polys, Point::new(0.0, 0.0));
+        let hw = ((b.max_x - b.min_x) * 0.5).max(0.4) as f32;
+        let hh = ((b.max_y - b.min_y) * 0.5).max(0.4) as f32;
+        let locked = if fp.is_locked { 1.0 } else { 0.0 };
+        fp_descs.push([hw, hh, locked, 0.0]);
+    }
+
+    let mut net_pads: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    for (fp_idx, fp) in board.footprints.iter().enumerate() {
+        for (pad_idx, pad) in fp.pads.iter().enumerate() {
+            if pad.net_id == 0 || pad.net_name.is_empty() || pad.net_name == "GND" {
+                continue;
+            }
+            net_pads.entry(pad.net_id).or_default().push((fp_idx, pad_idx));
+        }
+    }
+
+    let mut edges: Vec<[f32; 4]> = Vec::new();
+    let mut net_ids: Vec<usize> = net_pads.keys().copied().collect();
+    net_ids.sort_unstable();
+    for nid in net_ids {
+        let pads = &net_pads[&nid];
+        if pads.len() < 2 {
+            continue;
+        }
+        let mut visited = vec![false; pads.len()];
+        visited[0] = true;
+        let mut count = 1usize;
+        while count < pads.len() {
+            let mut best_d = f64::INFINITY;
+            let mut best_pair = (0usize, 0usize);
+            for i in 0..pads.len() {
+                if !visited[i] {
+                    continue;
+                }
+                let pi = base.cached_pads[pads[i].0][pads[i].1];
+                for j in 0..pads.len() {
+                    if visited[j] {
+                        continue;
+                    }
+                    let pj = base.cached_pads[pads[j].0][pads[j].1];
+                    let d = pi.distance_to(&pj);
+                    if d < best_d {
+                        best_d = d;
+                        best_pair = (i, j);
+                    }
+                }
+            }
+            visited[best_pair.1] = true;
+            count += 1;
+            let (fpa, pa) = pads[best_pair.0];
+            let (fpb, pb) = pads[best_pair.1];
+            if fpa != fpb {
+                let pad_a = &board.footprints[fpa].pads[pa];
+                let pad_b = &board.footprints[fpb].pads[pb];
+                edges.push([fpa as f32, pad_a.offset_x as f32, pad_a.offset_y as f32, 0.0]);
+                edges.push([fpb as f32, pad_b.offset_x as f32, pad_b.offset_y as f32, 0.0]);
+            }
+        }
+    }
+
+    for tie in ties {
+        let pad_p = &board.footprints[tie.passive_idx].pads[tie.passive_pad_idx];
+        let pad_a = &board.footprints[tie.anchor_idx].pads[tie.anchor_pad_idx];
+        let tag = if tie.is_decoupling { 2.0 } else { 1.0 };
+        edges.push([
+            tie.passive_idx as f32,
+            pad_p.offset_x as f32,
+            pad_p.offset_y as f32,
+            tag,
+        ]);
+        edges.push([
+            tie.anchor_idx as f32,
+            pad_a.offset_x as f32,
+            pad_a.offset_y as f32,
+            tag,
+        ]);
+    }
+
+    (fp_descs, edges)
+}
+
+fn run_gpu_placement_batch(
+    vk: &VulkanEngine,
+    board: &Board,
+    config: &PlacementConfig,
+    ties: &[PassiveTie],
+    movable: &[usize],
+    base: &PlacementState,
+    fp_descs: &[[f32; 4]],
+    edges: &[[f32; 4]],
+    seed_offset: u64,
+    cooling: f64,
+) -> Option<(PlacementState, usize)> {
+    if movable.is_empty() || board.footprints.is_empty() {
+        return None;
+    }
+    let nf = board.footprints.len();
+    let ne = edges.len() / 2;
+    let boundary = board.boundary_aabb();
+
+    let (num_chains, steps_per_pass, num_passes): (u32, u32, u32) = if nf > 8 {
+        (4096, 18, 4)
+    } else {
+        (128, 6, 2)
+    };
+
+    let mut init_poses = Vec::with_capacity((num_chains as usize) * nf);
+    for _ in 0..num_chains {
+        for i in 0..nf {
+            init_poses.push([
+                base.positions[i].x as f32,
+                base.positions[i].y as f32,
+                base.rotations[i] as f32,
+                0.0,
+            ]);
+        }
+    }
+
+    let seed = (0xA5A5_5A5Au32).wrapping_add((seed_offset as u32).wrapping_mul(0x9E37_79B9));
+    let sa_params = GpuSaParams {
+        num_chains,
+        num_footprints: nf as u32,
+        num_edges: ne as u32,
+        steps_per_pass,
+        seed,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+        board_min_x: boundary.min_x as f32,
+        board_min_y: boundary.min_y as f32,
+        board_max_x: boundary.max_x as f32,
+        board_max_y: boundary.max_y as f32,
+        grid_step: config.grid_step_mm as f32,
+        wirelength_weight: config.wirelength_weight as f32,
+        crossing_weight: config.crossing_weight as f32,
+        overlap_penalty: config.overlap_penalty as f32,
+        boundary_penalty: config.boundary_penalty as f32,
+        passive_affinity_weight: config.passive_affinity_weight as f32,
+        passive_max_dist: config.passive_max_dist as f32,
+        base_temp: (8.0 * cooling).max(0.5) as f32,
+    };
+
+    let (best_poses, best_scores) =
+        vk.run_gpu_sa_placer_chains(fp_descs, edges, &init_poses, &sa_params, num_passes)?;
+
+    let mut ranked: Vec<(usize, f32)> = best_scores
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i, s[1]))
+        .collect();
+    ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let total_gpu_evals = (num_chains as usize) * (steps_per_pass as usize) * (num_passes as usize);
+    let mut best_verified: Option<PlacementState> = None;
+
+    for &(chain_idx, _) in ranked.iter().take(4) {
+        let mut cand = base.clone();
+        let c_base = chain_idx * nf;
+        for i in 0..nf {
+            if !board.footprints[i].is_locked {
+                let p = best_poses[c_base + i];
+                cand.positions[i] = Point::new(p[0] as f64, p[1] as f64);
+                cand.rotations[i] = p[2] as f64;
+                cand.update_component(i, board, config);
+            }
+        }
+        cand.evaluate(board, config, ties);
+        if best_verified.as_ref().is_none_or(|b| {
+            cand.overlaps < b.overlaps || (cand.overlaps == b.overlaps && cand.cost < b.cost)
+        }) {
+            best_verified = Some(cand);
+        }
+    }
+
+    best_verified.map(|c| (c, total_gpu_evals))
+}
+
 pub fn legalize_placement(
     board: &Board,
     config: &PlacementConfig,
-    mut initial: PlacementState,
+    initial: PlacementState,
     live: Option<&Arc<Mutex<LiveTrialState>>>,
 ) -> PlacementState {
     if initial.overlaps == 0 {
         return initial;
     }
+    let num_threads = rayon::current_num_threads().max(2);
     if let Some(st) = live {
         if let Ok(mut g) = st.lock() {
             g.phase = TrialPhase::Legalizing;
             g.push_log(format!(
-                "[Legalizer] Resolving {} initial courtyard overlaps...",
-                initial.overlaps
+                "[Legalizer] Resolving {} initial courtyard overlaps across {} CPU cores...",
+                initial.overlaps, num_threads
             ));
         }
     }
@@ -352,50 +740,685 @@ pub fn legalize_placement(
 
     let boundary = board.boundary_aabb();
     let ties = build_passive_ties(board);
-    let mut rng = StdRng::seed_from_u64(0x517CC1B727220A95);
-    let mut best = initial.clone();
+    let solved = AtomicBool::new(false);
+    let steps_per_thread = (4500 / num_threads).max(900);
 
-    for step in 0..4500 {
-        if initial.overlaps == 0 {
-            break;
-        }
-        let idx = movable[rng.gen_range(0..movable.len())];
-        let old_pos = initial.positions[idx];
-        let old_rot = initial.rotations[idx];
-        let old_cost = initial.cost;
-        let old_ov = initial.overlaps;
+    let results: Vec<PlacementState> = (0..num_threads)
+        .into_par_iter()
+        .map(|tid| {
+            let seed = if tid == 0 {
+                0x517CC1B727220A95u64
+            } else {
+                0x517CC1B727220A95u64 ^ ((tid as u64).wrapping_mul(0x9E3779B97F4A7C15))
+            };
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut cur = initial.clone();
+            let mut local_best = cur.clone();
 
-        if rng.gen_bool(0.75) {
-            let r = if step < 1500 { 6.0 } else { 2.5 };
-            let nx = snap_to_grid(
-                (old_pos.x + rng.gen_range(-r..=r)).clamp(boundary.min_x + 1.5, boundary.max_x - 1.5),
-                config.grid_step_mm,
-            );
-            let ny = snap_to_grid(
-                (old_pos.y + rng.gen_range(-r..=r)).clamp(boundary.min_y + 1.5, boundary.max_y - 1.5),
-                config.grid_step_mm,
-            );
-            initial.positions[idx] = Point::new(nx, ny);
-        } else {
-            let angles = [0.0, 90.0, 180.0, 270.0];
-            initial.rotations[idx] = angles[rng.gen_range(0..4)];
-        }
-        initial.update_component(idx, board, config);
-        initial.evaluate(board, config, &ties);
+            for step in 0..steps_per_thread {
+                if cur.overlaps == 0 {
+                    solved.store(true, Ordering::Relaxed);
+                    break;
+                }
+                if step % 16 == 0 && solved.load(Ordering::Relaxed) {
+                    break;
+                }
 
-        if initial.overlaps < old_ov || (initial.overlaps == old_ov && initial.cost < old_cost) {
-            if initial.overlaps < best.overlaps || (initial.overlaps == best.overlaps && initial.cost < best.cost) {
-                best = initial.clone();
+                let overlapping_indices: Vec<usize> = if cur.overlaps > 0 && rng.gen_bool(0.85) {
+                    let mut ov_idxs = Vec::new();
+                    for i in 0..cur.cached_bounds.len() {
+                        for j in (i + 1)..cur.cached_bounds.len() {
+                            if board.footprints[i].is_locked && board.footprints[j].is_locked {
+                                continue;
+                            }
+                            if board.footprints[i].is_smd_only() && board.footprints[j].is_smd_only() && cur.layers[i] != cur.layers[j] {
+                                continue;
+                            }
+                            if cur.cached_bounds[i].overlaps(&cur.cached_bounds[j]) {
+                                let mut hit = false;
+                                for pa in &cur.cached_courtyards[i] {
+                                    for pb in &cur.cached_courtyards[j] {
+                                        if pa.intersects_convex(pb) {
+                                            hit = true;
+                                            break;
+                                        }
+                                    }
+                                    if hit { break; }
+                                }
+                                if hit {
+                                    if !board.footprints[i].is_locked { ov_idxs.push(i); }
+                                    if !board.footprints[j].is_locked { ov_idxs.push(j); }
+                                }
+                            }
+                        }
+                    }
+                    ov_idxs
+                } else {
+                    Vec::new()
+                };
+
+                let idx = if !overlapping_indices.is_empty() {
+                    overlapping_indices[rng.gen_range(0..overlapping_indices.len())]
+                } else {
+                    movable[rng.gen_range(0..movable.len())]
+                };
+
+                let old_pos = cur.positions[idx];
+                let old_rot = cur.rotations[idx];
+                let old_layer = cur.layers[idx];
+                let old_cost = cur.cost;
+                let old_ov = cur.overlaps;
+
+                let roll = rng.gen_range(0..100);
+                if roll < 70 {
+                    let r = if step < steps_per_thread / 3 { 6.0 } else { 2.5 };
+                    let nx = snap_to_grid(
+                        (old_pos.x + rng.gen_range(-r..=r)).clamp(boundary.min_x + 1.5, boundary.max_x - 1.5),
+                        config.grid_step_mm,
+                    );
+                    let ny = snap_to_grid(
+                        (old_pos.y + rng.gen_range(-r..=r)).clamp(boundary.min_y + 1.5, boundary.max_y - 1.5),
+                        config.grid_step_mm,
+                    );
+                    cur.positions[idx] = Point::new(nx, ny);
+                } else if roll < 90 || !config.allow_layer_flip || !board.footprints[idx].is_smd_only() {
+                    let angles = [0.0, 90.0, 180.0, 270.0];
+                    cur.rotations[idx] = angles[rng.gen_range(0..4)];
+                } else {
+                    cur.layers[idx] = 1 - cur.layers[idx];
+                }
+                cur.update_component(idx, board, config);
+                cur.evaluate(board, config, &ties);
+
+                let accept = cur.overlaps < old_ov
+                    || (cur.overlaps == old_ov && (cur.cost <= old_cost || rng.gen_bool(0.15)));
+
+                if accept {
+                    if cur.overlaps < local_best.overlaps
+                        || (cur.overlaps == local_best.overlaps && cur.cost < local_best.cost)
+                    {
+                        local_best = cur.clone();
+                    }
+                    if local_best.overlaps == 0 {
+                        solved.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                } else {
+                    cur.positions[idx] = old_pos;
+                    cur.rotations[idx] = old_rot;
+                    cur.layers[idx] = old_layer;
+                    cur.update_component(idx, board, config);
+                    cur.cost = old_cost;
+                    cur.overlaps = old_ov;
+                }
             }
-        } else {
-            initial.positions[idx] = old_pos;
-            initial.rotations[idx] = old_rot;
-            initial.update_component(idx, board, config);
-            initial.cost = old_cost;
-            initial.overlaps = old_ov;
+            local_best
+        })
+        .collect();
+
+    results
+        .into_iter()
+        .min_by(|a, b| {
+            a.overlaps
+                .cmp(&b.overlaps)
+                .then_with(|| a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal))
+        })
+        .unwrap_or(initial)
+}
+
+/// Positions components in priority order before Simulated Annealing starts:
+/// 1. High priority differential pair components (aligned and placed with direct corridors).
+/// 2. Decoupling capacitors situated as close as possible to their connected non-ground device power pin.
+/// 3. Remaining components placed around their cluster anchors or schematic positions.
+pub fn prioritize_and_position_initial_components(
+    board: &mut Board,
+    config: &PlacementConfig,
+    live: Option<&Arc<Mutex<LiveTrialState>>>,
+) {
+    if board.footprints.is_empty() {
+        return;
+    }
+
+    let boundary = board.boundary_aabb();
+    let ties = build_passive_ties(board);
+
+    // Track which movable footprints have been situated
+    let mut placed = vec![false; board.footprints.len()];
+    for (i, fp) in board.footprints.iter().enumerate() {
+        if fp.is_locked {
+            placed[i] = true;
         }
     }
-    best
+
+    // 1. Priority 1: High priority differential pair components
+    let diff_nets: HashSet<usize> = board
+        .nets
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| {
+            board.net_to_class.get(name.as_str()).map_or(false, |c| c == "USB_Diff")
+                || name.contains("USB_D")
+                || name.contains("DP")
+                || name.contains("DM")
+                || name.contains("D+")
+                || name.contains("D-")
+        })
+        .map(|(id, _)| id)
+        .collect();
+
+    let mut diff_pair_fps: Vec<usize> = Vec::new();
+    for (idx, fp) in board.footprints.iter().enumerate() {
+        if !placed[idx] && fp.pads.iter().any(|p| diff_nets.contains(&p.net_id)) {
+            diff_pair_fps.push(idx);
+        }
+    }
+
+    let locked_diff_anchor = board
+        .footprints
+        .iter()
+        .enumerate()
+        .find(|(i, fp)| placed[*i] && fp.pads.iter().any(|p| diff_nets.contains(&p.net_id)))
+        .map(|(i, _)| i);
+
+    for &diff_idx in &diff_pair_fps {
+        if placed[diff_idx] {
+            continue;
+        }
+        if let Some(anchor_idx) = locked_diff_anchor {
+            let anchor_pos = Point::new(board.footprints[anchor_idx].x, board.footprints[anchor_idx].y);
+            let (target_x, target_y) = if anchor_pos.x > (boundary.min_x + boundary.max_x) * 0.5 {
+                (anchor_pos.x - 12.0, anchor_pos.y)
+            } else {
+                (anchor_pos.x + 12.0, anchor_pos.y)
+            };
+            board.footprints[diff_idx].x = snap_to_grid(
+                target_x.clamp(boundary.min_x + 3.0, boundary.max_x - 3.0),
+                config.grid_step_mm,
+            );
+            board.footprints[diff_idx].y = snap_to_grid(
+                target_y.clamp(boundary.min_y + 3.0, boundary.max_y - 3.0),
+                config.grid_step_mm,
+            );
+        }
+        placed[diff_idx] = true;
+    }
+
+    // 2. Priority 2: Decoupling capacitors — situating them as close to the connected non-ground pin as possible!
+    for tie in &ties {
+        if !tie.is_decoupling {
+            continue;
+        }
+        let cap_idx = tie.passive_idx;
+        if placed[cap_idx] {
+            continue;
+        }
+        let anchor_idx = tie.anchor_idx;
+        let anchor_pad_idx = tie.anchor_pad_idx;
+        let cap_pad_idx = tie.passive_pad_idx;
+
+        let dev = &board.footprints[anchor_idx];
+        let dev_pos = Point::new(dev.x, dev.y);
+        let dev_pin = &dev.pads[anchor_pad_idx];
+        let (pin_x, pin_y) = dev.pad_absolute_position(dev_pin);
+        let pin_pt = Point::new(pin_x, pin_y);
+
+        let mut dx = pin_x - dev_pos.x;
+        let mut dy = pin_y - dev_pos.y;
+        let len = dx.hypot(dy);
+        if len > 1e-4 {
+            dx /= len;
+            dy /= len;
+        } else {
+            dx = 1.0;
+            dy = 0.0;
+        }
+        let base_angle = dy.atan2(dx);
+
+        let mut placed_courtyards: Vec<Vec<Polygon>> = Vec::new();
+        for (i, fp) in board.footprints.iter().enumerate() {
+            if placed[i] && i != cap_idx {
+                placed_courtyards.push(fp.transformed_courtyards_layered(
+                    Point::new(fp.x, fp.y),
+                    fp.rotation,
+                    fp.layer,
+                    config.min_spacing_mm,
+                ));
+            }
+        }
+
+        let mut best_cand: Option<(f64, f64, f64, f64)> = None;
+
+        let dist_steps = [0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.3, 2.6, 3.0];
+        let angle_deltas = [
+            0.0, 0.20, -0.20, 0.40, -0.40, 0.60, -0.60, 0.80, -0.80, 1.0, -1.0, 1.2, -1.2, 1.4, -1.4,
+        ];
+        let rotations = [0.0, 90.0, 180.0, 270.0];
+
+        let cap = &board.footprints[cap_idx];
+
+        'search: for &d in &dist_steps {
+            for &da in &angle_deltas {
+                let angle = base_angle + da;
+                let cx = snap_to_grid(
+                    (pin_x + d * angle.cos()).clamp(boundary.min_x + 1.5, boundary.max_x - 1.5),
+                    config.grid_step_mm,
+                );
+                let cy = snap_to_grid(
+                    (pin_y + d * angle.sin()).clamp(boundary.min_y + 1.5, boundary.max_y - 1.5),
+                    config.grid_step_mm,
+                );
+                let c_pos = Point::new(cx, cy);
+
+                for &rot in &rotations {
+                    let polys = cap.transformed_courtyards_layered(c_pos, rot, cap.layer, config.min_spacing_mm);
+                    let mut collides = false;
+                    'check: for group in &placed_courtyards {
+                        for p_placed in group {
+                            for p_cand in &polys {
+                                if p_cand.intersects_convex(p_placed) {
+                                    collides = true;
+                                    break 'check;
+                                }
+                            }
+                        }
+                    }
+                    if !collides {
+                        let cap_pad_world = cap.pad_world_point_layered(cap_pad_idx, c_pos, rot, cap.layer);
+                        let pad_dist = cap_pad_world.distance_to(&pin_pt);
+                        if best_cand.is_none_or(|b| pad_dist < b.0) {
+                            best_cand = Some((pad_dist, cx, cy, rot));
+                            if pad_dist <= 1.2 {
+                                break 'search;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((_, best_x, best_y, best_rot)) = best_cand {
+            board.footprints[cap_idx].x = best_x;
+            board.footprints[cap_idx].y = best_y;
+            board.footprints[cap_idx].rotation = best_rot;
+            placed[cap_idx] = true;
+        }
+    }
+
+    // Decoupling caps have been placed directly at their power pins.
+    // Remaining components retain their valid positions.
+    if let Some(st) = live {
+        if let Ok(mut g) = st.lock() {
+            g.push_log("[Auto-Placer] Prioritized differential pairs and situated decoupling caps near device power pins".to_string());
+        }
+    }
+}
+
+/// Checks if placing `fp` at `pos` with `rot` and `layer` is legal (within board boundary, no keepout intersection, no courtyard collision).
+pub fn is_placement_legal(
+    board: &Board,
+    fp: &crate::board::Footprint,
+    pos: Point,
+    rot: f64,
+    layer: usize,
+    min_spacing_mm: f64,
+) -> bool {
+    let cand_polys = fp.transformed_courtyards_layered(pos, rot, layer, min_spacing_mm);
+    let boundary = board.boundary_aabb();
+
+    // 1. Must be entirely inside the board outline (both courtyards AND copper pads/legs)
+    for poly in &cand_polys {
+        for v in &poly.vertices {
+            if !boundary.contains_point(v) {
+                return false;
+            }
+        }
+    }
+
+    let flipped = layer != fp.orig_layer;
+    for pad in &fp.pads {
+        let pad_rot = if flipped { -pad.rotation } else { pad.rotation };
+        let hw = pad.width / 2.0;
+        let hh = pad.height / 2.0;
+        let local_corners = [
+            Point::new(-hw, -hh),
+            Point::new(hw, -hh),
+            Point::new(hw, hh),
+            Point::new(-hw, hh),
+        ];
+        let oy = if flipped { -pad.offset_y } else { pad.offset_y };
+        for c in &local_corners {
+            let rot_c = c.rotate_ccw(pad_rot);
+            let fp_c = Point::new(rot_c.x + pad.offset_x, rot_c.y + oy);
+            let world_c = fp_c.rotate_ccw(rot);
+            let corner_pt = Point::new(pos.x + world_c.x, pos.y + world_c.y);
+            if !boundary.contains_point(&corner_pt) {
+                return false;
+            }
+        }
+    }
+
+    // 2. Must not overlap any keepout zones
+    for ko in &board.keepouts {
+        let ko_aabb = AABB::new(ko.min_x, ko.min_y, ko.max_x, ko.max_y);
+        for poly in &cand_polys {
+            if poly.aabb().overlaps(&ko_aabb) {
+                return false;
+            }
+        }
+    }
+
+    // 3. Must not collide with any already placed footprints
+    for placed_fp in &board.footprints {
+        // Two SMD-only footprints on opposite layers do not collide
+        if layer != placed_fp.layer && fp.is_smd_only() && placed_fp.is_smd_only() {
+            continue;
+        }
+        let placed_polys = placed_fp.transformed_courtyards_layered(
+            Point::new(placed_fp.x, placed_fp.y),
+            placed_fp.rotation,
+            placed_fp.layer,
+            min_spacing_mm,
+        );
+        for pa in &cand_polys {
+            for pb in &placed_polys {
+                if pa.intersects_convex(pb) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
+/// Finds the most favourable location (x, y), orientation (rotation in degrees), and layer for `fp` on `board`.
+/// - Decoupling capacitors are placed directly adjacent to their connected IC's non-ground power pin, oriented with their power pad facing the IC pin.
+/// - Differential pairs and connected passives/ICs are placed adjacent to their connected pins, minimizing Euclidean wirelength and crossings.
+/// - Unconnected components are placed in the nearest legal, non-colliding location.
+pub fn find_most_favourable_placement(
+    board: &Board,
+    fp: &crate::board::Footprint,
+    config: &PlacementConfig,
+) -> (f64, f64, f64, usize) {
+    let boundary = board.boundary_aabb();
+    let min_spacing = config.min_spacing_mm;
+    let grid_step = config.grid_step_mm.max(0.1);
+    let rotations = [0.0, 90.0, 180.0, 270.0];
+
+    // Compute maximum pad/lead reach from footprint center to guarantee protruding legs stay on the board
+    let mut pad_reach_x = fp.width * 0.5;
+    let mut pad_reach_y = fp.height * 0.5;
+    for pad in &fp.pads {
+        pad_reach_x = pad_reach_x.max(pad.offset_x.abs() + pad.width * 0.5);
+        pad_reach_y = pad_reach_y.max(pad.offset_y.abs() + pad.height * 0.5);
+    }
+    let pad_margin = pad_reach_x.max(pad_reach_y) + 0.6;
+
+    // Check if fp is a decoupling capacitor
+    let is_cap = fp.reference.starts_with('C');
+    let mut gnd_pad_idx = None;
+    let mut pwr_pad_idx = None;
+    for (pidx, p) in fp.pads.iter().enumerate() {
+        if is_ground_net(&p.net_name) {
+            gnd_pad_idx = Some(pidx);
+        } else if is_power_net(&p.net_name) {
+            pwr_pad_idx = Some(pidx);
+        }
+    }
+    let is_decoupling = is_cap && gnd_pad_idx.is_some() && pwr_pad_idx.is_some();
+
+    if is_decoupling {
+        let pwr_idx = pwr_pad_idx.unwrap();
+        let pwr_net = &fp.pads[pwr_idx].net_name;
+
+        // Find candidate active devices on the board sharing this power net, ranked by schematic and cluster affinity
+        let mut candidate_pins: Vec<(&crate::board::Footprint, usize, f64)> = Vec::new();
+        let fp_sch_pos = board.schematic_positions.get(&fp.reference);
+        let fp_cluster_idx = board.clusters.iter().position(|c| c.member_refs.contains(&fp.reference));
+
+        for placed_dev in &board.footprints {
+            let is_active = placed_dev.reference.starts_with('U')
+                || placed_dev.reference.starts_with('Q')
+                || placed_dev.reference.starts_with('J')
+                || placed_dev.reference.starts_with('M');
+            if !is_active {
+                continue;
+            }
+            for (pad_idx, pad) in placed_dev.pads.iter().enumerate() {
+                if pad.net_name == *pwr_net {
+                    let pin_pos = placed_dev.pad_absolute_position(pad);
+                    // Count how many caps are already within 3mm of this pin
+                    let existing_caps = board
+                        .footprints
+                        .iter()
+                        .filter(|f| f.reference.starts_with('C'))
+                        .filter(|f| {
+                            let (cx, cy) = (f.x, f.y);
+                            (cx - pin_pos.0).hypot(cy - pin_pos.1) < 3.0
+                        })
+                        .count();
+
+                    let mut score = 1000.0;
+                    if let Some(pos) = fp_sch_pos {
+                        if let Some(dev_pos) = board.schematic_positions.get(&placed_dev.reference) {
+                            let sch_dist = (pos.0 - dev_pos.0).hypot(pos.1 - dev_pos.1);
+                            score += sch_dist * 10.0;
+                        }
+                    }
+                    if let Some(c_idx) = fp_cluster_idx {
+                        if board.clusters[c_idx].member_refs.contains(&placed_dev.reference) {
+                            score -= 800.0;
+                        }
+                    }
+                    score += (existing_caps as f64) * 40.0;
+
+                    candidate_pins.push((placed_dev, pad_idx, score));
+                }
+            }
+        }
+
+        candidate_pins.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (dev, pad_idx, _) in candidate_pins {
+            let pin = &dev.pads[pad_idx];
+            let (pin_x, pin_y) = dev.pad_absolute_position(pin);
+            let pin_pt = Point::new(pin_x, pin_y);
+            let dev_pos = Point::new(dev.x, dev.y);
+
+            let dx = pin_x - dev_pos.x;
+            let dy = pin_y - dev_pos.y;
+            let len = dx.hypot(dy);
+            let base_angle = if len > 1e-4 { dy.atan2(dx) } else { 0.0 };
+
+            let dist_steps = [0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0];
+            let angle_deltas = [
+                0.0, 0.20, -0.20, 0.40, -0.40, 0.60, -0.60, 0.80, -0.80, 1.0, -1.0, 1.2, -1.2, 1.5, -1.5,
+                2.0, -2.0, 2.5, -2.5, 3.0, -3.0, std::f64::consts::PI,
+            ];
+
+            let mut best_cand: Option<(f64, f64, f64, f64, usize)> = None;
+
+            for &d in &dist_steps {
+                for &da in &angle_deltas {
+                    let angle = base_angle + da;
+                    let cx = snap_to_grid(
+                        (pin_x + d * angle.cos()).clamp(boundary.min_x + pad_margin, boundary.max_x - pad_margin),
+                        grid_step,
+                    );
+                    let cy = snap_to_grid(
+                        (pin_y + d * angle.sin()).clamp(boundary.min_y + pad_margin, boundary.max_y - pad_margin),
+                        grid_step,
+                    );
+                    let c_pos = Point::new(cx, cy);
+
+                    for &rot in &rotations {
+                        if is_placement_legal(board, fp, c_pos, rot, fp.layer, min_spacing) {
+                            let pwr_pad_world = fp.pad_world_point_layered(pwr_idx, c_pos, rot, fp.layer);
+                            let pad_dist = pwr_pad_world.distance_to(&pin_pt);
+                            if best_cand.as_ref().map_or(true, |b| pad_dist < b.0) {
+                                best_cand = Some((pad_dist, cx, cy, rot, fp.layer));
+                                if pad_dist <= 1.0 {
+                                    return (cx, cy, rot, fp.layer);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some((_, bx, by, brot, blayer)) = best_cand {
+                return (bx, by, brot, blayer);
+            }
+        }
+    }
+
+    // General case: connected component or other passives/ICs
+    // Find all pins on placed components that share nets with this footprint
+    let mut targets: Vec<(usize, Point, f64)> = Vec::new();
+    for (pidx, pad) in fp.pads.iter().enumerate() {
+        if pad.net_name.is_empty() {
+            continue;
+        }
+        let is_gnd = is_ground_net(&pad.net_name);
+        let is_pwr = is_power_net(&pad.net_name);
+        let weight = if !is_gnd && !is_pwr { 5.0 } else if is_pwr { 2.0 } else { 0.5 };
+
+        for placed_fp in &board.footprints {
+            for other_pad in &placed_fp.pads {
+                if other_pad.net_name == pad.net_name {
+                    let (ox, oy) = placed_fp.pad_absolute_position(other_pad);
+                    targets.push((pidx, Point::new(ox, oy), weight));
+                }
+            }
+        }
+    }
+
+    let target_center = if !targets.is_empty() {
+        let total_weight: f64 = targets.iter().map(|t| t.2).sum();
+        let sum_x: f64 = targets.iter().map(|t| t.1.x * t.2).sum();
+        let sum_y: f64 = targets.iter().map(|t| t.1.y * t.2).sum();
+        Point::new(sum_x / total_weight, sum_y / total_weight)
+    } else {
+        Point::new((boundary.min_x + boundary.max_x) * 0.5, (boundary.min_y + boundary.max_y) * 0.5)
+    };
+
+    // Concentric search around target_center
+    let radii = [
+        0.0, 0.8, 1.5, 2.5, 3.5, 5.0, 6.5, 8.0, 10.0, 12.5, 15.0, 18.0, 22.0, 26.0, 30.0, 35.0, 42.0, 50.0,
+    ];
+    let mut best_cand: Option<(f64, f64, f64, f64, usize)> = None;
+
+    for &r in &radii {
+        let steps = if r == 0.0 {
+            1
+        } else {
+            ((2.0 * std::f64::consts::PI * r / grid_step) as usize).clamp(8, 32)
+        };
+
+        for s in 0..steps {
+            let theta = (s as f64) * (2.0 * std::f64::consts::PI / steps as f64);
+            let cx = snap_to_grid(
+                (target_center.x + r * theta.cos()).clamp(boundary.min_x + pad_margin, boundary.max_x - pad_margin),
+                grid_step,
+            );
+            let cy = snap_to_grid(
+                (target_center.y + r * theta.sin()).clamp(boundary.min_y + pad_margin, boundary.max_y - pad_margin),
+                grid_step,
+            );
+            let c_pos = Point::new(cx, cy);
+
+            for &rot in &rotations {
+                if is_placement_legal(board, fp, c_pos, rot, fp.layer, min_spacing) {
+                    let mut cost = 0.1 * r;
+                    for &(pidx, target_pt, w) in &targets {
+                        let pad_pt = fp.pad_world_point_layered(pidx, c_pos, rot, fp.layer);
+                        cost += w * pad_pt.distance_to(&target_pt);
+                    }
+                    if best_cand.as_ref().map_or(true, |b| cost < b.0) {
+                        best_cand = Some((cost, cx, cy, rot, fp.layer));
+                    }
+                }
+            }
+        }
+        if r >= 6.0 && best_cand.is_some() {
+            break;
+        }
+    }
+
+    if let Some((_, bx, by, brot, blayer)) = best_cand {
+        return (bx, by, brot, blayer);
+    }
+
+    // Fallback: clamped within board outline with safe pad margin
+    (
+        fp.x.clamp(boundary.min_x + pad_margin, boundary.max_x - pad_margin),
+        fp.y.clamp(boundary.min_y + pad_margin, boundary.max_y - pad_margin),
+        fp.rotation,
+        fp.layer,
+    )
+}
+
+/// Places a single component from the holding palette at its most favourable location and orientation on the board.
+pub fn place_holding_component_at_best_location(
+    board: &mut Board,
+    idx: usize,
+    config: &PlacementConfig,
+) -> Option<crate::board::Footprint> {
+    if idx >= board.holding_palette.len() {
+        return None;
+    }
+    let mut fp = board.holding_palette.remove(idx);
+    let (bx, by, brot, blayer) = find_most_favourable_placement(board, &fp, config);
+    fp.x = bx;
+    fp.y = by;
+    fp.rotation = brot;
+    fp.layer = blayer;
+    board.footprints.push(fp.clone());
+    Some(fp)
+}
+
+/// Places all components in the holding palette at their most favourable locations and orientations on the board.
+pub fn place_all_holding_components_at_best_locations(
+    board: &mut Board,
+    config: &PlacementConfig,
+) -> usize {
+    if board.holding_palette.is_empty() {
+        return 0;
+    }
+    let mut palette = std::mem::take(&mut board.holding_palette);
+    // Sort by priority: differential pairs first, then decoupling caps, then active ICs, then passives
+    palette.sort_by(|a, b| {
+        let prio = |fp: &crate::board::Footprint| -> usize {
+            let is_diff = fp.pads.iter().any(|p| {
+                let u = p.net_name.to_ascii_uppercase();
+                u.contains("USB") || u.contains("DP") || u.contains("DM") || u.contains("D+") || u.contains("D-")
+            });
+            if is_diff {
+                return 0;
+            }
+            let has_gnd = fp.pads.iter().any(|p| is_ground_net(&p.net_name));
+            let has_pwr = fp.pads.iter().any(|p| is_power_net(&p.net_name));
+            if fp.reference.starts_with('C') && has_gnd && has_pwr {
+                return 1;
+            }
+            if fp.reference.starts_with('U') || fp.reference.starts_with('Q') {
+                return 2;
+            }
+            3
+        };
+        prio(a).cmp(&prio(b))
+    });
+
+    let count = palette.len();
+    for mut fp in palette {
+        let (bx, by, brot, blayer) = find_most_favourable_placement(board, &fp, config);
+        fp.x = bx;
+        fp.y = by;
+        fp.rotation = brot;
+        fp.layer = blayer;
+        board.footprints.push(fp);
+    }
+    count
 }
 
 pub fn run_auto_placer(
@@ -404,6 +1427,20 @@ pub fn run_auto_placer(
     live: Option<Arc<Mutex<LiveTrialState>>>,
     stop_flag: Arc<AtomicBool>,
 ) -> PlacementState {
+    // 1. Place any components from holding palette at favourable locations
+    if !board.holding_palette.is_empty() {
+        let count = place_all_holding_components_at_best_locations(board, config);
+        if let Some(ref st) = live {
+            if let Ok(mut g) = st.lock() {
+                g.push_log(format!("[Auto-Placer] Placed {} components from holding palette", count));
+            }
+        }
+    }
+
+    // 2. Prioritize initial placement: differential pairs & decoupling caps first,
+    // situating decoupling caps as close to the connected non-ground pin as possible.
+    prioritize_and_position_initial_components(board, config, live.as_ref());
+
     let initial = PlacementState::from_board(board, config);
     let legalized = legalize_placement(board, config, initial, live.as_ref());
 
@@ -420,6 +1457,7 @@ pub fn run_auto_placer(
         return legalized;
     }
 
+    let active_vulkan = config.vulkan.clone();
     let num_threads = rayon::current_num_threads().max(2);
     let global_best = Arc::new(Mutex::new(legalized.clone()));
     let total_evals = Arc::new(AtomicUsize::new(0));
@@ -431,164 +1469,255 @@ pub fn run_auto_placer(
     if let Some(ref st) = live {
         if let Ok(mut g) = st.lock() {
             g.phase = TrialPhase::AutoPlacing;
+            let gpu_tag = if let Some(ref vk) = active_vulkan {
+                format!(" + Vulkan GPU ({})", vk.device_name)
+            } else {
+                String::new()
+            };
             g.push_log(format!(
-                "[Auto-Placer] Launching {} Parallel Tempering SA replicas for {}s...",
-                num_threads, config.duration_secs
+                "[Auto-Placer] Launching {} Parallel Tempering CPU SA replicas{} for {}s...",
+                num_threads, gpu_tag, config.duration_secs
             ));
         }
     }
 
-    let num_epochs = (config.duration_secs * 2).max(1) as usize;
-    let epoch_dur = Duration::from_millis(500);
+    let num_epochs = (config.duration_secs * 4).max(1) as usize;
+    let epoch_dur = Duration::from_millis(250);
     let mut replicas: Vec<PlacementState> = (0..num_threads).map(|_| legalized.clone()).collect();
+    let gpu_done = AtomicBool::new(false);
 
-    for epoch in 0..num_epochs {
-        if stop_flag.load(Ordering::Relaxed) || start_time.elapsed() >= total_dur {
-            break;
-        }
-        let progress = (start_time.elapsed().as_secs_f64() / total_dur.as_secs_f64()).clamp(0.0, 1.0);
-        let ep_end = (Instant::now() + epoch_dur).min(start_time + total_dur);
+    std::thread::scope(|scope| {
+        if let Some(ref vk) = active_vulkan {
+            let (fp_descs, edges) = build_gpu_sa_descriptors(board, config, &ties, &legalized);
+            let fp_descs = Arc::new(fp_descs);
+            let edges = Arc::new(edges);
+            for (gpu_idx, vk_dev) in vk.all_engines().into_iter().enumerate() {
+                let board_ref = &*board;
+                let ties_ref = Arc::clone(&ties);
+                let movable_ref = &movable;
+                let global_best_ref = Arc::clone(&global_best);
+                let total_evals_ref = Arc::clone(&total_evals);
+                let stop_ref = Arc::clone(&stop_flag);
+                let gpu_done_ref = &gpu_done;
+                let fp_descs_ref = Arc::clone(&fp_descs);
+                let edges_ref = Arc::clone(&edges);
 
-        replicas
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(tid, current)| {
-                let mut rng = StdRng::seed_from_u64(
-                    0x9E3779B97F4A7C15u64
-                        .wrapping_mul((tid as u64) + 1)
-                        .wrapping_add(epoch as u64),
-                );
-                let temp_ratio = (tid as f64) / ((num_threads - 1).max(1) as f64);
-                let t_base = 8.0 * (350.0f64 / 8.0).powf(temp_ratio);
-                let cooling = (1.0 - progress * 0.85).max(0.05);
-                let temp = t_base * cooling;
-                let mut local_evals = 0usize;
-
-                while Instant::now() < ep_end && !stop_flag.load(Ordering::Relaxed) {
-                    for _ in 0..40 {
-                        let old_positions = current.positions.clone();
-                        let old_rotations = current.rotations.clone();
-                        let old_cost = current.cost;
-                        let old_crossings = current.crossings;
-                        let old_wl = current.wirelength;
-                        let old_ov = current.overlaps;
-                        let mut modified: Vec<usize> = Vec::with_capacity(2);
-
-                        let move_type = rng.gen_range(0..100);
-                        if move_type < 50 {
-                            let idx = movable[rng.gen_range(0..movable.len())];
-                            let max_shift = (10.0 * cooling).max(config.grid_step_mm * 2.0);
-                            let nx = snap_to_grid(
-                                (current.positions[idx].x + rng.gen_range(-max_shift..=max_shift))
-                                    .clamp(boundary.min_x + 1.2, boundary.max_x - 1.2),
-                                config.grid_step_mm,
-                            );
-                            let ny = snap_to_grid(
-                                (current.positions[idx].y + rng.gen_range(-max_shift..=max_shift))
-                                    .clamp(boundary.min_y + 1.2, boundary.max_y - 1.2),
-                                config.grid_step_mm,
-                            );
-                            current.positions[idx] = Point::new(nx, ny);
-                            modified.push(idx);
-                        } else if move_type < 75 {
-                            let idx = movable[rng.gen_range(0..movable.len())];
-                            let deltas = [90.0, 180.0, 270.0];
-                            current.rotations[idx] =
-                                (current.rotations[idx] + deltas[rng.gen_range(0..3)]) % 360.0;
-                            modified.push(idx);
-                        } else if move_type < 90 && movable.len() >= 2 {
-                            let a = movable[rng.gen_range(0..movable.len())];
-                            let b = movable[rng.gen_range(0..movable.len())];
-                            if a != b {
-                                current.positions.swap(a, b);
-                                modified.push(a);
-                                modified.push(b);
-                            }
-                        } else if !ties.is_empty() {
-                            let tie = &ties[rng.gen_range(0..ties.len())];
-                            let idx = tie.passive_idx;
-                            let anchor_pt = current.cached_pads[tie.anchor_idx][tie.anchor_pad_idx];
-                            let nx = snap_to_grid(
-                                (anchor_pt.x + rng.gen_range(-2.5..=2.5))
-                                    .clamp(boundary.min_x + 1.2, boundary.max_x - 1.2),
-                                config.grid_step_mm,
-                            );
-                            let ny = snap_to_grid(
-                                (anchor_pt.y + rng.gen_range(-2.5..=2.5))
-                                    .clamp(boundary.min_y + 1.2, boundary.max_y - 1.2),
-                                config.grid_step_mm,
-                            );
-                            current.positions[idx] = Point::new(nx, ny);
-                            let angles = [0.0, 90.0, 180.0, 270.0];
-                            current.rotations[idx] = angles[rng.gen_range(0..4)];
-                            modified.push(idx);
-                        }
-
-                        if modified.is_empty() {
-                            continue;
-                        }
-                        for &m in &modified {
-                            current.update_component(m, board, config);
-                        }
-                        current.evaluate(board, config, &ties);
-                        local_evals += 1;
-
-                        let delta = current.cost - old_cost;
-                        let accept = if delta <= 0.0 {
-                            true
-                        } else {
-                            rng.gen::<f64>() < (-delta / temp).exp()
-                        };
-
-                        if accept {
-                            if current.overlaps == 0 {
-                                if let Ok(mut g) = global_best.lock() {
-                                    if current.cost < g.cost || g.overlaps > 0 {
-                                        *g = current.clone();
+                scope.spawn(move || {
+                    let mut batch_idx = (gpu_idx as u64).wrapping_mul(10_000);
+                    while !gpu_done_ref.load(Ordering::Relaxed)
+                        && !stop_ref.load(Ordering::Relaxed)
+                        && start_time.elapsed() + Duration::from_millis(25) < total_dur
+                    {
+                        let progress = (start_time.elapsed().as_secs_f64() / total_dur.as_secs_f64()).clamp(0.0, 1.0);
+                        let cooling = (1.0 - progress * 0.85).max(0.05);
+                        let base = global_best_ref.lock().unwrap().clone();
+                        if let Some((cand, gpu_evals)) = run_gpu_placement_batch(
+                            &vk_dev,
+                            board_ref,
+                            config,
+                            &ties_ref,
+                            movable_ref,
+                            &base,
+                            &fp_descs_ref,
+                            &edges_ref,
+                            batch_idx,
+                            cooling,
+                        ) {
+                            total_evals_ref.fetch_add(gpu_evals, Ordering::Relaxed);
+                            if cand.overlaps == 0 {
+                                if let Ok(mut g) = global_best_ref.lock() {
+                                    if cand.cost < g.cost || g.overlaps > 0 {
+                                        *g = cand;
                                     }
                                 }
                             }
-                        } else {
-                            current.positions = old_positions;
-                            current.rotations = old_rotations;
+                        }
+                        batch_idx = batch_idx.wrapping_add(1);
+                    }
+                });
+            }
+        }
+
+        for epoch in 0..num_epochs {
+            if stop_flag.load(Ordering::Relaxed) || start_time.elapsed() >= total_dur {
+                break;
+            }
+            let progress = (start_time.elapsed().as_secs_f64() / total_dur.as_secs_f64()).clamp(0.0, 1.0);
+            let ep_end = (Instant::now() + epoch_dur).min(start_time + total_dur);
+
+            replicas
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(tid, current)| {
+                    let mut rng = StdRng::seed_from_u64(
+                        0x9E3779B97F4A7C15u64
+                            .wrapping_mul((tid as u64) + 1)
+                            .wrapping_add(epoch as u64),
+                    );
+                    let temp_ratio = (tid as f64) / ((num_threads - 1).max(1) as f64);
+                    let t_base = 8.0 * (350.0f64 / 8.0).powf(temp_ratio);
+                    let cooling = (1.0 - progress * 0.85).max(0.05);
+                    let temp = t_base * cooling;
+                    let mut local_evals = 0usize;
+
+                    while Instant::now() < ep_end && !stop_flag.load(Ordering::Relaxed) {
+                        for _ in 0..40 {
+                            let old_positions = current.positions.clone();
+                            let old_rotations = current.rotations.clone();
+                            let old_layers = current.layers.clone();
+                            let old_cost = current.cost;
+                            let old_crossings = current.crossings;
+                            let old_wl = current.wirelength;
+                            let old_ov = current.overlaps;
+                            let mut modified: Vec<usize> = Vec::with_capacity(2);
+
+                            let move_type = rng.gen_range(0..100);
+                            if move_type < 48 {
+                                let idx = movable[rng.gen_range(0..movable.len())];
+                                let max_shift = (10.0 * cooling).max(config.grid_step_mm * 2.0);
+                                let nx = snap_to_grid(
+                                    (current.positions[idx].x + rng.gen_range(-max_shift..=max_shift))
+                                        .clamp(boundary.min_x + 1.2, boundary.max_x - 1.2),
+                                    config.grid_step_mm,
+                                );
+                                let ny = snap_to_grid(
+                                    (current.positions[idx].y + rng.gen_range(-max_shift..=max_shift))
+                                        .clamp(boundary.min_y + 1.2, boundary.max_y - 1.2),
+                                    config.grid_step_mm,
+                                );
+                                current.positions[idx] = Point::new(nx, ny);
+                                modified.push(idx);
+                            } else if move_type < 72 {
+                                let idx = movable[rng.gen_range(0..movable.len())];
+                                let deltas = [90.0, 180.0, 270.0];
+                                current.rotations[idx] =
+                                    (current.rotations[idx] + deltas[rng.gen_range(0..3)]) % 360.0;
+                                modified.push(idx);
+                            } else if move_type < 80 && config.allow_layer_flip {
+                                let idx = movable[rng.gen_range(0..movable.len())];
+                                if board.footprints[idx].is_smd_only() {
+                                    current.layers[idx] = 1 - current.layers[idx];
+                                    modified.push(idx);
+                                }
+                            } else if move_type < 90 && movable.len() >= 2 {
+                                let a = movable[rng.gen_range(0..movable.len())];
+                                let b = movable[rng.gen_range(0..movable.len())];
+                                if a != b {
+                                    current.positions.swap(a, b);
+                                    modified.push(a);
+                                    modified.push(b);
+                                }
+                            } else if !ties.is_empty() {
+                                let tie = &ties[rng.gen_range(0..ties.len())];
+                                let idx = tie.passive_idx;
+                                let anchor_pt = current.cached_pads[tie.anchor_idx][tie.anchor_pad_idx];
+                                if tie.is_decoupling {
+                                    let anchor_center = current.positions[tie.anchor_idx];
+                                    let outward_angle = (anchor_pt.y - anchor_center.y)
+                                        .atan2(anchor_pt.x - anchor_center.x);
+                                    let theta = outward_angle + rng.gen_range(-1.2..=1.2);
+                                    let r = rng.gen_range(1.1..=2.2);
+                                    let nx = snap_to_grid(
+                                        (anchor_pt.x + r * theta.cos())
+                                            .clamp(boundary.min_x + 1.2, boundary.max_x - 1.2),
+                                        config.grid_step_mm,
+                                    );
+                                    let ny = snap_to_grid(
+                                        (anchor_pt.y + r * theta.sin())
+                                            .clamp(boundary.min_y + 1.2, boundary.max_y - 1.2),
+                                        config.grid_step_mm,
+                                    );
+                                    current.positions[idx] = Point::new(nx, ny);
+                                    let angles = [0.0, 90.0, 180.0, 270.0];
+                                    current.rotations[idx] = angles[rng.gen_range(0..4)];
+                                    modified.push(idx);
+                                } else {
+                                    let nx = snap_to_grid(
+                                        (anchor_pt.x + rng.gen_range(-2.5..=2.5))
+                                            .clamp(boundary.min_x + 1.2, boundary.max_x - 1.2),
+                                        config.grid_step_mm,
+                                    );
+                                    let ny = snap_to_grid(
+                                        (anchor_pt.y + rng.gen_range(-2.5..=2.5))
+                                            .clamp(boundary.min_y + 1.2, boundary.max_y - 1.2),
+                                        config.grid_step_mm,
+                                    );
+                                    current.positions[idx] = Point::new(nx, ny);
+                                    let angles = [0.0, 90.0, 180.0, 270.0];
+                                    current.rotations[idx] = angles[rng.gen_range(0..4)];
+                                    modified.push(idx);
+                                }
+                            }
+
+                            if modified.is_empty() {
+                                continue;
+                            }
                             for &m in &modified {
                                 current.update_component(m, board, config);
                             }
-                            current.cost = old_cost;
-                            current.crossings = old_crossings;
-                            current.wirelength = old_wl;
-                            current.overlaps = old_ov;
+                            current.evaluate(board, config, &ties);
+                            local_evals += 1;
+
+                            let delta = current.cost - old_cost;
+                            let accept = if delta <= 0.0 {
+                                true
+                            } else {
+                                rng.gen::<f64>() < (-delta / temp).exp()
+                            };
+
+                            if accept {
+                                if current.overlaps == 0 {
+                                    if let Ok(mut g) = global_best.lock() {
+                                        if current.cost < g.cost || g.overlaps > 0 {
+                                            *g = current.clone();
+                                        }
+                                    }
+                                }
+                            } else {
+                                current.positions = old_positions;
+                                current.rotations = old_rotations;
+                                current.layers = old_layers;
+                                for &m in &modified {
+                                    current.update_component(m, board, config);
+                                }
+                                current.cost = old_cost;
+                                current.crossings = old_crossings;
+                                current.wirelength = old_wl;
+                                current.overlaps = old_ov;
+                            }
                         }
                     }
+                    total_evals.fetch_add(local_evals, Ordering::Relaxed);
+                });
+
+            // Re-seed highest-cost replica from global best and update GUI state
+            let best_snap = global_best.lock().unwrap().clone();
+            if let Some(worst) = replicas.iter_mut().max_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap()) {
+                *worst = best_snap.clone();
+            }
+
+            let elapsed = start_time.elapsed().as_secs_f64().max(1e-3);
+            let rate = total_evals.load(Ordering::Relaxed) as f64 / elapsed;
+
+            if let Some(ref st) = live {
+                if let Ok(mut g) = st.lock() {
+                    best_snap.apply_to_board(&mut g.board);
+                    g.ratsnest = g.board.generate_ratsnest_segments(&best_snap.cached_pads);
+                    g.crossings = best_snap.crossings;
+                    g.wirelength_mm = best_snap.wirelength;
+                    g.overlaps = best_snap.overlaps;
+                    g.evals_per_sec = rate;
+                    g.progress = (progress as f32) * 0.5;
+                    g.status_text = format!(
+                        "Auto-Placing: Crossings={} | Wirelength={:.1}mm | {:.0} evals/s",
+                        best_snap.crossings, best_snap.wirelength, rate
+                    );
                 }
-                total_evals.fetch_add(local_evals, Ordering::Relaxed);
-            });
-
-        // Re-seed highest-cost replica from global best and update GUI state
-        let best_snap = global_best.lock().unwrap().clone();
-        if let Some(worst) = replicas.iter_mut().max_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap()) {
-            *worst = best_snap.clone();
-        }
-
-        let elapsed = start_time.elapsed().as_secs_f64().max(1e-3);
-        let rate = total_evals.load(Ordering::Relaxed) as f64 / elapsed;
-
-        if let Some(ref st) = live {
-            if let Ok(mut g) = st.lock() {
-                best_snap.apply_to_board(&mut g.board);
-                g.ratsnest = g.board.generate_ratsnest_segments(&best_snap.cached_pads);
-                g.crossings = best_snap.crossings;
-                g.wirelength_mm = best_snap.wirelength;
-                g.overlaps = best_snap.overlaps;
-                g.evals_per_sec = rate;
-                g.progress = (progress as f32) * 0.5;
-                g.status_text = format!(
-                    "Auto-Placing: Crossings={} | Wirelength={:.1}mm | {:.0} evals/s",
-                    best_snap.crossings, best_snap.wirelength, rate
-                );
             }
         }
-    }
+
+        gpu_done.store(true, Ordering::Relaxed);
+    });
 
     let final_best = global_best.lock().unwrap().clone();
     final_best.apply_to_board(board);
@@ -607,3 +1736,810 @@ pub fn run_auto_placer(
     }
     final_best
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::{CompiledCluster, Footprint, NetClass, Pad};
+    use std::collections::HashSet;
+    use std::fs;
+
+    fn make_test_fp(reference: &str, x: f64, y: f64, is_locked: bool, pads: Vec<Pad>) -> Footprint {
+        Footprint {
+            reference: reference.to_string(),
+            value: "VAL".to_string(),
+            x,
+            y,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked,
+            pads,
+            width: 2.0,
+            height: 2.0,
+            courtyards: vec![Polygon::new(vec![
+                Point::new(-1.0, -1.0),
+                Point::new(1.0, -1.0),
+                Point::new(1.0, 1.0),
+                Point::new(-1.0, 1.0),
+            ])],
+            perimeters: Vec::new(),
+            at_span: None,
+            fp_span: None,
+        }
+    }
+
+    fn make_synthetic_board() -> Board {
+        let nets = vec![
+            "".to_string(),
+            "GND".to_string(),
+            "+3.3V".to_string(),
+            "SIG_A".to_string(),
+            "SIG_B".to_string(),
+        ];
+        let mut net_name_to_id = HashMap::new();
+        for (i, n) in nets.iter().enumerate() {
+            net_name_to_id.insert(n.clone(), i);
+        }
+        let mut netclasses = HashMap::new();
+        netclasses.insert("Default".to_string(), NetClass::default());
+        let mut net_to_class = HashMap::new();
+        for n in &nets {
+            net_to_class.insert(n.clone(), "Default".to_string());
+        }
+
+        let u1 = make_test_fp(
+            "U1",
+            140.0,
+            100.0,
+            true,
+            vec![
+                Pad::new("1", -0.5, 0.0, 0.5, 0.5, 3, "SIG_A", false),
+                Pad::new("2", 0.5, 0.0, 0.5, 0.5, 4, "SIG_B", false),
+            ],
+        );
+
+        let j3 = make_test_fp(
+            "J3",
+            155.0,
+            100.0,
+            true,
+            vec![Pad::new("1", 0.0, 0.0, 0.8, 0.8, 4, "SIG_B", true)],
+        );
+
+        // R10 overlaps C10 initially at (145.0, 100.0)
+        let r10 = make_test_fp(
+            "R10",
+            145.0,
+            100.0,
+            false,
+            vec![
+                Pad::new("1", -0.5, 0.0, 0.5, 0.5, 3, "SIG_A", false),
+                Pad::new("2", 0.5, 0.0, 0.5, 0.5, 4, "SIG_B", false),
+            ],
+        );
+
+        let c10 = make_test_fp(
+            "C10",
+            145.2,
+            100.0,
+            false,
+            vec![
+                Pad::new("1", -0.5, 0.0, 0.5, 0.5, 4, "SIG_B", false),
+                Pad::new("2", 0.5, 0.0, 0.5, 0.5, 1, "GND", false),
+            ],
+        );
+
+        Board {
+            file_path: String::new(),
+            raw_content: "()".to_string(),
+            min_x: 125.0,
+            min_y: 85.0,
+            max_x: 170.0,
+            max_y: 120.0,
+            footprints: vec![u1, j3, r10, c10],
+            holding_palette: Vec::new(),
+            nets,
+            net_name_to_id,
+            netclasses,
+            net_to_class,
+            keepouts: Vec::new(),
+            tracks: Vec::new(),
+            vias: Vec::new(),
+            clusters: vec![
+                CompiledCluster {
+                    name: "ANCHORED".to_string(),
+                    anchor_idx: Some(0),
+                    member_indices: vec![0, 2],
+                    member_refs: vec!["U1".to_string(), "C1".to_string()],
+                    max_radius: 2.0,
+                    weight: 100.0,
+                },
+                CompiledCluster {
+                    name: "CENTROID".to_string(),
+                    anchor_idx: None,
+                    member_indices: vec![2, 3],
+                    member_refs: vec!["C1".to_string(), "R12".to_string()],
+                    max_radius: 10.0,
+                    weight: 60.0,
+                },
+            ],
+            schematic_positions: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_union_aabb_and_snap_to_grid() {
+        let fb = union_aabb(&[], Point::new(5.0, 10.0));
+        assert_eq!(fb, AABB::new(4.5, 9.5, 5.5, 10.5));
+
+        let p = Polygon::new(vec![Point::new(1.0, 2.0), Point::new(4.0, 6.0)]);
+        assert_eq!(union_aabb(&[p], Point::new(0.0, 0.0)), AABB::new(1.0, 2.0, 4.0, 6.0));
+
+        assert!((snap_to_grid(1.23, 0.0) - 1.23).abs() < 1e-6);
+        assert!((snap_to_grid(1.23, -1.0) - 1.23).abs() < 1e-6);
+        assert!((snap_to_grid(1.30, 0.5) - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_build_passive_ties_and_evaluation() {
+        let mut board = make_synthetic_board();
+        let cfg = PlacementConfig::default();
+        let ties = build_passive_ties(&board);
+        // R10 and C10 are unlocked passives; U1 has priority 3
+        assert_eq!(ties.len(), 2);
+        assert!(ties.iter().all(|t| t.anchor_idx == 0));
+
+        let mut st = PlacementState::from_board(&board, &cfg);
+        assert_eq!(st.overlaps, 1);
+
+        // Flip C10 to B.Cu (layer = 1) at the exact same XY position: SMD parts on opposite sides must not overlap
+        st.layers[3] = 1;
+        st.update_component(3, &board, &cfg);
+        st.evaluate(&board, &cfg, &ties);
+        assert_eq!(st.overlaps, 0, "SMD footprints on opposite layers (F.Cu vs B.Cu) must not collide");
+
+        // Move C10 out of bounds to exercise boundary_cost and far passive affinity
+        st.positions[3] = Point::new(100.0, 50.0);
+        st.update_component(3, &board, &cfg);
+        st.evaluate(&board, &cfg, &ties);
+        assert_eq!(st.overlaps, 0);
+        assert!(st.cost > cfg.boundary_penalty);
+
+        st.apply_to_board(&mut board);
+        assert!((board.footprints[3].x - 100.0).abs() < 1e-6);
+        assert_eq!(board.footprints[3].layer, 1);
+        // Locked U1 must not move even if state position changed
+        assert!((board.footprints[0].x - 140.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_legalize_placement_and_run_auto_placer() {
+        let mut board = make_synthetic_board();
+        let vk = VulkanEngine::new();
+        let cfg = PlacementConfig {
+            duration_secs: 1,
+            allow_layer_flip: true,
+            vulkan: vk.clone(),
+            ..PlacementConfig::default()
+        };
+        let live = Arc::new(Mutex::new(LiveTrialState::new(board.clone())));
+        let initial = PlacementState::from_board(&board, &cfg);
+        assert_eq!(initial.overlaps, 1);
+
+        let legalized = legalize_placement(&board, &cfg, initial, Some(&live));
+        assert_eq!(legalized.overlaps, 0);
+        // Calling legalize_placement when overlaps == 0 returns immediately
+        let already_legal = legalize_placement(&board, &cfg, legalized.clone(), None);
+        assert_eq!(already_legal.overlaps, 0);
+
+        // Calling legalize_placement when all footprints are locked returns immediately
+        let mut all_locked = board.clone();
+        for fp in &mut all_locked.footprints {
+            fp.is_locked = true;
+        }
+        let mut locked_state = PlacementState::from_board(&all_locked, &cfg);
+        locked_state.overlaps = 1;
+        let locked_res = legalize_placement(&all_locked, &cfg, locked_state, None);
+        assert_eq!(locked_res.overlaps, 1);
+
+        // Test duration_secs == 0 fast path
+        let cfg_zero = PlacementConfig {
+            duration_secs: 0,
+            ..PlacementConfig::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let st_zero = run_auto_placer(&mut board.clone(), &cfg_zero, None, Arc::clone(&stop));
+        assert_eq!(st_zero.overlaps, 0);
+
+        // Test full parallel tempering SA + Vulkan GPU batch auto-placer epoch with live telemetry
+        let final_st = run_auto_placer(&mut board, &cfg, Some(Arc::clone(&live)), stop);
+        assert_eq!(final_st.overlaps, 0);
+        if let Some(ref v) = vk {
+            assert!(v.compute_busy_ns.load(Ordering::Relaxed) > 0);
+        }
+        let g = live.lock().unwrap();
+        assert_eq!(g.overlaps, 0);
+        assert!(!g.log_lines.is_empty());
+        let _ = HashSet::<String>::new();
+    }
+
+    #[test]
+    fn test_is_ground_and_power_net() {
+        assert!(is_ground_net("GND"));
+        assert!(is_ground_net("/GND"));
+        assert!(is_ground_net("AGND"));
+        assert!(is_ground_net("DGND"));
+        assert!(is_ground_net("PGND"));
+        assert!(is_ground_net("GND_EARTH"));
+        assert!(!is_ground_net("+3.3V"));
+        assert!(!is_ground_net(""));
+
+        assert!(is_power_net("+3.3V"));
+        assert!(is_power_net("+5V"));
+        assert!(is_power_net("+12V"));
+        assert!(is_power_net("VCC_5V"));
+        assert!(is_power_net("VRAW"));
+        assert!(is_power_net("VBUS"));
+        assert!(is_power_net("/BUCK_VIN"));
+        assert!(is_power_net("VDD"));
+        assert!(is_power_net("VBAT"));
+        assert!(is_power_net("VIN"));
+        assert!(is_power_net("3V3_OUT"));
+        assert!(!is_power_net("GND"));
+        assert!(!is_power_net("SIG_A"));
+        assert!(!is_power_net("USB_DP"));
+        assert!(!is_power_net(""));
+    }
+
+    #[test]
+    fn test_decoupling_cap_identification_and_power_pin_targeting() {
+        let nets = vec![
+            "".to_string(),
+            "GND".to_string(),
+            "+3.3V".to_string(),
+            "SIG_A".to_string(),
+            "SIG_B".to_string(),
+        ];
+        let mut net_name_to_id = HashMap::new();
+        for (i, n) in nets.iter().enumerate() {
+            net_name_to_id.insert(n.clone(), i);
+        }
+        let mut netclasses = HashMap::new();
+        netclasses.insert("Default".to_string(), NetClass::default());
+        let mut net_to_class = HashMap::new();
+        for n in &nets {
+            net_to_class.insert(n.clone(), "Default".to_string());
+        }
+
+        // Active IC U1 at (100, 100) with Pin 1 (+3.3V power), Pin 2 (GND), Pin 3 (SIG_A)
+        let u1 = make_test_fp(
+            "U1",
+            100.0,
+            100.0,
+            true,
+            vec![
+                Pad::new("1", -1.0, 0.0, 0.5, 0.5, 2, "+3.3V", false),
+                Pad::new("2", 0.0, -1.0, 0.5, 0.5, 1, "GND", false),
+                Pad::new("3", 1.0, 0.0, 0.5, 0.5, 3, "SIG_A", false),
+            ],
+        );
+
+        // Active IC U2 at (180, 100) with Pin 1 (+3.3V power), Pin 2 (GND), Pin 3 (SIG_B)
+        let u2 = make_test_fp(
+            "U2",
+            180.0,
+            100.0,
+            true,
+            vec![
+                Pad::new("1", -1.0, 0.0, 0.5, 0.5, 2, "+3.3V", false),
+                Pad::new("2", 0.0, -1.0, 0.5, 0.5, 1, "GND", false),
+                Pad::new("3", 1.0, 0.0, 0.5, 0.5, 4, "SIG_B", false),
+            ],
+        );
+
+        // Decoupling cap C1 for U1: Pin 1 (+3.3V), Pin 2 (GND)
+        let c1 = make_test_fp(
+            "C1",
+            102.0,
+            100.0,
+            false,
+            vec![
+                Pad::new("1", -0.5, 0.0, 0.4, 0.4, 2, "+3.3V", false),
+                Pad::new("2", 0.5, 0.0, 0.4, 0.4, 1, "GND", false),
+            ],
+        );
+
+        // Decoupling cap C2 for U2: Pin 1 (+3.3V), Pin 2 (GND)
+        let c2 = make_test_fp(
+            "C2",
+            182.0,
+            100.0,
+            false,
+            vec![
+                Pad::new("1", -0.5, 0.0, 0.4, 0.4, 2, "+3.3V", false),
+                Pad::new("2", 0.5, 0.0, 0.4, 0.4, 1, "GND", false),
+            ],
+        );
+
+        let mut schematic_positions = HashMap::new();
+        schematic_positions.insert("U1".to_string(), (10.0, 10.0));
+        schematic_positions.insert("C1".to_string(), (12.0, 10.0)); // Close to U1
+        schematic_positions.insert("U2".to_string(), (100.0, 10.0));
+        schematic_positions.insert("C2".to_string(), (102.0, 10.0)); // Close to U2
+
+        let board = Board {
+            file_path: String::new(),
+            raw_content: "()".to_string(),
+            min_x: 50.0,
+            min_y: 50.0,
+            max_x: 220.0,
+            max_y: 150.0,
+            footprints: vec![u1, u2, c1, c2],
+            holding_palette: Vec::new(),
+            nets,
+            net_name_to_id,
+            netclasses,
+            net_to_class,
+            keepouts: Vec::new(),
+            tracks: Vec::new(),
+            vias: Vec::new(),
+            clusters: Vec::new(),
+            schematic_positions,
+        };
+
+        let ties = build_passive_ties(&board);
+        assert_eq!(ties.len(), 2, "Both C1 and C2 must be tied as decoupling capacitors");
+
+        let tie_c1 = ties.iter().find(|t| t.passive_idx == 2).expect("C1 tie must exist");
+        assert!(tie_c1.is_decoupling);
+        assert_eq!(tie_c1.anchor_idx, 0, "C1 must bind to U1 based on schematic proximity");
+        assert_eq!(tie_c1.anchor_pad_idx, 0, "C1 must bind directly to U1's +3.3V power pad (pad 1)");
+        assert_eq!(tie_c1.passive_pad_idx, 0, "C1's power pad (+3.3V) must be the passive pad");
+        assert_eq!(tie_c1.max_dist, 2.0);
+
+        let tie_c2 = ties.iter().find(|t| t.passive_idx == 3).expect("C2 tie must exist");
+        assert!(tie_c2.is_decoupling);
+        assert_eq!(tie_c2.anchor_idx, 1, "C2 must bind to U2 based on schematic proximity");
+        assert_eq!(tie_c2.anchor_pad_idx, 0, "C2 must bind directly to U2's +3.3V power pad (pad 1)");
+        assert_eq!(tie_c2.passive_pad_idx, 0, "C2's power pad (+3.3V) must be the passive pad");
+    }
+
+    #[test]
+    fn test_decoupling_cap_multi_power_pin_distribution() {
+        let nets = vec![
+            "".to_string(),
+            "GND".to_string(),
+            "+3.3V".to_string(),
+        ];
+        let mut net_name_to_id = HashMap::new();
+        for (i, n) in nets.iter().enumerate() {
+            net_name_to_id.insert(n.clone(), i);
+        }
+        let mut netclasses = HashMap::new();
+        netclasses.insert("Default".to_string(), NetClass::default());
+        let mut net_to_class = HashMap::new();
+        for n in &nets {
+            net_to_class.insert(n.clone(), "Default".to_string());
+        }
+
+        // Active IC U1 with TWO separate +3.3V power pins: pad 1 and pad 4
+        let u1 = make_test_fp(
+            "U1",
+            100.0,
+            100.0,
+            true,
+            vec![
+                Pad::new("1", -2.0, 0.0, 0.5, 0.5, 2, "+3.3V", false),
+                Pad::new("2", 0.0, -2.0, 0.5, 0.5, 1, "GND", false),
+                Pad::new("3", 0.0, 2.0, 0.5, 0.5, 1, "GND", false),
+                Pad::new("4", 2.0, 0.0, 0.5, 0.5, 2, "+3.3V", false),
+            ],
+        );
+
+        let c1 = make_test_fp(
+            "C1",
+            97.0,
+            100.0,
+            false,
+            vec![
+                Pad::new("1", -0.5, 0.0, 0.4, 0.4, 2, "+3.3V", false),
+                Pad::new("2", 0.5, 0.0, 0.4, 0.4, 1, "GND", false),
+            ],
+        );
+
+        let c2 = make_test_fp(
+            "C2",
+            103.0,
+            100.0,
+            false,
+            vec![
+                Pad::new("1", -0.5, 0.0, 0.4, 0.4, 2, "+3.3V", false),
+                Pad::new("2", 0.5, 0.0, 0.4, 0.4, 1, "GND", false),
+            ],
+        );
+
+        let board = Board {
+            file_path: String::new(),
+            raw_content: "()".to_string(),
+            min_x: 50.0,
+            min_y: 50.0,
+            max_x: 150.0,
+            max_y: 150.0,
+            footprints: vec![u1, c1, c2],
+            holding_palette: Vec::new(),
+            nets,
+            net_name_to_id,
+            netclasses,
+            net_to_class,
+            keepouts: Vec::new(),
+            tracks: Vec::new(),
+            vias: Vec::new(),
+            clusters: Vec::new(),
+            schematic_positions: HashMap::new(),
+        };
+
+        let ties = build_passive_ties(&board);
+        assert_eq!(ties.len(), 2);
+        // Both caps must bind to U1 (index 0)
+        assert_eq!(ties[0].anchor_idx, 0);
+        assert_eq!(ties[1].anchor_idx, 0);
+        // The two caps should be distributed across both power pads (pad 0 and pad 3)
+        let anchor_pads: HashSet<usize> = ties.iter().map(|t| t.anchor_pad_idx).collect();
+        assert_eq!(anchor_pads.len(), 2, "Decoupling caps must distribute across both power pins of U1");
+        assert!(anchor_pads.contains(&0) && anchor_pads.contains(&3));
+    }
+
+    #[test]
+    fn test_decoupling_cap_affinity_cost_steepness() {
+        let nets = vec![
+            "".to_string(),
+            "GND".to_string(),
+            "+3.3V".to_string(),
+        ];
+        let mut net_name_to_id = HashMap::new();
+        for (i, n) in nets.iter().enumerate() {
+            net_name_to_id.insert(n.clone(), i);
+        }
+        let mut netclasses = HashMap::new();
+        netclasses.insert("Default".to_string(), NetClass::default());
+        let mut net_to_class = HashMap::new();
+        for n in &nets {
+            net_to_class.insert(n.clone(), "Default".to_string());
+        }
+
+        let u1 = make_test_fp(
+            "U1",
+            100.0,
+            100.0,
+            true,
+            vec![
+                Pad::new("1", 0.0, 0.0, 0.5, 0.5, 2, "+3.3V", false),
+                Pad::new("2", 1.0, 0.0, 0.5, 0.5, 1, "GND", false),
+            ],
+        );
+
+        let c1 = make_test_fp(
+            "C1",
+            102.5,
+            100.0,
+            false,
+            vec![
+                Pad::new("1", -0.8, 0.0, 0.4, 0.4, 2, "+3.3V", false),
+                Pad::new("2", 0.8, 0.0, 0.4, 0.4, 1, "GND", false),
+            ],
+        );
+
+        let board = Board {
+            file_path: String::new(),
+            raw_content: "()".to_string(),
+            min_x: 50.0,
+            min_y: 50.0,
+            max_x: 150.0,
+            max_y: 150.0,
+            footprints: vec![u1, c1],
+            holding_palette: Vec::new(),
+            nets,
+            net_name_to_id,
+            netclasses,
+            net_to_class,
+            keepouts: Vec::new(),
+            tracks: Vec::new(),
+            vias: Vec::new(),
+            clusters: Vec::new(),
+            schematic_positions: HashMap::new(),
+        };
+
+        let cfg = PlacementConfig::default();
+        let ties = build_passive_ties(&board);
+        assert_eq!(ties.len(), 1);
+        assert!(ties[0].is_decoupling);
+
+        let mut st_close = PlacementState::from_board(&board, &cfg);
+        // Position C1 so pad 1 is at 102.5 - 0.8 = 101.7 (dist = 1.7mm <= decoupling_max_dist 2.0mm, no courtyard overlap)
+        st_close.positions[1] = Point::new(102.5, 100.0);
+        st_close.update_component(1, &board, &cfg);
+        st_close.evaluate(&board, &cfg, &ties);
+        assert_eq!(st_close.overlaps, 0);
+        let close_cost = st_close.cost;
+
+        let mut st_far = PlacementState::from_board(&board, &cfg);
+        // Position C1 so pad 1 is at 107.0 - 0.8 = 106.2 (dist = 6.2mm > decoupling_max_dist 2.0mm)
+        st_far.positions[1] = Point::new(107.0, 100.0);
+        st_far.update_component(1, &board, &cfg);
+        st_far.evaluate(&board, &cfg, &ties);
+        assert_eq!(st_far.overlaps, 0);
+        let far_cost = st_far.cost;
+
+        assert!(
+            far_cost > close_cost + 10000.0,
+            "Drifting away from power pin must incur massive quadratic penalty: far_cost {} vs close_cost {}",
+            far_cost, close_cost
+        );
+    }
+
+    #[test]
+    fn test_p1p2esp_decoupling_caps_binding_if_present() {
+        let pcb_path = "/home/deece/src/p1p2esp/p1p2esp.kicad_pcb";
+        if !std::path::Path::new(pcb_path).exists() {
+            return;
+        }
+
+        let board = Board::load(pcb_path, &HashSet::new()).expect("Failed to load p1p2esp PCB");
+        let ties = build_passive_ties(&board);
+
+        let fp_index = |ref_des: &str| -> usize {
+            board.footprints.iter().position(|f| f.reference == ref_des).unwrap()
+        };
+
+        let u1_idx = fp_index("U1");
+        let u2_idx = fp_index("U2");
+        let u4_idx = fp_index("U4");
+
+        // Verify C14 and C15 (ESP32-C3 +3.3V decoupling) bind directly to U4's +3.3V pin
+        let c14_idx = fp_index("C14");
+        let c15_idx = fp_index("C15");
+        let tie_c14 = ties.iter().find(|t| t.passive_idx == c14_idx).expect("C14 must have tie");
+        let tie_c15 = ties.iter().find(|t| t.passive_idx == c15_idx).expect("C15 must have tie");
+        assert!(tie_c14.is_decoupling && tie_c14.anchor_idx == u4_idx, "C14 must bind to U4");
+        assert!(tie_c15.is_decoupling && tie_c15.anchor_idx == u4_idx, "C15 must bind to U4");
+        assert_eq!(board.footprints[u4_idx].pads[tie_c14.anchor_pad_idx].net_name, "+3.3V");
+        assert_eq!(board.footprints[u4_idx].pads[tie_c15.anchor_pad_idx].net_name, "+3.3V");
+
+        // Verify C5 and C6 (MAX22088 power caps) bind to U1 power pins
+        let c5_idx = fp_index("C5");
+        let c6_idx = fp_index("C6");
+        let tie_c5 = ties.iter().find(|t| t.passive_idx == c5_idx).expect("C5 must have tie");
+        let tie_c6 = ties.iter().find(|t| t.passive_idx == c6_idx).expect("C6 must have tie");
+        assert!(tie_c5.is_decoupling && tie_c5.anchor_idx == u1_idx, "C5 must bind to U1");
+        assert!(tie_c6.is_decoupling && tie_c6.anchor_idx == u1_idx, "C6 must bind to U1");
+        assert_eq!(board.footprints[u1_idx].pads[tie_c5.anchor_pad_idx].net_name, "VCC_5V");
+        assert_eq!(board.footprints[u1_idx].pads[tie_c6.anchor_pad_idx].net_name, "VRAW");
+
+        // Verify C7 (Buck regulator input decoupling cap on /BUCK_VIN) binds to U2
+        let c7_idx = fp_index("C7");
+        let tie_c7 = ties.iter().find(|t| t.passive_idx == c7_idx).expect("C7 must have tie");
+        assert!(tie_c7.is_decoupling && tie_c7.anchor_idx == u2_idx, "C7 must bind to U2");
+        assert_eq!(board.footprints[u2_idx].pads[tie_c7.anchor_pad_idx].net_name, "/BUCK_VIN");
+    }
+
+    #[test]
+    fn test_prioritize_and_position_diff_pairs_and_decoupling_caps() {
+        let pcb_path = "/tmp/vulcan_test_priority_placement.kicad_pcb";
+        let content = r#"(kicad_pcb
+          (net 0 "") (net 1 "GND") (net 2 "+3.3V") (net 3 "USB_D+") (net 4 "USB_D-")
+          (gr_rect (start 100.0 100.0) (end 160.0 140.0) (layer "Edge.Cuts"))
+          (footprint "U" (at 120.0 120.0) (property "Reference" "U1") (locked yes)
+            (fp_line (start -3.0 -3.0) (end 3.0 -3.0) (layer "F.CrtYd"))
+            (fp_line (start 3.0 -3.0) (end 3.0 3.0) (layer "F.CrtYd"))
+            (fp_line (start 3.0 3.0) (end -3.0 3.0) (layer "F.CrtYd"))
+            (fp_line (start -3.0 3.0) (end -3.0 -3.0) (layer "F.CrtYd"))
+            (pad "1" smd rect (at 0.0 -2.5) (size 0.5 0.5) (net 2 "+3.3V"))
+            (pad "2" smd rect (at 0.0 2.5) (size 0.5 0.5) (net 1 "GND")))
+          (footprint "C" (at 150.0 135.0) (property "Reference" "C1")
+            (fp_line (start -0.8 -0.4) (end 0.8 -0.4) (layer "F.CrtYd"))
+            (fp_line (start 0.8 -0.4) (end 0.8 0.4) (layer "F.CrtYd"))
+            (fp_line (start 0.8 0.4) (end -0.8 0.4) (layer "F.CrtYd"))
+            (fp_line (start -0.8 0.4) (end -0.8 -0.4) (layer "F.CrtYd"))
+            (pad "1" smd rect (at -0.5 0.0) (size 0.4 0.4) (net 2 "+3.3V"))
+            (pad "2" smd rect (at 0.5 0.0) (size 0.4 0.4) (net 1 "GND")))
+          (footprint "J" (at 105.0 120.0) (property "Reference" "J1") (locked yes)
+            (pad "1" smd rect (at 0.0 -0.5) (size 0.4 0.4) (net 3 "USB_D+"))
+            (pad "2" smd rect (at 0.0 0.5) (size 0.4 0.4) (net 4 "USB_D-")))
+          (footprint "U" (at 155.0 135.0) (property "Reference" "U2")
+            (pad "1" smd rect (at 0.0 -0.5) (size 0.4 0.4) (net 3 "USB_D+"))
+            (pad "2" smd rect (at 0.0 0.5) (size 0.4 0.4) (net 4 "USB_D-")))
+        )"#;
+        fs::write(pcb_path, content).unwrap();
+
+        let mut board = Board::load(pcb_path, &HashSet::new()).unwrap();
+        let cfg = PlacementConfig {
+            grid_step_mm: 0.1,
+            ..PlacementConfig::default()
+        };
+
+        assert_eq!(board.footprints[1].x, 150.0);
+
+        prioritize_and_position_initial_components(&mut board, &cfg, None);
+
+        let u1_pin1_x = 120.0;
+        let u1_pin1_y = 117.5;
+        let c1_pin1_pos = board.footprints[1].pad_absolute_position(&board.footprints[1].pads[0]);
+        let dist = ((c1_pin1_pos.0 - u1_pin1_x).powi(2) + (c1_pin1_pos.1 - u1_pin1_y).powi(2)).sqrt();
+        assert!(dist < 2.0, "Decoupling cap power pin must be situated within 2.0 mm of IC power pin, got {:.2} mm", dist);
+        assert!(board.footprints[3].x < 130.0, "Diff pair IC U2 should be moved near locked connector J1");
+
+        let _ = fs::remove_file(pcb_path);
+    }
+
+    #[test]
+    fn test_find_most_favourable_placement_and_holding_palette() {
+        let pcb_path = "/tmp/vulcan_fav_placement_test.kicad_pcb";
+        let content = r#"(kicad_pcb (version 20240108)
+          (net 0 "") (net 1 "GND") (net 2 "+3.3V") (net 3 "SIG_NET")
+          (gr_rect (start 100.0 100.0) (end 160.0 140.0) (layer "Edge.Cuts"))
+          (footprint "U" (at 120.0 120.0) (property "Reference" "U1") (locked yes)
+            (fp_line (start -3.0 -3.0) (end 3.0 -3.0) (layer "F.CrtYd"))
+            (fp_line (start 3.0 -3.0) (end 3.0 3.0) (layer "F.CrtYd"))
+            (fp_line (start 3.0 3.0) (end -3.0 3.0) (layer "F.CrtYd"))
+            (fp_line (start -3.0 3.0) (end -3.0 -3.0) (layer "F.CrtYd"))
+            (pad "1" smd rect (at 0.0 -2.5) (size 0.5 0.5) (net 2 "+3.3V"))
+            (pad "2" smd rect (at 0.0 2.5) (size 0.5 0.5) (net 1 "GND"))
+            (pad "3" smd rect (at 2.5 0.0) (size 0.5 0.5) (net 3 "SIG_NET")))
+          (footprint "C" (at 150.0 135.0) (property "Reference" "C1")
+            (fp_line (start -0.8 -0.4) (end 0.8 -0.4) (layer "F.CrtYd"))
+            (fp_line (start 0.8 -0.4) (end 0.8 0.4) (layer "F.CrtYd"))
+            (fp_line (start 0.8 0.4) (end -0.8 0.4) (layer "F.CrtYd"))
+            (fp_line (start -0.8 0.4) (end -0.8 -0.4) (layer "F.CrtYd"))
+            (pad "1" smd rect (at -0.5 0.0) (size 0.4 0.4) (net 2 "+3.3V"))
+            (pad "2" smd rect (at 0.5 0.0) (size 0.4 0.4) (net 1 "GND")))
+          (footprint "R" (at 155.0 135.0) (property "Reference" "R12")
+            (fp_line (start -0.8 -0.4) (end 0.8 -0.4) (layer "F.CrtYd"))
+            (fp_line (start 0.8 -0.4) (end 0.8 0.4) (layer "F.CrtYd"))
+            (fp_line (start 0.8 0.4) (end -0.8 0.4) (layer "F.CrtYd"))
+            (fp_line (start -0.8 0.4) (end -0.8 -0.4) (layer "F.CrtYd"))
+            (pad "1" smd rect (at -0.5 0.0) (size 0.4 0.4) (net 3 "SIG_NET"))
+            (pad "2" smd rect (at 0.5 0.0) (size 0.4 0.4) (net 1 "GND")))
+        )"#;
+        fs::write(pcb_path, content).unwrap();
+
+        let mut board = Board::load(pcb_path, &HashSet::new()).unwrap();
+        let cfg = PlacementConfig {
+            grid_step_mm: 0.1,
+            ..PlacementConfig::default()
+        };
+
+        // Clear unlocked objects (C1 and R12 move to holding palette)
+        let (_ripped, cleared) = board.clear_unlocked_objects();
+        assert_eq!(cleared, 2);
+        assert_eq!(board.holding_palette.len(), 2);
+        assert_eq!(board.footprints.len(), 1); // Only U1 on board
+
+        // Place C1 individually at best location
+        let placed_c1 = place_holding_component_at_best_location(&mut board, 0, &cfg).unwrap();
+        assert_eq!(placed_c1.reference, "C1");
+        assert_eq!(board.footprints.len(), 2);
+        assert_eq!(board.holding_palette.len(), 1);
+
+        // Verify C1 was placed at most favourable location near U1 pin 1 (120.0, 117.5), NOT at (150.0, 135.0)
+        let orig_dist = (placed_c1.x - 150.0).hypot(placed_c1.y - 135.0);
+        assert!(orig_dist > 5.0, "C1 must not be placed at its original cleared position");
+
+        let u1_pin1_x = 120.0;
+        let u1_pin1_y = 117.5;
+        let c1_pin1 = placed_c1.pad_absolute_position(&placed_c1.pads[0]);
+        let pin_dist = (c1_pin1.0 - u1_pin1_x).hypot(c1_pin1.1 - u1_pin1_y);
+        assert!(pin_dist < 2.0, "C1 power pin must be within 2.0 mm of U1 power pin, got {:.2} mm", pin_dist);
+
+        // Place all remaining components (R12)
+        let placed_all = place_all_holding_components_at_best_locations(&mut board, &cfg);
+        assert_eq!(placed_all, 1);
+        assert_eq!(board.holding_palette.len(), 0);
+        assert_eq!(board.footprints.len(), 3);
+
+        // Verify 0 courtyard collisions among all 3 placed components
+        let st = PlacementState::from_board(&board, &cfg);
+        assert_eq!(st.overlaps, 0, "All placed components must have 0 courtyard collisions");
+
+        let _ = fs::remove_file(pcb_path);
+    }
+
+    #[test]
+    fn test_decoupling_caps_c14_c15_esp32_t_shape_notch_affinity() {
+        let pcb_path = "/tmp/vulcan_esp32_t_shape_caps_test.kicad_pcb";
+        let content = r#"(kicad_pcb (version 20240108)
+          (net 0 "") (net 1 "GND") (net 2 "+3.3V")
+          (gr_rect (start 90.0 80.0) (end 190.0 140.0) (layer "Edge.Cuts"))
+          (footprint "Buck_IC" (at 110.0 110.0) (property "Reference" "U1") (locked yes)
+            (fp_line (start -2.0 -2.0) (end 2.0 -2.0) (layer "F.CrtYd"))
+            (fp_line (start 2.0 -2.0) (end 2.0 2.0) (layer "F.CrtYd"))
+            (fp_line (start 2.0 2.0) (end -2.0 2.0) (layer "F.CrtYd"))
+            (fp_line (start -2.0 2.0) (end -2.0 -2.0) (layer "F.CrtYd"))
+            (pad "1" smd rect (at 0.0 -1.5) (size 0.5 0.5) (net 2 "+3.3V"))
+            (pad "2" smd rect (at 0.0 1.5) (size 0.5 0.5) (net 1 "GND")))
+          (footprint "ESP32-C3-WROOM-02" (at 165.0 105.0 -90) (property "Reference" "U4") (locked yes)
+            (fp_line (start -9.75 7.15) (end 9.75 7.15) (layer "F.CrtYd"))
+            (fp_line (start -9.75 7.15) (end -9.75 -6.85) (layer "F.CrtYd"))
+            (fp_line (start -14.25 -6.85) (end -9.75 -6.85) (layer "F.CrtYd"))
+            (fp_line (start 9.75 -6.85) (end 9.75 7.15) (layer "F.CrtYd"))
+            (fp_line (start 9.75 -6.85) (end 14.25 -6.85) (layer "F.CrtYd"))
+            (fp_line (start -14.25 -18.35) (end -14.25 -6.85) (layer "F.CrtYd"))
+            (fp_line (start -14.25 -18.35) (end 14.25 -18.35) (layer "F.CrtYd"))
+            (fp_line (start 14.25 -18.35) (end 14.25 -6.85) (layer "F.CrtYd"))
+            (pad "1" smd rect (at -8.75 6.0) (size 0.9 1.5) (net 2 "+3.3V"))
+            (pad "9" smd rect (at 8.75 6.0) (size 0.9 1.5) (net 1 "GND")))
+          (footprint "C_0603" (at 100.0 90.0) (property "Reference" "C14")
+            (fp_line (start -0.8 -0.4) (end 0.8 -0.4) (layer "F.CrtYd"))
+            (fp_line (start 0.8 -0.4) (end 0.8 0.4) (layer "F.CrtYd"))
+            (fp_line (start 0.8 0.4) (end -0.8 0.4) (layer "F.CrtYd"))
+            (fp_line (start -0.8 0.4) (end -0.8 -0.4) (layer "F.CrtYd"))
+            (pad "1" smd rect (at -0.5 0.0) (size 0.4 0.4) (net 2 "+3.3V"))
+            (pad "2" smd rect (at 0.5 0.0) (size 0.4 0.4) (net 1 "GND")))
+          (footprint "C_0603" (at 105.0 90.0) (property "Reference" "C15")
+            (fp_line (start -0.8 -0.4) (end 0.8 -0.4) (layer "F.CrtYd"))
+            (fp_line (start 0.8 -0.4) (end 0.8 0.4) (layer "F.CrtYd"))
+            (fp_line (start 0.8 0.4) (end -0.8 0.4) (layer "F.CrtYd"))
+            (fp_line (start -0.8 0.4) (end -0.8 -0.4) (layer "F.CrtYd"))
+            (pad "1" smd rect (at -0.5 0.0) (size 0.4 0.4) (net 2 "+3.3V"))
+            (pad "2" smd rect (at 0.5 0.0) (size 0.4 0.4) (net 1 "GND")))
+        )"#;
+        fs::write(pcb_path, content).unwrap();
+
+        let mut board = Board::load(pcb_path, &HashSet::new()).unwrap();
+        // Set schematic cluster & positions
+        board.clusters = vec![
+            CompiledCluster {
+                name: "ESP32 & CONTROLS".to_string(),
+                anchor_idx: Some(1),
+                member_indices: vec![1, 2, 3],
+                member_refs: vec!["U4".to_string(), "C14".to_string(), "C15".to_string()],
+                max_radius: 15.0,
+                weight: 100.0,
+            },
+        ];
+        board.schematic_positions.insert("U1".to_string(), (50.0, 50.0));
+        board.schematic_positions.insert("U4".to_string(), (320.0, 160.0));
+        board.schematic_positions.insert("C14".to_string(), (305.0, 155.0));
+        board.schematic_positions.insert("C15".to_string(), (305.0, 165.0));
+
+        let cfg = PlacementConfig {
+            grid_step_mm: 0.1,
+            ..PlacementConfig::default()
+        };
+
+        // Clear unlocked objects (C14 and C15 moved to palette)
+        let (_ripped, cleared) = board.clear_unlocked_objects();
+        assert_eq!(cleared, 2);
+        assert_eq!(board.holding_palette.len(), 2);
+        assert_eq!(board.footprints.len(), 2); // U1 and U4
+
+        // Place C14
+        let placed_c14 = place_holding_component_at_best_location(&mut board, 0, &cfg).unwrap();
+        assert_eq!(placed_c14.reference, "C14");
+
+        // Place C15
+        let placed_c15 = place_holding_component_at_best_location(&mut board, 0, &cfg).unwrap();
+        assert_eq!(placed_c15.reference, "C15");
+
+        // Compute U4 pin 1 absolute position
+        let u4 = board.footprints.iter().find(|f| f.reference == "U4").unwrap();
+        let (u4_p1_x, u4_p1_y) = u4.pad_absolute_position(&u4.pads[0]);
+
+        // Verify C14 is placed right next to U4 pin 1, NOT near U1 (110.0, 110.0)
+        let c14_to_u4_pin = (placed_c14.x - u4_p1_x).hypot(placed_c14.y - u4_p1_y);
+        let c14_to_u1 = (placed_c14.x - 110.0).hypot(placed_c14.y - 110.0);
+        assert!(c14_to_u4_pin < 3.5, "C14 should be placed adjacent to U4 pin 1, got {:.2} mm", c14_to_u4_pin);
+        assert!(c14_to_u1 > 20.0, "C14 must not be placed near U1");
+
+        // Verify C15 is also placed right next to U4 pin 1 / C14
+        let c15_to_u4_pin = (placed_c15.x - u4_p1_x).hypot(placed_c15.y - u4_p1_y);
+        assert!(c15_to_u4_pin < 4.0, "C15 should be placed adjacent to U4 pin 1, got {:.2} mm", c15_to_u4_pin);
+
+        // Verify zero courtyard collisions across all components!
+        let st = PlacementState::from_board(&board, &cfg);
+        assert_eq!(st.overlaps, 0, "All components including U4, C14, C15 must have 0 courtyard collisions");
+
+        let _ = fs::remove_file(pcb_path);
+    }
+}
+
