@@ -272,7 +272,7 @@ impl RoutingGrid {
                 }
 
                 let max_clearance = self.max_net_clearance.max(req_clearance);
-                let search_clearance = (track_width / 2.0) + max_clearance + self.res;
+                let search_clearance = (track_width / 2.0) + max_clearance;
                 let r_cells = (search_clearance / self.res).ceil() as isize;
                 let mut clearance_violation = false;
                 for cy_off in -r_cells..=r_cells {
@@ -289,12 +289,7 @@ impl RoutingGrid {
                                     req_clearance
                                 };
                                 let eff_c = req_clearance.max(raw_obst_c);
-                                let pad_margin = if self.smd_pad_cells[c_idx] {
-                                    self.res * 0.70
-                                } else {
-                                    self.res * 0.40
-                                };
-                                let eff_clearance = (track_width / 2.0) + eff_c + pad_margin;
+                                let eff_clearance = (track_width / 2.0) + eff_c;
                                 let c_dist_sq = (cx_off * cx_off + cy_off * cy_off) as f64 * (self.res * self.res);
                                 if c_dist_sq < eff_clearance.powi(2) + 1e-6 {
                                     clearance_violation = true;
@@ -523,6 +518,34 @@ impl NudgeEngine {
                     if pa.intersects_convex(pb) {
                         return false;
                     }
+                }
+            }
+        }
+
+        // Ensure moved footprint pads do not collide with existing tracks of other nets
+        for pad in &board.footprints[fp_idx].pads {
+            if pad.net_id == 0 {
+                continue;
+            }
+            let oy = if board.footprints[fp_idx].layer != board.footprints[fp_idx].orig_layer {
+                -pad.offset_y
+            } else {
+                pad.offset_y
+            };
+            let p = Point::new(pad.offset_x, oy).rotate_ccw(rot);
+            let pad_x = nx + p.x;
+            let pad_y = ny + p.y;
+            let (pw, ph) = board.footprints[fp_idx].pad_world_size(pad);
+            let pad_radius = (pw.max(ph) / 2.0).max(0.35);
+
+            for track in &board.tracks {
+                if track.layer != fp_layer || track.net_id == pad.net_id {
+                    continue;
+                }
+                let track_c = 0.15;
+                let d = dist_to_segment(pad_x, pad_y, track.start.0, track.start.1, track.end.0, track.end.1);
+                if d < pad_radius + (track.width / 2.0) + track_c {
+                    return false;
                 }
             }
         }
@@ -1772,50 +1795,6 @@ impl AutoRouter {
                     }
                 }
 
-                // Rip-up and Negotiated Congestion Update
-                if iteration + 1 < self.max_ripup_iterations {
-                    let max_rip_prio = if iteration == 0 { 2 } else { 10 };
-                    for conn_idx in 0..total_conns {
-                        if routed_paths[conn_idx].is_none() {
-                            let blocked_conn = &connections[conn_idx];
-                            let b_start = blocked_conn.start;
-                            let b_end = blocked_conn.end;
-
-                            let mut ripped = false;
-                            for rip_idx in 0..total_conns {
-                                if rip_idx == conn_idx || routed_paths[rip_idx].is_none() {
-                                    continue;
-                                }
-                                if Self::netclass_priority(&connections[rip_idx].netclass.name) > max_rip_prio {
-                                    continue;
-                                }
-                                let p = routed_paths[rip_idx].as_ref().unwrap();
-                                let passes_near = p.iter().any(|node| {
-                                    let (wx, wy) = grid.grid_to_world(node.gx, node.gy);
-                                    (wx - b_start.0).hypot(wy - b_start.1) < 3.5
-                                        || (wx - b_end.0).hypot(wy - b_end.1) < 3.5
-                                });
-
-                                if passes_near {
-                                    if let Some(p) = routed_paths[rip_idx].take() {
-                                        for node in &p {
-                                            let idx = grid.idx(node.gx, node.gy, node.layer);
-                                            grid.congestion[idx] += self.congestion_factor;
-                                        }
-                                        ripped = true;
-                                    }
-                                }
-                            }
-                            if ripped {
-                                self.rebuild_grid_state(board, grid, &connections, &routed_paths, &escape_stubs);
-                                if let Ok(mut obs_g) = shared_obs.lock() {
-                                    obs_g.clone_from(&grid.obstacle_net_ids);
-                                }
-                            }
-                        }
-                    }
-                }
-
                 let done = routed_paths.iter().filter(|p| p.is_some()).count();
                 if done > best_routed_count {
                     best_routed_count = done;
@@ -1834,6 +1813,59 @@ impl AutoRouter {
                 let _ = std::io::stdout().flush();
                 if done == total_conns {
                     break;
+                }
+
+                // Rip-up and Negotiated Congestion Update (budgeted to avoid wiping all progress)
+                if iteration + 1 < self.max_ripup_iterations {
+                    let max_rip_prio = if iteration == 0 { 2 } else { 10 };
+                    let mut rip_budget = 4;
+                    for conn_idx in 0..total_conns {
+                        if rip_budget == 0 {
+                            break;
+                        }
+                        if routed_paths[conn_idx].is_none() {
+                            let blocked_conn = &connections[conn_idx];
+                            let b_start = blocked_conn.start;
+                            let b_end = blocked_conn.end;
+
+                            let mut ripped = false;
+                            for rip_idx in 0..total_conns {
+                                if rip_budget == 0 {
+                                    break;
+                                }
+                                if rip_idx == conn_idx || routed_paths[rip_idx].is_none() {
+                                    continue;
+                                }
+                                if Self::netclass_priority(&connections[rip_idx].netclass.name) > max_rip_prio {
+                                    continue;
+                                }
+                                let p = routed_paths[rip_idx].as_ref().unwrap();
+                                let passes_near = p.iter().any(|node| {
+                                    let (wx, wy) = grid.grid_to_world(node.gx, node.gy);
+                                    dist_to_segment(wx, wy, b_start.0, b_start.1, b_end.0, b_end.1) < 1.2
+                                        || (wx - b_start.0).hypot(wy - b_start.1) < 1.8
+                                        || (wx - b_end.0).hypot(wy - b_end.1) < 1.8
+                                });
+
+                                if passes_near {
+                                    if let Some(p) = routed_paths[rip_idx].take() {
+                                        for node in &p {
+                                            let idx = grid.idx(node.gx, node.gy, node.layer);
+                                            grid.congestion[idx] += self.congestion_factor;
+                                        }
+                                        ripped = true;
+                                        rip_budget -= 1;
+                                    }
+                                }
+                            }
+                            if ripped {
+                                self.rebuild_grid_state(board, grid, &connections, &routed_paths, &escape_stubs);
+                                if let Ok(mut obs_g) = shared_obs.lock() {
+                                    obs_g.clone_from(&grid.obstacle_net_ids);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -3234,47 +3266,6 @@ impl AutoRouter {
             }
         }
 
-        // Outward escapes for 2-terminal SMD passives (resistors, capacitors, diodes)
-        // Ensures traces originate from exact pad center and extend along the component's normal axis
-        // away from the opposing pad before any bend or turn, preventing diagonal pad corner slicing.
-        for fp in &board.footprints {
-            if fp.reference == "U1" || fp.reference == "J2" {
-                continue;
-            }
-            if fp.pads.len() == 2 && fp.is_smd_only() {
-                for (p_idx, pad) in fp.pads.iter().enumerate() {
-                    if pad.net_id == 0
-                        || pad.net_name == "GND"
-                        || pad.net_name.is_empty()
-                        || pad.net_name.starts_with("unconnected")
-                    {
-                        continue;
-                    }
-                    let (px, py) = fp.pad_absolute_position(pad);
-                    let (opx, opy) = fp.pad_absolute_position(&fp.pads[1 - p_idx]);
-                    let odx = px - opx;
-                    let ody = py - opy;
-                    let dist = odx.hypot(ody);
-                    if dist > 1e-4 {
-                        let dir_x = odx / dist;
-                        let dir_y = ody / dist;
-                        let pad_len = pad.width.max(pad.height);
-                        let escape_len = (pad_len * 0.5 + 0.30).max(0.70);
-                        let tip = (px + dir_x * escape_len, py + dir_y * escape_len);
-                        stubs.push(EscapeStub {
-                            net_id: pad.net_id,
-                            pad_pos: (px, py),
-                            tip_pos: tip,
-                            width: 0.20,
-                            via: None,
-                            tip_layer: fp.layer,
-                            layer: fp.layer,
-                        });
-                    }
-                }
-            }
-        }
-
         stubs
     }
 
@@ -4400,7 +4391,7 @@ mod tests {
         let board = make_router_test_board();
         let router = AutoRouter::new(3);
         let stubs = router.generate_escape_stubs(&board);
-        assert_eq!(stubs.len(), 20); // 17 U1 non-GND pins + 2 J2 SMD signal pins + 1 R20 2-terminal passive stub
+        assert_eq!(stubs.len(), 19); // 17 U1 non-GND pins + 2 J2 SMD signal pins
 
         let conns = router.extract_connections(&board);
         assert!(!conns.is_empty());
