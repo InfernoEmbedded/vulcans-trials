@@ -187,7 +187,7 @@ impl VulcansTrialsApp {
     }
 
     pub fn footprint_screen_rect(&self, board: &Board, rect: Rect, fp: &crate::board::Footprint) -> Rect {
-        let polys = fp.transformed_courtyards_layered(Point::new(fp.x, fp.y), fp.rotation, fp.layer, 0.0);
+        let polys = fp.transformed_perimeters_layered(Point::new(fp.x, fp.y), fp.rotation, fp.layer, 0.0);
         let mut min_x = f32::INFINITY;
         let mut min_y = f32::INFINITY;
         let mut max_x = f32::NEG_INFINITY;
@@ -903,7 +903,7 @@ impl VulcansTrialsApp {
                     } else {
                         Color32::from_rgb(70, 210, 160)
                     };
-                    let polys = fp.transformed_courtyards_layered(Point::new(fp.x, fp.y), fp.rotation, fp.layer, 0.0);
+                    let polys = fp.transformed_perimeters_layered(Point::new(fp.x, fp.y), fp.rotation, fp.layer, 0.0);
                     for poly in polys {
                         if poly.vertices.len() >= 3 {
                             let pts: Vec<Pos2> = poly.vertices.iter().map(|v| to_screen(v.x, v.y)).collect();
@@ -1027,7 +1027,13 @@ pub fn draw_mini_footprint(ui: &mut egui::Ui, fp: &crate::board::Footprint, size
     let mut min_y = f64::INFINITY;
     let mut max_y = f64::NEG_INFINITY;
 
-    for poly in &fp.courtyards {
+    let perims = if !fp.perimeters.is_empty() {
+        &fp.perimeters
+    } else {
+        &fp.courtyards
+    };
+
+    for poly in perims {
         for v in &poly.vertices {
             min_x = min_x.min(v.x);
             max_x = max_x.max(v.x);
@@ -1069,9 +1075,9 @@ pub fn draw_mini_footprint(ui: &mut egui::Ui, fp: &crate::board::Footprint, size
         )
     };
 
-    // 1. Draw Courtyard
+    // 1. Draw Courtyard Perimeter
     let courtyard_col = Color32::from_rgba_unmultiplied(70, 200, 160, 160);
-    for poly in &fp.courtyards {
+    for poly in perims {
         if poly.vertices.len() >= 3 {
             let pts: Vec<Pos2> = poly.vertices.iter().map(|v| to_preview(v.x, v.y)).collect();
             for i in 0..pts.len() {
@@ -1290,7 +1296,7 @@ fn draw_load_badge(ui: &mut egui::Ui, label: &str, pct: f32, history: &[f32], co
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::{KeepoutZone, TrackSegment, Via};
+    use crate::board::{Footprint, KeepoutZone, Polygon, TrackSegment, Via};
     use std::fs;
     use std::time::Duration;
 
@@ -1627,6 +1633,72 @@ mod tests {
         let (j1_screen, _) = app.board_to_screen(&board, rect, 110.0, 115.0);
         let locked_res = app.handle_canvas_secondary_click_at(rect, j1_screen);
         assert_eq!(locked_res, None);
+
+        let _ = fs::remove_file(in_path);
+    }
+
+    #[test]
+    fn test_complex_footprint_perimeter_rendering_not_triangulated() {
+        let in_path = "/tmp/vulcan_gui_perimeter_test.kicad_pcb";
+        let mut board = make_gui_test_board(in_path);
+
+        // Add a complex T-shaped footprint (like ESP32 module)
+        let t_perimeter = Polygon::new(vec![
+            Point::new(-9.75, 7.15),
+            Point::new(9.75, 7.15),
+            Point::new(9.75, -6.85),
+            Point::new(14.25, -6.85),
+            Point::new(14.25, -18.35),
+            Point::new(-14.25, -18.35),
+            Point::new(-14.25, -6.85),
+            Point::new(-9.75, -6.85),
+        ]);
+        let decomposed_courtyards = t_perimeter.decompose_convex();
+        assert!(decomposed_courtyards.len() >= 2, "Courtyard must be decomposed into convex sub-polygons for SAT");
+
+        let complex_fp = Footprint {
+            reference: "U4".to_string(),
+            value: "ESP32-C3".to_string(),
+            x: 140.0,
+            y: 105.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: Vec::new(),
+            width: 28.5,
+            height: 25.5,
+            courtyards: decomposed_courtyards,
+            perimeters: vec![t_perimeter],
+            at_span: None,
+            fp_span: None,
+        };
+        board.footprints.push(complex_fp);
+
+        let mut app = VulcansTrialsApp::new(in_path.to_string(), String::new(), board.clone(), None);
+        let fp = board.footprints.last().unwrap();
+
+        // 1. transformed_courtyards_layered returns multiple convex polygons (triangles)
+        let courtyards = fp.transformed_courtyards_layered(Point::new(fp.x, fp.y), fp.rotation, fp.layer, 0.0);
+        assert!(courtyards.len() >= 2);
+
+        // 2. transformed_perimeters_layered returns ONLY the outer perimeter (1 polygon, 8 vertices)
+        let perimeters = fp.transformed_perimeters_layered(Point::new(fp.x, fp.y), fp.rotation, fp.layer, 0.0);
+        assert_eq!(perimeters.len(), 1, "Complex object should have exactly 1 perimeter polygon");
+        assert_eq!(perimeters[0].vertices.len(), 8, "Outer perimeter must preserve all 8 boundary vertices without diagonal chord edges");
+
+        // 3. UI rendering executes cleanly with perimeter rendering
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.render_ui(ctx);
+        });
+
+        // 4. draw_mini_footprint also uses perimeter
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                draw_mini_footprint(ui, fp, Vec2::new(100.0, 100.0));
+            });
+        });
 
         let _ = fs::remove_file(in_path);
     }
