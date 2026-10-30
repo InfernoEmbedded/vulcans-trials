@@ -51,9 +51,9 @@ Below is a comprehensive breakdown of features offered by flagship commercial PC
 - [x] KiCad Action Plugin integration (`kicad_plugin/`).
 
 ### Phase 2: v0.2 — High-Speed Digital & Differential Pairs
-- [ ] **Coupled Differential Pair Router:** Simultaneous dual-wavefront A* search maintaining exact differential gap (`diff_pair_gap`) and neck-down rules near fine-pitch pads.
-- [ ] **Intra-Pair Phase Matching:** Automatic asymmetrical bump insertion right at the launch/termination mismatch to correct skew within $\pm 0.05\text{ mm}$.
-- [ ] **Inter-Net Length Tuning (Trombone / Accordion):** Automated serpentine meander generator for DDR, SDIO, QSPI, and RMII buses with configurable amplitude and miter radius.
+- [x] **Coupled Differential Pair Router:** Simultaneous dual-wavefront A* search maintaining exact differential gap (`diff_pair_gap`) and neck-down rules near fine-pitch pads.
+- [x] **Intra-Pair Phase Matching:** Automatic asymmetrical bump insertion right at the launch/termination mismatch to correct skew within $\pm 0.05\text{ mm}$.
+- [x] **Inter-Net Length Tuning (Trombone / Accordion):** Automated serpentine meander generator for DDR, SDIO, QSPI, and RMII buses with configurable amplitude and miter radius.
 - [ ] **Net Topology Constraints:** Daisy-chain, fly-by, T-branch, and star-point routing rules per net.
 
 ### Phase 3: v0.3 — Glossing, Via Optimization & Any-Angle Topological Routing

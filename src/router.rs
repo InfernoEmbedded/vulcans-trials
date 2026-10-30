@@ -3104,6 +3104,17 @@ impl AutoRouter {
     ) -> bool {
         match_diff_pair_phase(board, grid, net_p, net_n, tolerance_mm)
     }
+
+    pub fn tune_net_length(
+        &self,
+        board: &mut Board,
+        grid: &mut RoutingGrid,
+        net_id: usize,
+        target_length_mm: f64,
+        max_amplitude_mm: f64,
+    ) -> bool {
+        tune_net_length(board, grid, net_id, target_length_mm, max_amplitude_mm)
+    }
 }
 
 pub fn enforce_coupled_diff_pair_spacing(
@@ -3529,6 +3540,225 @@ pub fn match_diff_pair_phase(
     final_skew <= tolerance_mm
 }
 
+pub fn tune_net_length(
+    board: &mut Board,
+    grid: &mut RoutingGrid,
+    net_id: usize,
+    target_length_mm: f64,
+    max_amplitude_mm: f64,
+) -> bool {
+    let calc_net_len = |tracks: &[TrackSegment]| -> f64 {
+        tracks
+            .iter()
+            .filter(|t| t.net_id == net_id)
+            .map(|t| (t.start.0 - t.end.0).hypot(t.start.1 - t.end.1))
+            .sum()
+    };
+
+    let mut current_len = calc_net_len(&board.tracks);
+    if current_len >= target_length_mm - 0.05 {
+        return true;
+    }
+
+    let mut needed = target_length_mm - current_len;
+    let netclass = board.get_netclass_for_net(net_id);
+    let clearance = netclass.clearance;
+    let track_width = netclass.track_width;
+
+    let pitch = (track_width + clearance).max(0.40);
+    let max_amp = max_amplitude_mm.max(0.20);
+
+    let candidates: Vec<TrackSegment> = board
+        .tracks
+        .iter()
+        .filter(|t| t.net_id == net_id && !t.is_locked)
+        .cloned()
+        .collect();
+
+    let mut sorted_candidates = candidates;
+    sorted_candidates.sort_by(|a, b| {
+        let la = (a.start.0 - a.end.0).hypot(a.start.1 - a.end.1);
+        let lb = (b.start.0 - b.end.0).hypot(b.start.1 - b.end.1);
+        lb.partial_cmp(&la).unwrap_or(Ordering::Equal)
+    });
+
+    let mut modified = false;
+
+    for orig in sorted_candidates {
+        if needed <= 0.05 {
+            break;
+        }
+
+        let seg_len = (orig.start.0 - orig.end.0).hypot(orig.start.1 - orig.end.1);
+        if seg_len < pitch + 0.30 {
+            continue;
+        }
+
+        let dir = (
+            (orig.end.0 - orig.start.0) / seg_len,
+            (orig.end.1 - orig.start.1) / seg_len,
+        );
+        let norm = (-dir.1, dir.0);
+
+        let check_side = |sign: f64| -> bool {
+            let test_pts = [0.25, 0.5, 0.75];
+            for &f in &test_pts {
+                let px = orig.start.0 + f * (orig.end.0 - orig.start.0) + sign * norm.0 * max_amp;
+                let py = orig.start.1 + f * (orig.end.1 - orig.start.1) + sign * norm.1 * max_amp;
+                if let Some((gx, gy)) = grid.world_to_grid(px, py) {
+                    let idx = grid.idx(gx, gy, orig.layer);
+                    let occ = grid.obstacle_net_ids[idx];
+                    if occ != FREE_NET && occ != net_id as i32 {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            true
+        };
+
+        let free_pos = check_side(1.0);
+        let free_neg = check_side(-1.0);
+        let (use_sign, alternate) = if free_pos && free_neg {
+            (1.0, true)
+        } else if free_pos {
+            (1.0, false)
+        } else if free_neg {
+            (-1.0, false)
+        } else {
+            continue;
+        };
+
+        let margin = 0.20;
+        let usable_len = seg_len - 2.0 * margin;
+        let max_teeth = (usable_len / (pitch * 2.0)).floor() as usize;
+        if max_teeth == 0 {
+            continue;
+        }
+
+        let teeth_count = max_teeth.min(((needed / (2.0 * max_amp)).ceil() as usize).max(1));
+        let amp_needed = (needed / (teeth_count as f64 * 2.0)).min(max_amp).max(0.10);
+
+        let mut replacement = Vec::new();
+        let total_teeth_span = teeth_count as f64 * pitch * 2.0;
+        let start_offset = margin + (usable_len - total_teeth_span) / 2.0;
+
+        let mut curr_pt = orig.start;
+        let tooth_start_base = (
+            orig.start.0 + dir.0 * start_offset,
+            orig.start.1 + dir.1 * start_offset,
+        );
+
+        if (curr_pt.0 - tooth_start_base.0).hypot(curr_pt.1 - tooth_start_base.1) > 1e-4 {
+            replacement.push(TrackSegment {
+                start: curr_pt,
+                end: tooth_start_base,
+                width: orig.width,
+                layer: orig.layer,
+                net_id: orig.net_id,
+                is_locked: false,
+            });
+            curr_pt = tooth_start_base;
+        }
+
+        for t in 0..teeth_count {
+            let tooth_sign = if alternate {
+                if t % 2 == 0 { 1.0 } else { -1.0 }
+            } else {
+                use_sign
+            };
+            let fold_amp = amp_needed * tooth_sign;
+            let p_peak1 = (
+                curr_pt.0 + norm.0 * fold_amp,
+                curr_pt.1 + norm.1 * fold_amp,
+            );
+            replacement.push(TrackSegment {
+                start: curr_pt,
+                end: p_peak1,
+                width: orig.width,
+                layer: orig.layer,
+                net_id: orig.net_id,
+                is_locked: false,
+            });
+            let p_peak2 = (
+                p_peak1.0 + dir.0 * pitch,
+                p_peak1.1 + dir.1 * pitch,
+            );
+            replacement.push(TrackSegment {
+                start: p_peak1,
+                end: p_peak2,
+                width: orig.width,
+                layer: orig.layer,
+                net_id: orig.net_id,
+                is_locked: false,
+            });
+            let p_base2 = (
+                p_peak2.0 - norm.0 * fold_amp,
+                p_peak2.1 - norm.1 * fold_amp,
+            );
+            replacement.push(TrackSegment {
+                start: p_peak2,
+                end: p_base2,
+                width: orig.width,
+                layer: orig.layer,
+                net_id: orig.net_id,
+                is_locked: false,
+            });
+            curr_pt = p_base2;
+
+            if t + 1 < teeth_count {
+                let next_base = (
+                    curr_pt.0 + dir.0 * pitch,
+                    curr_pt.1 + dir.1 * pitch,
+                );
+                replacement.push(TrackSegment {
+                    start: curr_pt,
+                    end: next_base,
+                    width: orig.width,
+                    layer: orig.layer,
+                    net_id: orig.net_id,
+                    is_locked: false,
+                });
+                curr_pt = next_base;
+            }
+        }
+
+        if (curr_pt.0 - orig.end.0).hypot(curr_pt.1 - orig.end.1) > 1e-4 {
+            replacement.push(TrackSegment {
+                start: curr_pt,
+                end: orig.end,
+                width: orig.width,
+                layer: orig.layer,
+                net_id: orig.net_id,
+                is_locked: false,
+            });
+        }
+
+        let new_seg_len: f64 = replacement
+            .iter()
+            .map(|t| (t.start.0 - t.end.0).hypot(t.start.1 - t.end.1))
+            .sum();
+        let added_len = new_seg_len - seg_len;
+
+        if added_len > 0.0 {
+            if let Some(pos) = board.tracks.iter().position(|t| t == &orig) {
+                board.tracks.remove(pos);
+                for r in replacement {
+                    board.tracks.push(r);
+                }
+                needed = (needed - added_len).max(0.0);
+                modified = true;
+                if needed <= 0.05 {
+                    break;
+                }
+            }
+        }
+    }
+
+    current_len = calc_net_len(&board.tracks);
+    current_len >= target_length_mm - 0.05 || modified
+}
 
 #[cfg(test)]
 mod tests {
@@ -4033,6 +4263,47 @@ mod tests {
         );
         let n_segs = board.tracks.iter().filter(|t| t.net_id == net_n).count();
         assert!(n_segs > 1, "Shorter trace must have tuning bump segments inserted");
+    }
+
+    #[test]
+    fn test_trombone_serpentine_length_tuning() {
+        let mut board = make_router_test_board();
+        board.nets = vec!["".to_string(), "GND".to_string(), "SDIO_CLK".to_string()];
+        board.net_to_class.insert("SDIO_CLK".to_string(), "Default".to_string());
+        let net_id = 2;
+
+        // Straight track of length 8.0mm in clear board routing area
+        board.tracks.push(TrackSegment {
+            start: (135.0, 107.0),
+            end: (143.0, 107.0),
+            width: 0.20,
+            layer: 0,
+            net_id,
+            is_locked: false,
+        });
+
+        let calc_len = |tracks: &[TrackSegment]| -> f64 {
+            tracks.iter().filter(|t| t.net_id == net_id).map(|t| (t.start.0 - t.end.0).hypot(t.start.1 - t.end.1)).sum()
+        };
+
+        let initial_len = calc_len(&board.tracks);
+        assert!((initial_len - 8.0).abs() < 1e-4);
+
+        let target_len = 11.50; // Needs +3.5mm of trombone/accordion tuning
+        let mut grid = RoutingGrid::new(&board, 0.20, None);
+
+        let success = tune_net_length(&mut board, &mut grid, net_id, target_len, 1.20);
+        assert!(success, "Trombone/accordion tuning must succeed");
+
+        let final_len = calc_len(&board.tracks);
+        assert!(
+            final_len >= target_len - 0.05,
+            "Final tuned length must reach target ({}mm +/- 0.05mm), got {:.3}mm",
+            target_len, final_len
+        );
+
+        let n_segs = board.tracks.iter().filter(|t| t.net_id == net_id).count();
+        assert!(n_segs >= 5, "Accordion pattern must replace straight segment with multiple meander segments, got {}", n_segs);
     }
 
     #[test]
