@@ -1026,6 +1026,9 @@ impl Board {
         let pro_path = Path::new(path).with_extension("kicad_pro");
         if pro_path.exists() {
             board.load_project_netclasses(&pro_path);
+            // The project defines its own classes; drop built-in fallbacks left with no nets.
+            let used: HashSet<&String> = board.net_to_class.values().collect();
+            board.netclasses.retain(|name, _| name == "Default" || used.contains(name));
         }
 
         // Auto-load schematic functional clusters if sibling .kicad_sch exists
@@ -2774,6 +2777,13 @@ mod tests {
         assert_eq!(board.get_netclass_for_net(3).name, "P1P2_Bus");
         assert_eq!(board.get_netclass_for_net(4).name, "Analog_Sense");
         assert_eq!(board.get_netclass_for_net(5).name, "Analog_Sense");
+
+        // Built-in fallback classes superseded by the project's classes are dropped.
+        assert!(!board.netclasses.contains_key("Power_15V"));
+        assert!(!board.netclasses.contains_key("Switching"));
+        for name in board.netclasses.keys() {
+            assert!(name == "Default" || board.net_to_class.values().any(|c| c == name), "empty class {name}");
+        }
 
         let _ = fs::remove_file(pcb_path);
         let _ = fs::remove_file(pro_path);
