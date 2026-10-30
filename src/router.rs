@@ -1566,6 +1566,7 @@ impl AutoRouter {
                         fc.start,
                         fc.end,
                     );
+                    match_diff_pair_phase(board, grid, lc.net_id, fc.net_id, 0.05);
                 }
             }
         }
@@ -3093,6 +3094,16 @@ impl AutoRouter {
         None
     }
 
+    pub fn match_diff_pair_phase(
+        &self,
+        board: &mut Board,
+        grid: &mut RoutingGrid,
+        net_p: usize,
+        net_n: usize,
+        tolerance_mm: f64,
+    ) -> bool {
+        match_diff_pair_phase(board, grid, net_p, net_n, tolerance_mm)
+    }
 }
 
 pub fn enforce_coupled_diff_pair_spacing(
@@ -3352,6 +3363,172 @@ pub fn enforce_coupled_diff_pair_spacing(
         }
     }
 }
+
+pub fn match_diff_pair_phase(
+    board: &mut Board,
+    grid: &mut RoutingGrid,
+    net_p: usize,
+    net_n: usize,
+    tolerance_mm: f64,
+) -> bool {
+    let calc_net_len = |tracks: &[TrackSegment], nid: usize| -> f64 {
+        tracks
+            .iter()
+            .filter(|t| t.net_id == nid)
+            .map(|t| (t.start.0 - t.end.0).hypot(t.start.1 - t.end.1))
+            .sum()
+    };
+
+    let len_p = calc_net_len(&board.tracks, net_p);
+    let len_n = calc_net_len(&board.tracks, net_n);
+    let skew = (len_p - len_n).abs();
+    if skew <= tolerance_mm {
+        return true;
+    }
+
+    let (short_net, long_net, delta_l) = if len_p < len_n {
+        (net_p, net_n, len_n - len_p)
+    } else {
+        (net_n, net_p, len_p - len_n)
+    };
+
+    let candidates: Vec<TrackSegment> = board
+        .tracks
+        .iter()
+        .filter(|t| t.net_id == short_net && !t.is_locked)
+        .cloned()
+        .collect();
+
+    if candidates.is_empty() {
+        return false;
+    }
+
+    let mut remaining_skew = delta_l;
+
+    for orig in candidates {
+        if remaining_skew <= tolerance_mm {
+            break;
+        }
+        let seg_len = (orig.start.0 - orig.end.0).hypot(orig.start.1 - orig.end.1);
+        if seg_len < 0.35 {
+            continue;
+        }
+
+        let dir = (
+            (orig.end.0 - orig.start.0) / seg_len,
+            (orig.end.1 - orig.start.1) / seg_len,
+        );
+        let norm = (-dir.1, dir.0);
+
+        let mid = (
+            (orig.start.0 + orig.end.0) * 0.5,
+            (orig.start.1 + orig.end.1) * 0.5,
+        );
+        let dist_to_mate = |pt: (f64, f64)| -> f64 {
+            let mut min_d = f64::INFINITY;
+            for t in &board.tracks {
+                if t.net_id == long_net {
+                    let d = (t.start.0 - pt.0).hypot(t.start.1 - pt.1).min((t.end.0 - pt.0).hypot(t.end.1 - pt.1));
+                    if d < min_d { min_d = d; }
+                }
+            }
+            min_d
+        };
+
+        let d_pos = dist_to_mate((mid.0 + norm.0 * 0.1, mid.1 + norm.1 * 0.1));
+        let d_neg = dist_to_mate((mid.0 - norm.0 * 0.1, mid.1 - norm.1 * 0.1));
+        let out_sign = if d_pos >= d_neg { 1.0 } else { -1.0 };
+        let out_norm = (norm.0 * out_sign, norm.1 * out_sign);
+
+        let max_h = 1.50;
+        let h = (remaining_skew / 2.0).min(max_h);
+        if h < 0.01 {
+            continue;
+        }
+
+        let jog_w = (seg_len * 0.5).min(0.40).max(0.15);
+        let p1_offset = (seg_len - jog_w) * 0.5;
+        let p1 = (orig.start.0 + dir.0 * p1_offset, orig.start.1 + dir.1 * p1_offset);
+        let p2 = (p1.0 + out_norm.0 * h, p1.1 + out_norm.1 * h);
+        let p3 = (p2.0 + dir.0 * jog_w, p2.1 + dir.1 * jog_w);
+        let p4 = (p1.0 + dir.0 * jog_w, p1.1 + dir.1 * jog_w);
+
+        let check_free = |pt: (f64, f64)| -> bool {
+            if let Some((gx, gy)) = grid.world_to_grid(pt.0, pt.1) {
+                let idx = grid.idx(gx, gy, orig.layer);
+                let occ = grid.obstacle_net_ids[idx];
+                occ == FREE_NET || occ == short_net as i32
+            } else {
+                false
+            }
+        };
+
+        if !check_free(p2) || !check_free(p3) {
+            continue;
+        }
+
+        let mut replacement = Vec::new();
+        if (orig.start.0 - p1.0).hypot(orig.start.1 - p1.1) > 1e-4 {
+            replacement.push(TrackSegment {
+                start: orig.start,
+                end: p1,
+                width: orig.width,
+                layer: orig.layer,
+                net_id: short_net,
+                is_locked: false,
+            });
+        }
+        replacement.push(TrackSegment {
+            start: p1,
+            end: p2,
+            width: orig.width,
+            layer: orig.layer,
+            net_id: short_net,
+            is_locked: false,
+        });
+        replacement.push(TrackSegment {
+            start: p2,
+            end: p3,
+            width: orig.width,
+            layer: orig.layer,
+            net_id: short_net,
+            is_locked: false,
+        });
+        replacement.push(TrackSegment {
+            start: p3,
+            end: p4,
+            width: orig.width,
+            layer: orig.layer,
+            net_id: short_net,
+            is_locked: false,
+        });
+        if (p4.0 - orig.end.0).hypot(p4.1 - orig.end.1) > 1e-4 {
+            replacement.push(TrackSegment {
+                start: p4,
+                end: orig.end,
+                width: orig.width,
+                layer: orig.layer,
+                net_id: short_net,
+                is_locked: false,
+            });
+        }
+
+        if let Some(pos) = board.tracks.iter().position(|t| t == &orig) {
+            board.tracks.remove(pos);
+            for r in replacement {
+                board.tracks.push(r);
+            }
+            let added_len = 2.0 * h;
+            remaining_skew = (remaining_skew - added_len).max(0.0);
+        }
+    }
+
+    let final_p = calc_net_len(&board.tracks, net_p);
+    let final_n = calc_net_len(&board.tracks, net_n);
+    let final_skew = (final_p - final_n).abs();
+    final_skew <= tolerance_mm
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -3794,6 +3971,68 @@ mod tests {
                 assert_eq!(dp_vias[0].drill, dm_vias[0].drill);
             }
         }
+    }
+
+    #[test]
+    fn test_intra_pair_phase_matching_corrects_skew() {
+        let mut board = make_router_test_board();
+        board.nets = vec!["".to_string(), "GND".to_string(), "USB_DP".to_string(), "USB_DM".to_string()];
+        board.netclasses.insert(
+            "USB_Diff".to_string(),
+            NetClass {
+                name: "USB_Diff".to_string(),
+                track_width: 0.20,
+                clearance: 0.20,
+                via_dia: 0.60,
+                via_drill: 0.30,
+                diff_pair_gap: 0.20,
+                diff_pair_width: 0.20,
+            },
+        );
+        board.net_to_class.insert("USB_DP".to_string(), "USB_Diff".to_string());
+        board.net_to_class.insert("USB_DM".to_string(), "USB_Diff".to_string());
+        let net_p = 2;
+        let net_n = 3;
+
+        // Long trace for P (length = 10.0mm in clear board routing area)
+        board.tracks.push(TrackSegment {
+            start: (135.0, 107.0),
+            end: (145.0, 107.0),
+            width: 0.20,
+            layer: 0,
+            net_id: net_p,
+            is_locked: false,
+        });
+
+        // Shorter trace for N (length = 9.4mm, so skew = 0.60mm > 0.05mm)
+        board.tracks.push(TrackSegment {
+            start: (135.0, 107.4),
+            end: (144.4, 107.4),
+            width: 0.20,
+            layer: 0,
+            net_id: net_n,
+            is_locked: false,
+        });
+
+        let calc_len = |tracks: &[TrackSegment], nid: usize| -> f64 {
+            tracks.iter().filter(|t| t.net_id == nid).map(|t| (t.start.0 - t.end.0).hypot(t.start.1 - t.end.1)).sum()
+        };
+
+        let initial_skew = (calc_len(&board.tracks, net_p) - calc_len(&board.tracks, net_n)).abs();
+        assert!((initial_skew - 0.60).abs() < 1e-4, "Initial skew must be 0.60mm");
+
+        let mut grid = RoutingGrid::new(&board, 0.20, None);
+        let ok = match_diff_pair_phase(&mut board, &mut grid, net_p, net_n, 0.05);
+        assert!(ok, "Phase matching must succeed");
+
+        let final_skew = (calc_len(&board.tracks, net_p) - calc_len(&board.tracks, net_n)).abs();
+        assert!(
+            final_skew <= 0.05,
+            "Intra-pair phase matching must equalize trace lengths within +/- 0.05mm, got final skew {:.4}mm",
+            final_skew
+        );
+        let n_segs = board.tracks.iter().filter(|t| t.net_id == net_n).count();
+        assert!(n_segs > 1, "Shorter trace must have tuning bump segments inserted");
     }
 
     #[test]
