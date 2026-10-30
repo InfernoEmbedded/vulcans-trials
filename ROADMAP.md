@@ -54,7 +54,7 @@ Below is a comprehensive breakdown of features offered by flagship commercial PC
 - [x] **Coupled Differential Pair Router:** Simultaneous dual-wavefront A* search maintaining exact differential gap (`diff_pair_gap`) and neck-down rules near fine-pitch pads.
 - [x] **Intra-Pair Phase Matching:** Automatic asymmetrical bump insertion right at the launch/termination mismatch to correct skew within $\pm 0.05\text{ mm}$.
 - [x] **Inter-Net Length Tuning (Trombone / Accordion):** Automated serpentine meander generator for DDR, SDIO, QSPI, and RMII buses with configurable amplitude and miter radius.
-- [ ] **Net Topology Constraints:** Daisy-chain, fly-by, T-branch, and star-point routing rules per net.
+- [x] **Net Topology Constraints:** Daisy-chain, fly-by, T-branch, and star-point routing rules per net.
 
 ### Phase 3: v0.3 — Glossing, Via Optimization & Any-Angle Topological Routing
 - [ ] **Post-Route Glossing Pass:** Rubber-band trace straightening, stair-step elimination, and $45^\circ$ / arc corner smoothing.

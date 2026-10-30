@@ -326,7 +326,75 @@ impl Segment {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NetTopology {
+    #[default]
+    #[serde(alias = "euclidean", alias = "mst", alias = "EuclideanMst")]
+    EuclideanMst,
+    #[serde(alias = "daisychain", alias = "daisy", alias = "DaisyChain")]
+    DaisyChain,
+    #[serde(alias = "flyby", alias = "FlyBy")]
+    FlyBy,
+    #[serde(alias = "tbranch", alias = "t_tree", alias = "TBranch")]
+    TBranch,
+    #[serde(alias = "star", alias = "starpoint", alias = "StarPoint")]
+    StarPoint,
+}
+
+impl NetTopology {
+    pub fn parse(s: &str) -> Option<Self> {
+        let clean = s.trim().trim_matches('"').to_ascii_lowercase().replace(['-', ' '], "_");
+        match clean.as_str() {
+            "euclidean_mst" | "euclidean" | "mst" => Some(Self::EuclideanMst),
+            "daisy_chain" | "daisychain" | "daisy" => Some(Self::DaisyChain),
+            "fly_by" | "flyby" => Some(Self::FlyBy),
+            "t_branch" | "tbranch" | "t_tree" => Some(Self::TBranch),
+            "star_point" | "starpoint" | "star" => Some(Self::StarPoint),
+            _ => None,
+        }
+    }
+
+    pub fn infer_from_net_name(net_name: &str) -> Self {
+        let upper = net_name.to_ascii_uppercase();
+        if upper.contains("KELVIN")
+            || upper.contains("STAR")
+            || upper.contains("SENSE")
+            || upper.starts_with('+')
+            || upper.starts_with("VCC")
+            || upper.starts_with("VDD")
+            || upper.contains("VREF")
+            || upper.contains("PWR")
+            || upper.contains("POWER")
+        {
+            Self::StarPoint
+        } else if upper.contains("CLK")
+            || upper.contains("SCK")
+            || upper.contains("STROBE")
+            || upper.ends_with("_CK")
+            || upper.ends_with("CK")
+        {
+            Self::TBranch
+        } else if upper.contains("ADDR")
+            || upper.contains("DDR")
+            || upper.contains("DATA")
+        {
+            Self::FlyBy
+        } else if upper.contains("SPI")
+            || upper.contains("I2C")
+            || upper.contains("SDA")
+            || upper.contains("SCL")
+            || upper.contains("UART")
+            || upper.contains("BUS")
+        {
+            Self::DaisyChain
+        } else {
+            Self::EuclideanMst
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NetClass {
     pub name: String,
@@ -338,6 +406,8 @@ pub struct NetClass {
     pub diff_pair_gap: f64,
     #[serde(default = "default_diff_pair_dim")]
     pub diff_pair_width: f64,
+    #[serde(default)]
+    pub topology: NetTopology,
 }
 
 fn default_diff_pair_dim() -> f64 {
@@ -354,6 +424,17 @@ impl Default for NetClass {
             via_drill: 0.30,
             diff_pair_gap: 0.20,
             diff_pair_width: 0.20,
+            topology: NetTopology::default(),
+        }
+    }
+}
+
+impl NetClass {
+    pub fn resolve_topology(&self, net_name: &str) -> NetTopology {
+        if self.topology != NetTopology::EuclideanMst {
+            self.topology
+        } else {
+            NetTopology::infer_from_net_name(net_name)
         }
     }
 }
@@ -788,6 +869,7 @@ impl Board {
                     via_drill: 0.30,
                     diff_pair_gap: 0.20,
                     diff_pair_width: width,
+                    topology: NetTopology::default(),
                 },
             );
         }
@@ -1113,6 +1195,12 @@ impl Board {
         self.netclasses.get("Default").unwrap()
     }
 
+    pub fn get_net_topology(&self, net_id: usize) -> NetTopology {
+        let netclass = self.get_netclass_for_net(net_id);
+        let net_name = self.nets.get(net_id).map(|s| s.as_str()).unwrap_or("");
+        netclass.resolve_topology(net_name)
+    }
+
     pub fn generate_ratsnest_segments(&self, pad_positions: &[Vec<Point>]) -> Vec<Segment> {
         let mut net_points: HashMap<usize, Vec<Point>> = HashMap::new();
         for (fp_idx, fp) in self.footprints.iter().enumerate() {
@@ -1137,33 +1225,72 @@ impl Board {
                 segments.push(Segment { p1: pts[0], p2: pts[1], net_id });
                 continue;
             }
-            // Prim's Euclidean MST
             let n = pts.len();
-            let mut in_mst = vec![false; n];
-            let mut min_dist = vec![f64::INFINITY; n];
-            let mut parent = vec![0usize; n];
-            in_mst[0] = true;
-            for i in 1..n {
-                min_dist[i] = pts[0].distance_to(&pts[i]);
-            }
-            for _ in 1..n {
-                let mut best = None;
-                let mut best_d = f64::INFINITY;
-                for i in 1..n {
-                    if !in_mst[i] && min_dist[i] < best_d {
-                        best_d = min_dist[i];
-                        best = Some(i);
+            let topo = self.get_net_topology(net_id);
+            match topo {
+                NetTopology::StarPoint => {
+                    for i in 1..n {
+                        segments.push(Segment { p1: pts[0], p2: pts[i], net_id });
                     }
                 }
-                if let Some(u) = best {
-                    in_mst[u] = true;
-                    segments.push(Segment { p1: pts[parent[u]], p2: pts[u], net_id });
-                    for v in 1..n {
-                        if !in_mst[v] {
-                            let d = pts[u].distance_to(&pts[v]);
-                            if d < min_dist[v] {
-                                min_dist[v] = d;
-                                parent[v] = u;
+                NetTopology::DaisyChain | NetTopology::FlyBy => {
+                    let mut chain = Vec::with_capacity(n);
+                    chain.push(0);
+                    let mut visited = vec![false; n];
+                    visited[0] = true;
+                    while chain.len() < n {
+                        let curr = *chain.last().unwrap();
+                        let mut best = None;
+                        let mut best_d = f64::INFINITY;
+                        for j in 0..n {
+                            if !visited[j] {
+                                let d = pts[curr].distance_to(&pts[j]);
+                                if d < best_d {
+                                    best_d = d;
+                                    best = Some(j);
+                                }
+                            }
+                        }
+                        if let Some(next) = best {
+                            visited[next] = true;
+                            chain.push(next);
+                        } else {
+                            break;
+                        }
+                    }
+                    for w in chain.windows(2) {
+                        segments.push(Segment { p1: pts[w[0]], p2: pts[w[1]], net_id });
+                    }
+                }
+                _ => {
+                    // Prim's Euclidean MST (for EuclideanMst and TBranch base segments)
+                    let mut in_mst = vec![false; n];
+                    let mut min_dist = vec![f64::INFINITY; n];
+                    let mut parent = vec![0usize; n];
+                    in_mst[0] = true;
+                    for i in 1..n {
+                        min_dist[i] = pts[0].distance_to(&pts[i]);
+                    }
+                    for _ in 1..n {
+                        let mut best = None;
+                        let mut best_d = f64::INFINITY;
+                        for i in 1..n {
+                            if !in_mst[i] && min_dist[i] < best_d {
+                                best_d = min_dist[i];
+                                best = Some(i);
+                            }
+                        }
+                        if let Some(u) = best {
+                            in_mst[u] = true;
+                            segments.push(Segment { p1: pts[parent[u]], p2: pts[u], net_id });
+                            for v in 1..n {
+                                if !in_mst[v] {
+                                    let d = pts[u].distance_to(&pts[v]);
+                                    if d < min_dist[v] {
+                                        min_dist[v] = d;
+                                        parent[v] = u;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1711,6 +1838,11 @@ pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetCla
                     let via_drill = cls.get("via_drill").and_then(|v| v.as_f64()).unwrap_or(0.30);
                     let diff_pair_gap = cls.get("diff_pair_gap").and_then(|v| v.as_f64()).unwrap_or(0.20);
                     let diff_pair_width = cls.get("diff_pair_width").and_then(|v| v.as_f64()).unwrap_or(track_width);
+                    let topology = cls
+                        .get("topology")
+                        .and_then(|v| v.as_str())
+                        .and_then(NetTopology::parse)
+                        .unwrap_or_default();
                     netclasses.insert(
                         name.to_string(),
                         NetClass {
@@ -1721,6 +1853,7 @@ pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetCla
                             via_drill,
                             diff_pair_gap,
                             diff_pair_width,
+                            topology,
                         },
                     );
                 }
@@ -1767,6 +1900,17 @@ pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetCla
                             let via_drill = parse_val("(via_drill", 0.30);
                             let diff_pair_gap = parse_val("(diff_pair_gap", 0.20);
                             let diff_pair_width = parse_val("(diff_pair_width", track_width);
+                            let topology = if let Some(pos) = block.find("(topology") {
+                                let rest = &block[pos + "(topology".len()..];
+                                let token = rest
+                                    .trim_start()
+                                    .split(|c: char| c.is_whitespace() || c == ')')
+                                    .next()
+                                    .unwrap_or("");
+                                NetTopology::parse(token).unwrap_or_default()
+                            } else {
+                                NetTopology::default()
+                            };
                             netclasses.insert(
                                 name.clone(),
                                 NetClass {
@@ -1777,6 +1921,7 @@ pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetCla
                                     via_drill,
                                     diff_pair_gap,
                                     diff_pair_width,
+                                    topology,
                                 },
                             );
                         }
@@ -2865,6 +3010,201 @@ mod tests {
         assert_eq!(live.ratsnest.len(), 1);
 
         let _ = fs::remove_file(pcb_path);
+    }
+
+    #[test]
+    fn test_net_topology_parsing_and_defaults() {
+        // 1. Default enum and NetClass
+        assert_eq!(NetTopology::default(), NetTopology::EuclideanMst);
+        let default_nc = NetClass::default();
+        assert_eq!(default_nc.topology, NetTopology::EuclideanMst);
+
+        // 2. Serde JSON serialization & deserialization roundtrip
+        for (topo, expected_name) in [
+            (NetTopology::EuclideanMst, "euclidean_mst"),
+            (NetTopology::DaisyChain, "daisy_chain"),
+            (NetTopology::FlyBy, "fly_by"),
+            (NetTopology::TBranch, "t_branch"),
+            (NetTopology::StarPoint, "star_point"),
+        ] {
+            let json = serde_json::to_string(&topo).unwrap();
+            assert_eq!(json, format!("\"{}\"", expected_name));
+            let parsed: NetTopology = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, topo);
+        }
+
+        // Serde aliases
+        assert_eq!(serde_json::from_str::<NetTopology>("\"star\"").unwrap(), NetTopology::StarPoint);
+        assert_eq!(serde_json::from_str::<NetTopology>("\"daisychain\"").unwrap(), NetTopology::DaisyChain);
+        assert_eq!(serde_json::from_str::<NetTopology>("\"flyby\"").unwrap(), NetTopology::FlyBy);
+        assert_eq!(serde_json::from_str::<NetTopology>("\"tbranch\"").unwrap(), NetTopology::TBranch);
+        assert_eq!(serde_json::from_str::<NetTopology>("\"mst\"").unwrap(), NetTopology::EuclideanMst);
+
+        // 3. parse_netclasses_from_pro_or_pcb with JSON (.kicad_pro)
+        let kicad_pro_content = r#"{
+            "net_settings": {
+                "classes": [
+                    {
+                        "name": "DDR_Bus",
+                        "track_width": 0.15,
+                        "clearance": 0.15,
+                        "topology": "fly_by"
+                    },
+                    {
+                        "name": "Sensor_Star",
+                        "track_width": 0.25,
+                        "clearance": 0.20,
+                        "topology": "star"
+                    },
+                    {
+                        "name": "SPI_Bus",
+                        "track_width": 0.20,
+                        "clearance": 0.20,
+                        "topology": "daisy_chain"
+                    }
+                ]
+            }
+        }"#;
+        let classes = parse_netclasses_from_pro_or_pcb(kicad_pro_content);
+        assert_eq!(classes["DDR_Bus"].topology, NetTopology::FlyBy);
+        assert_eq!(classes["Sensor_Star"].topology, NetTopology::StarPoint);
+        assert_eq!(classes["SPI_Bus"].topology, NetTopology::DaisyChain);
+
+        // 4. parse_netclasses_from_pro_or_pcb with S-expression (.kicad_pcb)
+        let kicad_pcb_content = r#"(kicad_pcb (version 20221018) (generator pcbnew)
+            (net_class "Clock_Net"
+                (trace_width 0.2)
+                (clearance 0.25)
+                (via_dia 0.6)
+                (via_drill 0.3)
+                (topology t_branch)
+            )
+            (net_class "Daisy_Net"
+                (trace_width 0.2)
+                (clearance 0.2)
+                (topology "daisy_chain")
+            )
+        )"#;
+        let pcb_classes = parse_netclasses_from_pro_or_pcb(kicad_pcb_content);
+        assert_eq!(pcb_classes["Clock_Net"].topology, NetTopology::TBranch);
+        assert_eq!(pcb_classes["Daisy_Net"].topology, NetTopology::DaisyChain);
+
+        // 5. Automatic heuristic detection when not explicitly set
+        assert_eq!(NetTopology::infer_from_net_name("CLK_100M"), NetTopology::TBranch);
+        assert_eq!(NetTopology::infer_from_net_name("RAM_CLK"), NetTopology::TBranch);
+        assert_eq!(NetTopology::infer_from_net_name("SPI_SCK"), NetTopology::TBranch);
+        assert_eq!(NetTopology::infer_from_net_name("DDR_ADDR0"), NetTopology::FlyBy);
+        assert_eq!(NetTopology::infer_from_net_name("RAM_DATA1"), NetTopology::FlyBy);
+        assert_eq!(NetTopology::infer_from_net_name("SPI_MISO"), NetTopology::DaisyChain);
+        assert_eq!(NetTopology::infer_from_net_name("I2C_SDA"), NetTopology::DaisyChain);
+        assert_eq!(NetTopology::infer_from_net_name("+3.3V"), NetTopology::StarPoint);
+        assert_eq!(NetTopology::infer_from_net_name("KELVIN_SENSE"), NetTopology::StarPoint);
+        assert_eq!(NetTopology::infer_from_net_name("STAR_GND"), NetTopology::StarPoint);
+        assert_eq!(NetTopology::infer_from_net_name("GENERAL_NET"), NetTopology::EuclideanMst);
+
+        // Explicit netclass topology overrides heuristic
+        let mut nc = NetClass::default();
+        nc.topology = NetTopology::DaisyChain;
+        assert_eq!(nc.resolve_topology("CLK_100M"), NetTopology::DaisyChain);
+    }
+
+    #[test]
+    fn test_net_topology_daisy_chain_and_fly_by() {
+        use crate::router::{build_net_topology_connections, PadInfo};
+        let nc = NetClass::default();
+        let pads = vec![
+            PadInfo::new(0.0, 0.0, 0, 0, 0).with_driver(true),
+            PadInfo::new(10.0, 0.0, 0, 1, 0),
+            PadInfo::new(20.0, 0.0, 0, 2, 0),
+            PadInfo::new(30.0, 0.0, 0, 3, 0),
+        ];
+
+        let daisy_conns = build_net_topology_connections(1, "SPI_BUS", &nc, &pads, NetTopology::DaisyChain);
+        assert_eq!(daisy_conns.len(), 3);
+        assert_eq!(daisy_conns[0].start, (0.0, 0.0, 0));
+        assert_eq!(daisy_conns[0].end, (10.0, 0.0, 0));
+        assert_eq!(daisy_conns[1].start, (10.0, 0.0, 0));
+        assert_eq!(daisy_conns[1].end, (20.0, 0.0, 0));
+        assert_eq!(daisy_conns[2].start, (20.0, 0.0, 0));
+        assert_eq!(daisy_conns[2].end, (30.0, 0.0, 0));
+
+        let mut degree = vec![0; 4];
+        for c in &daisy_conns {
+            let s_idx = pads.iter().position(|p| (p.x, p.y, p.layer) == c.start).unwrap();
+            let e_idx = pads.iter().position(|p| (p.x, p.y, p.layer) == c.end).unwrap();
+            degree[s_idx] += 1;
+            degree[e_idx] += 1;
+        }
+        assert_eq!(degree[0], 1);
+        assert_eq!(degree[1], 2);
+        assert_eq!(degree[2], 2);
+        assert_eq!(degree[3], 1);
+        assert!(degree.iter().all(|&d| d <= 2));
+
+        let flyby_conns = build_net_topology_connections(2, "DDR_ADDR", &nc, &pads, NetTopology::FlyBy);
+        assert_eq!(flyby_conns.len(), 3);
+        assert_eq!(flyby_conns[0].start, (0.0, 0.0, 0));
+        assert_eq!(flyby_conns[0].end, (10.0, 0.0, 0));
+        assert_eq!(flyby_conns[1].start, (10.0, 0.0, 0));
+        assert_eq!(flyby_conns[1].end, (20.0, 0.0, 0));
+        assert_eq!(flyby_conns[2].start, (20.0, 0.0, 0));
+        assert_eq!(flyby_conns[2].end, (30.0, 0.0, 0));
+    }
+
+    #[test]
+    fn test_net_topology_star_point() {
+        use crate::router::{build_net_topology_connections, PadInfo};
+        let nc = NetClass::default();
+        let star_center = (15.0, 15.0, 0);
+        let pads = vec![
+            PadInfo::new(15.0, 15.0, 0, 0, 0).with_driver(true),
+            PadInfo::new(0.0, 0.0, 0, 1, 0),
+            PadInfo::new(30.0, 0.0, 0, 2, 0),
+            PadInfo::new(15.0, 30.0, 0, 3, 0),
+        ];
+
+        let conns = build_net_topology_connections(1, "+3.3V", &nc, &pads, NetTopology::StarPoint);
+        assert_eq!(conns.len(), 3);
+        for c in &conns {
+            assert_eq!(c.start, star_center);
+            assert_eq!(c.start_fp, 0);
+            assert_eq!(c.start_pad, 0);
+        }
+
+        let endpoints: Vec<(f64, f64, usize)> = conns.iter().map(|c| c.end).collect();
+        assert!(endpoints.contains(&(0.0, 0.0, 0)));
+        assert!(endpoints.contains(&(30.0, 0.0, 0)));
+        assert!(endpoints.contains(&(15.0, 30.0, 0)));
+    }
+
+    #[test]
+    fn test_net_topology_t_branch() {
+        use crate::router::{build_net_topology_connections, PadInfo};
+        let nc = NetClass::default();
+        let pads = vec![
+            PadInfo::new(0.0, 0.0, 0, 0, 0).with_driver(true),
+            PadInfo::new(20.0, 10.0, 0, 1, 0),
+            PadInfo::new(20.0, -10.0, 0, 2, 0),
+        ];
+
+        let conns = build_net_topology_connections(1, "CLK_NET", &nc, &pads, NetTopology::TBranch);
+        assert_eq!(conns.len(), 3);
+        let trunk = &conns[0];
+        assert_eq!(trunk.start, (0.0, 0.0, 0));
+        assert_eq!(trunk.end, (20.0, 0.0, 0));
+
+        let branch1 = &conns[1];
+        let branch2 = &conns[2];
+        assert_eq!(branch1.start, (20.0, 0.0, 0));
+        assert_eq!(branch1.end, (20.0, 10.0, 0));
+        assert_eq!(branch2.start, (20.0, 0.0, 0));
+        assert_eq!(branch2.end, (20.0, -10.0, 0));
+
+        let len1 = (branch1.start.0 - branch1.end.0).hypot(branch1.start.1 - branch1.end.1);
+        let len2 = (branch2.start.0 - branch2.end.0).hypot(branch2.start.1 - branch2.end.1);
+        assert!((len1 - len2).abs() < 1e-6);
+        assert!((len1 - 10.0).abs() < 1e-6);
+        assert!((len2 - 10.0).abs() < 1e-6);
     }
 }
 
