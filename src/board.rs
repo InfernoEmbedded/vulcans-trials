@@ -327,12 +327,21 @@ impl Segment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NetClass {
     pub name: String,
     pub track_width: f64,
     pub clearance: f64,
     pub via_dia: f64,
     pub via_drill: f64,
+    #[serde(default = "default_diff_pair_dim")]
+    pub diff_pair_gap: f64,
+    #[serde(default = "default_diff_pair_dim")]
+    pub diff_pair_width: f64,
+}
+
+fn default_diff_pair_dim() -> f64 {
+    0.20
 }
 
 impl Default for NetClass {
@@ -343,6 +352,8 @@ impl Default for NetClass {
             clearance: 0.20,
             via_dia: 0.60,
             via_drill: 0.30,
+            diff_pair_gap: 0.20,
+            diff_pair_width: 0.20,
         }
     }
 }
@@ -668,7 +679,7 @@ pub fn outer_perimeter_edges(polys: &[Polygon]) -> Vec<(Point, Point)> {
         .collect()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrackSegment {
     pub start: (f64, f64),
     pub end: (f64, f64),
@@ -679,7 +690,7 @@ pub struct TrackSegment {
     pub is_locked: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Via {
     pub position: (f64, f64),
     pub size: f64,
@@ -775,6 +786,8 @@ impl Board {
                     clearance,
                     via_dia: 0.60,
                     via_drill: 0.30,
+                    diff_pair_gap: 0.20,
+                    diff_pair_width: width,
                 },
             );
         }
@@ -850,6 +863,16 @@ impl Board {
                         let block = &content[i..end];
                         if let Some(v) = parse_via(block) {
                             vias.push(v);
+                        }
+                        i = end;
+                        continue;
+                    }
+                } else if word == "net_class" {
+                    if let Some(end) = find_closing_paren(bytes, i) {
+                        let block = &content[i..end];
+                        let parsed = parse_netclasses_from_pro_or_pcb(block);
+                        for (name, nc) in parsed {
+                            netclasses.insert(name, nc);
                         }
                         i = end;
                         continue;
@@ -1216,8 +1239,8 @@ impl Board {
                 for name in sorted_cnames {
                     let nc = &self.netclasses[name];
                     s_expr.push_str(&format!(
-                        "  (net_class \"{}\" \"Netclass {}\"\n    (clearance {:.4})\n    (trace_width {:.4})\n    (via_dia {:.4})\n    (via_drill {:.4})\n",
-                        name, name, nc.clearance, nc.track_width, nc.via_dia, nc.via_drill
+                        "  (net_class \"{}\" \"Netclass {}\"\n    (clearance {:.4})\n    (trace_width {:.4})\n    (via_dia {:.4})\n    (via_drill {:.4})\n    (diff_pair_gap {:.4})\n    (diff_pair_width {:.4})\n",
+                        name, name, nc.clearance, nc.track_width, nc.via_dia, nc.via_drill, nc.diff_pair_gap, nc.diff_pair_width
                     ));
                     for (net_name, cls_name) in &self.net_to_class {
                         if cls_name == name {
@@ -1281,30 +1304,18 @@ impl Board {
         fs::write(ses_path, s).map_err(|e| e.to_string())
     }
 
+    pub fn parse_netclasses_from_pro_or_pcb(&mut self, content: &str) {
+        let classes = parse_netclasses_from_pro_or_pcb(content);
+        for (name, nc) in classes {
+            self.netclasses.insert(name, nc);
+        }
+    }
+
     pub fn load_project_netclasses(&mut self, pro_path: &Path) {
         let Ok(content) = fs::read_to_string(pro_path) else { return };
+        self.parse_netclasses_from_pro_or_pcb(&content);
         let Ok(root) = serde_json::from_str::<serde_json::Value>(&content) else { return };
         let Some(net_settings) = root.get("net_settings") else { return };
-
-        if let Some(classes) = net_settings.get("classes").and_then(|v| v.as_array()) {
-            for cls in classes {
-                let Some(name) = cls.get("name").and_then(|v| v.as_str()) else { continue };
-                let track_width = cls.get("track_width").and_then(|v| v.as_f64()).unwrap_or(0.20);
-                let clearance = cls.get("clearance").and_then(|v| v.as_f64()).unwrap_or(0.20);
-                let via_dia = cls.get("via_diameter").and_then(|v| v.as_f64()).unwrap_or(0.60);
-                let via_drill = cls.get("via_drill").and_then(|v| v.as_f64()).unwrap_or(0.30);
-                self.netclasses.insert(
-                    name.to_string(),
-                    NetClass {
-                        name: name.to_string(),
-                        track_width,
-                        clearance,
-                        via_dia,
-                        via_drill,
-                    },
-                );
-            }
-        }
 
         if let Some(assignments) = net_settings.get("netclass_assignments").and_then(|v| v.as_object()) {
             for (net_name, val) in assignments {
@@ -1679,6 +1690,105 @@ fn chain_lines_into_polygons(mut lines: Vec<(Point, Point)>) -> Vec<Polygon> {
     }
 
     polys
+}
+
+pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetClass> {
+    let mut netclasses = HashMap::new();
+    let trimmed = content.trim_start();
+    if trimmed.starts_with('{') {
+        if let Ok(root) = serde_json::from_str::<serde_json::Value>(content) {
+            let classes_opt = root
+                .get("net_settings")
+                .and_then(|v| v.get("classes"))
+                .or_else(|| root.get("classes"))
+                .and_then(|v| v.as_array());
+            if let Some(classes) = classes_opt {
+                for cls in classes {
+                    let Some(name) = cls.get("name").and_then(|v| v.as_str()) else { continue };
+                    let track_width = cls.get("track_width").and_then(|v| v.as_f64()).unwrap_or(0.20);
+                    let clearance = cls.get("clearance").and_then(|v| v.as_f64()).unwrap_or(0.20);
+                    let via_dia = cls.get("via_diameter").or_else(|| cls.get("via_dia")).and_then(|v| v.as_f64()).unwrap_or(0.60);
+                    let via_drill = cls.get("via_drill").and_then(|v| v.as_f64()).unwrap_or(0.30);
+                    let diff_pair_gap = cls.get("diff_pair_gap").and_then(|v| v.as_f64()).unwrap_or(0.20);
+                    let diff_pair_width = cls.get("diff_pair_width").and_then(|v| v.as_f64()).unwrap_or(track_width);
+                    netclasses.insert(
+                        name.to_string(),
+                        NetClass {
+                            name: name.to_string(),
+                            track_width,
+                            clearance,
+                            via_dia,
+                            via_drill,
+                            diff_pair_gap,
+                            diff_pair_width,
+                        },
+                    );
+                }
+            }
+        }
+    } else {
+        let bytes = content.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+        while i < len {
+            if bytes[i] == b'(' {
+                let word = next_token(content, i + 1);
+                if word == "net_class" {
+                    if let Some(end) = find_closing_paren(bytes, i) {
+                        let block = &content[i..end];
+                        let sub_tokens: Vec<&str> = block.split_whitespace().collect();
+                        let name = if sub_tokens.len() >= 2 {
+                            sub_tokens[1].trim_matches('"').to_string()
+                        } else {
+                            String::new()
+                        };
+                        if !name.is_empty() {
+                            let parse_val = |key: &str, def: f64| -> f64 {
+                                if let Some(pos) = block.find(key) {
+                                    let rest = &block[pos + key.len()..];
+                                    let mut num_str = String::new();
+                                    for ch in rest.chars() {
+                                        if ch.is_whitespace() || ch == '(' {
+                                            continue;
+                                        }
+                                        if ch == ')' {
+                                            break;
+                                        }
+                                        num_str.push(ch);
+                                    }
+                                    num_str.parse::<f64>().unwrap_or(def)
+                                } else {
+                                    def
+                                }
+                            };
+                            let clearance = parse_val("(clearance", 0.20);
+                            let track_width = parse_val("(trace_width", 0.20);
+                            let via_dia = parse_val("(via_dia", 0.60);
+                            let via_drill = parse_val("(via_drill", 0.30);
+                            let diff_pair_gap = parse_val("(diff_pair_gap", 0.20);
+                            let diff_pair_width = parse_val("(diff_pair_width", track_width);
+                            netclasses.insert(
+                                name.clone(),
+                                NetClass {
+                                    name,
+                                    track_width,
+                                    clearance,
+                                    via_dia,
+                                    via_drill,
+                                    diff_pair_gap,
+                                    diff_pair_width,
+                                },
+                            );
+                        }
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    netclasses
 }
 
 fn parse_footprint(
@@ -2193,6 +2303,8 @@ mod tests {
         let nc = NetClass::default();
         assert_eq!(nc.name, "Default");
         assert!((nc.track_width - 0.20).abs() < 1e-6);
+        assert!((nc.diff_pair_gap - 0.20).abs() < 1e-6);
+        assert!((nc.diff_pair_width - 0.20).abs() < 1e-6);
 
         let mut fp = Footprint {
             reference: "J2".to_string(),
@@ -2558,6 +2670,45 @@ mod tests {
 
         let _ = fs::remove_file(pcb_path);
         let _ = fs::remove_file(pro_path);
+    }
+
+    #[test]
+    fn test_netclass_diff_pair_parsing() {
+        let json_pro = r#"{
+            "net_settings": {
+                "classes": [
+                    {
+                        "name": "USB_Diff",
+                        "track_width": 0.22,
+                        "clearance": 0.18,
+                        "diff_pair_gap": 0.15,
+                        "diff_pair_width": 0.22
+                    }
+                ]
+            }
+        }"#;
+        let pro_classes = parse_netclasses_from_pro_or_pcb(json_pro);
+        let usb_cls = pro_classes.get("USB_Diff").expect("USB_Diff should be parsed");
+        assert!((usb_cls.diff_pair_gap - 0.15).abs() < 1e-6);
+        assert!((usb_cls.diff_pair_width - 0.22).abs() < 1e-6);
+
+        let pcb_sexpr = r#"(kicad_pcb
+            (net_class "ETH_Diff" "Ethernet 100-ohm diff pair"
+                (clearance 0.25)
+                (trace_width 0.30)
+                (via_dia 0.65)
+                (via_drill 0.35)
+                (diff_pair_gap 0.18)
+                (diff_pair_width 0.30)
+            )
+        )"#;
+        let pcb_classes = parse_netclasses_from_pro_or_pcb(pcb_sexpr);
+        let eth_cls = pcb_classes.get("ETH_Diff").expect("ETH_Diff should be parsed");
+        assert_eq!(eth_cls.name, "ETH_Diff");
+        assert!((eth_cls.clearance - 0.25).abs() < 1e-6);
+        assert!((eth_cls.track_width - 0.30).abs() < 1e-6);
+        assert!((eth_cls.diff_pair_gap - 0.18).abs() < 1e-6);
+        assert!((eth_cls.diff_pair_width - 0.30).abs() < 1e-6);
     }
 
     #[test]
