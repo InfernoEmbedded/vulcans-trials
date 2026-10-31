@@ -1307,6 +1307,12 @@ pub fn shove_overlapping_components(
         return 0;
     }
 
+    let orig_positions: Vec<(f64, f64, f64, usize)> = board
+        .footprints
+        .iter()
+        .map(|fp| (fp.x, fp.y, fp.rotation, fp.layer))
+        .collect();
+
     // 2. Directional shove for each colliding unlocked component
     for &idx in &colliding_unlocked_indices {
         let other_fp = board.footprints[idx].clone();
@@ -1360,6 +1366,21 @@ pub fn shove_overlapping_components(
         legalized.apply_to_board(board);
         board.footprints[placed_idx].is_locked = was_locked;
         shoved_count = shoved_count.max(colliding_unlocked_indices.len());
+    }
+
+    // Rip up connected traces for any footprints that were shoved or legalized
+    for (i, &orig_pos) in orig_positions.iter().enumerate() {
+        if i == placed_idx || i >= board.footprints.len() {
+            continue;
+        }
+        let fp = &board.footprints[i];
+        let moved = (fp.x - orig_pos.0).abs() > 1e-4
+            || (fp.y - orig_pos.1).abs() > 1e-4
+            || (fp.rotation - orig_pos.2).abs() > 1e-4
+            || fp.layer != orig_pos.3;
+        if moved {
+            board.rip_up_connected_traces_to_component_at(i, Some(orig_pos));
+        }
     }
 
     shoved_count

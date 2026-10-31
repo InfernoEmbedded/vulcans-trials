@@ -644,6 +644,7 @@ impl NudgeEngine {
             let nx = orig_x + dx;
             let ny = orig_y + dy;
             if self.is_placement_valid(board, fp_idx, nx, ny) {
+                board.rip_up_connected_traces_to_component(fp_idx);
                 board.footprints[fp_idx].x = nx;
                 board.footprints[fp_idx].y = ny;
                 return true;
@@ -3289,6 +3290,10 @@ impl AutoRouter {
             }
 
             if resolved {
+                board.rip_up_connected_traces_to_component_at(
+                    fp_idx,
+                    Some((orig_fp_x, orig_fp_y, board.footprints[fp_idx].rotation, board.footprints[fp_idx].layer)),
+                );
                 grid.update_distance_fields();
                 return true;
             } else {
@@ -6842,10 +6847,23 @@ mod tests {
         assert!(!router.nudge_engine.try_nudge_component(&mut board, 1, (1.0, 0.0)));
         assert!(!router.nudge_engine.try_nudge_component(&mut board, 2, (0.0, 0.0)));
 
+        // Add a track connecting C14 (idx 2) to R14 (idx 3)
+        board.tracks.push(TrackSegment {
+            start: (142.0, 95.0),
+            end: (146.0, 95.0),
+            width: 0.20,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+        assert_eq!(board.tracks.len(), 1);
+
         // Valid nudge of unlocked C14 (idx 2)
         let old_x = board.footprints[2].x;
         assert!(router.nudge_engine.try_nudge_component(&mut board, 2, (1.0, 0.0)));
         assert!((board.footprints[2].x - (old_x + 0.25)).abs() < 1e-6);
+        // Trace connected to C14 must have been ripped up!
+        assert_eq!(board.tracks.len(), 0);
 
         // AStarNode min-heap ordering check
         let mut heap = BinaryHeap::new();

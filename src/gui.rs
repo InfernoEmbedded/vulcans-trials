@@ -662,9 +662,20 @@ impl VulcansTrialsApp {
         if let Some(idx) = target_idx {
             let mut g = self.live.lock().unwrap();
             if idx < g.board.footprints.len() {
+                let ref_des = g.board.footprints[idx].reference.clone();
+                if self.moving_footprint.is_none() {
+                    let ripped = g.board.rip_up_connected_traces_to_component(idx);
+                    if ripped > 0 {
+                        g.push_log(format!(
+                            "[RipUp] Ripped up {} connected trace/via element{} for {}",
+                            ripped,
+                            if ripped == 1 { "" } else { "s" },
+                            ref_des
+                        ));
+                    }
+                }
                 let fp = &mut g.board.footprints[idx];
                 fp.rotation = (fp.rotation + 90.0) % 360.0;
-                let ref_des = fp.reference.clone();
                 let rot = fp.rotation;
                 g.refresh_ratsnest();
                 g.push_log(format!("[Rotate] Rotated {} by 90° to {:.0}°", ref_des, rot));
@@ -695,9 +706,20 @@ impl VulcansTrialsApp {
         if let Some(idx) = target_idx {
             let mut g = self.live.lock().unwrap();
             if idx < g.board.footprints.len() {
+                let ref_des = g.board.footprints[idx].reference.clone();
+                if self.moving_footprint.is_none() {
+                    let ripped = g.board.rip_up_connected_traces_to_component(idx);
+                    if ripped > 0 {
+                        g.push_log(format!(
+                            "[RipUp] Ripped up {} connected trace/via element{} for {}",
+                            ripped,
+                            if ripped == 1 { "" } else { "s" },
+                            ref_des
+                        ));
+                    }
+                }
                 let fp = &mut g.board.footprints[idx];
                 fp.layer = 1 - fp.layer;
-                let ref_des = fp.reference.clone();
                 let layer_str = if fp.layer == 1 { "B.Cu (Bottom)" } else { "F.Cu (Top)" };
                 g.refresh_ratsnest();
                 g.push_log(format!("[Flip] Flipped {} to {}", ref_des, layer_str));
@@ -715,6 +737,30 @@ impl VulcansTrialsApp {
         let mf = self.moving_footprint.take()?;
         let shoved_count = {
             let mut g = self.live.lock().unwrap();
+            let moved = if mf.fp_index < g.board.footprints.len() {
+                let fp = &g.board.footprints[mf.fp_index];
+                (fp.x - mf.original_x).abs() > 1e-4
+                    || (fp.y - mf.original_y).abs() > 1e-4
+                    || (fp.rotation - mf.original_rotation).abs() > 1e-4
+                    || fp.layer != mf.original_layer
+            } else {
+                false
+            };
+            if moved {
+                let ref_des = g.board.footprints[mf.fp_index].reference.clone();
+                let ripped = g.board.rip_up_connected_traces_to_component_at(
+                    mf.fp_index,
+                    Some((mf.original_x, mf.original_y, mf.original_rotation, mf.original_layer)),
+                );
+                if ripped > 0 {
+                    g.push_log(format!(
+                        "[RipUp] Ripped up {} connected trace/via element{} for {}",
+                        ripped,
+                        if ripped == 1 { "" } else { "s" },
+                        ref_des
+                    ));
+                }
+            }
             let count = crate::placer::shove_overlapping_components(&mut g.board, mf.fp_index, self.min_spacing_mm);
             g.refresh_ratsnest();
             if mf.fp_index < g.board.footprints.len() {

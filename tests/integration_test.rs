@@ -1118,4 +1118,96 @@ fn test_u1_test_pcb_full_route_pad_centering_and_drc_clean() {
     }
 }
 
+#[test]
+fn test_rip_up_connected_traces_on_move_and_shove_e2e() {
+    use eframe::egui::{Pos2, Rect};
+    use vulcans_trials::board::{TrackSegment, Via};
+    use vulcans_trials::gui::VulcansTrialsApp;
+
+    let dir = temp_test_dir("rip_up_e2e");
+    let (pcb_path, _) = write_synthetic_project(&dir, false);
+    let mut board = Board::load(pcb_path.to_str().unwrap(), &HashSet::new()).unwrap();
+
+    // Find C5 (unlocked), R3 (unlocked), and R4 (unlocked)
+    let c5_idx = board.footprints.iter().position(|f| f.reference == "C5").unwrap();
+    let r3_idx = board.footprints.iter().position(|f| f.reference == "R3").unwrap();
+    let r4_idx = board.footprints.iter().position(|f| f.reference == "R4").unwrap();
+
+    let c5_pad_pos = board.footprints[c5_idx].pad_absolute_position(&board.footprints[c5_idx].pads[0]);
+    let r3_pad_pos = board.footprints[r3_idx].pad_absolute_position(&board.footprints[r3_idx].pads[0]);
+    let r4_pad_pos = board.footprints[r4_idx].pad_absolute_position(&board.footprints[r4_idx].pads[0]);
+
+    let net_id = board.footprints[c5_idx].pads[0].net_id;
+    board.footprints[r3_idx].pads[0].net_id = net_id;
+    board.footprints[r4_idx].pads[0].net_id = net_id;
+
+    // Connect C5 -> R3 via 2 tracks and 1 via
+    let mid_x = (c5_pad_pos.0 + r3_pad_pos.0) * 0.5;
+    let mid_y = (c5_pad_pos.1 + r3_pad_pos.1) * 0.5;
+    board.tracks.push(TrackSegment {
+        start: c5_pad_pos,
+        end: (mid_x, mid_y),
+        width: 0.20,
+        layer: 0,
+        net_id,
+        is_locked: false,
+    });
+    board.vias.push(Via {
+        position: (mid_x, mid_y),
+        size: 0.60,
+        drill: 0.30,
+        net_id,
+        is_locked: false,
+    });
+    board.tracks.push(TrackSegment {
+        start: (mid_x, mid_y),
+        end: r3_pad_pos,
+        width: 0.20,
+        layer: 1,
+        net_id,
+        is_locked: false,
+    });
+
+    // Connect R3 -> R4 via 1 track on layer 0
+    board.tracks.push(TrackSegment {
+        start: r3_pad_pos,
+        end: r4_pad_pos,
+        width: 0.20,
+        layer: 0,
+        net_id,
+        is_locked: false,
+    });
+
+    assert_eq!(board.tracks.len(), 3);
+    assert_eq!(board.vias.len(), 1);
+
+    let mut app = VulcansTrialsApp::new(
+        pcb_path.to_str().unwrap().to_string(),
+        String::new(),
+        board.clone(),
+        None,
+    );
+    let canvas_rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1000.0, 750.0));
+
+    // 1. Pick up C5
+    let (c5_screen, _) = app.board_to_screen(&board, canvas_rect, board.footprints[c5_idx].x, board.footprints[c5_idx].y);
+    assert!(app.pick_up_component_at(canvas_rect, c5_screen));
+
+    // 2. Drag C5 to a new location (e.g. +5mm in X and Y)
+    let (target_screen, _) = app.board_to_screen(&board, canvas_rect, board.footprints[c5_idx].x + 5.0, board.footprints[c5_idx].y + 5.0);
+    app.update_moving_component_pos(canvas_rect, target_screen);
+
+    // 3. Place C5
+    let shoved = app.place_moving_component();
+    assert!(shoved.is_some());
+
+    // 4. Verify C5 -> R3 trace (2 tracks and 1 via) was ripped up, while R3 -> R4 track remains intact!
+    let snap = app.live.lock().unwrap();
+    assert_eq!(snap.board.tracks.len(), 1);
+    assert_eq!(snap.board.vias.len(), 0);
+    assert_eq!(snap.board.tracks[0].start, r3_pad_pos);
+    assert_eq!(snap.board.tracks[0].end, r4_pad_pos);
+}
+
+
 

@@ -1425,6 +1425,274 @@ impl Board {
         (tracks_ripped, fps_cleared)
     }
 
+    /// Rips up all connected tracks and vias from the component at `fp_idx` all the way
+    /// to the next attached component(s).
+    pub fn rip_up_connected_traces_to_component(&mut self, fp_idx: usize) -> usize {
+        self.rip_up_connected_traces_to_component_at(fp_idx, None)
+    }
+
+    /// Rips up all connected tracks and vias from the component at `fp_idx` (optionally evaluated
+    /// at `pos_override: (x, y, rotation, layer)` prior to its move) all the way to the next
+    /// attached component(s).
+    pub fn rip_up_connected_traces_to_component_at(
+        &mut self,
+        fp_idx: usize,
+        pos_override: Option<(f64, f64, f64, usize)>,
+    ) -> usize {
+        if fp_idx >= self.footprints.len() || self.footprints[fp_idx].is_locked {
+            return 0;
+        }
+
+        let mut target_fp = self.footprints[fp_idx].clone();
+        if let Some((ox, oy, orot, olayer)) = pos_override {
+            target_fp.x = ox;
+            target_fp.y = oy;
+            target_fp.rotation = orot;
+            target_fp.layer = olayer;
+        }
+
+        let active_nets: HashSet<usize> = target_fp
+            .pads
+            .iter()
+            .map(|p| p.net_id)
+            .filter(|&nid| nid > 0)
+            .collect();
+
+        if active_nets.is_empty() {
+            return 0;
+        }
+
+        const EPS: f64 = 0.05;
+
+        let mut tracks_to_remove = HashSet::new();
+        let mut vias_to_remove = HashSet::new();
+
+        for &net_id in &active_nets {
+            let my_pads: Vec<&Pad> = target_fp.pads.iter().filter(|p| p.net_id == net_id).collect();
+            if my_pads.is_empty() {
+                continue;
+            }
+
+            let other_pads: Vec<(&Footprint, &Pad)> = self
+                .footprints
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| *idx != fp_idx)
+                .flat_map(|(_, fp)| fp.pads.iter().filter(|p| p.net_id == net_id).map(move |p| (fp, p)))
+                .collect();
+
+            let trk_indices: Vec<usize> = self
+                .tracks
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.net_id == net_id && !t.is_locked)
+                .map(|(i, _)| i)
+                .collect();
+
+            let via_indices: Vec<usize> = self
+                .vias
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.net_id == net_id && !v.is_locked)
+                .map(|(i, _)| i)
+                .collect();
+
+            if trk_indices.is_empty() && via_indices.is_empty() {
+                continue;
+            }
+
+            let touches_any_other_pad = |pt: (f64, f64), layer: Option<usize>| -> bool {
+                for &(ofp, op) in &other_pads {
+                    if let Some(l) = layer {
+                        if !op.is_through_hole && ofp.layer != l {
+                            continue;
+                        }
+                    }
+                    if crate::router::dist_point_to_pad(pt, ofp, op) < EPS {
+                        return true;
+                    }
+                }
+                false
+            };
+
+            let track_touches_my_pads = |t: &TrackSegment| -> bool {
+                for pad in &my_pads {
+                    if !pad.is_through_hole && target_fp.layer != t.layer {
+                        continue;
+                    }
+                    if crate::router::dist_point_to_pad(t.start, &target_fp, pad) < EPS
+                        || crate::router::dist_point_to_pad(t.end, &target_fp, pad) < EPS
+                        || crate::router::dist_segment_to_pad(t.start, t.end, &target_fp, pad) < EPS
+                    {
+                        return true;
+                    }
+                }
+                false
+            };
+
+            let via_touches_my_pads = |v: &Via| -> bool {
+                for pad in &my_pads {
+                    let (px, py) = target_fp.pad_absolute_position(pad);
+                    let pad_rad = pad.width.max(pad.height) * 0.5;
+                    if (v.position.0 - px).hypot(v.position.1 - py) <= pad_rad + v.size * 0.5 + EPS
+                        || crate::router::dist_point_to_pad(v.position, &target_fp, pad) <= v.size * 0.5 + EPS
+                    {
+                        return true;
+                    }
+                }
+                false
+            };
+
+            #[derive(Copy, Clone, PartialEq, Eq, Hash)]
+            enum Item {
+                Track(usize),
+                Via(usize),
+            }
+
+            let mut visited = HashSet::new();
+            let mut queue = std::collections::VecDeque::new();
+
+            for &ti in &trk_indices {
+                if track_touches_my_pads(&self.tracks[ti]) {
+                    visited.insert(Item::Track(ti));
+                    queue.push_back(Item::Track(ti));
+                }
+            }
+            for &vi in &via_indices {
+                if via_touches_my_pads(&self.vias[vi]) {
+                    visited.insert(Item::Via(vi));
+                    queue.push_back(Item::Via(vi));
+                }
+            }
+
+            while let Some(item) = queue.pop_front() {
+                match item {
+                    Item::Track(t_idx) => {
+                        let t = &self.tracks[t_idx];
+
+                        for &other_t_idx in &trk_indices {
+                            if other_t_idx == t_idx || visited.contains(&Item::Track(other_t_idx)) {
+                                continue;
+                            }
+                            let ot = &self.tracks[other_t_idx];
+                            if ot.layer != t.layer {
+                                continue;
+                            }
+                            let d = crate::router::dist_segment_to_segment(t.start, t.end, ot.start, ot.end);
+                            if d < EPS {
+                                let contact_pt = if (t.start.0 - ot.start.0).hypot(t.start.1 - ot.start.1) < EPS
+                                    || (t.start.0 - ot.end.0).hypot(t.start.1 - ot.end.1) < EPS
+                                    || crate::router::dist_point_to_segment(t.start, ot.start, ot.end) < EPS
+                                {
+                                    t.start
+                                } else if (t.end.0 - ot.start.0).hypot(t.end.1 - ot.end.1) < EPS
+                                    || (t.end.0 - ot.end.0).hypot(t.end.1 - ot.end.1) < EPS
+                                    || crate::router::dist_point_to_segment(t.end, ot.start, ot.end) < EPS
+                                {
+                                    t.end
+                                } else if crate::router::dist_point_to_segment(ot.start, t.start, t.end) < EPS {
+                                    ot.start
+                                } else if crate::router::dist_point_to_segment(ot.end, t.start, t.end) < EPS {
+                                    ot.end
+                                } else {
+                                    ((t.start.0 + t.end.0 + ot.start.0 + ot.end.0) * 0.25, (t.start.1 + t.end.1 + ot.start.1 + ot.end.1) * 0.25)
+                                };
+
+                                if !touches_any_other_pad(contact_pt, Some(t.layer)) {
+                                    visited.insert(Item::Track(other_t_idx));
+                                    queue.push_back(Item::Track(other_t_idx));
+                                }
+                            }
+                        }
+
+                        for &vi in &via_indices {
+                            if visited.contains(&Item::Via(vi)) {
+                                continue;
+                            }
+                            let v = &self.vias[vi];
+                            let d = crate::router::dist_point_to_segment(v.position, t.start, t.end);
+                            if d <= v.size * 0.5 + EPS {
+                                if !touches_any_other_pad(v.position, None) {
+                                    visited.insert(Item::Via(vi));
+                                    queue.push_back(Item::Via(vi));
+                                }
+                            }
+                        }
+                    }
+                    Item::Via(v_idx) => {
+                        let v = &self.vias[v_idx];
+
+                        for &ti in &trk_indices {
+                            if visited.contains(&Item::Track(ti)) {
+                                continue;
+                            }
+                            let t = &self.tracks[ti];
+                            let d = crate::router::dist_point_to_segment(v.position, t.start, t.end);
+                            if d <= v.size * 0.5 + EPS {
+                                if !touches_any_other_pad(v.position, None) {
+                                    visited.insert(Item::Track(ti));
+                                    queue.push_back(Item::Track(ti));
+                                }
+                            }
+                        }
+
+                        for &other_v_idx in &via_indices {
+                            if other_v_idx == v_idx || visited.contains(&Item::Via(other_v_idx)) {
+                                continue;
+                            }
+                            let ov = &self.vias[other_v_idx];
+                            let d = (v.position.0 - ov.position.0).hypot(v.position.1 - ov.position.1);
+                            if d <= (v.size + ov.size) * 0.5 + EPS {
+                                if !touches_any_other_pad(ov.position, None) {
+                                    visited.insert(Item::Via(other_v_idx));
+                                    queue.push_back(Item::Via(other_v_idx));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            for item in visited {
+                match item {
+                    Item::Track(ti) => {
+                        tracks_to_remove.insert(ti);
+                    }
+                    Item::Via(vi) => {
+                        vias_to_remove.insert(vi);
+                    }
+                }
+            }
+        }
+
+        let ripped_tracks_count = tracks_to_remove.len();
+        let ripped_vias_count = vias_to_remove.len();
+        let total_ripped = ripped_tracks_count + ripped_vias_count;
+
+        if total_ripped > 0 {
+            let mut new_tracks = Vec::with_capacity(self.tracks.len() - ripped_tracks_count);
+            for (idx, trk) in self.tracks.drain(..).enumerate() {
+                if !tracks_to_remove.contains(&idx) {
+                    new_tracks.push(trk);
+                }
+            }
+            self.tracks = new_tracks;
+
+            let mut new_vias = Vec::with_capacity(self.vias.len() - ripped_vias_count);
+            for (idx, v) in self.vias.drain(..).enumerate() {
+                if !vias_to_remove.contains(&idx) {
+                    new_vias.push(v);
+                }
+            }
+            self.vias = new_vias;
+
+            // Prune any residual dangling tracks and vias created by this rip-up
+            crate::router::prune_dangling_tracks_and_vias(self);
+        }
+
+        total_ripped
+    }
+
     /// Restores all components currently in the holding palette back onto the board.
     pub fn return_holding_palette_to_board(&mut self) -> usize {
         let count = self.holding_palette.len();
@@ -3693,6 +3961,397 @@ mod tests {
         let (_r_min_x, r_max_x, _r_min_y, r_max_y) = fp.origin_clamp_range(90.0, 0, spacing, &boundary);
         assert!(r_max_x < max_x); // Needs more room on the right
         assert!(r_max_y > max_y); // Needs less room at bottom
+    }
+
+    #[test]
+    fn test_rip_up_connected_traces_point_to_point() {
+        let mut board = Board::default();
+        board.nets = vec!["".to_string(), "NET_A".to_string()];
+
+        let fp_a = Footprint {
+            reference: "R1".to_string(),
+            value: "10k".to_string(),
+            x: 10.0,
+            y: 10.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: vec![Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "NET_A", false)],
+            width: 1.0,
+            height: 1.0,
+            courtyards: vec![],
+            perimeters: vec![],
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+
+        let fp_b = Footprint {
+            reference: "R2".to_string(),
+            value: "10k".to_string(),
+            x: 30.0,
+            y: 10.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: vec![Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "NET_A", false)],
+            width: 1.0,
+            height: 1.0,
+            courtyards: vec![],
+            perimeters: vec![],
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+
+        board.footprints.push(fp_a);
+        board.footprints.push(fp_b);
+
+        // 3 connected track segments: (10,10) -> (15,10) -> (25,10) -> (30,10)
+        board.tracks.push(TrackSegment {
+            start: (10.0, 10.0),
+            end: (15.0, 10.0),
+            width: 0.20,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+        board.tracks.push(TrackSegment {
+            start: (15.0, 10.0),
+            end: (25.0, 10.0),
+            width: 0.20,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+        board.tracks.push(TrackSegment {
+            start: (25.0, 10.0),
+            end: (30.0, 10.0),
+            width: 0.20,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+
+        assert_eq!(board.tracks.len(), 3);
+        // Move Footprint 0 (R1)
+        let ripped = board.rip_up_connected_traces_to_component(0);
+        assert_eq!(ripped, 3);
+        assert_eq!(board.tracks.len(), 0);
+    }
+
+    #[test]
+    fn test_rip_up_connected_traces_with_vias() {
+        let mut board = Board::default();
+        board.nets = vec!["".to_string(), "NET_A".to_string()];
+
+        let fp_a = Footprint {
+            reference: "R1".to_string(),
+            value: "10k".to_string(),
+            x: 10.0,
+            y: 10.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: vec![Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "NET_A", false)],
+            width: 1.0,
+            height: 1.0,
+            courtyards: vec![],
+            perimeters: vec![],
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+
+        let fp_b = Footprint {
+            reference: "R2".to_string(),
+            value: "10k".to_string(),
+            x: 30.0,
+            y: 10.0,
+            rotation: 0.0,
+            layer: 1, // On B.Cu
+            orig_layer: 1,
+            is_locked: false,
+            pads: vec![Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "NET_A", false)],
+            width: 1.0,
+            height: 1.0,
+            courtyards: vec![],
+            perimeters: vec![],
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+
+        board.footprints.push(fp_a);
+        board.footprints.push(fp_b);
+
+        // Track 1 on F.Cu: (10, 10) to (20, 10)
+        board.tracks.push(TrackSegment {
+            start: (10.0, 10.0),
+            end: (20.0, 10.0),
+            width: 0.20,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+        // Via at (20, 10)
+        board.vias.push(Via {
+            position: (20.0, 10.0),
+            size: 0.60,
+            drill: 0.30,
+            net_id: 1,
+            is_locked: false,
+        });
+        // Track 2 on B.Cu: (20, 10) to (30, 10)
+        board.tracks.push(TrackSegment {
+            start: (20.0, 10.0),
+            end: (30.0, 10.0),
+            width: 0.20,
+            layer: 1,
+            net_id: 1,
+            is_locked: false,
+        });
+
+        assert_eq!(board.tracks.len(), 2);
+        assert_eq!(board.vias.len(), 1);
+
+        let ripped = board.rip_up_connected_traces_to_component(0);
+        assert_eq!(ripped, 3);
+        assert_eq!(board.tracks.len(), 0);
+        assert_eq!(board.vias.len(), 0);
+    }
+
+    #[test]
+    fn test_rip_up_connected_traces_daisy_chain_barrier() {
+        let mut board = Board::default();
+        board.nets = vec!["".to_string(), "NET_A".to_string()];
+
+        let fp_a = Footprint {
+            reference: "R1".to_string(),
+            value: "10k".to_string(),
+            x: 10.0,
+            y: 10.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: vec![Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "NET_A", false)],
+            width: 1.0,
+            height: 1.0,
+            courtyards: vec![],
+            perimeters: vec![],
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+
+        let fp_b = Footprint {
+            reference: "R2".to_string(),
+            value: "10k".to_string(),
+            x: 20.0,
+            y: 10.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: vec![Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "NET_A", false)],
+            width: 1.0,
+            height: 1.0,
+            courtyards: vec![],
+            perimeters: vec![],
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+
+        let fp_c = Footprint {
+            reference: "R3".to_string(),
+            value: "10k".to_string(),
+            x: 30.0,
+            y: 10.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: vec![Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "NET_A", false)],
+            width: 1.0,
+            height: 1.0,
+            courtyards: vec![],
+            perimeters: vec![],
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+
+        board.footprints.push(fp_a);
+        board.footprints.push(fp_b);
+        board.footprints.push(fp_c);
+
+        // Track 1: A -> B
+        board.tracks.push(TrackSegment {
+            start: (10.0, 10.0),
+            end: (20.0, 10.0),
+            width: 0.20,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+        // Track 2: B -> C
+        board.tracks.push(TrackSegment {
+            start: (20.0, 10.0),
+            end: (30.0, 10.0),
+            width: 0.20,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+
+        assert_eq!(board.tracks.len(), 2);
+
+        // Moving Footprint 0 (R1) should ONLY rip up Track 1 (A -> B).
+        // Track 2 (B -> C) must remain intact!
+        let ripped = board.rip_up_connected_traces_to_component(0);
+        assert_eq!(ripped, 1);
+        assert_eq!(board.tracks.len(), 1);
+        assert_eq!(board.tracks[0].start, (20.0, 10.0));
+        assert_eq!(board.tracks[0].end, (30.0, 10.0));
+    }
+
+    #[test]
+    fn test_rip_up_connected_traces_with_pos_override() {
+        let mut board = Board::default();
+        board.nets = vec!["".to_string(), "NET_A".to_string()];
+
+        let mut fp_a = Footprint {
+            reference: "R1".to_string(),
+            value: "10k".to_string(),
+            x: 10.0,
+            y: 10.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: vec![Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "NET_A", false)],
+            width: 1.0,
+            height: 1.0,
+            courtyards: vec![],
+            perimeters: vec![],
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+
+        let fp_b = Footprint {
+            reference: "R2".to_string(),
+            value: "10k".to_string(),
+            x: 30.0,
+            y: 10.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: vec![Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "NET_A", false)],
+            width: 1.0,
+            height: 1.0,
+            courtyards: vec![],
+            perimeters: vec![],
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+
+        // Track connected to R1's original position at (10, 10)
+        board.tracks.push(TrackSegment {
+            start: (10.0, 10.0),
+            end: (30.0, 10.0),
+            width: 0.20,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+
+        // Simulate GUI dragging R1 to (15, 25)
+        fp_a.x = 15.0;
+        fp_a.y = 25.0;
+        board.footprints.push(fp_a);
+        board.footprints.push(fp_b);
+
+        // Calling rip up with pos_override of the original (10, 10) position
+        let ripped = board.rip_up_connected_traces_to_component_at(0, Some((10.0, 10.0, 0.0, 0)));
+        assert_eq!(ripped, 1);
+        assert_eq!(board.tracks.len(), 0);
+    }
+
+    #[test]
+    fn test_rip_up_connected_traces_locked_objects_preserved() {
+        let mut board = Board::default();
+        board.nets = vec!["".to_string(), "NET_A".to_string()];
+
+        let fp_a = Footprint {
+            reference: "R1".to_string(),
+            value: "10k".to_string(),
+            x: 10.0,
+            y: 10.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: true, // Locked component!
+            pads: vec![Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "NET_A", false)],
+            width: 1.0,
+            height: 1.0,
+            courtyards: vec![],
+            perimeters: vec![],
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+
+        let fp_b = Footprint {
+            reference: "R2".to_string(),
+            value: "10k".to_string(),
+            x: 30.0,
+            y: 10.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: vec![Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "NET_A", false)],
+            width: 1.0,
+            height: 1.0,
+            courtyards: vec![],
+            perimeters: vec![],
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+
+        board.footprints.push(fp_a);
+        board.footprints.push(fp_b);
+
+        board.tracks.push(TrackSegment {
+            start: (10.0, 10.0),
+            end: (30.0, 10.0),
+            width: 0.20,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+
+        // Locked component returns 0 and does not rip up tracks
+        let ripped = board.rip_up_connected_traces_to_component(0);
+        assert_eq!(ripped, 0);
+        assert_eq!(board.tracks.len(), 1);
+
+        // Unlock footprint but lock track
+        board.footprints[0].is_locked = false;
+        board.tracks[0].is_locked = true;
+
+        let ripped = board.rip_up_connected_traces_to_component(0);
+        assert_eq!(ripped, 0);
+        assert_eq!(board.tracks.len(), 1);
     }
 }
 
