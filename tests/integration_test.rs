@@ -1119,6 +1119,31 @@ fn test_u1_test_pcb_full_route_pad_centering_and_drc_clean() {
 }
 
 #[test]
+fn test_u1_test_pcb_can_be_fully_routed() {
+    let board_path = "tests/boards/u1_test.kicad_pcb";
+    let locked_refs: HashSet<String> = [
+        "U1", "C1", "C2", "C3", "C4", "C5", "C6", "R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "J1",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    let mut board = Board::load(board_path, &locked_refs).expect("Failed to load u1_test.kicad_pcb");
+    assert_eq!(board.footprints.len(), 16);
+    let vulkan = VulkanEngine::new();
+    let mut grid = RoutingGrid::new(&board, 0.10, vulkan).with_inner_layer_penalty(8.0);
+    let router = AutoRouter::new(15).with_inner_layer_penalty(8.0);
+    let (routed, total) = router.route_all(&mut board, &mut grid, None, Arc::new(AtomicBool::new(false)));
+
+    assert!(total > 0, "U1 test board must have connections to route");
+    assert_eq!(
+        routed, total,
+        "U1 test PCB must be 100% fully routed (routed {}/{} connections)",
+        routed, total
+    );
+}
+
+#[test]
 fn test_rip_up_connected_traces_on_move_and_shove_e2e() {
     use eframe::egui::{Pos2, Rect};
     use vulcans_trials::board::{TrackSegment, Via};

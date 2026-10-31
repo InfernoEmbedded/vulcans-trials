@@ -413,14 +413,18 @@ impl RoutingGrid {
                                     break 'via_check;
                                 }
                             }
-                            if self.smd_pad_cells[c_idx] && c_net != target_net_id as i32 {
+                            if self.smd_pad_cells[c_idx] {
                                 let obst_c = if c_net > 0 && (c_net as usize) < self.net_clearances.len() {
                                     self.net_clearances[c_net as usize]
                                 } else {
                                     req_clearance
                                 };
-                                let eff_c = (via_dia / 2.0) + obst_half_w + req_clearance.max(obst_c) + 0.025;
-                                if d_sq < eff_c.powi(2) + 1e-6 {
+                                let eff_c = if c_net == target_net_id as i32 {
+                                    via_dia / 2.0
+                                } else {
+                                    (via_dia / 2.0) + obst_half_w + req_clearance.max(obst_c) + 0.025
+                                };
+                                if d_sq < eff_c.powi(2) - 1e-6 {
                                     via_clearance_violation = true;
                                     break 'via_check;
                                 }
@@ -3896,23 +3900,17 @@ impl AutoRouter {
                         continue;
                     }
                     let (px, py) = fp.pad_absolute_position(pad);
-                    let dir_inward_x = if (fp.x - px).abs() > 0.1 {
+                    let local_norm_x = if pad.offset_x.abs() > 0.1 {
+                        -pad.offset_x.signum()
+                    } else if (fp.x - px).abs() > 0.1 {
                         (fp.x - px).signum()
                     } else {
                         -1.0
                     };
-                    let dir_outward_x = -dir_inward_x;
-                    let inward_tip = (px + dir_inward_x * 1.35, py);
-                    let via_safe = !board.footprints.iter().any(|other_fp| {
-                        other_fp.pads.iter().any(|other_pad| {
-                            if other_pad.net_id == pad.net_id {
-                                return false;
-                            }
-                            let (opx, opy) = other_fp.pad_absolute_position(other_pad);
-                            let eff_clearance = 0.30 + 0.20 + 0.35;
-                            (opx - inward_tip.0).hypot(opy - inward_tip.1) < eff_clearance
-                        })
-                    });
+                    let world_inward = Point::new(local_norm_x, 0.0).rotate_ccw(fp.rotation);
+                    let inward_tip = (px + world_inward.x * 1.35, py + world_inward.y * 1.35);
+                    let outward_tip = (px - world_inward.x * 1.35, py - world_inward.y * 1.35);
+                    let via_safe = is_via_location_legal(board, inward_tip, 0.60, pad.net_id, 0.15);
 
                     let is_b_side = pad.number.starts_with('B') && fp.pads.len() >= 8 && via_safe;
                     let (tip, via, tip_layer) = if is_b_side {
@@ -3925,8 +3923,7 @@ impl AutoRouter {
                         };
                         (inward_tip, Some(v), 1)
                     } else {
-                        let tip_pos = (px + dir_outward_x * 1.35, py);
-                        (tip_pos, None, fp.layer)
+                        (outward_tip, None, fp.layer)
                     };
                     stubs.push(EscapeStub {
                         net_id: pad.net_id,
@@ -4196,7 +4193,7 @@ impl AutoRouter {
 
                     if !has_near_via && !has_near_pth {
                         if let Some((vx, vy)) =
-                            Self::find_safe_gnd_via_location(board, grid, gnd_net_id, px, py, fp.layer, &added_via_positions)
+                            Self::find_safe_gnd_via_location(board, grid, gnd_net_id, px, py, fp.layer, pad, &added_via_positions)
                         {
                             board.tracks.push(TrackSegment {
                                 start: (px, py),
@@ -4228,24 +4225,45 @@ impl AutoRouter {
         px: f64,
         py: f64,
         layer: usize,
+        pad: &Pad,
         existing_vias: &[(f64, f64)],
     ) -> Option<(f64, f64)> {
+        let pad_dim = pad.width.max(pad.height);
+        let min_d = (pad_dim * 0.5) + 0.35;
+        let d0 = 0.85;
+        let d1 = min_d.max(0.85);
+        let d2 = d1 + 0.25;
+        let d3 = d1 + 0.50;
+        let d4 = d1 + 0.75;
+
         let offsets = [
-            (0.0, 0.85),
-            (0.0, -0.85),
-            (0.85, 0.0),
-            (-0.85, 0.0),
-            (0.65, 0.65),
-            (-0.65, 0.65),
-            (0.65, -0.65),
-            (-0.65, -0.65),
-            (0.0, 1.10),
-            (0.0, -1.10),
-            (1.10, 0.0),
-            (-1.10, 0.0),
+            (0.0, d0),
+            (0.0, -d0),
+            (d0, 0.0),
+            (-d0, 0.0),
+            (0.0, d1),
+            (0.0, -d1),
+            (d1, 0.0),
+            (-d1, 0.0),
+            (0.0, d2),
+            (0.0, -d2),
+            (d2, 0.0),
+            (-d2, 0.0),
+            (d1 * 0.7071, d1 * 0.7071),
+            (-d1 * 0.7071, d1 * 0.7071),
+            (d1 * 0.7071, -d1 * 0.7071),
+            (-d1 * 0.7071, -d1 * 0.7071),
+            (0.0, d3),
+            (0.0, -d3),
+            (d3, 0.0),
+            (-d3, 0.0),
+            (0.0, d4),
+            (0.0, -d4),
+            (d4, 0.0),
+            (-d4, 0.0),
         ];
 
-        let via_r = 0.50;
+        let via_r = 0.35;
         let r_cells = (via_r / grid.res).ceil() as isize;
 
         for (dx, dy) in offsets {
@@ -5924,7 +5942,9 @@ pub fn dist_point_to_pad(pt: (f64, f64), fp: &Footprint, pad: &Pad) -> f64 {
         let d = (pt.0 - px).hypot(pt.1 - py);
         return (d - r).max(0.0);
     }
-    let total_rot = ((fp.rotation + pad.rotation) % 360.0 + 360.0) % 360.0;
+    let flipped = fp.layer != fp.orig_layer;
+    let pad_rot = if flipped { -pad.rotation } else { pad.rotation };
+    let total_rot = ((fp.rotation + pad_rot) % 360.0 + 360.0) % 360.0;
     let rad = (-total_rot).to_radians();
     let rx = pt.0 - px;
     let ry = pt.1 - py;
@@ -5932,9 +5952,25 @@ pub fn dist_point_to_pad(pt: (f64, f64), fp: &Footprint, pad: &Pad) -> f64 {
     let ly = rx * rad.sin() + ry * rad.cos();
     let hw = pad.width * 0.5;
     let hh = pad.height * 0.5;
-    let dx = (lx.abs() - hw).max(0.0);
-    let dy = (ly.abs() - hh).max(0.0);
-    dx.hypot(dy)
+
+    if pad.shape == "oval" {
+        let r = hw.min(hh);
+        if hw >= hh {
+            let cap_dx = hw - r;
+            let clamped_x = lx.clamp(-cap_dx, cap_dx);
+            let d = (lx - clamped_x).hypot(ly);
+            (d - r).max(0.0)
+        } else {
+            let cap_dy = hh - r;
+            let clamped_y = ly.clamp(-cap_dy, cap_dy);
+            let d = lx.hypot(ly - clamped_y);
+            (d - r).max(0.0)
+        }
+    } else {
+        let dx = (lx.abs() - hw).max(0.0);
+        let dy = (ly.abs() - hh).max(0.0);
+        dx.hypot(dy)
+    }
 }
 
 /// Computes the minimum distance from line segment `(s, e)` to the copper area of `pad`.
@@ -5945,7 +5981,9 @@ pub fn dist_segment_to_pad(s: (f64, f64), e: (f64, f64), fp: &Footprint, pad: &P
         let d = dist_point_to_segment((px, py), s, e);
         return (d - r).max(0.0);
     }
-    let total_rot = ((fp.rotation + pad.rotation) % 360.0 + 360.0) % 360.0;
+    let flipped = fp.layer != fp.orig_layer;
+    let pad_rot = if flipped { -pad.rotation } else { pad.rotation };
+    let total_rot = ((fp.rotation + pad_rot) % 360.0 + 360.0) % 360.0;
     let rad = (-total_rot).to_radians();
     let cos_r = rad.cos();
     let sin_r = rad.sin();
@@ -5989,7 +6027,8 @@ pub fn dist_segment_to_pad(s: (f64, f64), e: (f64, f64), fp: &Footprint, pad: &P
 }
 
 /// Verifies whether candidate via location `pos` is completely legal and clearance-free
-/// against all foreign pads, tracks, vias, board boundary, and keepouts.
+/// against all foreign pads, tracks, vias, board boundary, and keepouts, as well as
+/// preventing overlapping or violating clearance against same-net SMD pads.
 pub fn is_via_location_legal(
     board: &Board,
     pos: (f64, f64),
@@ -6012,13 +6051,18 @@ pub fn is_via_location_legal(
         }
     }
 
-    // 3. Foreign pads (through-hole on all layers, SMD on any layer since TH via passes through)
+    // 3. Footprint pads (foreign pads on all layers, including net 0; and same-net SMD pads)
     for fp in &board.footprints {
         for pad in &fp.pads {
-            if pad.net_id != net_id && pad.net_id != 0 {
+            let d = dist_point_to_pad(pos, fp, pad);
+            if pad.net_id != net_id {
                 let pad_c = clearance.max(board.get_netclass_for_net(pad.net_id).clearance).max(0.12);
-                let d = dist_point_to_pad(pos, fp, pad);
                 if d < via_r + pad_c - 1e-4 {
+                    return false;
+                }
+            } else if !pad.is_through_hole {
+                // Same-net SMD pad: via must NEVER overlap pad copper
+                if d < via_r - 1e-4 {
                     return false;
                 }
             }
@@ -6112,10 +6156,10 @@ pub fn is_track_segment_legal(
         }
     }
 
-    // 3. Foreign pads (SMD on same layer, through-hole on all layers)
+    // 3. Foreign pads (SMD on same layer, through-hole on all layers, including net 0)
     for fp in &board.footprints {
         for pad in &fp.pads {
-            if pad.net_id != net_id && pad.net_id != 0 {
+            if pad.net_id != net_id {
                 if pad.is_through_hole || fp.layer == layer {
                     let pad_c = clearance.max(board.get_netclass_for_net(pad.net_id).clearance).max(0.12);
                     let d = dist_segment_to_pad(start, end, fp, pad);
@@ -6519,7 +6563,7 @@ pub fn validate_and_clean_copper(board: &mut Board) {
 
             for fp in &board.footprints {
                 for pad in &fp.pads {
-                    if pad.net_id != t1.net_id && pad.net_id != 0 {
+                    if pad.net_id != t1.net_id {
                         if pad.is_through_hole || fp.layer == t1.layer {
                             let pad_c = req_c1.max(board.get_netclass_for_net(pad.net_id).clearance).max(0.12);
                             let min_dist = t1.width * 0.5 + pad_c;
@@ -6563,10 +6607,16 @@ pub fn validate_and_clean_copper(board: &mut Board) {
 
             for fp in &board.footprints {
                 for pad in &fp.pads {
-                    if pad.net_id != v1.net_id && pad.net_id != 0 {
+                    let d = dist_point_to_pad(v1.position, fp, pad);
+                    if pad.net_id != v1.net_id {
                         let pad_c = req_c1.max(board.get_netclass_for_net(pad.net_id).clearance).max(0.12);
                         let min_dist = v1.size * 0.5 + pad_c;
-                        let d = dist_point_to_pad(v1.position, fp, pad);
+                        if d < min_dist - 1e-4 {
+                            bad_via_indices.insert(i);
+                            break;
+                        }
+                    } else if !pad.is_through_hole {
+                        let min_dist = v1.size * 0.5;
                         if d < min_dist - 1e-4 {
                             bad_via_indices.insert(i);
                             break;
@@ -8429,6 +8479,59 @@ mod tests {
         });
         validate_and_clean_copper(&mut board);
         assert!(board.vias.is_empty(), "Colliding via must be eliminated by validate_and_clean_copper");
+
+        // 7. Same-net SMD pad clearance test:
+        // Candidate via of net 1 directly on top of net 1 SMD pad at (10.0, 10.0) -> MUST be illegal!
+        assert!(
+            !is_via_location_legal(&board, (10.0, 10.0), via_dia, 1, clearance),
+            "Via must never be legal overlapping its own net SMD pad"
+        );
+        // Candidate via of net 1 within clearance of net 1 SMD pad at (10.0, 10.45) -> MUST be illegal!
+        assert!(
+            !is_via_location_legal(&board, (10.0, 10.45), via_dia, 1, clearance),
+            "Via must never be legal violating clearance against its own net SMD pad"
+        );
+        // Candidate via of net 1 safely outside clearance at (10.0, 10.80) -> legal
+        assert!(
+            is_via_location_legal(&board, (10.0, 10.80), via_dia, 1, clearance),
+            "Via safely outside clearance of its own net SMD pad should be legal"
+        );
+
+        // 8. validate_and_clean_copper eliminates via overlapping same-net SMD pad
+        board.vias.push(Via {
+            position: (10.0, 10.0), // Collision with same-net SMD pad!
+            size: 0.60,
+            drill: 0.30,
+            net_id: 1,
+            is_locked: false,
+        });
+        validate_and_clean_copper(&mut board);
+        assert!(board.vias.is_empty(), "Same-net SMD pad colliding via must be eliminated by validate_and_clean_copper");
+
+        // 9. Net 0 unconnected pad clearance test
+        let mut board_nc = board.clone();
+        board_nc.footprints.push(make_fp("U2", 30.0, 30.0, false, vec![Pad::new("1", 0.0, 0.0, 0.60, 0.60, 0, "", false)]));
+        assert!(
+            !is_via_location_legal(&board_nc, (30.0, 30.0), via_dia, 1, clearance),
+            "Via must never be legal overlapping an unconnected net 0 pad"
+        );
+
+        // 10. Oval pad and flipped footprint clearance test
+        let mut board_oval = board.clone();
+        let mut oval_pad = Pad::new("1", 0.0, 0.0, 1.45, 0.30, 1, "SIG1", false);
+        oval_pad.shape = "oval".to_string();
+        oval_pad.rotation = 90.0;
+        let mut fp_flipped = make_fp("J2", 25.0, 25.0, false, vec![oval_pad]);
+        fp_flipped.layer = 1; // Flipped to B.Cu
+        fp_flipped.orig_layer = 0;
+        board_oval.footprints.push(fp_flipped);
+
+        // Candidate via directly on oval pad
+        assert!(!is_via_location_legal(&board_oval, (25.0, 25.0), via_dia, 1, clearance));
+        // Candidate via right at edge of oval pad
+        assert!(!is_via_location_legal(&board_oval, (25.0, 25.50), via_dia, 1, clearance));
+        // Candidate via safely away from flipped oval pad
+        assert!(is_via_location_legal(&board_oval, (25.0, 27.0), via_dia, 1, clearance));
     }
 }
 
