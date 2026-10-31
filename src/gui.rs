@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
-use crate::board::{Board, LiveTrialState, Point, Polygon, TrialPhase};
+use crate::board::{Board, LiveTrialState, Point, Polygon, TrackSegment, TrialPhase, Via};
 use crate::placer::{run_auto_placer, PlacementConfig};
 use crate::router::{AutoRouter, RoutingGrid};
 use crate::vulkan::{SystemTelemetry, VulkanEngine};
@@ -102,6 +102,72 @@ pub fn copper_layers_draw_order<'a>(active_layers: &[&'a str]) -> Vec<&'a str> {
     order
 }
 
+/// KiCad-standard 45° dogleg corner computation.
+/// When `diagonal_first` is false: straight horizontal/vertical segment first, then 45° diagonal to p1.
+/// When `diagonal_first` is true: 45° diagonal segment first, then straight horizontal/vertical to p1.
+pub fn compute_45_dogleg(p0: (f64, f64), p1: (f64, f64), diagonal_first: bool) -> Vec<(f64, f64)> {
+    let dx = p1.0 - p0.0;
+    let dy = p1.1 - p0.1;
+    let abs_dx = dx.abs();
+    let abs_dy = dy.abs();
+
+    if abs_dx < 1e-6 && abs_dy < 1e-6 {
+        return vec![p0];
+    }
+
+    let sign_x = if dx >= 0.0 { 1.0 } else { -1.0 };
+    let sign_y = if dy >= 0.0 { 1.0 } else { -1.0 };
+
+    let corner = if abs_dx > abs_dy {
+        // Dominant direction: horizontal
+        if diagonal_first {
+            (p0.0 + sign_x * abs_dy, p1.1)
+        } else {
+            (p1.0 - sign_x * abs_dy, p0.1)
+        }
+    } else {
+        // Dominant direction: vertical (or equal)
+        if diagonal_first {
+            (p1.0, p0.1 + sign_y * abs_dx)
+        } else {
+            (p0.0, p1.1 - sign_y * abs_dx)
+        }
+    };
+
+    let dist_to_p0 = (corner.0 - p0.0).hypot(corner.1 - p0.1);
+    let dist_to_p1 = (corner.0 - p1.0).hypot(corner.1 - p1.1);
+
+    if dist_to_p0 < 1e-6 || dist_to_p1 < 1e-6 {
+        vec![p0, p1]
+    } else {
+        vec![p0, corner, p1]
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ActiveRoute {
+    pub net_id: usize,
+    pub net_name: String,
+    pub current_layer: usize,
+    pub track_width: f64,
+    pub via_dia: f64,
+    pub via_drill: f64,
+    pub anchor_points: Vec<(f64, f64, usize)>, // (x, y, layer)
+    pub posture_diagonal_first: bool,          // toggleable via '/'
+    pub vias_placed: Vec<Via>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HoveredCopperItem {
+    pub net_id: usize,
+    pub net_name: String,
+    pub layer: usize,
+    pub snap_pos: (f64, f64),
+    pub is_pad: bool,
+    pub is_via: bool,
+    pub is_track: bool,
+}
+
 pub struct VulcansTrialsApp {
     pub input_path: String,
     pub output_path: String,
@@ -144,6 +210,8 @@ pub struct VulcansTrialsApp {
     pub selected_net: Option<String>,
     pub moving_footprint: Option<MovingFootprint>,
     pub hovered_footprint: Option<usize>,
+    pub active_route: Option<ActiveRoute>,
+    pub route_tool_active: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -204,6 +272,8 @@ impl VulcansTrialsApp {
             selected_net: None,
             moving_footprint: None,
             hovered_footprint: None,
+            active_route: None,
+            route_tool_active: false,
         }
     }
 
@@ -802,6 +872,289 @@ impl VulcansTrialsApp {
         false
     }
 
+    /// Locates any pad, via, or track at the given screen `pos`.
+    pub fn find_copper_item_at(&self, board: &Board, rect: Rect, pos: Pos2) -> Option<HoveredCopperItem> {
+        // 1. Check pads
+        for fp in &board.footprints {
+            for pad in &fp.pads {
+                if self.is_point_in_pad(board, rect, fp, pad, pos) {
+                    let (px, py) = fp.pad_absolute_position(pad);
+                    let layer = if pad.is_through_hole { 0 } else { fp.layer };
+                    let net_name = pad.net_name.clone();
+                    let net_id = if pad.net_id != 0 {
+                        pad.net_id
+                    } else {
+                        board.net_name_to_id.get(&net_name).copied().unwrap_or(0)
+                    };
+                    if !net_name.is_empty() && net_id != 0 {
+                        return Some(HoveredCopperItem {
+                            net_id,
+                            net_name,
+                            layer,
+                            snap_pos: (px, py),
+                            is_pad: true,
+                            is_via: false,
+                            is_track: false,
+                        });
+                    }
+                }
+            }
+        }
+
+        let (_, scale) = self.board_to_screen(board, rect, board.min_x, board.min_y);
+
+        // 2. Check vias
+        for via in &board.vias {
+            let (v_pos, _) = self.board_to_screen(board, rect, via.position.0, via.position.1);
+            let hit_r = ((via.size as f32) * 0.5 * scale).max(5.0);
+            if v_pos.distance(pos) <= hit_r {
+                let net_name = board.nets.get(via.net_id).cloned().unwrap_or_default();
+                if !net_name.is_empty() && via.net_id != 0 {
+                    return Some(HoveredCopperItem {
+                        net_id: via.net_id,
+                        net_name,
+                        layer: 0,
+                        snap_pos: via.position,
+                        is_pad: false,
+                        is_via: true,
+                        is_track: false,
+                    });
+                }
+            }
+        }
+
+        // 3. Check tracks
+        for tr in &board.tracks {
+            let p1 = self.board_to_screen(board, rect, tr.start.0, tr.start.1).0;
+            let p2 = self.board_to_screen(board, rect, tr.end.0, tr.end.1).0;
+            let v = p2 - p1;
+            let len_sq = v.length_sq();
+            let t = if len_sq < 1e-4 {
+                0.0
+            } else {
+                ((pos - p1).dot(v) / len_sq).clamp(0.0, 1.0)
+            };
+            let proj = p1 + v * t;
+            let hit_thresh = ((tr.width as f32) * 0.5 * scale).max(4.0);
+            if pos.distance(proj) <= hit_thresh {
+                let world_t = t as f64;
+                let wx = tr.start.0 + (tr.end.0 - tr.start.0) * world_t;
+                let wy = tr.start.1 + (tr.end.1 - tr.start.1) * world_t;
+                let net_name = board.nets.get(tr.net_id).cloned().unwrap_or_default();
+                if !net_name.is_empty() && tr.net_id != 0 {
+                    return Some(HoveredCopperItem {
+                        net_id: tr.net_id,
+                        net_name,
+                        layer: tr.layer,
+                        snap_pos: (wx, wy),
+                        is_pad: false,
+                        is_via: false,
+                        is_track: true,
+                    });
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Initiates interactive track routing at `pos`.
+    pub fn start_route_at(&mut self, rect: Rect, pos: Pos2) -> bool {
+        if self.worker_running.load(Ordering::Relaxed) {
+            return false;
+        }
+        let snap = self.live.lock().unwrap().clone();
+        let b = &snap.board;
+        if let Some(item) = self.find_copper_item_at(b, rect, pos) {
+            if item.net_id != 0 && !item.net_name.is_empty() {
+                let (track_width, via_dia, via_drill) = if let Some(nc) = b.netclasses.get(
+                    b.net_to_class.get(&item.net_name).unwrap_or(&"Default".to_string()),
+                ) {
+                    (nc.track_width, nc.via_dia, nc.via_drill)
+                } else if let Some(nc) = b.netclasses.get("Default") {
+                    (nc.track_width, nc.via_dia, nc.via_drill)
+                } else {
+                    (0.25, 0.8, 0.4)
+                };
+
+                let layer_name = b.layer_name(item.layer);
+                let mut g = self.live.lock().unwrap();
+                g.push_log(format!(
+                    "[Route] Started routing Net '{}' on {} at ({:.2}, {:.2})",
+                    item.net_name, layer_name, item.snap_pos.0, item.snap_pos.1
+                ));
+                drop(g);
+
+                self.active_route = Some(ActiveRoute {
+                    net_id: item.net_id,
+                    net_name: item.net_name,
+                    current_layer: item.layer,
+                    track_width,
+                    via_dia,
+                    via_drill,
+                    anchor_points: vec![(item.snap_pos.0, item.snap_pos.1, item.layer)],
+                    posture_diagonal_first: false,
+                    vias_placed: Vec::new(),
+                });
+                self.route_tool_active = true;
+                return true;
+            }
+        }
+        self.route_tool_active = true;
+        false
+    }
+
+    /// Places a through-hole via at `via_pt`, anchors segment to the via, and transitions layer.
+    pub fn place_via_and_switch_layer(&mut self, via_pt: (f64, f64)) {
+        if let Some(ref mut route) = self.active_route {
+            let p0 = *route.anchor_points.last().unwrap();
+            let dogleg = compute_45_dogleg((p0.0, p0.1), via_pt, route.posture_diagonal_first);
+            if dogleg.len() == 3 {
+                route.anchor_points.push((dogleg[1].0, dogleg[1].1, route.current_layer));
+                route.anchor_points.push((via_pt.0, via_pt.1, route.current_layer));
+            } else if dogleg.len() == 2 {
+                route.anchor_points.push((via_pt.0, via_pt.1, route.current_layer));
+            }
+
+            if !route.vias_placed.iter().any(|v| (v.position.0 - via_pt.0).hypot(v.position.1 - via_pt.1) < 1e-4) {
+                route.vias_placed.push(Via {
+                    position: via_pt,
+                    size: route.via_dia,
+                    drill: route.via_drill,
+                    net_id: route.net_id,
+                    is_locked: false,
+                });
+            }
+
+            let num_layers = {
+                let g = self.live.lock().unwrap();
+                g.board.copper_layers().len().max(2)
+            };
+            let new_layer = if num_layers == 2 {
+                1 - route.current_layer
+            } else {
+                (route.current_layer + 1) % num_layers
+            };
+            route.current_layer = new_layer;
+            route.anchor_points.push((via_pt.0, via_pt.1, new_layer));
+
+            let layer_name = self.live.lock().unwrap().board.layer_name(new_layer);
+            self.set_layer_visible(layer_name, true);
+            self.live.lock().unwrap().push_log(format!(
+                "[Route] Placed via at ({:.2}, {:.2}), switched to layer {}",
+                via_pt.0, via_pt.1, layer_name
+            ));
+        }
+    }
+
+    /// Anchors the intermediate dogleg corner and current point to `anchor_points`.
+    pub fn anchor_route_at(&mut self, pt: (f64, f64)) {
+        if let Some(ref mut route) = self.active_route {
+            let p0 = *route.anchor_points.last().unwrap();
+            let dogleg = compute_45_dogleg((p0.0, p0.1), pt, route.posture_diagonal_first);
+            if dogleg.len() == 3 {
+                route.anchor_points.push((dogleg[1].0, dogleg[1].1, route.current_layer));
+                route.anchor_points.push((pt.0, pt.1, route.current_layer));
+            } else if dogleg.len() == 2 {
+                route.anchor_points.push((pt.0, pt.1, route.current_layer));
+            }
+        }
+    }
+
+    /// Commits an in-progress route ending at `target_pt` to the board tracks and vias.
+    pub fn finish_route_at(&mut self, target_pt: (f64, f64)) -> bool {
+        if let Some(route) = self.active_route.take() {
+            let p0 = *route.anchor_points.last().unwrap();
+            let dogleg = compute_45_dogleg((p0.0, p0.1), target_pt, route.posture_diagonal_first);
+            let mut all_points = route.anchor_points.clone();
+            if dogleg.len() == 3 {
+                all_points.push((dogleg[1].0, dogleg[1].1, route.current_layer));
+                all_points.push((target_pt.0, target_pt.1, route.current_layer));
+            } else if dogleg.len() == 2 {
+                all_points.push((target_pt.0, target_pt.1, route.current_layer));
+            }
+
+            let mut added_tracks = 0;
+            let mut g = self.live.lock().unwrap();
+            for i in 0..(all_points.len().saturating_sub(1)) {
+                let p_a = all_points[i];
+                let p_b = all_points[i + 1];
+                if (p_a.0 - p_b.0).hypot(p_a.1 - p_b.1) > 1e-5 {
+                    g.board.tracks.push(TrackSegment {
+                        start: (p_a.0, p_a.1),
+                        end: (p_b.0, p_b.1),
+                        width: route.track_width,
+                        layer: p_a.2,
+                        net_id: route.net_id,
+                        is_locked: false,
+                    });
+                    added_tracks += 1;
+                }
+            }
+            let added_vias = route.vias_placed.len();
+            g.board.vias.extend(route.vias_placed);
+            g.refresh_ratsnest();
+            g.push_log(format!(
+                "[Route] Committed route for net '{}': {} tracks, {} vias",
+                route.net_name, added_tracks, added_vias
+            ));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Cancels in-progress route or exits route mode.
+    pub fn cancel_route(&mut self) -> bool {
+        if self.active_route.is_some() {
+            self.active_route = None;
+            let mut g = self.live.lock().unwrap();
+            g.push_log("[Route] Cancelled in-progress route");
+            true
+        } else if self.route_tool_active {
+            self.route_tool_active = false;
+            let mut g = self.live.lock().unwrap();
+            g.push_log("[Route] Exited route mode");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Handles a left click when routing is active.
+    pub fn handle_active_route_click(&mut self, rect: Rect, click_pos: Pos2) {
+        let snap = self.live.lock().unwrap().clone();
+        let b = &snap.board;
+        let grid = if self.grid_res_mm > 0.001 { self.grid_res_mm } else { 0.10 };
+        let world_pt = self.screen_to_board(b, rect, click_pos);
+        let mut snapped_pt = ((world_pt.x / grid).round() * grid, (world_pt.y / grid).round() * grid);
+
+        let copper_item = self.find_copper_item_at(b, rect, click_pos);
+        let active_net_id = self.active_route.as_ref().map(|r| r.net_id);
+        let active_net_name = self.active_route.as_ref().map(|r| r.net_name.clone());
+
+        if let (Some(route_net_id), Some(item)) = (active_net_id, copper_item) {
+            if item.net_id == route_net_id {
+                // Target is of the same net: finish and commit!
+                if item.is_pad || item.is_via {
+                    snapped_pt = item.snap_pos;
+                }
+                self.finish_route_at(snapped_pt);
+            } else if item.net_id != 0 {
+                // Foreign net: disallow / reject
+                let mut g = self.live.lock().unwrap();
+                g.push_log(format!(
+                    "[Route] Cannot connect net '{}' to foreign net '{}'",
+                    active_net_name.as_deref().unwrap_or(""), item.net_name
+                ));
+            } else {
+                self.anchor_route_at(snapped_pt);
+            }
+        } else {
+            self.anchor_route_at(snapped_pt);
+        }
+    }
+
     pub fn render_ui(&mut self, ctx: &egui::Context) {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
 
@@ -853,6 +1206,29 @@ impl VulcansTrialsApp {
                 ui.add_space(4.0);
                 ui.heading("Controls");
 
+                if let Some(ref route) = self.active_route {
+                    let layer_name = snap.board.layer_name(route.current_layer);
+                    ui.group(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Routing Net '{}' on {} | [L-Click] Anchor/Finish | [V] Via | [/] Posture | [Esc] Cancel",
+                                route.net_name, layer_name
+                            ))
+                            .color(Color32::from_rgb(255, 220, 80))
+                            .strong(),
+                        );
+                    });
+                    ui.add_space(2.0);
+                } else if self.route_tool_active {
+                    ui.group(|ui| {
+                        ui.label(
+                            egui::RichText::new("Route Mode Active | Click pad, via, or track to start [Esc to exit]")
+                                .color(Color32::from_rgb(100, 220, 255)),
+                        );
+                    });
+                    ui.add_space(2.0);
+                }
+
                 ui.horizontal(|ui| {
                     ui.label("Input PCB:");
                     ui.text_edit_singleline(&mut self.input_path);
@@ -888,6 +1264,24 @@ impl VulcansTrialsApp {
                             "[Clear] Ripped up {} unlocked tracks/vias; moved {} components to Holding Palette",
                             ripped, cleared
                         ));
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    let route_btn = if self.route_tool_active {
+                        egui::Button::new(
+                            egui::RichText::new("⚡ Route Track (X) [ACTIVE]")
+                                .color(Color32::from_rgb(100, 255, 120))
+                                .strong(),
+                        )
+                    } else {
+                        egui::Button::new("⚡ Route Track (X)")
+                    };
+                    if ui.add_enabled(!is_running, route_btn).clicked() {
+                        self.route_tool_active = !self.route_tool_active;
+                        if !self.route_tool_active {
+                            self.active_route = None;
+                        }
                     }
                 });
 
@@ -1262,30 +1656,93 @@ impl VulcansTrialsApp {
                 }
             }
 
-            // Keyboard shortcuts: 'm' (pick up/move), 'r' (rotate 90°), 'f' (flip layer), 'Escape' (cancel move)
+            // Keyboard shortcuts:
+            // KiCad route shortcuts: 'x' (route track), 'v' (place via & switch layer), '/' (toggle dogleg posture), 'Escape' (cancel route / exit route tool)
+            // Placement shortcuts: 'm' (pick up/move), 'r' (rotate 90°), 'f' (flip layer), 'Escape' (cancel move)
             if !ctx.wants_keyboard_input() && !is_running {
-                if ctx.input(|i| i.key_pressed(egui::Key::M)) {
-                    if self.moving_footprint.is_none() {
+                // 'X': Route Track mode / start route
+                if ctx.input(|i| i.key_pressed(egui::Key::X)) {
+                    if self.active_route.is_none() {
                         if let Some(pos) = pointer_pos {
                             if rect.contains(pos) {
-                                self.pick_up_component_at(rect, pos);
+                                self.start_route_at(rect, pos);
+                            } else {
+                                self.route_tool_active = true;
                             }
+                        } else {
+                            self.route_tool_active = true;
                         }
                     }
                 }
-                if ctx.input(|i| i.key_pressed(egui::Key::R)) {
-                    self.rotate_active_component();
+
+                // 'V': Place Via & Switch Layer
+                if ctx.input(|i| i.key_pressed(egui::Key::V)) {
+                    if self.active_route.is_some() {
+                        let via_pos = if let Some(pos) = pointer_pos {
+                            if rect.contains(pos) {
+                                let snap = self.live.lock().unwrap();
+                                let wpt = self.screen_to_board(&snap.board, rect, pos);
+                                let grid = if self.grid_res_mm > 0.001 { self.grid_res_mm } else { 0.10 };
+                                ((wpt.x / grid).round() * grid, (wpt.y / grid).round() * grid)
+                            } else {
+                                let last = self.active_route.as_ref().unwrap().anchor_points.last().unwrap();
+                                (last.0, last.1)
+                            }
+                        } else {
+                            let last = self.active_route.as_ref().unwrap().anchor_points.last().unwrap();
+                            (last.0, last.1)
+                        };
+                        self.place_via_and_switch_layer(via_pos);
+                    }
                 }
-                if ctx.input(|i| i.key_pressed(egui::Key::F)) {
-                    self.flip_active_component();
+
+                // '/': Toggle 45° dogleg corner posture (diagonal first vs orthogonal first)
+                let slash_pressed = ctx.input(|i| {
+                    i.key_pressed(egui::Key::Slash)
+                        || i.events.iter().any(|e| match e {
+                            egui::Event::Key { key: egui::Key::Slash, pressed: true, .. } => true,
+                            egui::Event::Text(t) => t == "/",
+                            _ => false,
+                        })
+                });
+                if slash_pressed {
+                    if let Some(ref mut route) = self.active_route {
+                        route.posture_diagonal_first = !route.posture_diagonal_first;
+                    }
                 }
+
+                // 'Escape': Cancel active route, exit route tool, or cancel footprint move
                 if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    self.cancel_moving_component();
+                    if self.active_route.is_some() || self.route_tool_active {
+                        self.cancel_route();
+                    } else if self.moving_footprint.is_some() {
+                        self.cancel_moving_component();
+                    }
+                }
+
+                if self.active_route.is_none() && !self.route_tool_active {
+                    if ctx.input(|i| i.key_pressed(egui::Key::M)) {
+                        if self.moving_footprint.is_none() {
+                            if let Some(pos) = pointer_pos {
+                                if rect.contains(pos) {
+                                    self.pick_up_component_at(rect, pos);
+                                }
+                            }
+                        }
+                    }
+                    if ctx.input(|i| i.key_pressed(egui::Key::R)) {
+                        self.rotate_active_component();
+                    }
+                    if ctx.input(|i| i.key_pressed(egui::Key::F)) {
+                        self.flip_active_component();
+                    }
                 }
             }
 
-            // If a footprint is actively being moved, update its position to follow the cursor
-            if self.moving_footprint.is_some() {
+            // If routing is active, show crosshair cursor
+            if self.active_route.is_some() || self.route_tool_active {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            } else if self.moving_footprint.is_some() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                 if let Some(pos) = pointer_pos {
                     if rect.contains(pos) {
@@ -1302,19 +1759,29 @@ impl VulcansTrialsApp {
             if response.clicked() {
                 if self.moving_footprint.is_some() {
                     self.place_moving_component();
+                } else if self.active_route.is_some() {
+                    if let Some(click_pos) = response.interact_pointer_pos() {
+                        self.handle_active_route_click(rect, click_pos);
+                    }
+                } else if self.route_tool_active {
+                    if let Some(click_pos) = response.interact_pointer_pos() {
+                        self.start_route_at(rect, click_pos);
+                    }
                 } else if let Some(click_pos) = response.interact_pointer_pos() {
                     self.handle_canvas_click_at(rect, click_pos);
                 }
             }
             if response.secondary_clicked() {
-                if self.moving_footprint.is_some() {
+                if self.active_route.is_some() || self.route_tool_active {
+                    self.cancel_route();
+                } else if self.moving_footprint.is_some() {
                     self.cancel_moving_component();
                 } else if let Some(click_pos) = response.interact_pointer_pos() {
                     self.handle_canvas_secondary_click_at(rect, click_pos);
                 }
             }
             if response.dragged() {
-                if self.moving_footprint.is_none() {
+                if self.moving_footprint.is_none() && self.active_route.is_none() {
                     self.pan_offset += response.drag_delta();
                 }
             }
@@ -1531,7 +1998,117 @@ impl VulcansTrialsApp {
 
             }
 
-            // 9. Draw Color Legend Overlay
+            // 10. Draw Active Interactive Route & Preview
+            if let Some(ref route) = self.active_route {
+                let w = ((route.track_width as f32) * scale).max(2.0);
+
+                // Draw committed anchored segments
+                for i in 0..route.anchor_points.len().saturating_sub(1) {
+                    let pa = route.anchor_points[i];
+                    let pb = route.anchor_points[i + 1];
+                    if (pa.0 - pb.0).hypot(pa.1 - pb.1) > 1e-5 {
+                        let col = copper_layer_color(b.layer_name(pa.2));
+                        draw_track_segment(&painter, to_screen(pa.0, pa.1), to_screen(pb.0, pb.1), w, col);
+                    }
+                }
+
+                // Draw vias placed during active route
+                for v in &route.vias_placed {
+                    let c = to_screen(v.position.0, v.position.1);
+                    let outer_r = ((v.size as f32) * 0.5 * scale).max(2.5);
+                    let inner_r = ((v.drill as f32) * 0.5 * scale).max(1.0);
+                    painter.circle_filled(c, outer_r, COL_VIA);
+                    painter.circle_filled(c, inner_r, Color32::from_rgb(25, 30, 35));
+                }
+
+                // Compute cursor point (with magnetic pad snapping if near same net pad)
+                let cur_pt = if let Some(pos) = pointer_pos {
+                    if rect.contains(pos) {
+                        let wpt = self.screen_to_board(b, rect, pos);
+                        let grid = if self.grid_res_mm > 0.001 { self.grid_res_mm } else { 0.10 };
+                        let mut pt = ((wpt.x / grid).round() * grid, (wpt.y / grid).round() * grid);
+                        for fp in &b.footprints {
+                            for pad in &fp.pads {
+                                if pad.net_name == route.net_name || (pad.net_id != 0 && pad.net_id == route.net_id) {
+                                    let (px, py) = fp.pad_absolute_position(pad);
+                                    let (pad_screen, _) = self.board_to_screen(b, rect, px, py);
+                                    if pad_screen.distance(pos) <= 14.0 || self.is_point_in_pad(b, rect, fp, pad, pos) {
+                                        pt = (px, py);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        pt
+                    } else {
+                        let last = route.anchor_points.last().unwrap();
+                        (last.0, last.1)
+                    }
+                } else {
+                    let last = route.anchor_points.last().unwrap();
+                    (last.0, last.1)
+                };
+
+                // Draw live tentative 45° dogleg preview
+                let p0 = *route.anchor_points.last().unwrap();
+                let dogleg_pts = compute_45_dogleg((p0.0, p0.1), cur_pt, route.posture_diagonal_first);
+                let active_col = copper_layer_color(b.layer_name(route.current_layer));
+                for i in 0..dogleg_pts.len().saturating_sub(1) {
+                    let q0 = to_screen(dogleg_pts[i].0, dogleg_pts[i].1);
+                    let q1 = to_screen(dogleg_pts[i + 1].0, dogleg_pts[i + 1].1);
+                    draw_track_segment(&painter, q0, q1, w, active_col);
+                }
+
+                // Guide ratsnest line to nearest unrouted target pad of same net
+                let mut nearest_pad: Option<((f64, f64), f64)> = None;
+                for fp in &b.footprints {
+                    for pad in &fp.pads {
+                        if pad.net_name == route.net_name || (pad.net_id != 0 && pad.net_id == route.net_id) {
+                            let (px, py) = fp.pad_absolute_position(pad);
+                            let d = (px - cur_pt.0).hypot(py - cur_pt.1);
+                            if d > 0.05 {
+                                if nearest_pad.map_or(true, |(_, best_d)| d < best_d) {
+                                    nearest_pad = Some(((px, py), d));
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((target_pt, _)) = nearest_pad {
+                    let c_screen = to_screen(cur_pt.0, cur_pt.1);
+                    let t_screen = to_screen(target_pt.0, target_pt.1);
+                    painter.line_segment([c_screen, t_screen], Stroke::new(1.0_f32, Color32::from_rgb(255, 230, 80)));
+                }
+
+                // Cursor indicator and tooltip badge
+                let cur_screen = to_screen(cur_pt.0, cur_pt.1);
+                painter.circle_stroke(cur_screen, ((route.track_width as f32) * 0.5 * scale).max(3.5), Stroke::new(1.5_f32, Color32::WHITE));
+
+                let label_pos = Pos2::new(cur_screen.x, cur_screen.y - 18.0);
+                let hint = format!("Routing '{}' [{}] · [V] Via · [/] Posture · [Esc] Cancel", route.net_name, b.layer_name(route.current_layer));
+                let galley = painter.layout_no_wrap(hint, egui::FontId::proportional(11.0), Color32::from_rgb(255, 235, 120));
+                let bg_rect = Rect::from_center_size(label_pos, galley.size() + Vec2::new(8.0, 4.0));
+                painter.rect_filled(bg_rect, 3.0, Color32::from_rgba_unmultiplied(20, 24, 30, 220));
+                painter.rect_stroke(bg_rect, 3.0, Stroke::new(1.0_f32, Color32::from_rgb(255, 215, 60)), egui::StrokeKind::Middle);
+                painter.galley(Pos2::new(bg_rect.left() + 4.0, bg_rect.top() + 2.0), galley, Color32::from_rgb(255, 235, 120));
+            } else if self.route_tool_active {
+                // If route tool is active but not yet routing, show tooltip when hovering over copper
+                if let Some(pos) = pointer_pos {
+                    if rect.contains(pos) {
+                        if let Some(item) = self.find_copper_item_at(b, rect, pos) {
+                            let label_pos = Pos2::new(pos.x, pos.y - 18.0);
+                            let hint = format!("[X/Click] Route Net '{}' [{}]", item.net_name, b.layer_name(item.layer));
+                            let galley = painter.layout_no_wrap(hint, egui::FontId::proportional(11.0), Color32::from_rgb(120, 235, 255));
+                            let bg_rect = Rect::from_center_size(label_pos, galley.size() + Vec2::new(8.0, 4.0));
+                            painter.rect_filled(bg_rect, 3.0, Color32::from_rgba_unmultiplied(20, 24, 30, 220));
+                            painter.rect_stroke(bg_rect, 3.0, Stroke::new(1.0_f32, Color32::from_rgb(80, 200, 255)), egui::StrokeKind::Middle);
+                            painter.galley(Pos2::new(bg_rect.left() + 4.0, bg_rect.top() + 2.0), galley, Color32::from_rgb(120, 235, 255));
+                        }
+                    }
+                }
+            }
+
+            // 11. Draw Color Legend Overlay
             draw_color_legend(&painter, rect, b);
         });
     }
@@ -2618,6 +3195,312 @@ mod tests {
         assert!((app.temp_scale - 1.0).abs() < 1e-6);
         assert!((app.escape_margin_mult - 1.0).abs() < 1e-6);
         assert!((app.crossing_weight - 200.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_compute_45_dogleg_geometry() {
+        // 1. Identical points
+        let p0 = (10.0, 20.0);
+        let pts = compute_45_dogleg(p0, p0, false);
+        assert_eq!(pts, vec![p0]);
+
+        // 2. Pure horizontal
+        let h_pts_diag_false = compute_45_dogleg((0.0, 0.0), (10.0, 0.0), false);
+        assert_eq!(h_pts_diag_false, vec![(0.0, 0.0), (10.0, 0.0)]);
+        let h_pts_diag_true = compute_45_dogleg((0.0, 0.0), (10.0, 0.0), true);
+        assert_eq!(h_pts_diag_true, vec![(0.0, 0.0), (10.0, 0.0)]);
+
+        // 3. Pure vertical
+        let v_pts_diag_false = compute_45_dogleg((0.0, 0.0), (0.0, 10.0), false);
+        assert_eq!(v_pts_diag_false, vec![(0.0, 0.0), (0.0, 10.0)]);
+        let v_pts_diag_true = compute_45_dogleg((0.0, 0.0), (0.0, 10.0), true);
+        assert_eq!(v_pts_diag_true, vec![(0.0, 0.0), (0.0, 10.0)]);
+
+        // 4. Pure 45° diagonal
+        let d_pts_diag_false = compute_45_dogleg((0.0, 0.0), (10.0, 10.0), false);
+        assert_eq!(d_pts_diag_false, vec![(0.0, 0.0), (10.0, 10.0)]);
+        let d_pts_diag_true = compute_45_dogleg((0.0, 0.0), (10.0, 10.0), true);
+        assert_eq!(d_pts_diag_true, vec![(0.0, 0.0), (10.0, 10.0)]);
+
+        // 5. Horizontal dominant (dx = 10, dy = 4)
+        // diagonal_first = false: straight horizontal first to (6, 0), then 45° diagonal to (10, 4)
+        let dogleg_h_false = compute_45_dogleg((0.0, 0.0), (10.0, 4.0), false);
+        assert_eq!(dogleg_h_false.len(), 3);
+        assert_eq!(dogleg_h_false[0], (0.0, 0.0));
+        assert_eq!(dogleg_h_false[1], (6.0, 0.0));
+        assert_eq!(dogleg_h_false[2], (10.0, 4.0));
+        // Verify segment 1 is horizontal, segment 2 is 45°
+        assert!((dogleg_h_false[1].1 - dogleg_h_false[0].1).abs() < 1e-6);
+        assert!(((dogleg_h_false[2].0 - dogleg_h_false[1].0).abs() - (dogleg_h_false[2].1 - dogleg_h_false[1].1).abs()).abs() < 1e-6);
+
+        // diagonal_first = true: 45° diagonal first to (4, 4), then straight horizontal to (10, 4)
+        let dogleg_h_true = compute_45_dogleg((0.0, 0.0), (10.0, 4.0), true);
+        assert_eq!(dogleg_h_true.len(), 3);
+        assert_eq!(dogleg_h_true[0], (0.0, 0.0));
+        assert_eq!(dogleg_h_true[1], (4.0, 4.0));
+        assert_eq!(dogleg_h_true[2], (10.0, 4.0));
+        // Verify segment 1 is 45°, segment 2 is horizontal
+        assert!(((dogleg_h_true[1].0 - dogleg_h_true[0].0).abs() - (dogleg_h_true[1].1 - dogleg_h_true[0].1).abs()).abs() < 1e-6);
+        assert!((dogleg_h_true[2].1 - dogleg_h_true[1].1).abs() < 1e-6);
+
+        // 6. Vertical dominant (dx = 4, dy = 10)
+        // diagonal_first = false: straight vertical first to (0, 6), then 45° diagonal to (4, 10)
+        let dogleg_v_false = compute_45_dogleg((0.0, 0.0), (4.0, 10.0), false);
+        assert_eq!(dogleg_v_false.len(), 3);
+        assert_eq!(dogleg_v_false[0], (0.0, 0.0));
+        assert_eq!(dogleg_v_false[1], (0.0, 6.0));
+        assert_eq!(dogleg_v_false[2], (4.0, 10.0));
+
+        // diagonal_first = true: 45° diagonal first to (4, 4), then straight vertical to (4, 10)
+        let dogleg_v_true = compute_45_dogleg((0.0, 0.0), (4.0, 10.0), true);
+        assert_eq!(dogleg_v_true.len(), 3);
+        assert_eq!(dogleg_v_true[0], (0.0, 0.0));
+        assert_eq!(dogleg_v_true[1], (4.0, 4.0));
+        assert_eq!(dogleg_v_true[2], (4.0, 10.0));
+
+        // 7. Negative directions (dx = -8, dy = -4) -> horizontal dominant
+        let dogleg_neg_false = compute_45_dogleg((10.0, 10.0), (2.0, 6.0), false);
+        assert_eq!(dogleg_neg_false.len(), 3);
+        assert_eq!(dogleg_neg_false[0], (10.0, 10.0));
+        assert_eq!(dogleg_neg_false[1], (6.0, 10.0));
+        assert_eq!(dogleg_neg_false[2], (2.0, 6.0));
+
+        let dogleg_neg_true = compute_45_dogleg((10.0, 10.0), (2.0, 6.0), true);
+        assert_eq!(dogleg_neg_true.len(), 3);
+        assert_eq!(dogleg_neg_true[0], (10.0, 10.0));
+        assert_eq!(dogleg_neg_true[1], (6.0, 6.0));
+        assert_eq!(dogleg_neg_true[2], (2.0, 6.0));
+    }
+
+    #[test]
+    fn test_manual_route_start_with_key_x_and_click() {
+        let in_path = "/tmp/vulcan_gui_route_start_test.kicad_pcb";
+        let board = make_gui_test_board(in_path);
+        let expected_net_id = board.footprints[0].pads[0].net_id;
+        let mut app = VulcansTrialsApp::new(in_path.to_string(), String::new(), board.clone(), None);
+
+        let canvas_rect = Rect::from_min_max(Pos2::new(318.0, 67.0), Pos2::new(792.0, 592.0));
+        // J1.1 is at (110.0, 115.0) on net "SIG"
+        let (j1_screen, _) = app.board_to_screen(&board, canvas_rect, 110.0, 115.0);
+
+        // Hover over J1.1 and start route
+        assert!(!app.route_tool_active);
+        assert!(app.active_route.is_none());
+
+        let started = app.start_route_at(canvas_rect, j1_screen);
+        assert!(started, "Hovering over J1 pad 1 must start routing net 'SIG'");
+        assert!(app.route_tool_active);
+        assert!(app.active_route.is_some());
+
+        let route = app.active_route.as_ref().unwrap();
+        assert_eq!(route.net_id, expected_net_id);
+        assert_eq!(route.net_name, "SIG");
+        assert_eq!(route.anchor_points, vec![(110.0, 115.0, 0)]);
+        assert_eq!(route.current_layer, 0); // F.Cu
+        assert!(!route.posture_diagonal_first);
+
+        let _ = fs::remove_file(in_path);
+    }
+
+    #[test]
+    fn test_manual_route_layer_transition_and_via_with_key_v() {
+        let in_path = "/tmp/vulcan_gui_route_via_test.kicad_pcb";
+        let board = make_gui_test_board(in_path);
+        let expected_net_id = board.footprints[0].pads[0].net_id;
+        let mut app = VulcansTrialsApp::new(in_path.to_string(), String::new(), board.clone(), None);
+
+        let canvas_rect = Rect::from_min_max(Pos2::new(318.0, 67.0), Pos2::new(792.0, 592.0));
+        let (j1_screen, _) = app.board_to_screen(&board, canvas_rect, 110.0, 115.0);
+
+        // Start routing at J1
+        app.start_route_at(canvas_rect, j1_screen);
+        assert_eq!(app.active_route.as_ref().unwrap().current_layer, 0);
+
+        // Route to (115.0, 115.0) and place a via
+        app.place_via_and_switch_layer((115.0, 115.0));
+
+        let route = app.active_route.as_ref().unwrap();
+        assert_eq!(route.current_layer, 1, "Layer must switch from F.Cu (0) to B.Cu (1)");
+        assert_eq!(route.vias_placed.len(), 1, "Via must be placed");
+        assert_eq!(route.vias_placed[0].position, (115.0, 115.0));
+        assert_eq!(route.vias_placed[0].net_id, expected_net_id);
+
+        // Verify anchor points contain:
+        // (110.0, 115.0, 0) -> start
+        // (115.0, 115.0, 0) -> track reaching via on layer 0
+        // (115.0, 115.0, 1) -> continuation point on layer 1
+        assert!(route.anchor_points.contains(&(115.0, 115.0, 0)));
+        assert_eq!(*route.anchor_points.last().unwrap(), (115.0, 115.0, 1));
+
+        let _ = fs::remove_file(in_path);
+    }
+
+    #[test]
+    fn test_manual_route_completion_on_target_pad() {
+        let in_path = "/tmp/vulcan_gui_route_commit_test.kicad_pcb";
+        let board = make_gui_test_board(in_path);
+        let mut app = VulcansTrialsApp::new(in_path.to_string(), String::new(), board.clone(), None);
+
+        let canvas_rect = Rect::from_min_max(Pos2::new(318.0, 67.0), Pos2::new(792.0, 592.0));
+        let (j1_screen, _) = app.board_to_screen(&board, canvas_rect, 110.0, 115.0);
+        let (r10_pad1_screen, _) = app.board_to_screen(&board, canvas_rect, 119.5, 115.0);
+
+        let init_tracks = app.live.lock().unwrap().board.tracks.len();
+        let init_vias = app.live.lock().unwrap().board.vias.len();
+
+        // 1. Start routing at J1.1
+        app.start_route_at(canvas_rect, j1_screen);
+
+        // 2. Route along and drop via at (114.0, 115.0)
+        app.place_via_and_switch_layer((114.0, 115.0));
+
+        // 3. Click on R10.1 (same net: "SIG", net 2) to finish and commit
+        app.handle_active_route_click(canvas_rect, r10_pad1_screen);
+
+        // Active route must now be finished and committed
+        assert!(app.active_route.is_none());
+
+        let g = app.live.lock().unwrap();
+        assert!(g.board.tracks.len() > init_tracks, "Tracks must be added to board");
+        assert_eq!(g.board.vias.len(), init_vias + 1, "Via must be added to board");
+
+        // Verify tracks on both layer 0 and layer 1 were created
+        assert!(g.board.tracks.iter().any(|t| t.net_id == 2 && t.layer == 0));
+        assert!(g.board.tracks.iter().any(|t| t.net_id == 2 && t.layer == 1));
+
+        let _ = fs::remove_file(in_path);
+    }
+
+    #[test]
+    fn test_manual_route_cancel_on_escape_and_posture_toggle() {
+        let in_path = "/tmp/vulcan_gui_route_cancel_test.kicad_pcb";
+        let board = make_gui_test_board(in_path);
+        let mut app = VulcansTrialsApp::new(in_path.to_string(), String::new(), board.clone(), None);
+
+        let canvas_rect = Rect::from_min_max(Pos2::new(318.0, 67.0), Pos2::new(792.0, 592.0));
+        let (j1_screen, _) = app.board_to_screen(&board, canvas_rect, 110.0, 115.0);
+
+        // Start routing
+        app.start_route_at(canvas_rect, j1_screen);
+        assert!(app.active_route.is_some());
+        assert!(!app.active_route.as_ref().unwrap().posture_diagonal_first);
+
+        // Toggle posture with '/'
+        app.active_route.as_mut().unwrap().posture_diagonal_first = !app.active_route.as_ref().unwrap().posture_diagonal_first;
+        assert!(app.active_route.as_ref().unwrap().posture_diagonal_first);
+
+        app.active_route.as_mut().unwrap().posture_diagonal_first = !app.active_route.as_ref().unwrap().posture_diagonal_first;
+        assert!(!app.active_route.as_ref().unwrap().posture_diagonal_first);
+
+        // Cancel route with Escape
+        let cancelled = app.cancel_route();
+        assert!(cancelled);
+        assert!(app.active_route.is_none());
+        assert!(app.route_tool_active, "First Escape cancels in-progress route but retains route tool active");
+
+        // Second Escape exits route mode
+        let exited = app.cancel_route();
+        assert!(exited);
+        assert!(!app.route_tool_active, "Second Escape exits route mode");
+
+        let _ = fs::remove_file(in_path);
+    }
+
+    #[test]
+    fn test_manual_route_keyboard_and_mouse_events_in_render_ui() {
+        let in_path = "/tmp/vulcan_gui_route_e2e_events_test.kicad_pcb";
+        let board = make_gui_test_board(in_path);
+        let expected_net_id = board.footprints[0].pads[0].net_id;
+        let mut app = VulcansTrialsApp::new(in_path.to_string(), String::new(), board.clone(), None);
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 600.0));
+
+        // Warm up layout
+        let mut warmup = egui::RawInput::default();
+        warmup.screen_rect = Some(rect);
+        let _ = ctx.run(warmup, |ctx| {
+            app.render_ui(ctx);
+        });
+
+        let canvas_rect = Rect::from_min_max(Pos2::new(318.0, 67.0), Pos2::new(792.0, 592.0));
+        let (j1_screen, _) = app.board_to_screen(&board, canvas_rect, 110.0, 115.0);
+        let (r10_screen, _) = app.board_to_screen(&board, canvas_rect, 119.5, 115.0);
+
+        // Frame 1: Move mouse to J1 pad 1 and press 'x' -> starts routing
+        let mut input1 = egui::RawInput::default();
+        input1.screen_rect = Some(rect);
+        input1.events.push(egui::Event::PointerMoved(j1_screen));
+        input1.events.push(egui::Event::Key {
+            key: egui::Key::X,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input1, |ctx| {
+            app.render_ui(ctx);
+        });
+        assert!(app.active_route.is_some(), "Key 'X' over pad must start routing");
+        assert_eq!(app.active_route.as_ref().unwrap().net_id, expected_net_id);
+
+        // Frame 2: Move mouse to (115.0, 115.0) and press 'v' -> places via and switches to layer 1
+        let (via_screen, _) = app.board_to_screen(&board, canvas_rect, 115.0, 115.0);
+        let mut input2 = egui::RawInput::default();
+        input2.screen_rect = Some(rect);
+        input2.events.push(egui::Event::PointerMoved(via_screen));
+        input2.events.push(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input2, |ctx| {
+            app.render_ui(ctx);
+        });
+        assert_eq!(app.active_route.as_ref().unwrap().current_layer, 1, "Key 'V' must drop via and switch layer");
+        assert_eq!(app.active_route.as_ref().unwrap().vias_placed.len(), 1);
+
+        // Frame 3: Press '/' -> toggles posture
+        let mut input3 = egui::RawInput::default();
+        input3.screen_rect = Some(rect);
+        input3.events.push(egui::Event::Key {
+            key: egui::Key::Slash,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input3, |ctx| {
+            app.render_ui(ctx);
+        });
+        assert!(app.active_route.as_ref().unwrap().posture_diagonal_first);
+
+        // Frame 4: Move mouse to R10 pad 1 and click Primary -> finishes route
+        let mut input4 = egui::RawInput::default();
+        input4.screen_rect = Some(rect);
+        input4.events.push(egui::Event::PointerMoved(r10_screen));
+        input4.events.push(egui::Event::PointerButton {
+            pos: r10_screen,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        input4.events.push(egui::Event::PointerButton {
+            pos: r10_screen,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input4, |ctx| {
+            app.render_ui(ctx);
+        });
+        assert!(app.active_route.is_none(), "Clicking on target pad of same net commits and finishes route");
+        let g = app.live.lock().unwrap();
+        assert!(g.board.vias.iter().any(|v| v.net_id == expected_net_id));
+        assert!(g.board.tracks.iter().any(|t| t.net_id == expected_net_id));
+
+        let _ = fs::remove_file(in_path);
     }
 }
 
