@@ -1232,6 +1232,7 @@ impl RouteConnection {
 
 #[derive(Clone, Debug)]
 pub struct EscapeStub {
+    pub fp_idx: usize,
     pub net_id: usize,
     pub pad_pos: (f64, f64),
     pub tip_pos: (f64, f64),
@@ -1591,6 +1592,7 @@ pub struct AutoRouter {
     pub max_ripup_iterations: usize,
     pub congestion_factor: f32,
     pub inner_layer_penalty: f64,
+    pub allow_component_nudge: bool,
 }
 
 impl AutoRouter {
@@ -1600,11 +1602,17 @@ impl AutoRouter {
             max_ripup_iterations,
             congestion_factor: 1.5,
             inner_layer_penalty: 8.0,
+            allow_component_nudge: false,
         }
     }
 
     pub fn with_inner_layer_penalty(mut self, pen: f64) -> Self {
         self.inner_layer_penalty = pen;
+        self
+    }
+
+    pub fn with_allow_component_nudge(mut self, allow: bool) -> Self {
+        self.allow_component_nudge = allow;
         self
     }
 
@@ -1819,7 +1827,7 @@ impl AutoRouter {
         live: Option<Arc<Mutex<LiveTrialState>>>,
         stop_flag: Arc<AtomicBool>,
     ) -> (usize, usize) {
-        if self.nudge_components_blocking_escapes(board) {
+        if self.allow_component_nudge && self.nudge_components_blocking_escapes(board) {
             grid.obstacle_net_ids.fill(FREE_NET);
             grid.nudgeable_fp.fill(None);
             grid.smd_pad_cells.fill(false);
@@ -2213,15 +2221,20 @@ impl AutoRouter {
                                 .iter()
                                 .enumerate()
                                 .filter(|&(i, _)| routed_paths[i].is_none())
-                                .map(|(_, c)| crate::board::Segment {
-                                    p1: Point::new(c.start.0, c.start.1),
-                                    p2: Point::new(c.end.0, c.end.1),
-                                    net_id: c.net_id,
+                                .map(|(_, c)| {
+                                    let p1 = board.footprints[c.start_fp].pad_absolute_position(&board.footprints[c.start_fp].pads[c.start_pad]);
+                                    let p2 = board.footprints[c.end_fp].pad_absolute_position(&board.footprints[c.end_fp].pads[c.end_pad]);
+                                    crate::board::Segment {
+                                        p1: Point::new(p1.0, p1.1),
+                                        p2: Point::new(p2.0, p2.1),
+                                        net_id: c.net_id,
+                                    }
                                 })
                                 .collect();
                             if let Ok(mut g) = st.lock() {
                                 g.board.tracks = board.tracks.clone();
                                 g.board.vias = board.vias.clone();
+                                g.board.footprints = board.footprints.clone();
                                 g.ratsnest = remaining_ratsnest;
                                 g.routed_conns = done;
                                 g.routing_pass = iteration + 1;
@@ -2250,24 +2263,26 @@ impl AutoRouter {
                     }
 
                     // 1. Try nudging blocking unlocked components
-                    let nudged_comp = self.try_nudge_blocking_components(
-                        board,
-                        grid,
-                        &mut connections,
-                        &mut routed_paths,
-                        &escape_stubs,
-                        conn_idx,
-                        u1_center,
-                        &stop_flag,
-                    );
-                    if nudged_comp {
-                        if let Ok(mut obs_g) = shared_obs.lock() {
-                            obs_g.clone_from(&grid.obstacle_net_ids);
+                    if self.allow_component_nudge {
+                        let nudged_comp = self.try_nudge_blocking_components(
+                            board,
+                            grid,
+                            &mut connections,
+                            &mut routed_paths,
+                            &escape_stubs,
+                            conn_idx,
+                            u1_center,
+                            &stop_flag,
+                        );
+                        if nudged_comp {
+                            if let Ok(mut obs_g) = shared_obs.lock() {
+                                obs_g.clone_from(&grid.obstacle_net_ids);
+                            }
+                            if let Ok(mut df_g) = shared_df.lock() {
+                                df_g.clone_from(&grid.dist_field);
+                            }
+                            continue;
                         }
-                        if let Ok(mut df_g) = shared_df.lock() {
-                            df_g.clone_from(&grid.dist_field);
-                        }
-                        continue;
                     }
 
                     // 2. Try shoving or ripping up blocking unlocked tracks
@@ -2490,15 +2505,20 @@ impl AutoRouter {
                 .iter()
                 .enumerate()
                 .filter(|&(i, _)| routed_paths[i].is_none())
-                .map(|(_, c)| crate::board::Segment {
-                    p1: Point::new(c.start.0, c.start.1),
-                    p2: Point::new(c.end.0, c.end.1),
-                    net_id: c.net_id,
+                .map(|(_, c)| {
+                    let p1 = board.footprints[c.start_fp].pad_absolute_position(&board.footprints[c.start_fp].pads[c.start_pad]);
+                    let p2 = board.footprints[c.end_fp].pad_absolute_position(&board.footprints[c.end_fp].pads[c.end_pad]);
+                    crate::board::Segment {
+                        p1: Point::new(p1.0, p1.1),
+                        p2: Point::new(p2.0, p2.1),
+                        net_id: c.net_id,
+                    }
                 })
                 .collect();
             if let Ok(mut g) = st.lock() {
                 g.board.tracks = board.tracks.clone();
                 g.board.vias = board.vias.clone();
+                g.board.footprints = board.footprints.clone();
                 g.ratsnest = remaining_ratsnest;
                 g.routed_conns = completed_count;
                 g.total_conns = total_conns;
@@ -3129,14 +3149,20 @@ impl AutoRouter {
 
     /// Pre-routing pass: nudges unlocked components away if they directly block escape stubs.
     pub fn nudge_components_blocking_escapes(&self, board: &mut Board) -> bool {
+        if !self.allow_component_nudge {
+            return false;
+        }
         let provisional_stubs = self.generate_escape_stubs(board);
         let mut any_nudged = false;
         for stub in &provisional_stubs {
             let s_p1 = Point::new(stub.pad_pos.0, stub.pad_pos.1);
             let s_p2 = Point::new(stub.tip_pos.0, stub.tip_pos.1);
             for fp_idx in 0..board.footprints.len() {
+                if fp_idx == stub.fp_idx {
+                    continue;
+                }
                 let fp = &board.footprints[fp_idx];
-                if fp.is_locked {
+                if fp.is_locked || fp.pads.len() > 2 {
                     continue;
                 }
                 let mut is_blocking = false;
@@ -3175,6 +3201,9 @@ impl AutoRouter {
         u1_center: Option<(f64, f64)>,
         stop_flag: &AtomicBool,
     ) -> bool {
+        if !self.allow_component_nudge {
+            return false;
+        }
         let conn = &connections[conn_idx];
         let c_start = conn.start;
         let c_end = conn.end;
@@ -3185,7 +3214,7 @@ impl AutoRouter {
 
         let mut blocking_candidates = Vec::new();
         for (fp_idx, fp) in board.footprints.iter().enumerate() {
-            if fp.is_locked || fp_idx == conn.start_fp || fp_idx == conn.end_fp {
+            if fp.is_locked || fp.pads.len() > 2 || fp_idx == conn.start_fp || fp_idx == conn.end_fp {
                 continue;
             }
             let d_start = (fp.x - c_start.0).hypot(fp.y - c_start.1);
@@ -3888,7 +3917,7 @@ impl AutoRouter {
 
         let mut stubs = Vec::new();
 
-        for fp in &board.footprints {
+        for (fp_idx, fp) in board.footprints.iter().enumerate() {
             if fp.reference == "J2" {
                 for pad in &fp.pads {
                     if pad.net_id == 0
@@ -3926,6 +3955,7 @@ impl AutoRouter {
                         (outward_tip, None, fp.layer)
                     };
                     stubs.push(EscapeStub {
+                        fp_idx,
                         net_id: pad.net_id,
                         pad_pos: (px, py),
                         tip_pos: tip,
@@ -4070,6 +4100,7 @@ impl AutoRouter {
                     };
 
                     stubs.push(EscapeStub {
+                        fp_idx,
                         net_id: pad.net_id,
                         pad_pos: (px, py),
                         tip_pos: tip,
@@ -7398,7 +7429,7 @@ mod tests {
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
-        let router = AutoRouter::new(3);
+        let router = AutoRouter::new(3).with_allow_component_nudge(true);
         let stop = Arc::new(AtomicBool::new(false));
 
         let orig_c1_x = board.footprints[2].x;

@@ -118,6 +118,7 @@ pub struct VulcansTrialsApp {
     pub max_ripup_passes: usize,
     pub allow_layer_flip: bool,
     pub inner_plane_penalty: f64,
+    pub allow_component_nudge: bool,
 
     // Aggressive placement exploration & weights
     pub max_jump_radius_mm: f64,
@@ -181,6 +182,7 @@ impl VulcansTrialsApp {
             max_ripup_passes: 15,
             allow_layer_flip: false,
             inner_plane_penalty: 8.0,
+            allow_component_nudge: false,
             max_jump_radius_mm: 20.0,
             pair_swap_prob: 0.15,
             centroid_pull_prob: 0.20,
@@ -251,6 +253,7 @@ impl VulcansTrialsApp {
         let max_passes = self.max_ripup_passes;
         let allow_flip = self.allow_layer_flip;
         let inner_plane_pen = self.inner_plane_penalty;
+        let allow_comp_nudge = self.allow_component_nudge;
         let max_jump_rad = self.max_jump_radius_mm;
         let pair_swap_p = self.pair_swap_prob;
         let centroid_pull_p = self.centroid_pull_prob;
@@ -301,7 +304,7 @@ impl VulcansTrialsApp {
 
             if do_route && !stop_flag.load(Ordering::Relaxed) {
                 let mut grid = RoutingGrid::new(&working_board, grid_res, vulkan).with_inner_layer_penalty(inner_plane_pen);
-                let mut router = AutoRouter::new(max_passes);
+                let mut router = AutoRouter::new(max_passes).with_allow_component_nudge(allow_comp_nudge);
                 router.inner_layer_penalty = inner_plane_pen;
                 router.route_all(
                     &mut working_board,
@@ -966,6 +969,10 @@ impl VulcansTrialsApp {
                 ui.add_enabled(
                     !is_running,
                     egui::Checkbox::new(&mut self.allow_layer_flip, "Allow SMD Side Flip (F.Cu ↔ B.Cu)"),
+                );
+                ui.add_enabled(
+                    !is_running,
+                    egui::Checkbox::new(&mut self.allow_component_nudge, "Allow Router to Nudge Unlocked Passives"),
                 );
 
                 ui.collapsing("Aggressive Placement & Exploration", |ui| {
