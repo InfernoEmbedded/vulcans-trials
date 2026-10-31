@@ -6208,13 +6208,36 @@ pub fn smooth_45_miters(chain: &mut TrackChain, board: &Board, grid: &RoutingGri
 pub fn reduce_vias(board: &mut Board, grid: &mut RoutingGrid) {
     let max_passes = 8;
     for _pass in 0..max_passes {
-        if !reduce_vias_single_pass(board, grid) {
+        let changed_pairs = eliminate_via_pairs(board, grid);
+        let changed_single = consolidate_single_vias(board, grid);
+        let changed_slide = slide_and_align_vias(board, grid);
+        if !changed_pairs && !changed_single && !changed_slide {
             break;
         }
     }
+    prune_dangling_tracks_and_vias(board);
 }
 
-fn reduce_vias_single_pass(board: &mut Board, grid: &RoutingGrid) -> bool {
+pub fn reduce_vias_single_pass(board: &mut Board, grid: &RoutingGrid) -> bool {
+    let p = eliminate_via_pairs(board, grid);
+    let s = consolidate_single_vias(board, grid);
+    let l = slide_and_align_vias(board, grid);
+    p || s || l
+}
+
+/// Eliminates redundant layer-hopping via pairs (L_orig -> L_alt -> L_orig).
+pub fn eliminate_via_pairs(board: &mut Board, grid: &RoutingGrid) -> bool {
+    let mut any_changed = false;
+    for _ in 0..20 {
+        if !eliminate_via_pair_once(board, grid) {
+            break;
+        }
+        any_changed = true;
+    }
+    any_changed
+}
+
+fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid) -> bool {
     let is_plane_net = |nid: usize| -> bool {
         let net_name = board.nets.get(nid).map(|s| s.as_str()).unwrap_or("");
         net_name == "GND"
@@ -6436,6 +6459,455 @@ fn reduce_vias_single_pass(board: &mut Board, grid: &RoutingGrid) -> bool {
     false
 }
 
+/// Identifies connections with a single via transitioning between layers,
+/// testing whether the alternate layer segment chain can be moved/projected onto
+/// the primary layer without DRC violations, eliminating the solitary via.
+pub fn consolidate_single_vias(board: &mut Board, grid: &RoutingGrid) -> bool {
+    let mut any_changed = false;
+    for _ in 0..20 {
+        if !consolidate_single_via_once(board, grid) {
+            break;
+        }
+        any_changed = true;
+    }
+    any_changed
+}
+
+fn consolidate_single_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
+    let is_plane_net = |nid: usize| -> bool {
+        let net_name = board.nets.get(nid).map(|s| s.as_str()).unwrap_or("");
+        net_name == "GND"
+            || net_name.starts_with("GND")
+            || grid.plane_nets.values().any(|&pn| pn == nid)
+    };
+
+    let vias_info: Vec<(usize, (f64, f64), usize)> = board
+        .vias
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| !v.is_locked && !is_plane_net(v.net_id))
+        .map(|(i, v)| (i, v.position, v.net_id))
+        .collect();
+
+    for (v_idx, v_pos, net_id) in vias_info {
+        let q_v = quant_point(v_pos);
+        let clearance = board.get_netclass_for_net(net_id).clearance;
+
+        let incident: Vec<(usize, usize, (f64, f64), f64)> = board
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.net_id == net_id && !t.is_locked)
+            .filter_map(|(idx, t)| {
+                if quant_point(t.start) == q_v {
+                    Some((idx, t.layer, t.end, t.width))
+                } else if quant_point(t.end) == q_v {
+                    Some((idx, t.layer, t.start, t.width))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut layers: Vec<usize> = incident.iter().map(|&(_, l, _, _)| l).collect();
+        layers.sort_unstable();
+        layers.dedup();
+        if layers.len() < 2 {
+            continue;
+        }
+
+        for &l_prim in &layers {
+            let alt_layers: Vec<usize> = layers.iter().copied().filter(|&l| l != l_prim).collect();
+            for &l_alt in &alt_layers {
+                let alt_incidents: Vec<(usize, (f64, f64), f64)> = incident
+                    .iter()
+                    .filter(|&&(_, l, _, _)| l == l_alt)
+                    .map(|&(idx, _, pt, w)| (idx, pt, w))
+                    .collect();
+
+                if alt_incidents.len() != 1 {
+                    continue;
+                }
+
+                let (t1_idx, next_pt, track_width) = alt_incidents[0];
+                let mut chain_segs = vec![t1_idx];
+                let mut chain_pts = vec![v_pos, next_pt];
+                let mut curr_pt = next_pt;
+                let mut hit_another_via = false;
+
+                while chain_segs.len() < 32 {
+                    let curr_q = quant_point(curr_pt);
+                    if board.vias.iter().enumerate().any(|(i, other_v)| {
+                        i != v_idx && other_v.net_id == net_id && quant_point(other_v.position) == curr_q
+                    }) {
+                        hit_another_via = true;
+                        break;
+                    }
+
+                    let next_track = board
+                        .tracks
+                        .iter()
+                        .enumerate()
+                        .filter(|&(idx, t)| {
+                            t.net_id == net_id
+                                && !t.is_locked
+                                && t.layer == l_alt
+                                && !chain_segs.contains(&idx)
+                        })
+                        .find_map(|(idx, t)| {
+                            if quant_point(t.start) == curr_q {
+                                Some((idx, t.end))
+                            } else if quant_point(t.end) == curr_q {
+                                Some((idx, t.start))
+                            } else {
+                                None
+                            }
+                        });
+
+                    if let Some((next_seg_idx, nxt_p)) = next_track {
+                        chain_segs.push(next_seg_idx);
+                        chain_pts.push(nxt_p);
+                        curr_pt = nxt_p;
+                    } else {
+                        break;
+                    }
+                }
+
+                if hit_another_via {
+                    continue;
+                }
+
+                // Check if curr_pt can exist on l_prim
+                let pad_can_exist_on_l_prim = board.footprints.iter().any(|fp| {
+                    fp.pads.iter().any(|p| {
+                        if p.net_id != net_id {
+                            return false;
+                        }
+                        let (px, py) = fp.pad_absolute_position(p);
+                        if (px - curr_pt.0).hypot(py - curr_pt.1) < 0.15 {
+                            p.is_through_hole || fp.layer == l_prim
+                        } else {
+                            false
+                        }
+                    })
+                });
+
+                let curr_q = quant_point(curr_pt);
+                let connects_to_track_on_l_prim = board.tracks.iter().enumerate().any(|(idx, t)| {
+                    t.net_id == net_id
+                        && t.layer == l_prim
+                        && !t.is_locked
+                        && !chain_segs.contains(&idx)
+                        && (quant_point(t.start) == curr_q || quant_point(t.end) == curr_q)
+                });
+
+                if !pad_can_exist_on_l_prim && !connects_to_track_on_l_prim {
+                    continue;
+                }
+
+                let orig_len: f64 = chain_pts
+                    .windows(2)
+                    .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+                    .sum();
+
+                let mut winner_path = None;
+
+                // Priority 1: Direct segment on l_prim
+                let direct_len = (curr_pt.0 - v_pos.0).hypot(curr_pt.1 - v_pos.1);
+                if direct_len <= orig_len * 1.25 + 1e-4
+                    && (direct_len - orig_len) <= 5.0 + 1e-4
+                    && is_segment_clear(board, Some(grid), v_pos, curr_pt, l_prim, net_id, track_width)
+                    && is_track_segment_legal(board, v_pos, curr_pt, track_width, l_prim, net_id, clearance)
+                {
+                    winner_path = Some(vec![v_pos, curr_pt]);
+                }
+
+                // Priority 2: Same path coordinates on l_prim
+                if winner_path.is_none() {
+                    let all_clear = chain_pts.windows(2).all(|w| {
+                        is_segment_clear(board, Some(grid), w[0], w[1], l_prim, net_id, track_width)
+                            && is_track_segment_legal(board, w[0], w[1], track_width, l_prim, net_id, clearance)
+                    });
+                    if all_clear {
+                        winner_path = Some(chain_pts.clone());
+                    }
+                }
+
+                // Priority 3: Canonical 45-degree detour on l_prim
+                if winner_path.is_none() {
+                    let dx = curr_pt.0 - v_pos.0;
+                    let dy = curr_pt.1 - v_pos.1;
+                    let s = dx.abs().min(dy.abs());
+                    if s > 1e-4 {
+                        let sx = s * dx.signum();
+                        let sy = s * dy.signum();
+                        let c_a = (v_pos.0 + sx, v_pos.1 + sy);
+                        let c_b = (curr_pt.0 - sx, curr_pt.1 - sy);
+                        for c in [c_a, c_b] {
+                            let d1 = (c.0 - v_pos.0).hypot(c.1 - v_pos.1);
+                            let d2 = (curr_pt.0 - c.0).hypot(curr_pt.1 - c.1);
+                            let cand_len = d1 + d2;
+                            let budget_ok = cand_len <= orig_len * 1.25 + 1e-4
+                                && (cand_len - orig_len) <= 5.0 + 1e-4;
+                            if budget_ok
+                                && is_segment_clear(board, Some(grid), v_pos, c, l_prim, net_id, track_width)
+                                && is_segment_clear(board, Some(grid), c, curr_pt, l_prim, net_id, track_width)
+                                && is_track_segment_legal(board, v_pos, c, track_width, l_prim, net_id, clearance)
+                                && is_track_segment_legal(board, c, curr_pt, track_width, l_prim, net_id, clearance)
+                            {
+                                winner_path = Some(vec![v_pos, c, curr_pt]);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(new_pts) = winner_path {
+                    chain_segs.sort_unstable();
+                    for &idx in chain_segs.iter().rev() {
+                        board.tracks.remove(idx);
+                    }
+
+                    for w in new_pts.windows(2) {
+                        if (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1) > 1e-5 {
+                            board.tracks.push(TrackSegment {
+                                start: w[0],
+                                end: w[1],
+                                width: track_width,
+                                layer: l_prim,
+                                net_id,
+                                is_locked: false,
+                            });
+                        }
+                    }
+
+                    if let Some(pos) = board.vias.iter().position(|v| {
+                        v.net_id == net_id && !v.is_locked && quant_point(v.position) == q_v
+                    }) {
+                        board.vias.remove(pos);
+                    }
+
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Slides and aligns signal vias along incident track vectors to eliminate micro-jogs,
+/// doglegs, reduce wirelength, and snap close vias to through-hole pads.
+pub fn slide_and_align_vias(board: &mut Board, grid: &RoutingGrid) -> bool {
+    let mut any_changed = false;
+    for _ in 0..20 {
+        if !slide_and_align_via_once(board, grid) {
+            break;
+        }
+        any_changed = true;
+    }
+    any_changed
+}
+
+fn slide_and_align_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
+    let is_plane_net = |nid: usize| -> bool {
+        let net_name = board.nets.get(nid).map(|s| s.as_str()).unwrap_or("");
+        net_name == "GND"
+            || net_name.starts_with("GND")
+            || grid.plane_nets.values().any(|&pn| pn == nid)
+    };
+
+    let num_vias = board.vias.len();
+    for v_idx in 0..num_vias {
+        let (v_pos, net_id, via_size, is_locked) = {
+            let v = &board.vias[v_idx];
+            (v.position, v.net_id, v.size, v.is_locked)
+        };
+        if is_locked || is_plane_net(net_id) {
+            continue;
+        }
+
+        let clearance = board.get_netclass_for_net(net_id).clearance;
+
+        // Incident tracks
+        let incident: Vec<(usize, usize, (f64, f64), f64)> = board
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.net_id == net_id && !t.is_locked)
+            .filter_map(|(idx, t)| {
+                if (t.start.0 - v_pos.0).hypot(t.start.1 - v_pos.1) < 1e-4 {
+                    Some((idx, t.layer, t.end, t.width))
+                } else if (t.end.0 - v_pos.0).hypot(t.end.1 - v_pos.1) < 1e-4 {
+                    Some((idx, t.layer, t.start, t.width))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if incident.is_empty() {
+            continue;
+        }
+
+        // 1. Pad Snapping: check if close to a same-net through-hole pad (< 0.50mm)
+        for fp in &board.footprints {
+            for pad in &fp.pads {
+                if pad.net_id == net_id && pad.is_through_hole {
+                    let (px, py) = fp.pad_absolute_position(pad);
+                    let d = (v_pos.0 - px).hypot(v_pos.1 - py);
+                    if d > 1e-4 && d < 0.50 {
+                        let all_clear = incident.iter().all(|&(_, l, other, w)| {
+                            let dx = (other.0 - px).abs();
+                            let dy = (other.1 - py).abs();
+                            let is_octilinear = dx < 1e-4 || dy < 1e-4 || (dx - dy).abs() < 1e-4;
+                            is_octilinear
+                                && is_track_segment_legal(board, (px, py), other, w, l, net_id, clearance)
+                                && is_segment_clear(board, Some(grid), (px, py), other, l, net_id, w)
+                        });
+                        if all_clear {
+                            for &(t_idx, _, _, _) in &incident {
+                                let t = &mut board.tracks[t_idx];
+                                if (t.start.0 - v_pos.0).hypot(t.start.1 - v_pos.1) < 1e-4 {
+                                    t.start = (px, py);
+                                } else {
+                                    t.end = (px, py);
+                                }
+                            }
+                            board.tracks.retain(|t| (t.start.0 - t.end.0).hypot(t.start.1 - t.end.1) > 1e-4);
+                            board.vias.remove(v_idx);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Collinear & Jog Elimination:
+        // If via is connected to a track that has a dogleg or micro-jog (< 1.0mm) before turning
+        for &(t_idx, layer, other_pt, _) in &incident {
+            let seg_len = (other_pt.0 - v_pos.0).hypot(other_pt.1 - v_pos.1);
+            if seg_len < 1.0 && seg_len > 1e-4 {
+                let is_pad = board.footprints.iter().any(|fp| {
+                    fp.pads.iter().any(|p| {
+                        let (px, py) = fp.pad_absolute_position(p);
+                        (px - other_pt.0).hypot(py - other_pt.1) < 1e-3
+                    })
+                });
+                if !is_pad {
+                    let has_connecting_track = board.tracks.iter().enumerate().any(|(i, t)| {
+                        i != t_idx
+                            && t.net_id == net_id
+                            && t.layer == layer
+                            && !t.is_locked
+                            && ((t.start.0 - other_pt.0).hypot(t.start.1 - other_pt.1) < 1e-4
+                                || (t.end.0 - other_pt.0).hypot(t.end.1 - other_pt.1) < 1e-4)
+                    });
+
+                    if has_connecting_track {
+                        if is_via_location_legal_ignoring(board, other_pt, via_size, net_id, clearance, Some(v_pos)) {
+                            let other_tracks_ok = incident.iter().all(|&(ot_idx, ot_layer, ot_other, ot_w)| {
+                                if ot_idx == t_idx {
+                                    true
+                                } else if (ot_other.0 - other_pt.0).hypot(ot_other.1 - other_pt.1) < 1e-4 {
+                                    true
+                                } else {
+                                    let dx = (ot_other.0 - other_pt.0).abs();
+                                    let dy = (ot_other.1 - other_pt.1).abs();
+                                    let is_octilinear = dx < 1e-4 || dy < 1e-4 || (dx - dy).abs() < 1e-4;
+                                    is_octilinear
+                                        && is_track_segment_legal(board, other_pt, ot_other, ot_w, ot_layer, net_id, clearance)
+                                        && is_segment_clear(board, Some(grid), other_pt, ot_other, ot_layer, net_id, ot_w)
+                                }
+                            });
+
+                            if other_tracks_ok {
+                                board.vias[v_idx].position = other_pt;
+                                for &(ot_idx, _, _, _) in &incident {
+                                    let t = &mut board.tracks[ot_idx];
+                                    if (t.start.0 - v_pos.0).hypot(t.start.1 - v_pos.1) < 1e-4 {
+                                        t.start = other_pt;
+                                    } else {
+                                        t.end = other_pt;
+                                    }
+                                }
+                                board.tracks.retain(|t| (t.start.0 - t.end.0).hypot(t.start.1 - t.end.1) > 1e-4);
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Vector Sliding:
+        // Test candidate positions along vectors of connected tracks
+        let orig_tot_len: f64 = incident.iter().map(|&(_, _, other, _)| (other.0 - v_pos.0).hypot(other.1 - v_pos.1)).sum();
+        let mut best_cand: Option<((f64, f64), f64)> = None;
+
+        for &(_, _, other_pt, _) in &incident {
+            let dx = other_pt.0 - v_pos.0;
+            let dy = other_pt.1 - v_pos.1;
+            let dist = dx.hypot(dy);
+            if dist < 0.15 {
+                continue;
+            }
+            let ux = dx / dist;
+            let uy = dy / dist;
+
+            let steps = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00, 1.50, 2.00];
+            for &s in &steps {
+                if s >= dist - 0.05 {
+                    break;
+                }
+                let cand = (v_pos.0 + s * ux, v_pos.1 + s * uy);
+                if !is_via_location_legal_ignoring(board, cand, via_size, net_id, clearance, Some(v_pos)) {
+                    continue;
+                }
+
+                let all_ok = incident.iter().all(|&(_, l, other, w)| {
+                    if (other.0 - cand.0).hypot(other.1 - cand.1) < 1e-4 {
+                        true
+                    } else {
+                        let dx = (other.0 - cand.0).abs();
+                        let dy = (other.1 - cand.1).abs();
+                        let is_octilinear = dx < 1e-4 || dy < 1e-4 || (dx - dy).abs() < 1e-4;
+                        is_octilinear
+                            && is_track_segment_legal(board, cand, other, w, l, net_id, clearance)
+                            && is_segment_clear(board, Some(grid), cand, other, l, net_id, w)
+                    }
+                });
+
+                if all_ok {
+                    let cand_len: f64 = incident.iter().map(|&(_, _, other, _)| (other.0 - cand.0).hypot(other.1 - cand.1)).sum();
+                    if cand_len < orig_tot_len - 0.05 {
+                        let min_len = best_cand.map(|(_, l)| l).unwrap_or(orig_tot_len - 0.05);
+                        if cand_len < min_len - 1e-4 {
+                            best_cand = Some((cand, cand_len));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((best_pos, _)) = best_cand {
+            board.vias[v_idx].position = best_pos;
+            for &(t_idx, _, _, _) in &incident {
+                let t = &mut board.tracks[t_idx];
+                if (t.start.0 - v_pos.0).hypot(t.start.1 - v_pos.1) < 1e-4 {
+                    t.start = best_pos;
+                } else {
+                    t.end = best_pos;
+                }
+            }
+            board.tracks.retain(|t| (t.start.0 - t.end.0).hypot(t.start.1 - t.end.1) > 1e-4);
+            return true;
+        }
+    }
+
+    false
+}
+
 pub fn gloss_tracks(board: &mut Board, grid: &RoutingGrid) {
     let mut net_ids: Vec<usize> = board
         .tracks
@@ -6599,12 +7071,15 @@ pub fn dist_segment_to_pad(s: (f64, f64), e: (f64, f64), fp: &Footprint, pad: &P
 /// Verifies whether candidate via location `pos` is completely legal and clearance-free
 /// against all foreign pads, tracks, vias, board boundary, and keepouts, as well as
 /// preventing overlapping or violating clearance against same-net SMD pads.
-pub fn is_via_location_legal(
+/// An optional `ignore_pos` can be supplied to skip drill and proximity collision with
+/// an existing via undergoing repositioning or sliding.
+pub fn is_via_location_legal_ignoring(
     board: &Board,
     pos: (f64, f64),
     via_dia: f64,
     net_id: usize,
     clearance: f64,
+    ignore_pos: Option<(f64, f64)>,
 ) -> bool {
     let via_r = via_dia * 0.5;
 
@@ -6652,6 +7127,11 @@ pub fn is_via_location_legal(
 
     // 5. Foreign vias
     for v in &board.vias {
+        if let Some(ig) = ignore_pos {
+            if (v.position.0 - ig.0).hypot(v.position.1 - ig.1) < 1e-4 {
+                continue;
+            }
+        }
         if v.net_id != net_id {
             let v_c = clearance.max(board.get_netclass_for_net(v.net_id).clearance).max(0.12);
             let d = (pos.0 - v.position.0).hypot(pos.1 - v.position.1);
@@ -6682,6 +7162,11 @@ pub fn is_via_location_legal(
 
     // 7. Hole-to-hole drill clearance against all other vias (including same net)
     for v in &board.vias {
+        if let Some(ig) = ignore_pos {
+            if (v.position.0 - ig.0).hypot(v.position.1 - ig.1) < 1e-4 {
+                continue;
+            }
+        }
         let d = (pos.0 - v.position.0).hypot(pos.1 - v.position.1);
         let min_hole_dist = (via_drill * 0.5) + (v.drill * 0.5) + 0.25;
         if d < min_hole_dist - 1e-4 {
@@ -6690,6 +7175,19 @@ pub fn is_via_location_legal(
     }
 
     true
+}
+
+/// Verifies whether candidate via location `pos` is completely legal and clearance-free
+/// against all foreign pads, tracks, vias, board boundary, and keepouts, as well as
+/// preventing overlapping or violating clearance against same-net SMD pads.
+pub fn is_via_location_legal(
+    board: &Board,
+    pos: (f64, f64),
+    via_dia: f64,
+    net_id: usize,
+    clearance: f64,
+) -> bool {
+    is_via_location_legal_ignoring(board, pos, via_dia, net_id, clearance, None)
 }
 
 /// Verifies whether a candidate track segment is legal and clearance-free against foreign copper and keepouts.
@@ -6776,6 +7274,9 @@ pub fn is_track_segment_legal(
 /// Automated dangling track & via pruning.
 /// Iteratively removes dead-end degree-1 track segments (antennas) and unconnected/single-layer vias.
 pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
+    if board.footprints.is_empty() {
+        return;
+    }
     let plane_nets = board.inner_plane_nets();
     let is_plane_net = |nid: usize| -> bool {
         let net_name = board.nets.get(nid).map(|s| s.as_str()).unwrap_or("");
@@ -8547,6 +9048,170 @@ mod tests {
         assert_eq!(board.vias.len(), 0, "Via reduction pass must remove redundant via pair in free space");
         let l1_tracks = board.tracks.iter().filter(|t| t.layer == 1).count();
         assert_eq!(l1_tracks, 0, "All tracks must be unified on layer 0 with 0 tracks on layer 1");
+    }
+
+    #[test]
+    fn test_via_consolidation_single_via_elimination() {
+        let nets = vec!["".to_string(), "SIG1".to_string()];
+        let mut net_name_to_id = HashMap::new();
+        net_name_to_id.insert("SIG1".to_string(), 1);
+        let mut netclasses = HashMap::new();
+        netclasses.insert("Default".to_string(), NetClass::default());
+        let mut net_to_class = HashMap::new();
+        net_to_class.insert("SIG1".to_string(), "Default".to_string());
+
+        // Net 1 with Pad A at (10, 10) on F.Cu and Pad B at (30, 10) on F.Cu
+        // Connected via 1 via at (15, 10) and tracks on B.Cu (layer 1) to (30, 10).
+        let pad_a = Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "SIG1", false);
+        let fp_a = make_fp("U1", 10.0, 10.0, false, vec![pad_a]);
+        let pad_b = Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "SIG1", false);
+        let fp_b = make_fp("U2", 30.0, 10.0, false, vec![pad_b]);
+
+        let mut board = Board {
+            file_path: String::new(),
+            raw_content: String::new(),
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 100.0,
+            max_y: 100.0,
+            footprints: vec![fp_a, fp_b],
+            holding_palette: Vec::new(),
+            nets,
+            net_name_to_id,
+            netclasses,
+            net_to_class,
+            keepouts: Vec::new(),
+            tracks: vec![
+                TrackSegment {
+                    start: (10.0, 10.0),
+                    end: (15.0, 10.0),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+                TrackSegment {
+                    start: (15.0, 10.0),
+                    end: (30.0, 10.0),
+                    width: 0.25,
+                    layer: 1,
+                    net_id: 1,
+                    is_locked: false,
+                },
+            ],
+            vias: vec![
+                Via {
+                    position: (15.0, 10.0),
+                    size: 0.60,
+                    drill: 0.30,
+                    net_id: 1,
+                    is_locked: false,
+                },
+            ],
+            clusters: Vec::new(),
+            schematic_positions: HashMap::new(),
+            outline_polygon: None,
+        };
+
+        let mut grid = RoutingGrid::new(&board, 0.20, None);
+        assert_eq!(board.vias.len(), 1);
+        assert_eq!(board.tracks.iter().filter(|t| t.layer == 1).count(), 1);
+
+        reduce_vias(&mut board, &mut grid);
+
+        assert_eq!(board.vias.len(), 0, "Via consolidation must eliminate the solitary via");
+        let l1_tracks = board.tracks.iter().filter(|t| t.layer == 1).count();
+        assert_eq!(l1_tracks, 0, "All tracks must be moved to F.Cu (layer 0)");
+    }
+
+    #[test]
+    fn test_via_sliding_eliminates_jog() {
+        let nets = vec!["".to_string(), "SIG1".to_string()];
+        let mut net_name_to_id = HashMap::new();
+        net_name_to_id.insert("SIG1".to_string(), 1);
+        let mut netclasses = HashMap::new();
+        netclasses.insert("Default".to_string(), NetClass::default());
+        let mut net_to_class = HashMap::new();
+        net_to_class.insert("SIG1".to_string(), "Default".to_string());
+
+        let pad_a = Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "SIG1", false);
+        let fp_a = make_fp("U1", 0.0, 0.0, false, vec![pad_a]);
+        let pad_b = Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "SIG1", false);
+        let mut fp_b = make_fp("U2", 10.0, 10.0, false, vec![pad_b]);
+        fp_b.layer = 1;
+
+        let mut board = Board {
+            file_path: String::new(),
+            raw_content: String::new(),
+            min_x: -10.0,
+            min_y: -10.0,
+            max_x: 100.0,
+            max_y: 100.0,
+            footprints: vec![fp_a, fp_b],
+            holding_palette: Vec::new(),
+            nets,
+            net_name_to_id,
+            netclasses,
+            net_to_class,
+            keepouts: Vec::new(),
+            tracks: vec![
+                TrackSegment {
+                    start: (0.0, 0.0),
+                    end: (10.0, 0.0),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+                TrackSegment {
+                    start: (10.0, 0.0),
+                    end: (10.0, 0.5),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+                TrackSegment {
+                    start: (10.0, 0.5),
+                    end: (10.0, 10.0),
+                    width: 0.25,
+                    layer: 1,
+                    net_id: 1,
+                    is_locked: false,
+                },
+            ],
+            vias: vec![
+                Via {
+                    position: (10.0, 0.5),
+                    size: 0.60,
+                    drill: 0.30,
+                    net_id: 1,
+                    is_locked: false,
+                },
+            ],
+            clusters: Vec::new(),
+            schematic_positions: HashMap::new(),
+            outline_polygon: None,
+        };
+
+        let grid = RoutingGrid::new(&board, 0.20, None);
+        assert_eq!(board.vias.len(), 1);
+        assert_eq!(board.tracks.len(), 3);
+
+        let changed = slide_and_align_vias(&mut board, &grid);
+        assert!(changed, "slide_and_align_vias should return true");
+
+        assert_eq!(board.vias.len(), 1);
+        assert_eq!(board.vias[0].position, (10.0, 0.0), "Via should slide to the corner at (10.0, 0.0)");
+        assert_eq!(board.tracks.len(), 2, "Dogleg jog track should be eliminated");
+
+        let l0_track = board.tracks.iter().find(|t| t.layer == 0).unwrap();
+        assert_eq!(l0_track.start, (0.0, 0.0));
+        assert_eq!(l0_track.end, (10.0, 0.0));
+
+        let l1_track = board.tracks.iter().find(|t| t.layer == 1).unwrap();
+        assert_eq!(l1_track.start, (10.0, 0.0));
+        assert_eq!(l1_track.end, (10.0, 10.0));
     }
 
     #[test]
