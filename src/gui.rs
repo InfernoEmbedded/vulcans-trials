@@ -119,6 +119,14 @@ pub struct VulcansTrialsApp {
     pub allow_layer_flip: bool,
     pub inner_plane_penalty: f64,
 
+    // Aggressive placement exploration & weights
+    pub max_jump_radius_mm: f64,
+    pub pair_swap_prob: f64,
+    pub centroid_pull_prob: f64,
+    pub temp_scale: f64,
+    pub escape_margin_mult: f64,
+    pub crossing_weight: f64,
+
     // Canvas viewport controls
     pub pan_offset: Vec2,
     pub zoom: f32,
@@ -173,6 +181,12 @@ impl VulcansTrialsApp {
             max_ripup_passes: 15,
             allow_layer_flip: false,
             inner_plane_penalty: 8.0,
+            max_jump_radius_mm: 20.0,
+            pair_swap_prob: 0.15,
+            centroid_pull_prob: 0.20,
+            temp_scale: 1.0,
+            escape_margin_mult: 1.0,
+            crossing_weight: 200.0,
             pan_offset: Vec2::ZERO,
             zoom: 1.0,
             show_courtyards: true,
@@ -237,6 +251,12 @@ impl VulcansTrialsApp {
         let max_passes = self.max_ripup_passes;
         let allow_flip = self.allow_layer_flip;
         let inner_plane_pen = self.inner_plane_penalty;
+        let max_jump_rad = self.max_jump_radius_mm;
+        let pair_swap_p = self.pair_swap_prob;
+        let centroid_pull_p = self.centroid_pull_prob;
+        let t_scale = self.temp_scale;
+        let esc_mult = self.escape_margin_mult;
+        let cross_w = self.crossing_weight;
         let out_path = self.output_path.clone();
 
         thread::spawn(move || {
@@ -247,6 +267,12 @@ impl VulcansTrialsApp {
                         duration_secs: place_dur,
                         min_spacing_mm: min_spacing,
                         allow_layer_flip: allow_flip,
+                        max_jump_radius_mm: max_jump_rad,
+                        pair_swap_prob: pair_swap_p,
+                        centroid_pull_prob: centroid_pull_p,
+                        temp_scale: t_scale,
+                        escape_margin_mult: esc_mult,
+                        crossing_weight: cross_w,
                         vulkan: vulkan.clone(),
                         ..PlacementConfig::default()
                     };
@@ -261,6 +287,12 @@ impl VulcansTrialsApp {
                     duration_secs: place_dur,
                     min_spacing_mm: min_spacing,
                     allow_layer_flip: allow_flip,
+                    max_jump_radius_mm: max_jump_rad,
+                    pair_swap_prob: pair_swap_p,
+                    centroid_pull_prob: centroid_pull_p,
+                    temp_scale: t_scale,
+                    escape_margin_mult: esc_mult,
+                    crossing_weight: cross_w,
                     vulkan: vulkan.clone(),
                     ..PlacementConfig::default()
                 };
@@ -889,6 +921,44 @@ impl VulcansTrialsApp {
                     !is_running,
                     egui::Checkbox::new(&mut self.allow_layer_flip, "Allow SMD Side Flip (F.Cu ↔ B.Cu)"),
                 );
+
+                ui.collapsing("Aggressive Placement & Exploration", |ui| {
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.max_jump_radius_mm, 2.0..=50.0)
+                            .text("Max Jump Radius (mm)")
+                            .suffix(" mm"),
+                    );
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.pair_swap_prob, 0.0..=0.50)
+                            .text("Pair Swap %")
+                            .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)),
+                    );
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.centroid_pull_prob, 0.0..=0.60)
+                            .text("Centroid Pull %")
+                            .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)),
+                    );
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.temp_scale, 0.2..=4.0)
+                            .text("Annealing Temp Scale")
+                            .suffix("x"),
+                    );
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.escape_margin_mult, 0.5..=3.0)
+                            .text("Escape Corridor Halo")
+                            .suffix("x"),
+                    );
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.crossing_weight, 50.0..=600.0)
+                            .text("Crossing Penalty Weight"),
+                    );
+                });
 
                 ui.separator();
                 ui.heading("Visibility & View");
@@ -2483,6 +2553,18 @@ mod tests {
             }
         }
         assert_eq!(pass_order, vec![false, true], "SMD pads must render first, through-hole thermal pads on top");
+    }
+
+    #[test]
+    fn test_aggressive_placement_params_gui_defaults() {
+        let board = Board::default();
+        let app = VulcansTrialsApp::new("in.kicad_pcb".to_string(), "out.kicad_pcb".to_string(), board, None);
+        assert!((app.max_jump_radius_mm - 20.0).abs() < 1e-6);
+        assert!((app.pair_swap_prob - 0.15).abs() < 1e-6);
+        assert!((app.centroid_pull_prob - 0.20).abs() < 1e-6);
+        assert!((app.temp_scale - 1.0).abs() < 1e-6);
+        assert!((app.escape_margin_mult - 1.0).abs() < 1e-6);
+        assert!((app.crossing_weight - 200.0).abs() < 1e-6);
     }
 }
 

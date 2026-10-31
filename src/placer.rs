@@ -27,6 +27,10 @@ pub struct PlacementConfig {
     pub allow_layer_flip: bool,
     pub enable_escape_clearance: bool,
     pub escape_margin_mult: f64,
+    pub max_jump_radius_mm: f64,
+    pub pair_swap_prob: f64,
+    pub centroid_pull_prob: f64,
+    pub temp_scale: f64,
     pub vulkan: Option<Arc<VulkanEngine>>,
 }
 
@@ -47,6 +51,10 @@ impl Default for PlacementConfig {
             allow_layer_flip: false,
             enable_escape_clearance: true,
             escape_margin_mult: 1.0,
+            max_jump_radius_mm: 20.0,
+            pair_swap_prob: 0.15,
+            centroid_pull_prob: 0.20,
+            temp_scale: 1.0,
             vulkan: None,
         }
     }
@@ -1659,6 +1667,30 @@ pub fn run_auto_placer(
     let boundary = board.boundary_aabb();
     let ties = Arc::new(build_passive_ties(board));
 
+    // Precompute connected foreign pad references for barycentric centroid pull moves
+    let mut connected_pins: Vec<Vec<(usize, usize)>> = vec![Vec::new(); board.footprints.len()];
+    for (net_id, _) in board.nets.iter().enumerate() {
+        if net_id == 0 {
+            continue;
+        }
+        let mut net_pads: Vec<(usize, usize)> = Vec::new();
+        for (f_idx, fp) in board.footprints.iter().enumerate() {
+            for (p_idx, p) in fp.pads.iter().enumerate() {
+                if p.net_id == net_id {
+                    net_pads.push((f_idx, p_idx));
+                }
+            }
+        }
+        for &(fa, _) in &net_pads {
+            for &(fb, pb) in &net_pads {
+                if fa != fb && !connected_pins[fa].contains(&(fb, pb)) {
+                    connected_pins[fa].push((fb, pb));
+                }
+            }
+        }
+    }
+    let connected_pins = Arc::new(connected_pins);
+
     if let Some(ref st) = live {
         if let Ok(mut g) = st.lock() {
             g.phase = TrialPhase::AutoPlacing;
@@ -1668,8 +1700,9 @@ pub fn run_auto_placer(
                 String::new()
             };
             g.push_log(format!(
-                "[Auto-Placer] Launching {} Parallel Tempering CPU SA replicas{} for {}s...",
-                num_threads, gpu_tag, config.duration_secs
+                "[Auto-Placer] Launching {} Parallel Tempering CPU SA replicas{} for {}s (jump_r={:.1}mm, swap={:.0}%, centroid={:.0}%)...",
+                num_threads, gpu_tag, config.duration_secs,
+                config.max_jump_radius_mm, config.pair_swap_prob * 100.0, config.centroid_pull_prob * 100.0
             ));
         }
     }
@@ -1753,10 +1786,16 @@ pub fn run_auto_placer(
                             .wrapping_add(epoch as u64),
                     );
                     let temp_ratio = (tid as f64) / ((num_threads - 1).max(1) as f64);
-                    let t_base = 8.0 * (350.0f64 / 8.0).powf(temp_ratio);
+                    let t_base = 8.0 * (350.0f64 / 8.0).powf(temp_ratio) * config.temp_scale;
                     let cooling = (1.0 - progress * 0.85).max(0.05);
                     let temp = t_base * cooling;
                     let mut local_evals = 0usize;
+
+                    let p_swap = (config.pair_swap_prob * 100.0).clamp(0.0, 40.0) as usize;
+                    let p_centroid = (config.centroid_pull_prob * 100.0).clamp(0.0, 50.0) as usize;
+                    let p_rot = 16usize;
+                    let p_flip = if config.allow_layer_flip { 8usize } else { 0usize };
+                    let p_affinity = if !ties.is_empty() { 12usize } else { 0usize };
 
                     while Instant::now() < ep_end && !stop_flag.load(Ordering::Relaxed) {
                         for _ in 0..40 {
@@ -1770,47 +1809,15 @@ pub fn run_auto_placer(
                             let old_bv = current.boundary_violations;
                             let mut modified: Vec<usize> = Vec::with_capacity(2);
 
-                            let move_type = rng.gen_range(0..100);
-                            if move_type < 48 {
-                                let idx = movable[rng.gen_range(0..movable.len())];
-                                let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
-                                    .origin_clamp_range(current.rotations[idx], current.layers[idx], config.min_spacing_mm, &boundary);
-                                let max_shift = (10.0 * cooling).max(config.grid_step_mm * 2.0);
-                                let nx = snap_to_grid(
-                                    (current.positions[idx].x + rng.gen_range(-max_shift..=max_shift))
-                                        .clamp(cx_min, cx_max),
-                                    config.grid_step_mm,
-                                );
-                                let ny = snap_to_grid(
-                                    (current.positions[idx].y + rng.gen_range(-max_shift..=max_shift))
-                                        .clamp(cy_min, cy_max),
-                                    config.grid_step_mm,
-                                );
-                                current.positions[idx] = Point::new(nx, ny);
-                                modified.push(idx);
-                            } else if move_type < 72 {
-                                let idx = movable[rng.gen_range(0..movable.len())];
-                                let deltas = [90.0, 180.0, 270.0];
-                                let new_rot =
-                                    (current.rotations[idx] + deltas[rng.gen_range(0..3)]) % 360.0;
-                                current.rotations[idx] = new_rot;
-                                let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
-                                    .origin_clamp_range(new_rot, current.layers[idx], config.min_spacing_mm, &boundary);
-                                current.positions[idx].x = current.positions[idx].x.clamp(cx_min, cx_max);
-                                current.positions[idx].y = current.positions[idx].y.clamp(cy_min, cy_max);
-                                modified.push(idx);
-                            } else if move_type < 80 && config.allow_layer_flip {
-                                let idx = movable[rng.gen_range(0..movable.len())];
-                                if board.footprints[idx].is_smd_only() {
-                                    let new_layer = 1 - current.layers[idx];
-                                    current.layers[idx] = new_layer;
-                                    let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
-                                        .origin_clamp_range(current.rotations[idx], new_layer, config.min_spacing_mm, &boundary);
-                                    current.positions[idx].x = current.positions[idx].x.clamp(cx_min, cx_max);
-                                    current.positions[idx].y = current.positions[idx].y.clamp(cy_min, cy_max);
-                                    modified.push(idx);
-                                }
-                            } else if move_type < 90 && movable.len() >= 2 {
+                            let roll = rng.gen_range(0..100);
+                            let t1 = p_swap;
+                            let t2 = t1 + p_centroid;
+                            let t3 = t2 + p_rot;
+                            let t4 = t3 + p_flip;
+                            let t5 = t4 + p_affinity;
+
+                            if roll < t1 && movable.len() >= 2 {
+                                // 1. Component Pair Swap
                                 let a = movable[rng.gen_range(0..movable.len())];
                                 let b = movable[rng.gen_range(0..movable.len())];
                                 if a != b {
@@ -1825,7 +1832,58 @@ pub fn run_auto_placer(
                                     modified.push(a);
                                     modified.push(b);
                                 }
-                            } else if !ties.is_empty() {
+                            } else if roll < t2 {
+                                // 2. Barycentric Centroid Pull (magnetic pull towards connected nets)
+                                let idx = movable[rng.gen_range(0..movable.len())];
+                                let pins = &connected_pins[idx];
+                                if !pins.is_empty() {
+                                    let mut sum_x = 0.0;
+                                    let mut sum_y = 0.0;
+                                    for &(other_fp, other_pad) in pins {
+                                        let pt = current.cached_pads[other_fp][other_pad];
+                                        sum_x += pt.x;
+                                        sum_y += pt.y;
+                                    }
+                                    let cx = sum_x / pins.len() as f64;
+                                    let cy = sum_y / pins.len() as f64;
+                                    let alpha = rng.gen_range(0.35..=0.80);
+                                    let jitter = (3.0 * cooling).max(0.635);
+                                    let target_x = current.positions[idx].x * (1.0 - alpha) + cx * alpha + rng.gen_range(-jitter..=jitter);
+                                    let target_y = current.positions[idx].y * (1.0 - alpha) + cy * alpha + rng.gen_range(-jitter..=jitter);
+
+                                    let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
+                                        .origin_clamp_range(current.rotations[idx], current.layers[idx], config.min_spacing_mm, &boundary);
+                                    let nx = snap_to_grid(target_x.clamp(cx_min, cx_max), config.grid_step_mm);
+                                    let ny = snap_to_grid(target_y.clamp(cy_min, cy_max), config.grid_step_mm);
+                                    current.positions[idx] = Point::new(nx, ny);
+                                    modified.push(idx);
+                                }
+                            } else if roll < t3 {
+                                // 3. Rotation (90°, 180°, 270°)
+                                let idx = movable[rng.gen_range(0..movable.len())];
+                                let deltas = [90.0, 180.0, 270.0];
+                                let new_rot =
+                                    (current.rotations[idx] + deltas[rng.gen_range(0..3)]) % 360.0;
+                                current.rotations[idx] = new_rot;
+                                let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
+                                    .origin_clamp_range(new_rot, current.layers[idx], config.min_spacing_mm, &boundary);
+                                current.positions[idx].x = current.positions[idx].x.clamp(cx_min, cx_max);
+                                current.positions[idx].y = current.positions[idx].y.clamp(cy_min, cy_max);
+                                modified.push(idx);
+                            } else if roll < t4 && config.allow_layer_flip {
+                                // 4. Layer Flip (F.Cu <-> B.Cu)
+                                let idx = movable[rng.gen_range(0..movable.len())];
+                                if board.footprints[idx].is_smd_only() {
+                                    let new_layer = 1 - current.layers[idx];
+                                    current.layers[idx] = new_layer;
+                                    let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
+                                        .origin_clamp_range(current.rotations[idx], new_layer, config.min_spacing_mm, &boundary);
+                                    current.positions[idx].x = current.positions[idx].x.clamp(cx_min, cx_max);
+                                    current.positions[idx].y = current.positions[idx].y.clamp(cy_min, cy_max);
+                                    modified.push(idx);
+                                }
+                            } else if roll < t5 && !ties.is_empty() {
+                                // 5. Decoupling & Passive Tie Affinity Move
                                 let tie = &ties[rng.gen_range(0..ties.len())];
                                 let idx = tie.passive_idx;
                                 let anchor_pt = current.cached_pads[tie.anchor_idx][tie.anchor_pad_idx];
@@ -1874,6 +1932,34 @@ pub fn run_auto_placer(
                                     current.positions[idx] = Point::new(nx, ny);
                                     modified.push(idx);
                                 }
+                            } else {
+                                // 6. Positional Shift & Long-Range Jumps
+                                let idx = movable[rng.gen_range(0..movable.len())];
+                                let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
+                                    .origin_clamp_range(current.rotations[idx], current.layers[idx], config.min_spacing_mm, &boundary);
+                                let max_shift = (config.max_jump_radius_mm * cooling).max(config.grid_step_mm * 2.0);
+                                let (shift_x, shift_y) = if rng.gen_bool(0.06) {
+                                    // 6% chance of macro teleport jump across full max_jump_radius
+                                    (
+                                        rng.gen_range(-config.max_jump_radius_mm..=config.max_jump_radius_mm),
+                                        rng.gen_range(-config.max_jump_radius_mm..=config.max_jump_radius_mm),
+                                    )
+                                } else {
+                                    (
+                                        rng.gen_range(-max_shift..=max_shift),
+                                        rng.gen_range(-max_shift..=max_shift),
+                                    )
+                                };
+                                let nx = snap_to_grid(
+                                    (current.positions[idx].x + shift_x).clamp(cx_min, cx_max),
+                                    config.grid_step_mm,
+                                );
+                                let ny = snap_to_grid(
+                                    (current.positions[idx].y + shift_y).clamp(cy_min, cy_max),
+                                    config.grid_step_mm,
+                                );
+                                current.positions[idx] = Point::new(nx, ny);
+                                modified.push(idx);
                             }
 
                             if modified.is_empty() {
@@ -3270,6 +3356,147 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_aggressive_placement_moves_and_centroid_pull() {
+        use std::sync::atomic::AtomicBool;
+
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 60.0;
+        board.max_y = 60.0;
+        board.outline_polygon = Some(Polygon::from_rect(0.0, 0.0, 60.0, 60.0));
+
+        let net_id = 1;
+        board.nets.insert(net_id, "VCC_NET".to_string());
+
+        // J1: Locked anchor at (45, 45)
+        let j1 = Footprint {
+            reference: "J1".to_string(),
+            value: "CONN".to_string(),
+            x: 45.0,
+            y: 45.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: true,
+            pads: vec![crate::board::Pad {
+                number: "1".to_string(),
+                net_id,
+                net_name: "VCC_NET".to_string(),
+                offset_x: 0.0,
+                offset_y: 0.0,
+                width: 1.0,
+                height: 1.0,
+                shape: "rect".to_string(),
+                rotation: 0.0,
+                is_through_hole: false,
+                drill: None,
+            }],
+            width: 4.0,
+            height: 4.0,
+            courtyards: vec![Polygon::from_rect(43.0, 43.0, 4.0, 4.0)],
+            perimeters: vec![],
+            escape_margin: 0.25,
+            at_span: None,
+            fp_span: None,
+        };
+
+        // U1: Unlocked IC initially at (10, 10)
+        let u1 = Footprint {
+            reference: "U1".to_string(),
+            value: "MCU".to_string(),
+            x: 10.0,
+            y: 10.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: vec![crate::board::Pad {
+                number: "1".to_string(),
+                net_id,
+                net_name: "VCC_NET".to_string(),
+                offset_x: 0.0,
+                offset_y: 0.0,
+                width: 1.0,
+                height: 1.0,
+                shape: "rect".to_string(),
+                rotation: 0.0,
+                is_through_hole: false,
+                drill: None,
+            }],
+            width: 5.0,
+            height: 5.0,
+            courtyards: vec![Polygon::from_rect(7.5, 7.5, 5.0, 5.0)],
+            perimeters: vec![],
+            escape_margin: 0.25,
+            at_span: None,
+            fp_span: None,
+        };
+
+        // C1: Unlocked capacitor initially at (15, 10)
+        let c1 = Footprint {
+            reference: "C1".to_string(),
+            value: "100nF".to_string(),
+            x: 15.0,
+            y: 10.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: vec![crate::board::Pad {
+                number: "1".to_string(),
+                net_id,
+                net_name: "VCC_NET".to_string(),
+                offset_x: 0.0,
+                offset_y: 0.0,
+                width: 0.6,
+                height: 0.6,
+                shape: "rect".to_string(),
+                rotation: 0.0,
+                is_through_hole: false,
+                drill: None,
+            }],
+            width: 2.0,
+            height: 1.5,
+            courtyards: vec![Polygon::from_rect(14.0, 9.25, 2.0, 1.5)],
+            perimeters: vec![],
+            escape_margin: 0.25,
+            at_span: None,
+            fp_span: None,
+        };
+
+        board.footprints = vec![j1, u1, c1];
+
+        let cfg = PlacementConfig {
+            duration_secs: 1,
+            grid_step_mm: 0.5,
+            min_spacing_mm: 0.25,
+            max_jump_radius_mm: 25.0,
+            pair_swap_prob: 0.25,
+            centroid_pull_prob: 0.35,
+            temp_scale: 1.5,
+            ..PlacementConfig::default()
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let result = run_auto_placer(&mut board, &cfg, None, stop);
+
+        assert_eq!(result.boundary_violations, 0, "All components must be within board outline");
+        assert_eq!(result.overlaps, 0, "No courtyard overlaps allowed");
+
+        // Verify locked component stayed fixed
+        let j1_after = board.footprints.iter().find(|f| f.reference == "J1").unwrap();
+        assert!((j1_after.x - 45.0).abs() < 1e-6);
+        assert!((j1_after.y - 45.0).abs() < 1e-6);
+
+        // Verify all components are legally contained
+        for fp in &board.footprints {
+            let p = Point::new(fp.x, fp.y);
+            assert!(board.contains_point_in_boundary(&p), "Footprint {} must be within boundary", fp.reference);
         }
     }
 }

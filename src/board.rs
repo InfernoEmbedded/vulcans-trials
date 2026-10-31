@@ -72,6 +72,17 @@ impl Polygon {
         Self { vertices }
     }
 
+    pub fn from_rect(min_x: f64, min_y: f64, w: f64, h: f64) -> Self {
+        Self {
+            vertices: vec![
+                Point::new(min_x, min_y),
+                Point::new(min_x + w, min_y),
+                Point::new(min_x + w, min_y + h),
+                Point::new(min_x, min_y + h),
+            ],
+        }
+    }
+
     pub fn aabb(&self) -> AABB {
         let mut min_x = f64::INFINITY;
         let mut min_y = f64::INFINITY;
@@ -928,6 +939,31 @@ pub struct Board {
     pub clusters: Vec<CompiledCluster>,
     pub schematic_positions: HashMap<String, (f64, f64)>,
     pub outline_polygon: Option<Polygon>,
+}
+
+impl Default for Board {
+    fn default() -> Self {
+        Self {
+            file_path: String::new(),
+            raw_content: "()".to_string(),
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 100.0,
+            max_y: 100.0,
+            footprints: Vec::new(),
+            holding_palette: Vec::new(),
+            nets: vec!["".to_string()],
+            net_name_to_id: HashMap::new(),
+            netclasses: HashMap::new(),
+            net_to_class: HashMap::new(),
+            keepouts: Vec::new(),
+            tracks: Vec::new(),
+            vias: Vec::new(),
+            clusters: Vec::new(),
+            schematic_positions: HashMap::new(),
+            outline_polygon: None,
+        }
+    }
 }
 
 pub const INTERNAL_COPPER_LAYERS: [&str; 30] = [
