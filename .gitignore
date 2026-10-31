@@ -1,5 +1,6 @@
 /target/
 *.kicad_pcb
+!tests/boards/*.kicad_pcb
 *.ses
 kicad_plugin/pcm/
 __pycache__/

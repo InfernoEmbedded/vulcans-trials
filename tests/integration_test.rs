@@ -945,4 +945,177 @@ fn test_clear_unlocked_objects_holding_palette_and_priority_placement_e2e() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn test_u1_board_routing_inspection() {
+    let board = Board::load("tests/boards/u1_test.kicad_pcb", &HashSet::new()).expect("Load u1_test");
+    println!("Board loaded: {} footprints, {} nets", board.footprints.len(), board.nets.len());
+    let u1 = board.footprints.iter().find(|fp| fp.reference == "U1").expect("U1");
+    println!("U1 pos: ({}, {}), rot: {}", u1.x, u1.y, u1.rotation);
+    for pad in &u1.pads {
+        let (px, py) = u1.pad_absolute_position(pad);
+        println!("  U1 pad {} (net {} '{}'): ({:.4}, {:.4})", pad.number, pad.net_id, pad.net_name, px, py);
+    }
+    let router = AutoRouter::new(3);
+    let stubs = router.generate_escape_stubs(&board);
+    println!("Total escape stubs: {}", stubs.len());
+    for s in &stubs {
+        println!("  Stub net {}: pad=({:.4}, {:.4}) -> tip=({:.4}, {:.4})", s.net_id, s.pad_pos.0, s.pad_pos.1, s.tip_pos.0, s.tip_pos.1);
+    }
+    let conns = router.extract_connections(&board);
+    println!("Total connections: {}", conns.len());
+    for (i, c) in conns.iter().enumerate() {
+        println!("  [{}] Conn net {} '{}': ({:.4}, {:.4}, L{}) -> ({:.4}, {:.4}, L{})", i, c.net_id, c.net_name, c.start.0, c.start.1, c.start.2, c.end.0, c.end.1, c.end.2);
+    }
+
+    let mut grid = RoutingGrid::new(&board, 0.10, None);
+    for stub in &stubs {
+        router.commit_stub_to_grid(&mut grid, stub);
+    }
+    let mut routed_count = 0;
+    for c in &conns {
+        let mut conn = c.clone();
+        for stub in &stubs {
+            if conn.net_id == stub.net_id && (conn.start.0 - stub.pad_pos.0).hypot(conn.start.1 - stub.pad_pos.1) < 0.15 {
+                conn.start = (stub.tip_pos.0, stub.tip_pos.1, stub.tip_layer);
+                break;
+            }
+        }
+        for stub in &stubs {
+            if conn.net_id == stub.net_id && (conn.end.0 - stub.pad_pos.0).hypot(conn.end.1 - stub.pad_pos.1) < 0.15 {
+                conn.end = (stub.tip_pos.0, stub.tip_pos.1, stub.tip_layer);
+                break;
+            }
+        }
+        // Apply neckdown if connecting to U1
+        let is_u1_conn = board.footprints[conn.start_fp].reference == "U1" || board.footprints[conn.end_fp].reference == "U1";
+        let req_width = if is_u1_conn { conn.netclass.track_width.min(0.20) } else { conn.netclass.track_width };
+        let req_clearance = if is_u1_conn { conn.netclass.clearance.min(0.15) } else { conn.netclass.clearance };
+
+        let start_node = grid.world_to_grid(conn.start.0, conn.start.1).map(|(gx, gy)| GridNode { gx, gy, layer: conn.start.2 });
+        let goal_node = grid.world_to_grid(conn.end.0, conn.end.1).map(|(gx, gy)| GridNode { gx, gy, layer: conn.end.2 });
+        if start_node.is_none() || goal_node.is_none() {
+            continue;
+        }
+        let s_n = start_node.unwrap();
+        let g_n = goal_node.unwrap();
+        let path = router.find_path_with_params(
+            &grid,
+            s_n,
+            g_n,
+            conn.net_id,
+            req_clearance,
+            req_width,
+            conn.netclass.via_dia,
+            None,
+            1.0,
+            0.0,
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        if path.is_some() {
+            routed_count += 1;
+        }
+    }
+    println!("Individually routed: {}/{}", routed_count, conns.len());
+    assert_eq!(routed_count, conns.len(), "All {} connections must route individually", conns.len());
+}
+
+#[test]
+fn test_u1_test_pcb_full_route_pad_centering_and_drc_clean() {
+    let board_path = "tests/boards/u1_test.kicad_pcb";
+    let locked_refs: HashSet<String> = [
+        "U1", "C1", "C2", "C3", "C4", "C5", "C6", "R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "J1",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    let mut board = Board::load(board_path, &locked_refs).expect("Failed to load u1_test.kicad_pcb");
+    assert_eq!(board.footprints.len(), 16);
+    let vulkan = VulkanEngine::new();
+    let mut grid = RoutingGrid::new(&board, 0.10, vulkan).with_inner_layer_penalty(8.0);
+    let router = AutoRouter::new(15).with_inner_layer_penalty(8.0);
+    let (routed, total) = router.route_all(&mut board, &mut grid, None, Arc::new(AtomicBool::new(false)));
+
+    assert_eq!(
+        routed, total,
+        "All connections on u1_test must route to 100% completion (routed {}/{})",
+        routed, total
+    );
+
+    // Verify pad centering: Every signal pad must have a track segment starting/ending exactly at pad center
+    for fp in &board.footprints {
+        for pad in &fp.pads {
+            if pad.net_id == 0 || pad.net_name == "GND" || pad.net_name.is_empty() || pad.net_name.starts_with("unconnected") {
+                continue;
+            }
+            let (px, py) = fp.pad_absolute_position(pad);
+            let has_centered_track = board.tracks.iter().any(|t| {
+                t.net_id == pad.net_id
+                    && ((t.start.0 - px).hypot(t.start.1 - py) < 1e-4
+                        || (t.end.0 - px).hypot(t.end.1 - py) < 1e-4)
+            });
+            assert!(
+                has_centered_track,
+                "Pad {} on {} (net {} '{}') at ({:.4}, {:.4}) must have a track centered exactly at its position",
+                pad.number, fp.reference, pad.net_id, pad.net_name, px, py
+            );
+        }
+    }
+
+    // Save and verify with KiCad DRC CLI if available
+    let temp_dir = temp_test_dir("u1_full_route");
+    let out_pcb = temp_dir.join("u1_test_routed.kicad_pcb");
+    let out_drc = temp_dir.join("u1_drc.json");
+
+    board.save_pcb(&out_pcb).expect("Failed to save routed board");
+
+    if let Ok(kicad_check) = Command::new("kicad-cli").arg("--version").output() {
+        if kicad_check.status.success() {
+            let drc_status = Command::new("kicad-cli")
+                .args([
+                    "pcb",
+                    "drc",
+                    "--refill-zones",
+                    "--format",
+                    "json",
+                    "--output",
+                    out_drc.to_str().unwrap(),
+                    out_pcb.to_str().unwrap(),
+                ])
+                .status()
+                .expect("Failed to execute kicad-cli pcb drc");
+
+            assert!(drc_status.success(), "kicad-cli pcb drc command failed");
+            let drc_json = fs::read_to_string(&out_drc).expect("Failed to read DRC JSON report");
+            let v: serde_json::Value = serde_json::from_str(&drc_json).expect("Invalid DRC JSON format");
+
+            let unconnected_count = v["unconnected_items"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
+            assert_eq!(
+                unconnected_count, 0,
+                "KiCad DRC reported {} unconnected items: {:?}",
+                unconnected_count, v["unconnected_items"]
+            );
+
+            let error_violations: Vec<_> = v["violations"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|item| item["severity"].as_str() == Some("error"))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            assert!(
+                error_violations.is_empty(),
+                "KiCad DRC reported {} error violations: {:?}",
+                error_violations.len(),
+                error_violations
+            );
+        }
+    }
+}
+
 

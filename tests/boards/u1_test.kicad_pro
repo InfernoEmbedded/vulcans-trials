@@ -1,0 +1,177 @@
+{
+  "meta": {
+    "filename": "p1p2esp.kicad_pro",
+    "version": 3
+  },
+  "net_settings": {
+    "classes": [
+      {
+        "bus_width": 12,
+        "clearance": 0.15,
+        "diff_pair_gap": 0.25,
+        "diff_pair_via_gap": 0.25,
+        "diff_pair_width": 0.2,
+        "line_style": 0,
+        "microvia_diameter": 0.3,
+        "microvia_drill": 0.1,
+        "name": "Default",
+        "pcb_color": "rgba(0, 0, 0, 0.000)",
+        "priority": 2147483647,
+        "schematic_color": "rgba(0, 0, 0, 0.000)",
+        "track_width": 0.2,
+        "tuning_profile": "",
+        "via_diameter": 0.6,
+        "via_drill": 0.3,
+        "wire_width": 6
+      },
+      {
+        "clearance": 0.15,
+        "name": "Analog_Sense",
+        "pcb_color": "rgba(0, 0, 0, 0.000)",
+        "priority": -1,
+        "schematic_color": "rgba(0, 0, 0, 0.000)",
+        "track_width": 0.25,
+        "tuning_profile": "",
+        "via_diameter": 0.6,
+        "via_drill": 0.3
+      },
+      {
+        "clearance": 0.15,
+        "name": "P1P2_Bus",
+        "pcb_color": "rgba(0, 0, 0, 0.000)",
+        "priority": -1,
+        "schematic_color": "rgba(0, 0, 0, 0.000)",
+        "track_width": 0.25,
+        "tuning_profile": "",
+        "via_diameter": 0.6,
+        "via_drill": 0.3
+      },
+      {
+        "clearance": 0.15,
+        "name": "Power",
+        "pcb_color": "rgba(0, 0, 0, 0.000)",
+        "priority": -1,
+        "schematic_color": "rgba(0, 0, 0, 0.000)",
+        "track_width": 0.25,
+        "tuning_profile": "",
+        "via_diameter": 0.6,
+        "via_drill": 0.3
+      },
+      {
+        "clearance": 0.15,
+        "name": "Power_SW",
+        "pcb_color": "rgba(0, 0, 0, 0.000)",
+        "priority": -1,
+        "schematic_color": "rgba(0, 0, 0, 0.000)",
+        "track_width": 0.25,
+        "tuning_profile": "",
+        "via_diameter": 0.6,
+        "via_drill": 0.3
+      },
+      {
+        "clearance": 0.15,
+        "name": "USB_Diff",
+        "pcb_color": "rgba(0, 0, 0, 0.000)",
+        "priority": -1,
+        "schematic_color": "rgba(0, 0, 0, 0.000)",
+        "track_width": 0.3,
+        "tuning_profile": "",
+        "via_diameter": 0.6,
+        "via_drill": 0.3
+      }
+    ],
+    "meta": {
+      "version": 5
+    },
+    "net_colors": {},
+    "netclass_assignments": {},
+    "netclass_patterns": [
+      {
+        "netclass": "Power",
+        "pattern": "+3.3V"
+      },
+      {
+        "netclass": "Power",
+        "pattern": "VBUS"
+      },
+      {
+        "netclass": "Power",
+        "pattern": "VRAW"
+      },
+      {
+        "netclass": "Power",
+        "pattern": "/BUCK_VIN"
+      },
+      {
+        "netclass": "Power",
+        "pattern": "VCC_5V"
+      },
+      {
+        "netclass": "P1P2_Bus",
+        "pattern": "P1"
+      },
+      {
+        "netclass": "P1P2_Bus",
+        "pattern": "P2"
+      },
+      {
+        "netclass": "P1P2_Bus",
+        "pattern": "HP"
+      },
+      {
+        "netclass": "P1P2_Bus",
+        "pattern": "HN"
+      },
+      {
+        "netclass": "Power_SW",
+        "pattern": "Net-(U2-SW)"
+      },
+      {
+        "netclass": "Power_SW",
+        "pattern": "Net-(U2-BOOT)"
+      },
+      {
+        "netclass": "USB_Diff",
+        "pattern": "USB_DP"
+      },
+      {
+        "netclass": "USB_Diff",
+        "pattern": "USB_DM"
+      },
+      {
+        "netclass": "Analog_Sense",
+        "pattern": "AIO"
+      },
+      {
+        "netclass": "Analog_Sense",
+        "pattern": "BIO"
+      },
+      {
+        "netclass": "Analog_Sense",
+        "pattern": "TERM"
+      },
+      {
+        "netclass": "Analog_Sense",
+        "pattern": "TVL"
+      },
+      {
+        "netclass": "Analog_Sense",
+        "pattern": "TVT"
+      },
+      {
+        "netclass": "Analog_Sense",
+        "pattern": "BUS_ADC"
+      },
+      {
+        "netclass": "Analog_Sense",
+        "pattern": "Net-(C3-Pad1)"
+      },
+      {
+        "netclass": "Analog_Sense",
+        "pattern": "Net-(C4-Pad1)"
+      }
+    ]
+  },
+  "boards": [],
+  "sheets": []
+}

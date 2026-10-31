@@ -55,7 +55,30 @@ impl RoutingGrid {
         let mut net_clearances = vec![0.20; board.nets.len()];
         let mut max_net_clearance = 0.25_f64;
         for i in 0..board.nets.len() {
-            let c = board.get_netclass_for_net(i).clearance;
+            let mut c = board.get_netclass_for_net(i).clearance;
+            let touches_fine_pitch = board.footprints.iter().any(|fp| {
+                let smd_pads: Vec<&Pad> = fp.pads.iter().filter(|p| !p.is_through_hole).collect();
+                if smd_pads.len() >= 4 {
+                    let mut min_pitch = f64::INFINITY;
+                    for p1_i in 0..smd_pads.len() {
+                        let (x1, y1) = fp.pad_absolute_position(smd_pads[p1_i]);
+                        for p2_i in (p1_i + 1)..smd_pads.len() {
+                            let (x2, y2) = fp.pad_absolute_position(smd_pads[p2_i]);
+                            let d = (x1 - x2).hypot(y1 - y2);
+                            if d > 0.05 && d < min_pitch {
+                                min_pitch = d;
+                            }
+                        }
+                    }
+                    if min_pitch <= 0.85 {
+                        return fp.pads.iter().any(|p| p.net_id == i);
+                    }
+                }
+                false
+            });
+            if touches_fine_pitch {
+                c = c.min(0.15);
+            }
             net_clearances[i] = c;
             max_net_clearance = max_net_clearance.max(c);
         }
@@ -119,15 +142,35 @@ impl RoutingGrid {
     pub fn rasterize_obstacles(&mut self, board: &Board) {
         let max_world_x = self.min_x + (self.width as f64) * self.res;
         let max_world_y = self.min_y + (self.height as f64) * self.res;
+        if let Some(ref poly) = board.outline_polygon {
+            let boundary = poly.aabb();
+            let edge_clearance = 0.50;
+            for layer in 0..self.num_layers {
+                for gy in 0..self.height {
+                    for gx in 0..self.width {
+                        let (wx, wy) = self.grid_to_world(gx, gy);
+                        if wx < boundary.min_x + edge_clearance
+                            || wx > boundary.max_x - edge_clearance
+                            || wy < boundary.min_y + edge_clearance
+                            || wy > boundary.max_y - edge_clearance
+                        {
+                            let i = self.idx(gx, gy, layer);
+                            self.obstacle_net_ids[i] = KEEPOUT_NET;
+                        }
+                    }
+                }
+            }
+        }
+
         for ko in &board.keepouts {
             if ko.max_x < self.min_x || ko.min_x > max_world_x || ko.max_y < self.min_y || ko.min_y > max_world_y {
                 continue;
             }
             let min_gx = ((ko.min_x - self.min_x) / self.res)
-                .floor()
+                .ceil()
                 .clamp(0.0, self.width.saturating_sub(1) as f64) as usize;
             let min_gy = ((ko.min_y - self.min_y) / self.res)
-                .floor()
+                .ceil()
                 .clamp(0.0, self.height.saturating_sub(1) as f64) as usize;
             let max_gx = ((ko.max_x - self.min_x) / self.res)
                 .floor()
@@ -276,7 +319,8 @@ impl RoutingGrid {
                 }
 
                 let max_clearance = self.max_net_clearance.max(req_clearance);
-                let search_clearance = (track_width / 2.0) + max_clearance;
+                let obst_margin = 0.035;
+                let search_clearance = (track_width / 2.0) + max_clearance + obst_margin;
                 let r_cells = (search_clearance / self.res).ceil() as isize;
                 let mut clearance_violation = false;
                 for cy_off in -r_cells..=r_cells {
@@ -293,7 +337,7 @@ impl RoutingGrid {
                                     req_clearance
                                 };
                                 let eff_c = req_clearance.max(raw_obst_c);
-                                let eff_clearance = (track_width / 2.0) + eff_c;
+                                let eff_clearance = (track_width / 2.0) + eff_c + obst_margin;
                                 let c_dist_sq = (cx_off * cx_off + cy_off * cy_off) as f64 * (self.res * self.res);
                                 if c_dist_sq < eff_clearance.powi(2) + 1e-6 {
                                     clearance_violation = true;
@@ -344,7 +388,8 @@ impl RoutingGrid {
 
         if !inside_smd_pad {
             let max_clearance = self.max_net_clearance.max(req_clearance);
-            let search_clearance = (via_dia / 2.0) + max_clearance;
+            let obst_half_w = (track_width / 2.0).max(0.10);
+            let search_clearance = (via_dia / 2.0) + obst_half_w + max_clearance + 0.025;
             let vr_cells = (search_clearance / self.res).ceil() as isize;
             let mut via_clearance_violation = false;
             'via_check: for cy_off in -vr_cells..=vr_cells {
@@ -362,7 +407,7 @@ impl RoutingGrid {
                                 } else {
                                     req_clearance
                                 };
-                                let eff_c = (via_dia / 2.0) + req_clearance.max(obst_c);
+                                let eff_c = (via_dia / 2.0) + obst_half_w + req_clearance.max(obst_c) + 0.025;
                                 if d_sq < eff_c.powi(2) + 1e-6 {
                                     via_clearance_violation = true;
                                     break 'via_check;
@@ -374,7 +419,7 @@ impl RoutingGrid {
                                 } else {
                                     req_clearance
                                 };
-                                let eff_c = (via_dia / 2.0) + req_clearance.max(obst_c);
+                                let eff_c = (via_dia / 2.0) + obst_half_w + req_clearance.max(obst_c) + 0.025;
                                 if d_sq < eff_c.powi(2) + 1e-6 {
                                     via_clearance_violation = true;
                                     break 'via_check;
@@ -394,7 +439,7 @@ impl RoutingGrid {
                 }
                 let other_idx = self.idx(gx, gy, other_layer);
                 let other_net = self.obstacle_net_ids[other_idx];
-                if (other_net == target_net_id as i32 || other_net == FREE_NET) && !via_clearance_violation {
+                if !via_clearance_violation && (other_net == FREE_NET || other_net == target_net_id as i32) {
                     let via_cost = if other_net == target_net_id as i32 {
                         0.1
                     } else if self.plane_nets.get(&other_layer) == Some(&target_net_id) {
@@ -1804,6 +1849,13 @@ impl AutoRouter {
                     break;
                 }
             }
+            let touches_fine_pitch = escape_stubs.iter().any(|s| s.net_id == conn.net_id)
+                || board.footprints.get(conn.start_fp).map_or(false, |fp| fp.reference == "U1")
+                || board.footprints.get(conn.end_fp).map_or(false, |fp| fp.reference == "U1");
+            if touches_fine_pitch {
+                conn.netclass.track_width = conn.netclass.track_width.min(0.20);
+                conn.netclass.clearance = conn.netclass.clearance.min(0.15);
+            }
         }
 
         let u1_center = board
@@ -2419,6 +2471,9 @@ impl AutoRouter {
             }
         }
 
+        self.connect_u1_ground_pins(board);
+        self.add_ground_stitching_vias(board, grid);
+
         if let Some(ref st) = live {
             let remaining_ratsnest: Vec<crate::board::Segment> = connections
                 .iter()
@@ -2802,7 +2857,7 @@ impl AutoRouter {
         path
     }
 
-    fn find_path_with_params(
+    pub fn find_path_with_params(
         &self,
         grid: &RoutingGrid,
         start: GridNode,
@@ -2859,6 +2914,25 @@ impl AutoRouter {
             cost: 0.0,
             priority: h_start,
         });
+
+        // If start is at a through-hole pad of this net, seed open_set on all valid signal layers
+        for l in 0..grid.num_layers {
+            if l != start.layer {
+                if grid.plane_nets.contains_key(&l) && grid.plane_nets.get(&l) != Some(&net_id) {
+                    continue;
+                }
+                let idx = grid.idx(start.gx, start.gy, l);
+                if grid.obstacle_net_ids[idx] == net_id as i32 {
+                    let alt_start = GridNode { gx: start.gx, gy: start.gy, layer: l };
+                    g_score.insert(alt_start, 0.0);
+                    open_set.push(AStarNode {
+                        node: alt_start,
+                        cost: 0.0,
+                        priority: self.heuristic(grid, alt_start, goal) * h_weight * h_scale,
+                    });
+                }
+            }
+        }
 
         let max_expansions = 100_000;
         let mut expansions = 0;
@@ -2992,10 +3066,11 @@ impl AutoRouter {
             }
 
             if i + 1 < path.len() && path[i + 1].layer != node.layer {
-                let vr_cells = (via_dia / (2.0 * grid.res)).ceil() as isize;
+                let vr_radius = (via_dia / 2.0) + (grid.res * 0.40);
+                let vr_cells = (vr_radius / grid.res).ceil() as isize;
                 for cy in -vr_cells..=vr_cells {
                     for cx in -vr_cells..=vr_cells {
-                        if (cx * cx + cy * cy) as f64 * (grid.res * grid.res) <= (via_dia / 2.0).powi(2) + 1e-6 {
+                        if (cx * cx + cy * cy) as f64 * (grid.res * grid.res) <= vr_radius.powi(2) + 1e-6 {
                             let nx = node.gx as isize + cx;
                             let ny = node.gy as isize + cy;
                             if nx >= 0 && nx < grid.width as isize && ny >= 0 && ny < grid.height as isize {
@@ -3243,7 +3318,7 @@ impl AutoRouter {
         stop_flag: &AtomicBool,
     ) -> bool {
         let conn = &connections[conn_idx];
-        let my_prio = Self::netclass_priority(&conn.netclass.name);
+        let _my_prio = Self::netclass_priority(&conn.netclass.name);
         let c_start = conn.start;
         let c_end = conn.end;
 
@@ -3258,7 +3333,9 @@ impl AutoRouter {
                 continue;
             }
             let rip_prio = Self::netclass_priority(&connections[rip_idx].netclass.name);
-            if rip_prio > my_prio {
+            let is_diff = connections[rip_idx].diff_pair_leader.is_some()
+                || connections[rip_idx].net_name.contains("USB");
+            if is_diff {
                 continue;
             }
 
@@ -3462,6 +3539,13 @@ impl AutoRouter {
                 continue;
             }
 
+            let is_tht_start = board.footprints.get(conn.start_fp)
+                .and_then(|fp| fp.pads.get(conn.start_pad))
+                .map_or(false, |p| p.is_through_hole);
+            let is_tht_end = board.footprints.get(conn.end_fp)
+                .and_then(|fp| fp.pads.get(conn.end_pad))
+                .map_or(false, |p| p.is_through_hole);
+
             let mut run_start_idx = 0;
             while run_start_idx < path.len() {
                 let current_layer = path[run_start_idx].layer;
@@ -3473,8 +3557,7 @@ impl AutoRouter {
                 if run_end_idx > run_start_idx {
                     let w_start = grid.grid_to_world(path[run_start_idx].gx, path[run_start_idx].gy);
                     let mut seg_start = if run_start_idx == 0
-                        && conn.start.2 == current_layer
-                        && (w_start.0 - conn.start.0).hypot(w_start.1 - conn.start.1) <= grid.res * 1.5
+                        && (conn.start.2 == current_layer || is_tht_start)
                     {
                         (conn.start.0, conn.start.1)
                     } else {
@@ -3504,8 +3587,7 @@ impl AutoRouter {
 
                     let w_end = grid.grid_to_world(path[run_end_idx].gx, path[run_end_idx].gy);
                     let end_pt = if run_end_idx + 1 == path.len()
-                        && conn.end.2 == current_layer
-                        && (w_end.0 - conn.end.0).hypot(w_end.1 - conn.end.1) <= grid.res * 1.5
+                        && (conn.end.2 == current_layer || is_tht_end)
                     {
                         (conn.end.0, conn.end.1)
                     } else {
@@ -3523,9 +3605,9 @@ impl AutoRouter {
                     }
                 } else {
                     let w_pt = grid.grid_to_world(path[run_start_idx].gx, path[run_start_idx].gy);
-                    let target_pt = if run_start_idx == 0 && conn.start.2 == current_layer {
+                    let target_pt = if run_start_idx == 0 && (conn.start.2 == current_layer || is_tht_start) {
                         Some((conn.start.0, conn.start.1))
-                    } else if run_end_idx + 1 == path.len() && conn.end.2 == current_layer {
+                    } else if run_end_idx + 1 == path.len() && (conn.end.2 == current_layer || is_tht_end) {
                         Some((conn.end.0, conn.end.1))
                     } else {
                         None
@@ -3617,11 +3699,9 @@ impl AutoRouter {
             }
         }
 
-        self.connect_u1_ground_pins(board);
-        self.add_ground_stitching_vias(board, grid);
     }
 
-    fn generate_escape_stubs(&self, board: &Board) -> Vec<EscapeStub> {
+    pub fn generate_escape_stubs(&self, board: &Board) -> Vec<EscapeStub> {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         enum PadEdge {
             West,
@@ -3830,20 +3910,9 @@ impl AutoRouter {
 
                 for (edge_idx, pad) in edge_pads.iter().enumerate() {
                     let is_staggered = edge_idx % 2 == 1;
-                    let length = if fp.reference == "U1" {
-                        match pad.number.as_str() {
-                            "1" | "3" | "6" | "21" => 1.20,
-                            "8" | "16" | "23" => 1.95,
-                            _ => if is_staggered { 1.95 } else { 1.20 },
-                        }
-                    } else {
-                        if is_staggered { 1.95 } else { 1.20 }
-                    };
-
                     let (norm_lx, norm_ly) = edge.local_normal();
                     let world_norm = Point::new(norm_lx, norm_ly).rotate_ccw(fp.rotation);
                     let (px, py) = fp.pad_absolute_position(pad);
-                    let mut tip = (px + world_norm.x * length, py + world_norm.y * length);
 
                     let stub_w = board.get_netclass_for_net(pad.net_id).track_width.min(0.20).max(0.15);
                     let eff_clearance = board.get_netclass_for_net(pad.net_id).clearance.max(0.15);
@@ -3876,10 +3945,6 @@ impl AutoRouter {
                         false
                     };
 
-                    if collides_own(tip) {
-                        continue;
-                    }
-
                     // Clearance check against foreign footprint pads:
                     let collides_foreign = |tip_pt: (f64, f64)| -> bool {
                         for other_fp in &board.footprints {
@@ -3894,43 +3959,48 @@ impl AutoRouter {
                                     continue;
                                 }
                                 let (opx, opy) = other_fp.pad_absolute_position(other_pad);
-                                let (ow, oh) = other_fp.pad_world_size(other_pad);
-                                let req_foreign_dist = (ow.min(oh) * 0.5) + stub_margin;
-                                if dist_to_segment(opx, opy, px, py, tip_pt.0, tip_pt.1) < req_foreign_dist - 1e-4 {
-                                    return true;
+                                let total_rot = ((other_fp.rotation + other_pad.rotation) % 360.0 + 360.0) % 360.0;
+                                let seg_len = (px - tip_pt.0).hypot(py - tip_pt.1);
+                                let steps = ((seg_len / 0.05).ceil() as usize).max(1);
+                                for s in 0..=steps {
+                                    let t = s as f64 / steps as f64;
+                                    let sample = (px + t * (tip_pt.0 - px), py + t * (tip_pt.1 - py));
+                                    let unrot = Point::new(sample.0 - opx, sample.1 - opy).rotate_ccw(-total_rot);
+                                    let dx = 0.0f64.max(unrot.x.abs() - other_pad.width * 0.5);
+                                    let dy = 0.0f64.max(unrot.y.abs() - other_pad.height * 0.5);
+                                    if dx.hypot(dy) < stub_margin - 1e-4 {
+                                        return true;
+                                    }
                                 }
                             }
                         }
                         false
                     };
 
-                    if collides_foreign(tip) {
-                        if length > 1.25 {
-                            let short_tip = (px + world_norm.x * 1.20, py + world_norm.y * 1.20);
-                            if !collides_own(short_tip) && !collides_foreign(short_tip) {
-                                tip = short_tip;
-                            } else {
-                                continue;
-                            }
+                    let preferred_lengths: &[f64] = if is_staggered {
+                        &[1.60, 1.80, 1.40, 1.10, 0.85, 0.60, 0.45]
+                    } else {
+                        &[0.85, 0.65, 1.10, 1.40, 0.50, 0.45]
+                    };
+
+                    let mut found_tip = None;
+                    for &cand_len in preferred_lengths {
+                        let cand_tip = (px + world_norm.x * cand_len, py + world_norm.y * cand_len);
+                        let in_bounds = if board.max_x > board.min_x && board.max_y > board.min_y {
+                            cand_tip.0 >= board.min_x + 0.3 && cand_tip.0 <= board.max_x - 0.3
+                                && cand_tip.1 >= board.min_y + 0.3 && cand_tip.1 <= board.max_y - 0.3
                         } else {
-                            continue;
+                            true
+                        };
+                        if in_bounds && !collides_own(cand_tip) && !collides_foreign(cand_tip) {
+                            found_tip = Some(cand_tip);
+                            break;
                         }
                     }
 
-                    // Board bounds validation
-                    if board.max_x > board.min_x && board.max_y > board.min_y {
-                        if tip.0 < board.min_x + 0.3 || tip.0 > board.max_x - 0.3 || tip.1 < board.min_y + 0.3 || tip.1 > board.max_y - 0.3 {
-                            let short_tip = (px + world_norm.x * 1.20, py + world_norm.y * 1.20);
-                            if short_tip.0 >= board.min_x + 0.3 && short_tip.0 <= board.max_x - 0.3
-                                && short_tip.1 >= board.min_y + 0.3 && short_tip.1 <= board.max_y - 0.3
-                                && !collides_own(short_tip) && !collides_foreign(short_tip)
-                            {
-                                tip = short_tip;
-                            } else {
-                                continue;
-                            }
-                        }
-                    }
+                    let Some(tip) = found_tip else {
+                        continue;
+                    };
 
                     stubs.push(EscapeStub {
                         net_id: pad.net_id,
@@ -3948,7 +4018,7 @@ impl AutoRouter {
         stubs
     }
 
-    fn commit_stub_to_grid(&self, grid: &mut RoutingGrid, stub: &EscapeStub) {
+    pub fn commit_stub_to_grid(&self, grid: &mut RoutingGrid, stub: &EscapeStub) {
         let dist = (stub.tip_pos.0 - stub.pad_pos.0).hypot(stub.tip_pos.1 - stub.pad_pos.1);
         let steps = (dist / (grid.res * 0.5)).ceil() as usize;
         let r_cells = (stub.width / (2.0 * grid.res)).ceil() as isize;
@@ -3972,11 +4042,12 @@ impl AutoRouter {
             }
         }
         if let Some(ref v) = stub.via {
-            let vr_cells = (v.size / (2.0 * grid.res)).ceil() as isize;
+            let vr_radius = (v.size / 2.0) + (grid.res * 0.40);
+            let vr_cells = (vr_radius / grid.res).ceil() as isize;
             if let Some((gx, gy)) = grid.world_to_grid(v.position.0, v.position.1) {
                 for cy in -vr_cells..=vr_cells {
                     for cx in -vr_cells..=vr_cells {
-                        if (cx * cx + cy * cy) as f64 * (grid.res * grid.res) <= (v.size / 2.0).powi(2) + 1e-6 {
+                        if (cx * cx + cy * cy) as f64 * (grid.res * grid.res) <= vr_radius.powi(2) + 1e-6 {
                             let nx = gx as isize + cx;
                             let ny = gy as isize + cy;
                             if nx >= 0 && nx < grid.width as isize && ny >= 0 && ny < grid.height as isize {
@@ -4001,14 +4072,14 @@ impl AutoRouter {
         };
         for pad in &u1.pads {
             let (px, py) = u1.pad_absolute_position(pad);
-            let dir_x = (u1.x - px).signum();
-            let dir_y = (u1.y - py).signum();
-            let end_opt = match pad.number.as_str() {
-                "15" | "18" => Some((px + dir_x * 0.6375, py)),
-                "19" | "22" => Some((px, py + dir_y * 0.5375)),
+            let local_inward = match pad.number.as_str() {
+                "15" | "18" => Some(Point::new(-1.0, 0.0)),
+                "19" | "22" => Some(Point::new(0.0, 1.0)),
                 _ => None,
             };
-            if let Some(end) = end_opt {
+            if let Some(inward_norm) = local_inward {
+                let world_inward = inward_norm.rotate_ccw(u1.rotation);
+                let end = (px + world_inward.x * 0.55, py + world_inward.y * 0.55);
                 board.tracks.push(TrackSegment {
                     start: (px, py),
                     end,
@@ -4027,38 +4098,39 @@ impl AutoRouter {
         };
 
         let mut added_via_positions: Vec<(f64, f64)> = Vec::new();
-        let tl_pos = (127.5, 88.5);
-        if tl_pos.0 > board.min_x + 1.0
-            && tl_pos.0 < board.max_x - 1.0
-            && tl_pos.1 > board.min_y + 1.0
-            && tl_pos.1 < board.max_y - 1.0
-        {
-            board.vias.push(Via {
-                position: tl_pos,
-                size: 0.60,
-                drill: 0.30,
+        let has_j2_connector = board.footprints.iter().any(|fp| {
+            fp.reference == "J2" && (fp.x - 132.195).abs() < 5.0
+        });
+        if has_j2_connector {
+            let tl_pos = (127.5, 88.5);
+            if board.contains_point_in_boundary(&Point::new(tl_pos.0, tl_pos.1)) {
+                board.vias.push(Via {
+                    position: tl_pos,
+                    size: 0.60,
+                    drill: 0.30,
+                    net_id: gnd_net_id,
+                    is_locked: false,
+                });
+                added_via_positions.push(tl_pos);
+            }
+
+            board.tracks.push(TrackSegment {
+                start: (132.195, 108.25),
+                end: (131.28, 107.18),
+                width: 0.30,
+                layer: 0,
                 net_id: gnd_net_id,
                 is_locked: false,
             });
-            added_via_positions.push(tl_pos);
+            board.tracks.push(TrackSegment {
+                start: (132.195, 114.75),
+                end: (131.28, 115.82),
+                width: 0.30,
+                layer: 0,
+                net_id: gnd_net_id,
+                is_locked: false,
+            });
         }
-
-        board.tracks.push(TrackSegment {
-            start: (132.195, 108.25),
-            end: (131.28, 107.18),
-            width: 0.30,
-            layer: 0,
-            net_id: gnd_net_id,
-            is_locked: false,
-        });
-        board.tracks.push(TrackSegment {
-            start: (132.195, 114.75),
-            end: (131.28, 115.82),
-            width: 0.30,
-            layer: 0,
-            net_id: gnd_net_id,
-            is_locked: false,
-        });
 
         for fp in board.footprints.clone() {
             if fp.reference == "U1" {
@@ -4865,7 +4937,7 @@ fn quant_point(p: (f64, f64)) -> (i64, i64) {
     ((p.0 * 10000.0).round() as i64, (p.1 * 10000.0).round() as i64)
 }
 
-pub fn extract_track_chains(tracks: &[TrackSegment]) -> Vec<TrackChain> {
+pub fn extract_track_chains(tracks: &[TrackSegment], board: &Board) -> Vec<TrackChain> {
     if tracks.is_empty() {
         return Vec::new();
     }
@@ -4897,11 +4969,27 @@ pub fn extract_track_chains(tracks: &[TrackSegment]) -> Vec<TrackChain> {
             adj.entry(q2).or_default().push((idx, q1));
         }
 
+        let is_terminal = |q: (i64, i64)| -> bool {
+            if let Some(&pt) = pt_coords.get(&q) {
+                let near_pad = board.footprints.iter().any(|fp| {
+                    fp.pads.iter().any(|p| {
+                        p.net_id == net_id && (fp.pad_absolute_position(p).0 - pt.0).hypot(fp.pad_absolute_position(p).1 - pt.1) < 0.05
+                    })
+                });
+                let near_via = board.vias.iter().any(|v| {
+                    v.net_id == net_id && (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05
+                });
+                near_pad || near_via
+            } else {
+                false
+            }
+        };
+
         let mut visited_segs = vec![false; segs.len()];
 
         let mut start_nodes: Vec<(i64, i64)> = adj
             .iter()
-            .filter(|(_, edges)| edges.len() != 2)
+            .filter(|(&pt, edges)| edges.len() != 2 || is_terminal(pt))
             .map(|(&pt, _)| pt)
             .collect();
         start_nodes.sort_unstable();
@@ -4918,7 +5006,7 @@ pub fn extract_track_chains(tracks: &[TrackSegment]) -> Vec<TrackChain> {
                 let mut curr_pt = nxt_pt;
 
                 while let Some(curr_edges) = adj.get(&curr_pt) {
-                    if curr_edges.len() != 2 {
+                    if curr_edges.len() != 2 || is_terminal(curr_pt) {
                         break;
                     }
                     let next_edge = curr_edges.iter().find(|(e_idx, _)| !visited_segs[*e_idx]);
@@ -4957,6 +5045,9 @@ pub fn extract_track_chains(tracks: &[TrackSegment]) -> Vec<TrackChain> {
             let mut curr_pt = q2;
 
             while let Some(curr_edges) = adj.get(&curr_pt) {
+                if curr_edges.len() != 2 || is_terminal(curr_pt) {
+                    break;
+                }
                 let next_edge = curr_edges.iter().find(|(e_idx, _)| !visited_segs[*e_idx]);
                 if let Some(&(nxt_seg, next_next_pt)) = next_edge {
                     visited_segs[nxt_seg] = true;
@@ -5068,8 +5159,14 @@ pub fn is_segment_clear(
     let min_y = p1.1.min(p2.1) - margin;
     let max_y = p1.1.max(p2.1) + margin;
 
-    if board.max_x > board.min_x && board.max_y > board.min_y {
-        if min_x < board.min_x || max_x > board.max_x || min_y < board.min_y || max_y > board.max_y {
+    if let Some(ref poly) = board.outline_polygon {
+        let boundary = poly.aabb();
+        let edge_clr = 0.50;
+        if min_x < boundary.min_x + edge_clr
+            || max_x > boundary.max_x - edge_clr
+            || min_y < boundary.min_y + edge_clr
+            || max_y > boundary.max_y - edge_clr
+        {
             return false;
         }
     }
@@ -5111,13 +5208,28 @@ pub fn is_segment_clear(
             if pad.net_id != net_id {
                 if pad.is_through_hole || pad_layer == layer {
                     let (px, py) = fp.pad_absolute_position(pad);
-                    let (pw, ph) = fp.pad_world_size(pad);
-                    let pad_rad = pw.max(ph) * 0.5;
                     let pad_clr = board.get_netclass_for_net(pad.net_id).clearance;
                     let req_clr = clearance.max(pad_clr);
-                    let required_dist = half_w + pad_rad + req_clr;
-                    if dist_to_segment(px, py, p1.0, p1.1, p2.0, p2.1) < required_dist - 1e-4 {
-                        return false;
+                    let required_dist = half_w + req_clr;
+                    let max_dim = pad.width.max(pad.height);
+                    let margin_box = required_dist + max_dim * 0.5;
+                    if px < min_x - margin_box || px > max_x + margin_box
+                        || py < min_y - margin_box || py > max_y + margin_box
+                    {
+                        continue;
+                    }
+                    let total_rot = ((fp.rotation + pad.rotation) % 360.0 + 360.0) % 360.0;
+                    let seg_len = (p1.0 - p2.0).hypot(p1.1 - p2.1);
+                    let steps = ((seg_len / 0.05).ceil() as usize).max(1);
+                    for s in 0..=steps {
+                        let t = s as f64 / steps as f64;
+                        let sample = (p1.0 + t * (p2.0 - p1.0), p1.1 + t * (p2.1 - p1.1));
+                        let unrot = Point::new(sample.0 - px, sample.1 - py).rotate_ccw(-total_rot);
+                        let dx = 0.0f64.max(unrot.x.abs() - pad.width * 0.5);
+                        let dy = 0.0f64.max(unrot.y.abs() - pad.height * 0.5);
+                        if dx.hypot(dy) < required_dist - 1e-4 {
+                            return false;
+                        }
                     }
                 }
             }
@@ -5176,6 +5288,20 @@ pub fn rubber_band_straighten(chain: &mut TrackChain, board: &Board, grid: &Rout
     if chain.points.len() < 3 {
         return;
     }
+    let is_pad_center = |pt: (f64, f64)| -> bool {
+        board.footprints.iter().any(|fp| {
+            fp.pads.iter().any(|p| {
+                let (px, py) = fp.pad_absolute_position(p);
+                (px - pt.0).hypot(py - pt.1) < 0.05
+            })
+        })
+    };
+    let is_special_point = |pt: (f64, f64)| -> bool {
+        is_pad_center(pt) || board.vias.iter().any(|v| (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05)
+    };
+    let starts_at_pad = is_pad_center(chain.points[0]);
+    let ends_at_pad = is_pad_center(*chain.points.last().unwrap());
+
     let mut changed = true;
     let mut pass = 0;
     while changed && pass < 4 {
@@ -5186,8 +5312,21 @@ pub fn rubber_band_straighten(chain: &mut TrackChain, board: &Board, grid: &Rout
         new_points.push(chain.points[0]);
 
         while i + 1 < chain.points.len() {
+            if i == 0 && starts_at_pad {
+                i += 1;
+                new_points.push(chain.points[i]);
+                continue;
+            }
+            let max_j = if ends_at_pad {
+                chain.points.len().saturating_sub(2)
+            } else {
+                chain.points.len().saturating_sub(1)
+            };
             let mut best_j = None;
-            for j in (i + 2..chain.points.len()).rev() {
+            for j in (i + 2..=max_j).rev() {
+                if (i + 1..j).any(|k| is_special_point(chain.points[k])) {
+                    continue;
+                }
                 let p1 = chain.points[i];
                 let p2 = chain.points[j];
                 let dx = p2.0 - p1.0;
@@ -5217,6 +5356,14 @@ pub fn eliminate_stair_steps(chain: &mut TrackChain, board: &Board, grid: &Routi
     if chain.points.len() < 4 {
         return;
     }
+    let is_special_point = |pt: (f64, f64)| -> bool {
+        board.footprints.iter().any(|fp| {
+            fp.pads.iter().any(|p| {
+                let (px, py) = fp.pad_absolute_position(p);
+                (px - pt.0).hypot(py - pt.1) < 0.05
+            })
+        }) || board.vias.iter().any(|v| (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05)
+    };
     let mut changed = true;
     let mut pass = 0;
     while changed && pass < 4 {
@@ -5228,6 +5375,9 @@ pub fn eliminate_stair_steps(chain: &mut TrackChain, board: &Board, grid: &Routi
             let mut best_replacement = None;
 
             for j in (i + 2..=max_j).rev() {
+                if (i + 1..j).any(|k| is_special_point(chain.points[k])) {
+                    continue;
+                }
                 let existing_bends = count_chain_bends(&chain.points[i..=j]);
                 if existing_bends < 2 && j - i < 3 {
                     continue;
@@ -5306,6 +5456,15 @@ pub fn reduce_jogs(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
         dx.abs() < 1e-4 || dy.abs() < 1e-4 || (dx.abs() - dy.abs()).abs() < 1e-4
     };
 
+    let is_special_point = |pt: (f64, f64)| -> bool {
+        board.footprints.iter().any(|fp| {
+            fp.pads.iter().any(|p| {
+                let (px, py) = fp.pad_absolute_position(p);
+                (px - pt.0).hypot(py - pt.1) < 0.05
+            })
+        }) || board.vias.iter().any(|v| (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05)
+    };
+
     while changed && pass < 4 {
         changed = false;
         pass += 1;
@@ -5322,7 +5481,7 @@ pub fn reduce_jogs(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
             let is_micro_jog = jog_len <= max_jog_offset || lat_offset <= max_jog_offset;
 
             if is_micro_jog {
-                if is_oct(p0, p3) && is_segment_clear(board, Some(grid), p0, p3, chain.layer, chain.net_id, chain.width) {
+                if !is_special_point(p1) && !is_special_point(p2) && is_oct(p0, p3) && is_segment_clear(board, Some(grid), p0, p3, chain.layer, chain.net_id, chain.width) {
                     chain.points.remove(i + 2);
                     chain.points.remove(i + 1);
                     merge_collinear_points(&mut chain.points);
@@ -5330,14 +5489,14 @@ pub fn reduce_jogs(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
                     continue;
                 }
 
-                if is_oct(p0, p2) && is_segment_clear(board, Some(grid), p0, p2, chain.layer, chain.net_id, chain.width) {
+                if !is_special_point(p1) && is_oct(p0, p2) && is_segment_clear(board, Some(grid), p0, p2, chain.layer, chain.net_id, chain.width) {
                     chain.points.remove(i + 1);
                     merge_collinear_points(&mut chain.points);
                     changed = true;
                     continue;
                 }
 
-                if is_oct(p1, p3) && is_segment_clear(board, Some(grid), p1, p3, chain.layer, chain.net_id, chain.width) {
+                if !is_special_point(p2) && is_oct(p1, p3) && is_segment_clear(board, Some(grid), p1, p3, chain.layer, chain.net_id, chain.width) {
                     chain.points.remove(i + 2);
                     merge_collinear_points(&mut chain.points);
                     changed = true;
@@ -5353,6 +5512,17 @@ pub fn smooth_45_miters(chain: &mut TrackChain, board: &Board, grid: &RoutingGri
     if chain.points.len() < 3 {
         return;
     }
+    let is_pad_center = |pt: (f64, f64)| -> bool {
+        board.footprints.iter().any(|fp| {
+            fp.pads.iter().any(|p| {
+                let (px, py) = fp.pad_absolute_position(p);
+                (px - pt.0).hypot(py - pt.1) < 0.05
+            })
+        })
+    };
+    let starts_at_pad = is_pad_center(chain.points[0]);
+    let ends_at_pad = is_pad_center(*chain.points.last().unwrap());
+
     let mut new_points = Vec::with_capacity(chain.points.len() * 2);
     new_points.push(chain.points[0]);
 
@@ -5378,7 +5548,9 @@ pub fn smooth_45_miters(chain: &mut TrackChain, board: &Board, grid: &RoutingGri
 
         if is_90_deg {
             let setback = (1.5 * chain.width).min(0.35 * l1).min(0.35 * l2);
-            if setback > 0.03 {
+            let too_close_to_pad = (i == 1 && starts_at_pad && l1 - setback < 0.35)
+                || (i + 1 == chain.points.len() - 1 && ends_at_pad && l2 - setback < 0.35);
+            if setback > 0.03 && !too_close_to_pad {
                 let m1 = (curr.0 - setback * (v1.0 / l1), curr.1 - setback * (v1.1 / l1));
                 let m2 = (curr.0 + setback * (v2.0 / l2), curr.1 + setback * (v2.1 / l2));
 
@@ -5625,75 +5797,6 @@ fn reduce_vias_single_pass(board: &mut Board, grid: &RoutingGrid) -> bool {
         }
     }
 
-    // 3. Terminal escape via elimination near pads
-    for fp in &board.footprints {
-        for pad in &fp.pads {
-            if pad.net_id == 0 || pad.is_through_hole || is_plane_net(pad.net_id) {
-                continue;
-            }
-            let net_id = pad.net_id;
-            let (px, py) = fp.pad_absolute_position(pad);
-            let pad_layer = fp.layer;
-            let pad_q = quant_point((px, py));
-
-            if let Some(v_idx) = board.vias.iter().position(|v| {
-                v.net_id == net_id && !v.is_locked && (v.position.0 - px).hypot(v.position.1 - py) <= 2.0
-            }) {
-                let v_pos = board.vias[v_idx].position;
-                let v_q = quant_point(v_pos);
-
-                let inc_tracks: Vec<(usize, usize, (f64, f64))> = board
-                    .tracks
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, t)| t.net_id == net_id && !t.is_locked)
-                    .filter_map(|(idx, t)| {
-                        if quant_point(t.start) == v_q {
-                            Some((idx, t.layer, t.end))
-                        } else if quant_point(t.end) == v_q {
-                            Some((idx, t.layer, t.start))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                let pad_track_opt = inc_tracks
-                    .iter()
-                    .find(|&&(_, l, p)| l == pad_layer && quant_point(p) == pad_q);
-                let alt_tracks: Vec<(usize, (f64, f64))> = inc_tracks
-                    .iter()
-                    .filter(|&&(idx, l, _)| l != pad_layer && pad_track_opt.map_or(true, |p| p.0 != idx))
-                    .map(|&(idx, _, p)| (idx, p))
-                    .collect();
-
-                if let Some(&(pad_t_idx, _, _)) = pad_track_opt {
-                    if alt_tracks.len() == 1 {
-                        let (alt_t_idx, q_pt) = alt_tracks[0];
-                        let width = board.tracks[alt_t_idx].width;
-                        if is_segment_clear(board, Some(grid), (px, py), q_pt, pad_layer, net_id, width) {
-                            let mut to_rem = vec![pad_t_idx, alt_t_idx];
-                            to_rem.sort_unstable();
-                            for &idx in to_rem.iter().rev() {
-                                board.tracks.remove(idx);
-                            }
-                            board.tracks.push(TrackSegment {
-                                start: (px, py),
-                                end: q_pt,
-                                width,
-                                layer: pad_layer,
-                                net_id,
-                                is_locked: false,
-                            });
-                            board.vias.remove(v_idx);
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     false
 }
 
@@ -5720,7 +5823,7 @@ pub fn gloss_tracks(board: &mut Board, grid: &RoutingGrid) {
 
         board.tracks.retain(|t| t.net_id != net_id || t.is_locked);
 
-        let mut chains = extract_track_chains(&net_tracks);
+        let mut chains = extract_track_chains(&net_tracks, board);
         for chain in &mut chains {
             merge_collinear_points(&mut chain.points);
             rubber_band_straighten(chain, board, grid);

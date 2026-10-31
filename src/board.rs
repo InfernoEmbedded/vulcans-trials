@@ -1511,6 +1511,16 @@ impl Board {
             if src_sch.exists() && src_sch != out_sch {
                 let _ = fs::copy(&src_sch, &out_sch);
             }
+            let src_dru = src_base.with_extension("kicad_dru");
+            let out_dru = out_path.with_extension("kicad_dru");
+            if src_dru.exists() && src_dru != out_dru {
+                let _ = fs::copy(&src_dru, &out_dru);
+            }
+            let src_prl = src_base.with_extension("kicad_prl");
+            let out_prl = out_path.with_extension("kicad_prl");
+            if src_prl.exists() && src_prl != out_prl {
+                let _ = fs::copy(&src_prl, &out_prl);
+            }
         }
 
         Ok(())
