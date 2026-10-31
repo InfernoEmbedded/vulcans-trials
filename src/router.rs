@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
-use crate::board::{Board, LiveTrialState, NetClass, NetTopology, Point, TrackSegment, TrialPhase, Via};
+use crate::board::{Board, Footprint, LiveTrialState, NetClass, NetTopology, Pad, Point, TrackSegment, TrialPhase, Via};
 use crate::vulkan::VulkanEngine;
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -247,7 +247,11 @@ impl RoutingGrid {
 
         let (h_mult, v_mult): (f64, f64) = if layer % 2 == 0 { (1.0, 1.35) } else { (1.35, 1.0) };
 
-        for (dx, dy, base_len) in planar_dirs {
+        let is_dedicated_plane = self.plane_nets.contains_key(&layer);
+        let allow_planar = !is_dedicated_plane || self.plane_nets.get(&layer) == Some(&target_net_id);
+
+        if allow_planar {
+            for (dx, dy, base_len) in planar_dirs {
             let nx = gx as isize + dx;
             let ny = gy as isize + dy;
             if nx >= 0 && nx < self.width as isize && ny >= 0 && ny < self.height as isize {
@@ -327,6 +331,7 @@ impl RoutingGrid {
                 neighbors.push((GridNode { gx: ngx, gy: ngy, layer }, step_cost));
             }
         }
+    }
 
         // Through-hole via transitions across all available copper layers (F.Cu, B.Cu, In1.Cu, In2.Cu)
         let mut inside_smd_pad = false;
@@ -382,6 +387,9 @@ impl RoutingGrid {
 
             for other_layer in 0..self.num_layers {
                 if other_layer == layer {
+                    continue;
+                }
+                if self.plane_nets.contains_key(&other_layer) && self.plane_nets.get(&other_layer) != Some(&target_net_id) {
                     continue;
                 }
                 let other_idx = self.idx(gx, gy, other_layer);
@@ -3614,42 +3622,183 @@ impl AutoRouter {
     }
 
     fn generate_escape_stubs(&self, board: &Board) -> Vec<EscapeStub> {
-        let mut stubs = Vec::new();
-        if let Some(u1_fp) = board.footprints.iter().find(|fp| fp.reference == "U1") {
-            for pad in &u1_fp.pads {
-                if pad.net_id == 0 || pad.net_name == "GND" || pad.net_name.is_empty() {
-                    continue;
-                }
-                let (px, py) = u1_fp.pad_absolute_position(pad);
-                let (dx, dy) = (px - u1_fp.x, py - u1_fp.y);
-                let (sign_x, sign_y) = (dx.signum(), dy.signum());
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum PadEdge {
+            West,
+            East,
+            North,
+            South,
+        }
 
-                let pad_num = pad.number.parse::<usize>().unwrap_or(0);
-                let is_staggered = pad_num % 2 == 0;
-                let length = match pad.number.as_str() {
-                    "1" | "3" | "6" | "21" => 1.20,
-                    "8" | "16" | "23" => 1.95,
-                    _ => if is_staggered { 1.90 } else { 1.15 },
-                };
-                let tip = if dx.abs() >= dy.abs() {
-                    (px + sign_x * length, py)
-                } else {
-                    (px, py + sign_y * length)
-                };
-                stubs.push(EscapeStub {
-                    net_id: pad.net_id,
-                    pad_pos: (px, py),
-                    tip_pos: tip,
-                    width: 0.15,
-                    via: None,
-                    tip_layer: u1_fp.layer,
-                    layer: u1_fp.layer,
-                });
+        impl PadEdge {
+            fn local_normal(self) -> (f64, f64) {
+                match self {
+                    PadEdge::West => (-1.0, 0.0),
+                    PadEdge::East => (1.0, 0.0),
+                    PadEdge::North => (0.0, -1.0),
+                    PadEdge::South => (0.0, 1.0),
+                }
             }
         }
 
-        if let Some(j2_fp) = board.footprints.iter().find(|fp| fp.reference == "J2") {
-            for pad in &j2_fp.pads {
+        let calculate_pad_edge = |fp: &Footprint, pad: &Pad| -> Option<PadEdge> {
+            let smd_pads: Vec<&Pad> = fp.pads.iter().filter(|p| !p.is_through_hole).collect();
+            if smd_pads.is_empty() {
+                return None;
+            }
+
+            let oy = |p: &Pad| if fp.layer != fp.orig_layer { -p.offset_y } else { p.offset_y };
+
+            let mut min_x = f64::INFINITY;
+            let mut max_x = f64::NEG_INFINITY;
+            let mut min_y = f64::INFINITY;
+            let mut max_y = f64::NEG_INFINITY;
+
+            for p in &smd_pads {
+                let lx = p.offset_x;
+                let ly = oy(p);
+                if lx < min_x { min_x = lx; }
+                if lx > max_x { max_x = lx; }
+                if ly < min_y { min_y = ly; }
+                if ly > max_y { max_y = ly; }
+            }
+
+            let span_x = max_x - min_x;
+            let span_y = max_y - min_y;
+            let cx = (min_x + max_x) * 0.5;
+            let cy = (min_y + max_y) * 0.5;
+
+            let target_lx = pad.offset_x;
+            let target_ly = oy(pad);
+
+            // Filter out large central thermal/ground pads
+            if pad.width >= 1.8 && pad.height >= 1.8 && (target_lx - cx).hypot(target_ly - cy) < 0.3 * span_x.max(span_y).max(1.0) {
+                return None;
+            }
+
+            let d_west = (target_lx - min_x).abs();
+            let d_east = (max_x - target_lx).abs();
+            let d_north = (target_ly - min_y).abs();
+            let d_south = (max_y - target_ly).abs();
+
+            if pad.width > pad.height * 1.15 {
+                if target_lx < cx {
+                    Some(PadEdge::West)
+                } else {
+                    Some(PadEdge::East)
+                }
+            } else if pad.height > pad.width * 1.15 {
+                if target_ly < cy {
+                    Some(PadEdge::North)
+                } else {
+                    Some(PadEdge::South)
+                }
+            } else {
+                let min_d = d_west.min(d_east).min(d_north).min(d_south);
+                if (d_west - min_d).abs() < 1e-4 {
+                    Some(PadEdge::West)
+                } else if (d_east - min_d).abs() < 1e-4 {
+                    Some(PadEdge::East)
+                } else if (d_north - min_d).abs() < 1e-4 {
+                    Some(PadEdge::North)
+                } else {
+                    Some(PadEdge::South)
+                }
+            }
+        };
+
+        let is_dense_escape_footprint = |fp: &Footprint| -> bool {
+            if fp.reference == "J2" {
+                return true;
+            }
+            let smd_pads: Vec<&Pad> = fp.pads.iter().filter(|p| !p.is_through_hole).collect();
+            if smd_pads.len() < 4 {
+                return false;
+            }
+            if smd_pads.len() >= 8 {
+                return true;
+            }
+            let mut min_pitch = f64::INFINITY;
+            for i in 0..smd_pads.len() {
+                let (x1, y1) = fp.pad_absolute_position(smd_pads[i]);
+                for j in (i + 1)..smd_pads.len() {
+                    let (x2, y2) = fp.pad_absolute_position(smd_pads[j]);
+                    let d = (x1 - x2).hypot(y1 - y2);
+                    if d > 0.05 && d < min_pitch {
+                        min_pitch = d;
+                    }
+                }
+            }
+            min_pitch <= 0.85 || fp.reference.starts_with('U') || fp.reference.starts_with('J')
+        };
+
+        let mut stubs = Vec::new();
+
+        for fp in &board.footprints {
+            if fp.reference == "J2" {
+                for pad in &fp.pads {
+                    if pad.net_id == 0
+                        || pad.net_name == "GND"
+                        || pad.net_name.is_empty()
+                        || pad.net_name.starts_with("unconnected")
+                        || pad.is_through_hole
+                    {
+                        continue;
+                    }
+                    let (px, py) = fp.pad_absolute_position(pad);
+                    let dir_inward_x = if (fp.x - px).abs() > 0.1 {
+                        (fp.x - px).signum()
+                    } else {
+                        -1.0
+                    };
+                    let dir_outward_x = -dir_inward_x;
+                    let inward_tip = (px + dir_inward_x * 1.35, py);
+                    let via_safe = !board.footprints.iter().any(|other_fp| {
+                        other_fp.pads.iter().any(|other_pad| {
+                            if other_pad.net_id == pad.net_id {
+                                return false;
+                            }
+                            let (opx, opy) = other_fp.pad_absolute_position(other_pad);
+                            let eff_clearance = 0.30 + 0.20 + 0.35;
+                            (opx - inward_tip.0).hypot(opy - inward_tip.1) < eff_clearance
+                        })
+                    });
+
+                    let is_b_side = pad.number.starts_with('B') && fp.pads.len() >= 8 && via_safe;
+                    let (tip, via, tip_layer) = if is_b_side {
+                        let v = Via {
+                            position: inward_tip,
+                            size: 0.60,
+                            drill: 0.30,
+                            net_id: pad.net_id,
+                            is_locked: false,
+                        };
+                        (inward_tip, Some(v), 1)
+                    } else {
+                        let tip_pos = (px + dir_outward_x * 1.35, py);
+                        (tip_pos, None, fp.layer)
+                    };
+                    stubs.push(EscapeStub {
+                        net_id: pad.net_id,
+                        pad_pos: (px, py),
+                        tip_pos: tip,
+                        width: 0.20,
+                        via,
+                        tip_layer,
+                        layer: fp.layer,
+                    });
+                }
+                continue;
+            }
+
+            if !is_dense_escape_footprint(fp) {
+                continue;
+            }
+
+            let oy = |p: &Pad| if fp.layer != fp.orig_layer { -p.offset_y } else { p.offset_y };
+
+            let mut candidates: Vec<(PadEdge, &Pad)> = Vec::new();
+            for pad in &fp.pads {
                 if pad.net_id == 0
                     || pad.net_name == "GND"
                     || pad.net_name.is_empty()
@@ -3658,48 +3807,141 @@ impl AutoRouter {
                 {
                     continue;
                 }
-                let (px, py) = j2_fp.pad_absolute_position(pad);
-                let dir_inward_x = if (j2_fp.x - px).abs() > 0.1 {
-                    (j2_fp.x - px).signum()
-                } else {
-                    -1.0
-                };
-                let dir_outward_x = -dir_inward_x;
-                let inward_tip = (px + dir_inward_x * 1.35, py);
-                let via_safe = !board.footprints.iter().any(|other_fp| {
-                    other_fp.pads.iter().any(|other_pad| {
-                        if other_pad.net_id == pad.net_id {
-                            return false;
-                        }
-                        let (opx, opy) = other_fp.pad_absolute_position(other_pad);
-                        let eff_clearance = 0.30 + 0.20 + 0.35;
-                        (opx - inward_tip.0).hypot(opy - inward_tip.1) < eff_clearance
-                    })
-                });
+                if let Some(edge) = calculate_pad_edge(fp, pad) {
+                    candidates.push((edge, pad));
+                }
+            }
 
-                let is_b_side = pad.number.starts_with('B') && j2_fp.pads.len() >= 8 && via_safe;
-                let (tip, via, tip_layer) = if is_b_side {
-                    let v = Via {
-                        position: inward_tip,
-                        size: 0.60,
-                        drill: 0.30,
-                        net_id: pad.net_id,
-                        is_locked: false,
+            for edge in [PadEdge::West, PadEdge::East, PadEdge::North, PadEdge::South] {
+                let mut edge_pads: Vec<&Pad> = candidates
+                    .iter()
+                    .filter(|(e, _)| *e == edge)
+                    .map(|(_, p)| *p)
+                    .collect();
+
+                match edge {
+                    PadEdge::West | PadEdge::East => {
+                        edge_pads.sort_by(|a, b| oy(a).partial_cmp(&oy(b)).unwrap_or(std::cmp::Ordering::Equal));
+                    }
+                    PadEdge::North | PadEdge::South => {
+                        edge_pads.sort_by(|a, b| a.offset_x.partial_cmp(&b.offset_x).unwrap_or(std::cmp::Ordering::Equal));
+                    }
+                }
+
+                for (edge_idx, pad) in edge_pads.iter().enumerate() {
+                    let is_staggered = edge_idx % 2 == 1;
+                    let length = if fp.reference == "U1" {
+                        match pad.number.as_str() {
+                            "1" | "3" | "6" | "21" => 1.20,
+                            "8" | "16" | "23" => 1.95,
+                            _ => if is_staggered { 1.95 } else { 1.20 },
+                        }
+                    } else {
+                        if is_staggered { 1.95 } else { 1.20 }
                     };
-                    (inward_tip, Some(v), 1)
-                } else {
-                    let tip_pos = (px + dir_outward_x * 1.35, py);
-                    (tip_pos, None, j2_fp.layer)
-                };
-                stubs.push(EscapeStub {
-                    net_id: pad.net_id,
-                    pad_pos: (px, py),
-                    tip_pos: tip,
-                    width: 0.20,
-                    via,
-                    tip_layer,
-                    layer: j2_fp.layer,
-                });
+
+                    let (norm_lx, norm_ly) = edge.local_normal();
+                    let world_norm = Point::new(norm_lx, norm_ly).rotate_ccw(fp.rotation);
+                    let (px, py) = fp.pad_absolute_position(pad);
+                    let mut tip = (px + world_norm.x * length, py + world_norm.y * length);
+
+                    let stub_w = board.get_netclass_for_net(pad.net_id).track_width.min(0.20).max(0.15);
+                    let eff_clearance = board.get_netclass_for_net(pad.net_id).clearance.max(0.15);
+                    let stub_margin = (stub_w * 0.5) + eff_clearance;
+
+                    // Clearance check against own footprint pads:
+                    // NEVER allow stub to shoot sideways towards neighboring pads or come within clearance
+                    let collides_own = |tip_pt: (f64, f64)| -> bool {
+                        for other_pad in &fp.pads {
+                            if other_pad.number == pad.number || other_pad.net_id == pad.net_id {
+                                continue;
+                            }
+                            let (opx, opy) = fp.pad_absolute_position(other_pad);
+                            let d_start = (opx - px).hypot(opy - py);
+                            let d_seg = dist_to_segment(opx, opy, px, py, tip_pt.0, tip_pt.1);
+                            // If the stub gets closer to other_pad than pad_pos was, it is shooting towards other_pad!
+                            if d_seg < d_start - 0.05 {
+                                return true;
+                            }
+                            let (ow, oh) = fp.pad_world_size(other_pad);
+                            let req_dist = (ow.min(oh) * 0.5) + stub_margin;
+                            if d_start >= req_dist && d_seg < req_dist - 1e-4 {
+                                return true;
+                            }
+                            let d_tip = (opx - tip_pt.0).hypot(opy - tip_pt.1);
+                            if d_tip < req_dist - 1e-4 {
+                                return true;
+                            }
+                        }
+                        false
+                    };
+
+                    if collides_own(tip) {
+                        continue;
+                    }
+
+                    // Clearance check against foreign footprint pads:
+                    let collides_foreign = |tip_pt: (f64, f64)| -> bool {
+                        for other_fp in &board.footprints {
+                            if other_fp.reference == fp.reference {
+                                continue;
+                            }
+                            for other_pad in &other_fp.pads {
+                                if other_pad.net_id == pad.net_id {
+                                    continue;
+                                }
+                                if !other_pad.is_through_hole && other_fp.layer != fp.layer {
+                                    continue;
+                                }
+                                let (opx, opy) = other_fp.pad_absolute_position(other_pad);
+                                let (ow, oh) = other_fp.pad_world_size(other_pad);
+                                let req_foreign_dist = (ow.min(oh) * 0.5) + stub_margin;
+                                if dist_to_segment(opx, opy, px, py, tip_pt.0, tip_pt.1) < req_foreign_dist - 1e-4 {
+                                    return true;
+                                }
+                            }
+                        }
+                        false
+                    };
+
+                    if collides_foreign(tip) {
+                        if length > 1.25 {
+                            let short_tip = (px + world_norm.x * 1.20, py + world_norm.y * 1.20);
+                            if !collides_own(short_tip) && !collides_foreign(short_tip) {
+                                tip = short_tip;
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+
+                    // Board bounds validation
+                    if board.max_x > board.min_x && board.max_y > board.min_y {
+                        if tip.0 < board.min_x + 0.3 || tip.0 > board.max_x - 0.3 || tip.1 < board.min_y + 0.3 || tip.1 > board.max_y - 0.3 {
+                            let short_tip = (px + world_norm.x * 1.20, py + world_norm.y * 1.20);
+                            if short_tip.0 >= board.min_x + 0.3 && short_tip.0 <= board.max_x - 0.3
+                                && short_tip.1 >= board.min_y + 0.3 && short_tip.1 <= board.max_y - 0.3
+                                && !collides_own(short_tip) && !collides_foreign(short_tip)
+                            {
+                                tip = short_tip;
+                            } else {
+                                continue;
+                            }
+                        }
+                    }
+
+                    stubs.push(EscapeStub {
+                        net_id: pad.net_id,
+                        pad_pos: (px, py),
+                        tip_pos: tip,
+                        width: stub_w,
+                        via: None,
+                        tip_layer: fp.layer,
+                        layer: fp.layer,
+                    });
+                }
             }
         }
 
@@ -4809,6 +5051,17 @@ pub fn is_segment_clear(
     let half_w = width * 0.5;
     let margin = half_w + clearance;
 
+    // 0. Dedicated plane isolation
+    if let Some(g) = grid {
+        if g.plane_nets.contains_key(&layer) && g.plane_nets.get(&layer) != Some(&net_id) {
+            return false;
+        }
+    } else if let Some(&plane_net) = board.inner_plane_nets().get(&layer) {
+        if plane_net != net_id {
+            return false;
+        }
+    }
+
     // 1. Board bounds check
     let min_x = p1.0.min(p2.0) - margin;
     let max_x = p1.0.max(p2.0) + margin;
@@ -5731,6 +5984,73 @@ mod tests {
             assert!(c.start_pad < board.footprints[c.start_fp].pads.len());
             assert!(c.end_pad < board.footprints[c.end_fp].pads.len());
         }
+    }
+
+    #[test]
+    fn test_escape_stubs_direction_and_pad_clearance() {
+        let mut board = make_router_test_board();
+        let router = AutoRouter::new(3);
+
+        // Test with 0, 90, 180, 270 degree rotation of U1
+        for rot in [0.0, 90.0, 180.0, 270.0] {
+            board.footprints[0].rotation = rot;
+            let stubs = router.generate_escape_stubs(&board);
+            let u1_stubs: Vec<_> = stubs.iter().filter(|s| {
+                s.layer == board.footprints[0].layer && (s.pad_pos.0 - board.footprints[0].x).hypot(s.pad_pos.1 - board.footprints[0].y) < 5.0
+            }).collect();
+            assert_eq!(u1_stubs.len(), 17, "All 17 non-GND pins of U1 must generate escape stubs at rot={}", rot);
+
+            for stub in &u1_stubs {
+                // Verify stub projects outward away from footprint center
+                let pad_dist = (stub.pad_pos.0 - board.footprints[0].x).hypot(stub.pad_pos.1 - board.footprints[0].y);
+                let tip_dist = (stub.tip_pos.0 - board.footprints[0].x).hypot(stub.tip_pos.1 - board.footprints[0].y);
+                assert!(tip_dist > pad_dist, "Escape stub tip must project outward away from footprint center (rot={})", rot);
+
+                // Verify stub never shoots towards any neighboring pad
+                for pad in &board.footprints[0].pads {
+                    let (px, py) = board.footprints[0].pad_absolute_position(pad);
+                    let pad_to_pad_dist = (px - stub.pad_pos.0).hypot(py - stub.pad_pos.1);
+                    if pad_to_pad_dist < 1e-3 {
+                        continue; // same pad
+                    }
+                    let d = dist_to_segment(px, py, stub.pad_pos.0, stub.pad_pos.1, stub.tip_pos.0, stub.tip_pos.1);
+                    assert!(d >= pad_to_pad_dist - 1e-4, "Escape stub must not shoot towards pad {} on U1 (d={}, pad_to_pad={})", pad.number, d, pad_to_pad_dist);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_dedicated_plane_isolation() {
+        let mut board = make_router_test_board();
+        board.raw_content = "(\"In1.Cu\" \"In2.Cu\")".to_string();
+        let mut grid = RoutingGrid::new(&board, 0.25, None);
+        // Add dedicated inner plane layer 2 (GND = net 1) and layer 3 (PWR = net 4)
+        grid.plane_nets.insert(2, 1);
+        grid.plane_nets.insert(3, 4);
+
+        let signal_net_id = 2; // SIG1
+        let center_gx = grid.width / 2;
+        let center_gy = grid.height / 2;
+
+        // Test 1: Planar steps on dedicated plane layer 2 are prohibited for signal net
+        let node_plane = GridNode { gx: center_gx, gy: center_gy, layer: 2 };
+        let nbrs_plane = grid.get_neighbors(node_plane, signal_net_id, 0.2, 0.2, 0.6, None);
+        let planar_steps: Vec<_> = nbrs_plane.iter().filter(|(n, _)| n.layer == 2).collect();
+        assert!(planar_steps.is_empty(), "Signal net must not take planar steps on dedicated plane layer 2");
+
+        // Test 2: Via transitions from layer 0 cannot transition to dedicated plane layer 2 or 3 for signal net
+        let node_top = GridNode { gx: center_gx, gy: center_gy, layer: 0 };
+        let nbrs_top = grid.get_neighbors(node_top, signal_net_id, 0.2, 0.2, 0.6, None);
+        for (nbr, _) in &nbrs_top {
+            assert_ne!(nbr.layer, 2, "Signal net must not transition via to plane layer 2");
+            assert_ne!(nbr.layer, 3, "Signal net must not transition via to plane layer 3");
+        }
+
+        // Test 3: Plane net itself (GND = 1) CAN take planar steps on its own plane layer
+        let nbrs_gnd_plane = grid.get_neighbors(node_plane, 1, 0.2, 0.2, 0.6, None);
+        let gnd_planar_steps: Vec<_> = nbrs_gnd_plane.iter().filter(|(n, _)| n.layer == 2).collect();
+        assert!(!gnd_planar_steps.is_empty(), "Plane net must be allowed to route planar steps on its plane layer");
     }
 
     #[test]

@@ -821,6 +821,25 @@ pub struct Board {
     pub schematic_positions: HashMap<String, (f64, f64)>,
 }
 
+pub const INTERNAL_COPPER_LAYERS: [&str; 30] = [
+    "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu", "In5.Cu",
+    "In6.Cu", "In7.Cu", "In8.Cu", "In9.Cu", "In10.Cu",
+    "In11.Cu", "In12.Cu", "In13.Cu", "In14.Cu", "In15.Cu",
+    "In16.Cu", "In17.Cu", "In18.Cu", "In19.Cu", "In20.Cu",
+    "In21.Cu", "In22.Cu", "In23.Cu", "In24.Cu", "In25.Cu",
+    "In26.Cu", "In27.Cu", "In28.Cu", "In29.Cu", "In30.Cu",
+];
+
+pub fn detect_copper_layers(raw_content: &str) -> Vec<&'static str> {
+    let mut layers = vec!["F.Cu", "B.Cu"];
+    for &name in &INTERNAL_COPPER_LAYERS {
+        if raw_content.contains(&format!("\"{}\"", name)) {
+            layers.push(name);
+        }
+    }
+    layers
+}
+
 impl Board {
     pub fn load(path: &str, extra_locked: &HashSet<String>) -> Result<Self, String> {
         let content = fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", path, e))?;
@@ -884,6 +903,8 @@ impl Board {
         let mut tracks = Vec::new();
         let mut vias = Vec::new();
 
+        let active_layers = detect_copper_layers(&content);
+
         let bytes = content.as_bytes();
         let len = bytes.len();
         let mut i = 0;
@@ -915,7 +936,7 @@ impl Board {
                                     min_y: kmin_y,
                                     max_x: kmax_x,
                                     max_y: kmax_y,
-                                    layers: vec![0, 1, 2, 3],
+                                    layers: (0..active_layers.len()).collect(),
                                 });
                             }
                         }
@@ -934,7 +955,7 @@ impl Board {
                 } else if word == "segment" {
                     if let Some(end) = find_closing_paren(bytes, i) {
                         let block = &content[i..end];
-                        if let Some(tr) = parse_segment(block) {
+                        if let Some(tr) = parse_segment(block, &active_layers) {
                             tracks.push(tr);
                         }
                         i = end;
@@ -998,7 +1019,7 @@ impl Board {
                 min_y: 91.0,
                 max_x: 183.1,
                 max_y: 119.0,
-                layers: vec![0, 1, 2, 3],
+                layers: (0..active_layers.len()).collect(),
             });
         }
 
@@ -1041,13 +1062,7 @@ impl Board {
     }
 
     pub fn copper_layers(&self) -> Vec<&'static str> {
-        let mut layers = vec!["F.Cu", "B.Cu"];
-        for name in ["In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu"] {
-            if self.raw_content.contains(&format!("\"{}\"", name)) {
-                layers.push(name);
-            }
-        }
-        layers
+        detect_copper_layers(&self.raw_content)
     }
 
     pub fn layer_name(&self, layer_idx: usize) -> &'static str {
@@ -1588,19 +1603,14 @@ fn extract_named_usize(block: &str, tag: &str) -> Option<usize> {
     rest[..end].split_whitespace().next()?.parse::<usize>().ok()
 }
 
-fn parse_segment(block: &str) -> Option<TrackSegment> {
+fn parse_segment(block: &str, active_layers: &[&str]) -> Option<TrackSegment> {
     let (sx, sy) = extract_point(block, "start")?;
     let (ex, ey) = extract_point(block, "end")?;
     let width = extract_named_f64(block, "width").unwrap_or(0.20);
-    let layer = if block.contains("\"B.Cu\"") {
-        1
-    } else if block.contains("\"In1.Cu\"") {
-        2
-    } else if block.contains("\"In2.Cu\"") {
-        3
-    } else {
-        0
-    };
+    let layer = active_layers
+        .iter()
+        .position(|&l| block.contains(&format!("\"{}\"", l)))
+        .unwrap_or_else(|| if block.contains("\"B.Cu\"") { 1 } else { 0 });
     let net_id = extract_named_usize(block, "net").unwrap_or(0);
     let is_locked = block.contains("(locked yes)") || block.contains("(locked)") || block.contains("(status 40000)");
     Some(TrackSegment {
@@ -3177,6 +3187,37 @@ mod tests {
         assert!((len1 - len2).abs() < 1e-6);
         assert!((len1 - 10.0).abs() < 1e-6);
         assert!((len2 - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dynamic_active_copper_layers_detection() {
+        // 2-layer board
+        let pcb_2l = r#"(kicad_pcb (layers (0 "F.Cu" signal) (31 "B.Cu" signal)))"#;
+        assert_eq!(detect_copper_layers(pcb_2l), vec!["F.Cu", "B.Cu"]);
+
+        // 4-layer board
+        let pcb_4l = r#"(kicad_pcb (layers (0 "F.Cu" signal) (1 "In1.Cu" signal) (2 "In2.Cu" signal) (31 "B.Cu" signal)))"#;
+        assert_eq!(detect_copper_layers(pcb_4l), vec!["F.Cu", "B.Cu", "In1.Cu", "In2.Cu"]);
+
+        // 6-layer board
+        let pcb_6l = r#"(kicad_pcb (layers (0 "F.Cu" signal) (1 "In1.Cu" signal) (2 "In2.Cu" signal) (3 "In3.Cu" signal) (4 "In4.Cu" signal) (31 "B.Cu" signal)))"#;
+        assert_eq!(
+            detect_copper_layers(pcb_6l),
+            vec!["F.Cu", "B.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu"]
+        );
+
+        // 32-layer board
+        let mut pcb_32l = String::from("(kicad_pcb (layers (0 \"F.Cu\" signal) ");
+        for i in 1..=30 {
+            pcb_32l.push_str(&format!("({} \"In{}.Cu\" signal) ", i, i));
+        }
+        pcb_32l.push_str("(31 \"B.Cu\" signal)))");
+        let layers_32 = detect_copper_layers(&pcb_32l);
+        assert_eq!(layers_32.len(), 32);
+        assert_eq!(layers_32[0], "F.Cu");
+        assert_eq!(layers_32[1], "B.Cu");
+        assert_eq!(layers_32[2], "In1.Cu");
+        assert_eq!(layers_32[31], "In30.Cu");
     }
 }
 

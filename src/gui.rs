@@ -12,8 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-// KiCad default colour theme (KiCad 8/9/10 "default"; pcbnew builtin scheme, inner layers per user spec).
-// ponytail: F.Cu/In1/In2/B.Cu sampled from a KiCad 10 PCB Editor screenshot; remaining values transcribed, not read from a theme file.
+// KiCad default colour theme (KiCad 8/9/10 "default"; pcbnew builtin scheme).
 pub const COL_F_CU: Color32 = Color32::from_rgb(0xC8, 0x34, 0x34);
 pub const COL_B_CU: Color32 = Color32::from_rgb(0x4D, 0x7F, 0xC4);
 pub const COL_IN1_CU: Color32 = Color32::from_rgb(0x7F, 0xC8, 0x7F);
@@ -24,9 +23,84 @@ pub const COL_F_CRTYD: Color32 = Color32::from_rgb(0xFF, 0x26, 0xE2);
 pub const COL_B_CRTYD: Color32 = Color32::from_rgb(0x26, 0xE2, 0xFF);
 pub const COL_EDGE_CUTS: Color32 = Color32::from_rgb(0xD0, 0xD2, 0xCD);
 pub const COL_RATSNEST: Color32 = Color32::from_rgb(0x00, 0xF8, 0xFF);
-pub const COL_KEEPOUT: Color32 = Color32::from_rgb(200, 70, 70);
-/// Canvas copper draw order, bottom to top (KiCad: B.Cu, inner layers, F.Cu).
+// Keepout: Color32::from_rgba_unmultiplied(255, 0, 5, 128) (#FF000580)
+pub const COL_KEEPOUT: Color32 = Color32::from_rgba_premultiplied(0xBC, 0x00, 0x03, 0x80);
+pub const COL_CANVAS_BG: Color32 = Color32::from_rgb(0x00, 0x10, 0x23);
+
+/// Canvas copper draw order for standard 4-layer boards (KiCad: B.Cu, inner layers, F.Cu).
 pub const COPPER_DRAW_ORDER: [&str; 4] = ["B.Cu", "In2.Cu", "In1.Cu", "F.Cu"];
+
+/// KiCad default layer color lookup.
+pub fn copper_layer_color(layer_name: &str) -> Color32 {
+    match layer_name {
+        "F.Cu" => COL_F_CU,
+        "B.Cu" => COL_B_CU,
+        "In1.Cu" => COL_IN1_CU,
+        "In2.Cu" => COL_IN2_CU,
+        "In3.Cu" => Color32::from_rgb(0x4F, 0xCB, 0xCB),
+        "In4.Cu" => Color32::from_rgb(0xDB, 0x62, 0x8B),
+        "In5.Cu" => Color32::from_rgb(0xA7, 0xA5, 0xC6),
+        "In6.Cu" => Color32::from_rgb(0x28, 0xCC, 0xD9),
+        "In7.Cu" => Color32::from_rgb(0xE8, 0xB2, 0xA7),
+        "In8.Cu" => Color32::from_rgb(0xF2, 0xED, 0xA1),
+        "In9.Cu" => Color32::from_rgb(0x8D, 0xCB, 0x81),
+        _ => {
+            if let Some(num_str) = layer_name.strip_prefix("In").and_then(|s| s.strip_suffix(".Cu")) {
+                if let Ok(num) = num_str.parse::<usize>() {
+                    if (10..=30).contains(&num) {
+                        const CYCLE: [Color32; 7] = [
+                            Color32::from_rgb(237, 124, 51),
+                            Color32::from_rgb(91, 195, 235),
+                            Color32::from_rgb(247, 111, 142),
+                            Color32::from_rgb(167, 165, 198),
+                            Color32::from_rgb(40, 204, 217),
+                            Color32::from_rgb(232, 178, 167),
+                            Color32::from_rgb(242, 237, 161),
+                        ];
+                        return CYCLE[(num - 10) % 7];
+                    }
+                }
+            }
+            Color32::from_rgb(180, 180, 180)
+        }
+    }
+}
+
+/// Returns active copper layers in KiCad display/legend order: F.Cu, internal layers, B.Cu.
+pub fn kicad_layer_display_order<'a>(active_layers: &[&'a str]) -> Vec<&'a str> {
+    let mut order = Vec::new();
+    if active_layers.contains(&"F.Cu") {
+        order.push("F.Cu");
+    }
+    for &layer in active_layers {
+        if layer != "F.Cu" && layer != "B.Cu" {
+            order.push(layer);
+        }
+    }
+    if active_layers.contains(&"B.Cu") {
+        order.push("B.Cu");
+    }
+    order
+}
+
+/// Returns active copper layers in canvas draw order (bottom to top): B.Cu, internal layers descending, F.Cu.
+pub fn copper_layers_draw_order<'a>(active_layers: &[&'a str]) -> Vec<&'a str> {
+    let mut order = Vec::new();
+    if active_layers.contains(&"B.Cu") {
+        order.push("B.Cu");
+    }
+    let mut inner: Vec<&'a str> = active_layers
+        .iter()
+        .copied()
+        .filter(|&l| l != "F.Cu" && l != "B.Cu")
+        .collect();
+    inner.reverse();
+    order.extend(inner);
+    if active_layers.contains(&"F.Cu") {
+        order.push("F.Cu");
+    }
+    order
+}
 
 pub struct VulcansTrialsApp {
     pub input_path: String,
@@ -54,6 +128,7 @@ pub struct VulcansTrialsApp {
     pub show_b_cu: bool,
     pub show_in1_cu: bool,
     pub show_in2_cu: bool,
+    pub visible_layers: HashSet<String>,
     pub show_vias: bool,
     pub show_refs: bool,
     pub show_holding_palette: bool,
@@ -76,6 +151,12 @@ impl VulcansTrialsApp {
     pub fn new(input_path: String, output_path: String, board: Board, vulkan: Option<Arc<VulkanEngine>>) -> Self {
         let busy_counter = vulkan.as_ref().map(|v| Arc::clone(&v.compute_busy_ns));
         let telemetry = SystemTelemetry::spawn(busy_counter);
+        let mut visible_layers = HashSet::new();
+        visible_layers.insert("F.Cu".to_string());
+        visible_layers.insert("B.Cu".to_string());
+        for &layer in &board.copper_layers() {
+            visible_layers.insert(layer.to_string());
+        }
         let live = Arc::new(Mutex::new(LiveTrialState::new(board)));
 
         Self {
@@ -100,12 +181,38 @@ impl VulcansTrialsApp {
             show_b_cu: true,
             show_in1_cu: true,
             show_in2_cu: true,
+            visible_layers,
             show_vias: true,
             show_refs: true,
             show_holding_palette: true,
             selected_net: None,
             moving_footprint: None,
             hovered_footprint: None,
+        }
+    }
+
+    pub fn is_layer_visible(&self, layer_name: &str) -> bool {
+        match layer_name {
+            "F.Cu" => self.show_f_cu && self.visible_layers.contains("F.Cu"),
+            "B.Cu" => self.show_b_cu && self.visible_layers.contains("B.Cu"),
+            "In1.Cu" => self.show_in1_cu && self.visible_layers.contains("In1.Cu"),
+            "In2.Cu" => self.show_in2_cu && self.visible_layers.contains("In2.Cu"),
+            _ => self.visible_layers.contains(layer_name),
+        }
+    }
+
+    pub fn set_layer_visible(&mut self, layer_name: &str, visible: bool) {
+        match layer_name {
+            "F.Cu" => self.show_f_cu = visible,
+            "B.Cu" => self.show_b_cu = visible,
+            "In1.Cu" => self.show_in1_cu = visible,
+            "In2.Cu" => self.show_in2_cu = visible,
+            _ => {}
+        }
+        if visible {
+            self.visible_layers.insert(layer_name.to_string());
+        } else {
+            self.visible_layers.remove(layer_name);
         }
     }
 
@@ -785,25 +892,41 @@ impl VulcansTrialsApp {
 
                 ui.separator();
                 ui.heading("Visibility & View");
+                let active_layers = snap.board.copper_layers();
+                let display_layers = kicad_layer_display_order(&active_layers);
                 let plane_names = snap.board.layer_plane_net_names();
-                let in1_txt = match plane_names.get(&2) {
-                    Some(n) => format!("In1.Cu ({})", n),
-                    None => "In1.Cu (Inner 1)".to_string(),
-                };
-                let in2_txt = match plane_names.get(&3) {
-                    Some(n) => format!("In2.Cu ({})", n),
-                    None => "In2.Cu (Inner 2)".to_string(),
-                };
                 ui.vertical(|ui| {
                     ui.checkbox(
                         &mut self.show_holding_palette,
                         format!("Holding Palette ({})", snap.board.holding_palette.len()),
                     );
                     // KiCad layer order with colour swatches (text tinted to the canvas colour)
-                    ui.checkbox(&mut self.show_f_cu, egui::RichText::new("F.Cu (Top)").color(COL_F_CU));
-                    ui.checkbox(&mut self.show_in1_cu, egui::RichText::new(in1_txt).color(COL_IN1_CU));
-                    ui.checkbox(&mut self.show_in2_cu, egui::RichText::new(in2_txt).color(COL_IN2_CU));
-                    ui.checkbox(&mut self.show_b_cu, egui::RichText::new("B.Cu (Bottom)").color(COL_B_CU));
+                    for &layer_name in &display_layers {
+                        let l_idx = active_layers.iter().position(|&l| l == layer_name);
+                        let plane = l_idx.and_then(|idx| plane_names.get(&idx));
+                        let label = match layer_name {
+                            "F.Cu" => match plane {
+                                Some(n) => format!("F.Cu (Top - {})", n),
+                                None => "F.Cu (Top)".to_string(),
+                            },
+                            "B.Cu" => match plane {
+                                Some(n) => format!("B.Cu (Bottom - {})", n),
+                                None => "B.Cu (Bottom)".to_string(),
+                            },
+                            _ => {
+                                let k = layer_name.strip_prefix("In").and_then(|s| s.strip_suffix(".Cu")).unwrap_or("");
+                                match plane {
+                                    Some(n) => format!("{layer_name} ({n})"),
+                                    None => format!("{layer_name} (Inner {k})"),
+                                }
+                            }
+                        };
+                        let col = copper_layer_color(layer_name);
+                        let mut vis = self.is_layer_visible(layer_name);
+                        if ui.checkbox(&mut vis, egui::RichText::new(label).color(col)).changed() {
+                            self.set_layer_visible(layer_name, vis);
+                        }
+                    }
                     ui.checkbox(&mut self.show_vias, egui::RichText::new("Vias").color(COL_VIA));
                     ui.checkbox(&mut self.show_ratsnest, egui::RichText::new("Ratsnest").color(COL_RATSNEST));
                     ui.checkbox(&mut self.show_courtyards, egui::RichText::new("Courtyards").color(COL_F_CRTYD));
@@ -984,7 +1107,7 @@ impl VulcansTrialsApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
             let rect = response.rect;
-            painter.rect_filled(rect, 0.0, Color32::from_rgb(16, 20, 24));
+            painter.rect_filled(rect, 0.0, COL_CANVAS_BG);
 
             let pointer_pos = ui.input(|i| i.pointer.hover_pos());
 
@@ -1109,47 +1232,21 @@ impl VulcansTrialsApp {
                 );
             }
 
-            // 3. Draw Copper Layers bottom-up like KiCad (B.Cu, In2.Cu, In1.Cu, F.Cu)
-            if self.show_b_cu {
-                for tr in &b.tracks {
-                    if tr.layer == 1 {
-                        let p1 = to_screen(tr.start.0, tr.start.1);
-                        let p2 = to_screen(tr.end.0, tr.end.1);
-                        let w = ((tr.width as f32) * scale).max(1.5);
-                        draw_track_segment(&painter, p1, p2, w, COL_B_CU);
-                    }
-                }
-            }
-
-            if self.show_in2_cu {
-                for tr in &b.tracks {
-                    if tr.layer == 3 {
-                        let p1 = to_screen(tr.start.0, tr.start.1);
-                        let p2 = to_screen(tr.end.0, tr.end.1);
-                        let w = ((tr.width as f32) * scale).max(1.5);
-                        draw_track_segment(&painter, p1, p2, w, COL_IN2_CU);
-                    }
-                }
-            }
-            if self.show_in1_cu {
-                for tr in &b.tracks {
-                    if tr.layer == 2 {
-                        let p1 = to_screen(tr.start.0, tr.start.1);
-                        let p2 = to_screen(tr.end.0, tr.end.1);
-                        let w = ((tr.width as f32) * scale).max(1.5);
-                        draw_track_segment(&painter, p1, p2, w, COL_IN1_CU);
-                    }
-                }
-            }
-
-            // 5. Draw F.Cu Tracks (Red)
-            if self.show_f_cu {
-                for tr in &b.tracks {
-                    if tr.layer == 0 {
-                        let p1 = to_screen(tr.start.0, tr.start.1);
-                        let p2 = to_screen(tr.end.0, tr.end.1);
-                        let w = ((tr.width as f32) * scale).max(1.5);
-                        draw_track_segment(&painter, p1, p2, w, COL_F_CU);
+            // 3. Draw Copper Layers bottom-up like KiCad (B.Cu, inner layers descending, F.Cu)
+            let copper_layers = b.copper_layers();
+            let draw_order = copper_layers_draw_order(&copper_layers);
+            for &layer_name in &draw_order {
+                if let Some(layer_idx) = copper_layers.iter().position(|&l| l == layer_name) {
+                    if self.is_layer_visible(layer_name) {
+                        let col = copper_layer_color(layer_name);
+                        for tr in &b.tracks {
+                            if tr.layer == layer_idx {
+                                let p1 = to_screen(tr.start.0, tr.start.1);
+                                let p2 = to_screen(tr.end.0, tr.end.1);
+                                let w = ((tr.width as f32) * scale).max(1.5);
+                                draw_track_segment(&painter, p1, p2, w, col);
+                            }
+                        }
                     }
                 }
             }
@@ -1160,53 +1257,56 @@ impl VulcansTrialsApp {
                 let is_moving = self.moving_footprint.as_ref().map_or(false, |m| m.fp_index == idx);
                 let is_hovered = self.hovered_footprint == Some(idx) && !is_moving;
 
-                for pad in &fp.pads {
-                    let is_highlighted = self
-                        .selected_net
-                        .as_ref()
-                        .map_or(false, |sn| !sn.is_empty() && sn == &pad.net_name);
+                // Two passes: render SMD pads first, then through-hole pads (thermal vias) on top
+                for is_th in [false, true] {
+                    for pad in fp.pads.iter().filter(|p| p.is_through_hole == is_th) {
+                        let is_highlighted = self
+                            .selected_net
+                            .as_ref()
+                            .map_or(false, |sn| !sn.is_empty() && sn == &pad.net_name);
 
-                    let (px, py) = fp.pad_absolute_position(pad);
-                    let center = to_screen(px, py);
-                    let pad_col = if is_highlighted {
-                        Color32::from_rgb(255, 245, 140)
-                    } else if pad.is_through_hole {
-                        COL_PAD_TH
-                    } else if fp.layer == 1 {
-                        COL_B_CU
-                    } else {
-                        COL_F_CU
-                    };
+                        let (px, py) = fp.pad_absolute_position(pad);
+                        let center = to_screen(px, py);
+                        let pad_col = if is_highlighted {
+                            Color32::from_rgb(255, 245, 140)
+                        } else if pad.is_through_hole {
+                            COL_PAD_TH
+                        } else if fp.layer == 1 {
+                            COL_B_CU
+                        } else {
+                            COL_F_CU
+                        };
 
-                    if pad.shape == "circle" {
-                        let r = ((pad.width.max(pad.height) as f32) * 0.5 * scale).max(1.0);
-                        if is_highlighted {
-                            painter.circle_filled(center, r + 2.5, Color32::from_rgba_unmultiplied(255, 220, 40, 160));
-                            painter.circle_stroke(center, r + 3.0, Stroke::new(1.8_f32, Color32::WHITE));
-                        }
-                        painter.circle_filled(center, r, pad_col);
-                    } else {
-                        let corners = fp.pad_world_corners(pad);
-                        let screen_pts: Vec<Pos2> = corners.iter().map(|p| to_screen(p.x, p.y)).collect();
-                        if is_highlighted {
-                            let halo_poly = Polygon::new(corners.clone()).expanded(0.20);
-                            let halo_pts: Vec<Pos2> = halo_poly.vertices.iter().map(|p| to_screen(p.x, p.y)).collect();
+                        if pad.shape == "circle" {
+                            let r = ((pad.width.max(pad.height) as f32) * 0.5 * scale).max(1.0);
+                            if is_highlighted {
+                                painter.circle_filled(center, r + 2.5, Color32::from_rgba_unmultiplied(255, 220, 40, 160));
+                                painter.circle_stroke(center, r + 3.0, Stroke::new(1.8_f32, Color32::WHITE));
+                            }
+                            painter.circle_filled(center, r, pad_col);
+                        } else {
+                            let corners = fp.pad_world_corners(pad);
+                            let screen_pts: Vec<Pos2> = corners.iter().map(|p| to_screen(p.x, p.y)).collect();
+                            if is_highlighted {
+                                let halo_poly = Polygon::new(corners.clone()).expanded(0.20);
+                                let halo_pts: Vec<Pos2> = halo_poly.vertices.iter().map(|p| to_screen(p.x, p.y)).collect();
+                                painter.add(egui::Shape::convex_polygon(
+                                    halo_pts.clone(),
+                                    Color32::from_rgba_unmultiplied(255, 220, 40, 160),
+                                    Stroke::new(1.8_f32, Color32::WHITE),
+                                ));
+                            }
                             painter.add(egui::Shape::convex_polygon(
-                                halo_pts.clone(),
-                                Color32::from_rgba_unmultiplied(255, 220, 40, 160),
-                                Stroke::new(1.8_f32, Color32::WHITE),
+                                screen_pts,
+                                pad_col,
+                                egui::Stroke::NONE,
                             ));
                         }
-                        painter.add(egui::Shape::convex_polygon(
-                            screen_pts,
-                            pad_col,
-                            egui::Stroke::NONE,
-                        ));
-                    }
 
-                    if let Some(drill_dia) = pad.drill {
-                        let drill_r = ((drill_dia as f32) * 0.5 * scale).max(0.8);
-                        painter.circle_filled(center, drill_r, Color32::from_rgb(25, 30, 35));
+                        if let Some(drill_dia) = pad.drill {
+                            let drill_r = ((drill_dia as f32) * 0.5 * scale).max(0.8);
+                            painter.circle_filled(center, drill_r, Color32::from_rgb(25, 30, 35));
+                        }
                     }
                 }
 
@@ -1391,49 +1491,51 @@ pub fn draw_mini_footprint(ui: &mut egui::Ui, fp: &crate::board::Footprint, size
         }
     }
 
-    // 2. Draw Pads
-    for pad in &fp.pads {
-        let pad_col = if pad.is_through_hole {
-            Color32::from_rgb(215, 185, 80)
-        } else if pad.net_name == "GND" {
-            Color32::from_rgb(90, 165, 110)
-        } else if crate::placer::is_power_net(&pad.net_name) {
-            Color32::from_rgb(245, 140, 50)
-        } else if fp.layer == 1 {
-            Color32::from_rgb(85, 145, 235)
-        } else {
-            Color32::from_rgb(220, 85, 80)
-        };
+    // 2. Draw Pads in two passes: SMD first, then through-hole on top
+    for is_th in [false, true] {
+        for pad in fp.pads.iter().filter(|p| p.is_through_hole == is_th) {
+            let pad_col = if pad.is_through_hole {
+                Color32::from_rgb(215, 185, 80)
+            } else if pad.net_name == "GND" {
+                Color32::from_rgb(90, 165, 110)
+            } else if crate::placer::is_power_net(&pad.net_name) {
+                Color32::from_rgb(245, 140, 50)
+            } else if fp.layer == 1 {
+                Color32::from_rgb(85, 145, 235)
+            } else {
+                Color32::from_rgb(220, 85, 80)
+            };
 
-        let center = to_preview(pad.offset_x, pad.offset_y);
-        if pad.shape == "circle" {
-            let r = ((pad.width.max(pad.height) as f32) * 0.5 * scale).max(1.0);
-            painter.circle_filled(center, r, pad_col);
-        } else {
-            let half_w = pad.width * 0.5;
-            let half_h = pad.height * 0.5;
-            let rad = (-pad.rotation).to_radians();
-            let cos_r = rad.cos();
-            let sin_r = rad.sin();
-            let pts: Vec<Pos2> = [
-                (-half_w, -half_h),
-                (half_w, -half_h),
-                (half_w, half_h),
-                (-half_w, half_h),
-            ]
-            .iter()
-            .map(|&(cx, cy)| {
-                let rx = cx * cos_r - cy * sin_r + pad.offset_x;
-                let ry = cx * sin_r + cy * cos_r + pad.offset_y;
-                to_preview(rx, ry)
-            })
-            .collect();
-            painter.add(egui::Shape::convex_polygon(pts, pad_col, egui::Stroke::NONE));
-        }
+            let center = to_preview(pad.offset_x, pad.offset_y);
+            if pad.shape == "circle" {
+                let r = ((pad.width.max(pad.height) as f32) * 0.5 * scale).max(1.0);
+                painter.circle_filled(center, r, pad_col);
+            } else {
+                let half_w = pad.width * 0.5;
+                let half_h = pad.height * 0.5;
+                let rad = (-pad.rotation).to_radians();
+                let cos_r = rad.cos();
+                let sin_r = rad.sin();
+                let pts: Vec<Pos2> = [
+                    (-half_w, -half_h),
+                    (half_w, -half_h),
+                    (half_w, half_h),
+                    (-half_w, half_h),
+                ]
+                .iter()
+                .map(|&(cx, cy)| {
+                    let rx = cx * cos_r - cy * sin_r + pad.offset_x;
+                    let ry = cx * sin_r + cy * cos_r + pad.offset_y;
+                    to_preview(rx, ry)
+                })
+                .collect();
+                painter.add(egui::Shape::convex_polygon(pts, pad_col, egui::Stroke::NONE));
+            }
 
-        if let Some(drill_dia) = pad.drill {
-            let drill_r = ((drill_dia as f32) * 0.5 * scale).max(0.6);
-            painter.circle_filled(center, drill_r, Color32::from_rgb(20, 24, 28));
+            if let Some(drill_dia) = pad.drill {
+                let drill_r = ((drill_dia as f32) * 0.5 * scale).max(0.6);
+                painter.circle_filled(center, drill_r, Color32::from_rgb(20, 24, 28));
+            }
         }
     }
 
@@ -1499,39 +1601,42 @@ pub fn draw_lock_icon(painter: &egui::Painter, fp_rect: Rect) {
 }
 
 pub fn draw_color_legend(painter: &egui::Painter, canvas_rect: Rect, board: &Board) {
+    let active_layers = board.copper_layers();
+    let display_layers = kicad_layer_display_order(&active_layers);
     let plane_names = board.layer_plane_net_names();
-    let f_label = match plane_names.get(&0) {
-        Some(net) => format!("F.Cu Track (Top - {})", net),
-        None => "F.Cu Track (Top)".to_string(),
-    };
-    let b_label = match plane_names.get(&1) {
-        Some(net) => format!("B.Cu Track (Bottom - {})", net),
-        None => "B.Cu Track (Bottom)".to_string(),
-    };
-    let in1_label = match plane_names.get(&2) {
-        Some(net) => format!("In1.Cu Track (Inner 1 - {})", net),
-        None => "In1.Cu Track (Inner 1)".to_string(),
-    };
-    let in2_label = match plane_names.get(&3) {
-        Some(net) => format!("In2.Cu Track (Inner 2 - {})", net),
-        None => "In2.Cu Track (Inner 2)".to_string(),
-    };
 
-    let items: &[(&str, Color32)] = &[
-        (&f_label, COL_F_CU),
-        (&in1_label, COL_IN1_CU),
-        (&in2_label, COL_IN2_CU),
-        (&b_label, COL_B_CU),
-        ("Edge.Cuts Outline", COL_EDGE_CUTS),
-        ("Keepout Zone", COL_KEEPOUT),
-        ("Ratsnest (Unrouted)", COL_RATSNEST),
-        ("Courtyard (F.Cu Top)", COL_F_CRTYD),
-        ("Courtyard (B.Cu Bottom)", COL_B_CRTYD),
-        ("Courtyard (Locked 🔒)", Color32::from_rgb(240, 175, 50)),
-        ("SMD Pad (F.Cu / B.Cu colour)", COL_F_CU),
-        ("Through-Hole Pad", COL_PAD_TH),
-        ("Via Annular Ring", COL_VIA),
-    ];
+    let mut items: Vec<(String, Color32)> = Vec::new();
+    for &layer_name in &display_layers {
+        let l_idx = active_layers.iter().position(|&l| l == layer_name);
+        let plane = l_idx.and_then(|idx| plane_names.get(&idx));
+        let label = match layer_name {
+            "F.Cu" => match plane {
+                Some(net) => format!("F.Cu Track (Top - {})", net),
+                None => "F.Cu Track (Top)".to_string(),
+            },
+            "B.Cu" => match plane {
+                Some(net) => format!("B.Cu Track (Bottom - {})", net),
+                None => "B.Cu Track (Bottom)".to_string(),
+            },
+            _ => {
+                let k = layer_name.strip_prefix("In").and_then(|s| s.strip_suffix(".Cu")).unwrap_or("");
+                match plane {
+                    Some(net) => format!("{layer_name} Track (Inner {k} - {net})"),
+                    None => format!("{layer_name} Track (Inner {k})"),
+                }
+            }
+        };
+        items.push((label, copper_layer_color(layer_name)));
+    }
+    items.push(("Edge.Cuts Outline".to_string(), COL_EDGE_CUTS));
+    items.push(("Keepout Zone".to_string(), COL_KEEPOUT));
+    items.push(("Ratsnest (Unrouted)".to_string(), COL_RATSNEST));
+    items.push(("Courtyard (F.Cu Top)".to_string(), COL_F_CRTYD));
+    items.push(("Courtyard (B.Cu Bottom)".to_string(), COL_B_CRTYD));
+    items.push(("Courtyard (Locked 🔒)".to_string(), Color32::from_rgb(240, 175, 50)));
+    items.push(("SMD Pad (F.Cu / B.Cu colour)".to_string(), COL_F_CU));
+    items.push(("Through-Hole Pad".to_string(), COL_PAD_TH));
+    items.push(("Via Annular Ring".to_string(), COL_VIA));
 
     let row_h = 15.0_f32;
     let box_w = 205.0_f32;
@@ -1563,7 +1668,7 @@ pub fn draw_color_legend(painter: &egui::Painter, canvas_rect: Rect, board: &Boa
         painter.text(
             Pos2::new(legend_rect.left() + 24.0, y),
             egui::Align2::LEFT_TOP,
-            *label,
+            label,
             egui::FontId::proportional(11.0),
             Color32::from_rgb(205, 212, 220),
         );
@@ -1610,10 +1715,42 @@ mod tests {
         assert_eq!(COL_B_CU, Color32::from_rgb(0x4D, 0x7F, 0xC4));
         assert_eq!(COL_IN1_CU, Color32::from_rgb(0x7F, 0xC8, 0x7F));
         assert_eq!(COL_IN2_CU, Color32::from_rgb(0xCE, 0x7D, 0x2C));
+        assert_eq!(copper_layer_color("In3.Cu"), Color32::from_rgb(0x4F, 0xCB, 0xCB));
+        assert_eq!(copper_layer_color("In4.Cu"), Color32::from_rgb(0xDB, 0x62, 0x8B));
+        assert_eq!(copper_layer_color("In5.Cu"), Color32::from_rgb(0xA7, 0xA5, 0xC6));
+        assert_eq!(copper_layer_color("In6.Cu"), Color32::from_rgb(0x28, 0xCC, 0xD9));
+        assert_eq!(copper_layer_color("In7.Cu"), Color32::from_rgb(0xE8, 0xB2, 0xA7));
+        assert_eq!(copper_layer_color("In8.Cu"), Color32::from_rgb(0xF2, 0xED, 0xA1));
+        assert_eq!(copper_layer_color("In9.Cu"), Color32::from_rgb(0x8D, 0xCB, 0x81));
+
+        // 7-color repeat cycle starting at (237, 124, 51)
+        assert_eq!(copper_layer_color("In10.Cu"), Color32::from_rgb(237, 124, 51));
+        assert_eq!(copper_layer_color("In11.Cu"), Color32::from_rgb(91, 195, 235));
+        assert_eq!(copper_layer_color("In12.Cu"), Color32::from_rgb(247, 111, 142));
+        assert_eq!(copper_layer_color("In13.Cu"), Color32::from_rgb(167, 165, 198));
+        assert_eq!(copper_layer_color("In14.Cu"), Color32::from_rgb(40, 204, 217));
+        assert_eq!(copper_layer_color("In15.Cu"), Color32::from_rgb(232, 178, 167));
+        assert_eq!(copper_layer_color("In16.Cu"), Color32::from_rgb(242, 237, 161));
+        // Verify cycle repeat
+        assert_eq!(copper_layer_color("In17.Cu"), copper_layer_color("In10.Cu"));
+        assert_eq!(copper_layer_color("In24.Cu"), copper_layer_color("In10.Cu"));
+        assert_eq!(copper_layer_color("In30.Cu"), Color32::from_rgb(242, 237, 161));
+
         assert_eq!(COL_F_CRTYD, Color32::from_rgb(0xFF, 0x26, 0xE2));
         assert_eq!(COL_B_CRTYD, Color32::from_rgb(0x26, 0xE2, 0xFF));
         assert_eq!(COL_EDGE_CUTS, Color32::from_rgb(0xD0, 0xD2, 0xCD));
+        assert_eq!(COL_KEEPOUT, Color32::from_rgba_unmultiplied(255, 0, 5, 128));
+        assert_eq!(COL_CANVAS_BG, Color32::from_rgb(0x00, 0x10, 0x23));
+
         assert_eq!(COPPER_DRAW_ORDER, ["B.Cu", "In2.Cu", "In1.Cu", "F.Cu"]);
+        assert_eq!(
+            kicad_layer_display_order(&["F.Cu", "B.Cu", "In1.Cu", "In2.Cu"]),
+            vec!["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+        );
+        assert_eq!(
+            copper_layers_draw_order(&["F.Cu", "B.Cu", "In1.Cu", "In2.Cu"]),
+            vec!["B.Cu", "In2.Cu", "In1.Cu", "F.Cu"]
+        );
     }
 
     fn make_gui_test_board(pcb_path: &str) -> Board {
@@ -2231,6 +2368,111 @@ mod tests {
         assert_eq!(r10.layer, 1);
 
         let _ = fs::remove_file(in_path);
+    }
+
+    #[test]
+    fn test_dynamic_active_copper_layers_gui_visibility() {
+        let pcb_path = "/tmp/test_gui_dynamic_layers.kicad_pcb";
+        let content = r#"(kicad_pcb
+          (layers
+            (0 "F.Cu" signal)
+            (1 "In1.Cu" signal)
+            (2 "In2.Cu" signal)
+            (31 "B.Cu" signal)
+          )
+          (net 0 "") (net 1 "GND")
+          (gr_rect (start 100.0 100.0) (end 140.0 130.0) (layer "Edge.Cuts"))
+        )"#;
+        fs::write(pcb_path, content).unwrap();
+        let board = Board::load(pcb_path, &HashSet::new()).unwrap();
+        let mut app = VulcansTrialsApp::new(
+            pcb_path.to_string(),
+            "/tmp/test_out.kicad_pcb".to_string(),
+            board,
+            None,
+        );
+
+        assert!(app.is_layer_visible("F.Cu"));
+        assert!(app.is_layer_visible("B.Cu"));
+        assert!(app.is_layer_visible("In1.Cu"));
+        assert!(app.is_layer_visible("In2.Cu"));
+        // In3.Cu is not active on this board
+        assert!(!app.live.lock().unwrap().board.copper_layers().contains(&"In3.Cu"));
+
+        // Toggle visibility and verify backward-compatible fields stay in sync
+        app.set_layer_visible("F.Cu", false);
+        assert!(!app.show_f_cu);
+        assert!(!app.is_layer_visible("F.Cu"));
+
+        app.set_layer_visible("In1.Cu", false);
+        assert!(!app.show_in1_cu);
+        assert!(!app.is_layer_visible("In1.Cu"));
+
+        app.set_layer_visible("F.Cu", true);
+        assert!(app.show_f_cu);
+        assert!(app.is_layer_visible("F.Cu"));
+
+        let _ = fs::remove_file(pcb_path);
+    }
+
+    #[test]
+    fn test_pad_two_pass_rendering_thermal_vias_visible() {
+        let fp = Footprint {
+            reference: "U1".to_string(),
+            value: "IC".to_string(),
+            x: 100.0,
+            y: 100.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: vec![
+                // Central large thermal SMD pad
+                crate::board::Pad {
+                    number: "17".to_string(),
+                    net_id: 1,
+                    net_name: "GND".to_string(),
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                    width: 3.0,
+                    height: 3.0,
+                    shape: "rect".to_string(),
+                    rotation: 0.0,
+                    is_through_hole: false,
+                    drill: None,
+                },
+                // Thermal through-hole via
+                crate::board::Pad {
+                    number: "17".to_string(),
+                    net_id: 1,
+                    net_name: "GND".to_string(),
+                    offset_x: 0.5,
+                    offset_y: 0.5,
+                    width: 0.6,
+                    height: 0.6,
+                    shape: "circle".to_string(),
+                    rotation: 0.0,
+                    is_through_hole: true,
+                    drill: Some(0.3),
+                },
+            ],
+            width: 5.0,
+            height: 5.0,
+            courtyards: vec![],
+            perimeters: vec![],
+            escape_margin: 0.25,
+            at_span: None,
+            fp_span: None,
+        };
+
+        // Two passes: SMD (is_th=false) must be processed first, TH (is_th=true) second
+        let mut pass_order = Vec::new();
+        for is_th in [false, true] {
+            for pad in fp.pads.iter().filter(|p| p.is_through_hole == is_th) {
+                pass_order.push(pad.is_through_hole);
+            }
+        }
+        assert_eq!(pass_order, vec![false, true], "SMD pads must render first, through-hole thermal pads on top");
     }
 }
 
