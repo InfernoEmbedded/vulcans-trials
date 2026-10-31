@@ -4145,18 +4145,16 @@ impl AutoRouter {
                     let eff_clearance = board.get_netclass_for_net(pad.net_id).clearance.max(0.15);
                     let stub_margin = (stub_w * 0.5) + eff_clearance;
 
-                    // Clearance check against own footprint pads:
-                    // NEVER allow stub to shoot sideways towards neighboring pads or come within clearance
+                    // Clearance check against own footprint pads
                     let collides_own = |tip_pt: (f64, f64)| -> bool {
                         for other_pad in &fp.pads {
-                            if other_pad.number == pad.number || other_pad.net_id == pad.net_id {
+                            if other_pad.number == pad.number {
                                 continue;
                             }
                             let (opx, opy) = fp.pad_absolute_position(other_pad);
                             let d_start = (opx - px).hypot(opy - py);
                             let d_seg = dist_to_segment(opx, opy, px, py, tip_pt.0, tip_pt.1);
-                            // If the stub gets closer to other_pad than pad_pos was, it is shooting towards other_pad!
-                            if d_seg < d_start - 0.05 {
+                            if d_seg < d_start - 1e-4 {
                                 return true;
                             }
                             let (ow, oh) = fp.pad_world_size(other_pad);
@@ -4204,6 +4202,92 @@ impl AutoRouter {
                         false
                     };
 
+                    // Destination/target coordinates for this pad's net (external destinations)
+                    let mut target_positions = Vec::new();
+                    for other_fp in &board.footprints {
+                        if other_fp.reference == fp.reference {
+                            continue;
+                        }
+                        for other_pad in &other_fp.pads {
+                            if other_pad.net_id == pad.net_id {
+                                let op = other_fp.pad_absolute_position(other_pad);
+                                target_positions.push(op);
+                            }
+                        }
+                    }
+                    let target_dir = target_positions
+                        .iter()
+                        .min_by(|a, b| {
+                            let d1 = (a.0 - px).hypot(a.1 - py);
+                            let d2 = (b.0 - px).hypot(b.1 - py);
+                            d1.partial_cmp(&d2).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .and_then(|closest| {
+                            let dx = closest.0 - px;
+                            let dy = closest.1 - py;
+                            let d = dx.hypot(dy);
+                            if d > 1e-4 {
+                                Some((dx / d, dy / d))
+                            } else {
+                                None
+                            }
+                        });
+
+                    let is_first = edge_idx == 0;
+                    let is_last = edge_idx == edge_pads.len() - 1;
+
+                    let mut open_lat_locals: Vec<(f64, f64)> = Vec::new();
+                    if is_first {
+                        open_lat_locals.push(match edge {
+                            PadEdge::West | PadEdge::East => (0.0, -1.0),
+                            PadEdge::North | PadEdge::South => (-1.0, 0.0),
+                        });
+                    }
+                    if is_last {
+                        open_lat_locals.push(match edge {
+                            PadEdge::West | PadEdge::East => (0.0, 1.0),
+                            PadEdge::North | PadEdge::South => (1.0, 0.0),
+                        });
+                    }
+
+                    struct EscapeCandDir {
+                        dir: (f64, f64),
+                        is_diag: bool,
+                        dot: f64,
+                    }
+
+                    let mut cand_dirs = Vec::new();
+                    // 1. Perpendicular outward
+                    cand_dirs.push(EscapeCandDir {
+                        dir: (world_norm.x, world_norm.y),
+                        is_diag: false,
+                        dot: target_dir.map_or(0.0, |td| world_norm.x * td.0 + world_norm.y * td.1),
+                    });
+
+                    // 2. Corner candidates: diagonal and lateral
+                    for lat_local in open_lat_locals {
+                        let w_lat = Point::new(lat_local.0, lat_local.1).rotate_ccw(fp.rotation);
+                        let w_diag_x = world_norm.x + w_lat.x;
+                        let w_diag_y = world_norm.y + w_lat.y;
+                        let d_len = w_diag_x.hypot(w_diag_y);
+                        if d_len > 1e-4 {
+                            let w_diag = (w_diag_x / d_len, w_diag_y / d_len);
+                            cand_dirs.push(EscapeCandDir {
+                                dir: w_diag,
+                                is_diag: true,
+                                dot: target_dir.map_or(0.0, |td| w_diag.0 * td.0 + w_diag.1 * td.1),
+                            });
+                        }
+                        cand_dirs.push(EscapeCandDir {
+                            dir: (w_lat.x, w_lat.y),
+                            is_diag: false,
+                            dot: target_dir.map_or(0.0, |td| w_lat.x * td.0 + w_lat.y * td.1),
+                        });
+                    }
+
+                    // Rank candidate escape directions by dot product with destination vector descending
+                    cand_dirs.sort_by(|a, b| b.dot.partial_cmp(&a.dot).unwrap_or(std::cmp::Ordering::Equal));
+
                     let preferred_lengths: &[f64] = if is_staggered {
                         &[1.60, 1.80, 1.40, 1.10, 0.85, 0.60, 0.45]
                     } else {
@@ -4211,24 +4295,33 @@ impl AutoRouter {
                     };
 
                     let mut found_tip = None;
-                    for &cand_len in preferred_lengths {
-                        let snap50 = |v: f64| (v / 0.05).round() * 0.05;
-                        let cand_tip = if world_norm.y.abs() < 1e-4 {
-                            (snap50(px + world_norm.x * cand_len), py)
-                        } else if world_norm.x.abs() < 1e-4 {
-                            (px, snap50(py + world_norm.y * cand_len))
-                        } else {
-                            (snap50(px + world_norm.x * cand_len), snap50(py + world_norm.y * cand_len))
-                        };
-                        let in_bounds = if board.max_x > board.min_x && board.max_y > board.min_y {
-                            cand_tip.0 >= board.min_x + 0.3 && cand_tip.0 <= board.max_x - 0.3
-                                && cand_tip.1 >= board.min_y + 0.3 && cand_tip.1 <= board.max_y - 0.3
-                        } else {
-                            true
-                        };
-                        if in_bounds && !collides_own(cand_tip) && !collides_foreign(cand_tip) {
-                            found_tip = Some(cand_tip);
-                            break;
+                    'cand_loop: for cand in &cand_dirs {
+                        for &cand_len in preferred_lengths {
+                            let snap50 = |v: f64| (v / 0.05).round() * 0.05;
+                            let cand_tip = if cand.is_diag {
+                                let step = (snap50(cand_len * std::f64::consts::FRAC_1_SQRT_2)).max(0.20);
+                                (px + cand.dir.0.signum() * step, py + cand.dir.1.signum() * step)
+                            } else if cand.dir.1.abs() < 1e-4 {
+                                (snap50(px + cand.dir.0.signum() * cand_len), py)
+                            } else if cand.dir.0.abs() < 1e-4 {
+                                (px, snap50(py + cand.dir.1.signum() * cand_len))
+                            } else {
+                                (snap50(px + cand.dir.0 * cand_len), snap50(py + cand.dir.1 * cand_len))
+                            };
+                            let in_bounds = if board.max_x > board.min_x && board.max_y > board.min_y {
+                                cand_tip.0 >= board.min_x + 0.3 && cand_tip.0 <= board.max_x - 0.3
+                                    && cand_tip.1 >= board.min_y + 0.3 && cand_tip.1 <= board.max_y - 0.3
+                            } else {
+                                true
+                            };
+                            if in_bounds
+                                && !collides_own(cand_tip)
+                                && !collides_foreign(cand_tip)
+                                && is_track_segment_legal(board, (px, py), cand_tip, stub_w, fp.layer, pad.net_id, eff_clearance)
+                            {
+                                found_tip = Some(cand_tip);
+                                break 'cand_loop;
+                            }
                         }
                     }
 
@@ -5730,7 +5823,7 @@ pub fn reduce_jogs(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
     }
 }
 
-pub fn smooth_45_miters(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
+pub fn avoid_acid_traps(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
     if chain.points.len() < 3 {
         return;
     }
@@ -5742,8 +5835,310 @@ pub fn smooth_45_miters(chain: &mut TrackChain, board: &Board, grid: &RoutingGri
             })
         })
     };
-    let starts_at_pad = is_pad_center(chain.points[0]);
-    let ends_at_pad = is_pad_center(*chain.points.last().unwrap());
+    let is_special_point = |pt: (f64, f64)| -> bool {
+        is_pad_center(pt) || board.vias.iter().any(|v| (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05)
+    };
+    let is_oct = |a: (f64, f64), b: (f64, f64)| -> bool {
+        let dx = b.0 - a.0;
+        let dy = b.1 - a.1;
+        dx.abs() < 1e-4 || dy.abs() < 1e-4 || (dx.abs() - dy.abs()).abs() < 1e-4
+    };
+
+    let mut changed = true;
+    let mut pass = 0;
+    while changed && pass < 4 {
+        changed = false;
+        pass += 1;
+        let mut i = 1;
+        while i + 1 < chain.points.len() {
+            let p0 = chain.points[i - 1];
+            let p1 = chain.points[i];
+            let p2 = chain.points[i + 1];
+
+            if is_special_point(p1) {
+                i += 1;
+                continue;
+            }
+
+            let v1 = (p1.0 - p0.0, p1.1 - p0.1);
+            let v2 = (p2.0 - p1.0, p2.1 - p1.1);
+            let l1 = v1.0.hypot(v1.1);
+            let l2 = v2.0.hypot(v2.1);
+
+            if l1 < 1e-4 || l2 < 1e-4 {
+                i += 1;
+                continue;
+            }
+
+            let dot = (v1.0 * v2.0 + v1.1 * v2.1) / (l1 * l2);
+
+            // Acute angle: turn angle > 90 degrees (dot product < -0.05)
+            // creating an interior acute wedge (< 90 degrees) that traps etching acid
+            if dot < -0.05 {
+                // 1. Direct bypass across acute corner: p0 -> p2
+                if is_oct(p0, p2) && is_segment_clear(board, Some(grid), p0, p2, chain.layer, chain.net_id, chain.width) {
+                    chain.points.remove(i);
+                    merge_collinear_points(&mut chain.points);
+                    changed = true;
+                    continue;
+                }
+
+                // 2. Mitered obtuse bypass: cut back along v1 and v2 with candidate setbacks
+                let u1 = (v1.0 / l1, v1.1 / l1);
+                let u2 = (v2.0 / l2, v2.1 / l2);
+
+                let setbacks = [1.50, 1.25, 1.00, 0.75, 0.50, 0.35];
+                let mut resolved = false;
+
+                for &sb_factor in &setbacks {
+                    let sb_base = sb_factor * chain.width;
+                    let candidate_pairs = [
+                        (sb_base, sb_base),
+                        (sb_base, sb_base * std::f64::consts::SQRT_2),
+                        (sb_base * std::f64::consts::SQRT_2, sb_base),
+                    ];
+
+                    for &(s1, s2) in &candidate_pairs {
+                        if s1 >= 0.45 * l1 || s2 >= 0.45 * l2 || s1 < 0.02 || s2 < 0.02 {
+                            continue;
+                        }
+
+                        let m1 = (p1.0 - s1 * u1.0, p1.1 - s1 * u1.1);
+                        let m2 = (p1.0 + s2 * u2.0, p1.1 + s2 * u2.1);
+
+                        if is_oct(m1, m2) && is_segment_clear(board, Some(grid), m1, m2, chain.layer, chain.net_id, chain.width) {
+                            chain.points[i] = m1;
+                            chain.points.insert(i + 1, m2);
+                            merge_collinear_points(&mut chain.points);
+                            resolved = true;
+                            changed = true;
+                            break;
+                        }
+                    }
+                    if resolved {
+                        break;
+                    }
+                }
+
+                if resolved {
+                    continue;
+                }
+            }
+
+            i += 1;
+        }
+    }
+}
+
+pub fn reduce_corners(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
+    if chain.points.len() < 4 {
+        return;
+    }
+    let is_pad_center = |pt: (f64, f64)| -> bool {
+        board.footprints.iter().any(|fp| {
+            fp.pads.iter().any(|p| {
+                let (px, py) = fp.pad_absolute_position(p);
+                (px - pt.0).hypot(py - pt.1) < 0.05
+            })
+        })
+    };
+    let is_special_point = |pt: (f64, f64)| -> bool {
+        is_pad_center(pt) || board.vias.iter().any(|v| (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05)
+    };
+    let is_oct = |a: (f64, f64), b: (f64, f64)| -> bool {
+        let dx = b.0 - a.0;
+        let dy = b.1 - a.1;
+        dx.abs() < 1e-4 || dy.abs() < 1e-4 || (dx.abs() - dy.abs()).abs() < 1e-4
+    };
+
+    let mut changed = true;
+    let mut pass = 0;
+    while changed && pass < 4 {
+        changed = false;
+        pass += 1;
+        let mut i = 0;
+        while i + 3 < chain.points.len() {
+            let p0 = chain.points[i];
+            let p1 = chain.points[i + 1];
+            let p2 = chain.points[i + 2];
+            let p3 = chain.points[i + 3];
+
+            // 1. Try direct connection p0 -> p3 (collapsing 3 segments into 1)
+            if !is_special_point(p1) && !is_special_point(p2) && is_oct(p0, p3) {
+                if is_segment_clear(board, Some(grid), p0, p3, chain.layer, chain.net_id, chain.width) {
+                    chain.points.remove(i + 2);
+                    chain.points.remove(i + 1);
+                    merge_collinear_points(&mut chain.points);
+                    changed = true;
+                    continue;
+                }
+            }
+
+            // 2. Try shortcut p0 -> p2 (removing corner p1)
+            if !is_special_point(p1) && is_oct(p0, p2) {
+                if is_segment_clear(board, Some(grid), p0, p2, chain.layer, chain.net_id, chain.width) {
+                    chain.points.remove(i + 1);
+                    merge_collinear_points(&mut chain.points);
+                    changed = true;
+                    continue;
+                }
+            }
+
+            // 3. Try shortcut p1 -> p3 (removing corner p2)
+            if !is_special_point(p2) && is_oct(p1, p3) {
+                if is_segment_clear(board, Some(grid), p1, p3, chain.layer, chain.net_id, chain.width) {
+                    chain.points.remove(i + 2);
+                    merge_collinear_points(&mut chain.points);
+                    changed = true;
+                    continue;
+                }
+            }
+
+            i += 1;
+        }
+    }
+}
+
+pub fn reposition_lines(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
+    if chain.points.len() < 4 {
+        return;
+    }
+    let is_pad_center = |pt: (f64, f64)| -> bool {
+        board.footprints.iter().any(|fp| {
+            fp.pads.iter().any(|p| {
+                let (px, py) = fp.pad_absolute_position(p);
+                (px - pt.0).hypot(py - pt.1) < 0.05
+            })
+        })
+    };
+    let is_special_point = |pt: (f64, f64)| -> bool {
+        is_pad_center(pt) || board.vias.iter().any(|v| (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05)
+    };
+
+    let sample_min_obstacle_dist = |p1: (f64, f64), p2: (f64, f64)| -> f64 {
+        let mut min_d = f64::INFINITY;
+        let samples = [0.15, 0.35, 0.50, 0.65, 0.85];
+        for &t in &samples {
+            let sx = p1.0 + t * (p2.0 - p1.0);
+            let sy = p1.1 + t * (p2.1 - p1.1);
+            if let Some((gx, gy)) = grid.world_to_grid(sx, sy) {
+                if gx < grid.width && gy < grid.height {
+                    let d = grid.dist_field[grid.idx(gx, gy, chain.layer)] as f64;
+                    if d < min_d {
+                        min_d = d;
+                    }
+                }
+            }
+        }
+        min_d
+    };
+
+    let mut i = 0;
+    while i + 3 < chain.points.len() {
+        let p0 = chain.points[i];
+        let p1 = chain.points[i + 1];
+        let p2 = chain.points[i + 2];
+        let p3 = chain.points[i + 3];
+
+        if is_special_point(p1) || is_special_point(p2) {
+            i += 1;
+            continue;
+        }
+
+        let dx = p2.0 - p1.0;
+        let dy = p2.1 - p1.1;
+        let seg_len = dx.hypot(dy);
+
+        // Only evaluate non-trivial axis-aligned segments
+        if seg_len < 0.35 {
+            i += 1;
+            continue;
+        }
+
+        let is_horiz = dy.abs() < 1e-4 && dx.abs() > 1e-4;
+        let is_vert = dx.abs() < 1e-4 && dy.abs() > 1e-4;
+
+        if !is_horiz && !is_vert {
+            i += 1;
+            continue;
+        }
+
+        // Check if connecting legs p0->p1 and p2->p3 are perpendicular to p1->p2
+        let p0_p1_perp = if is_horiz {
+            (p1.0 - p0.0).abs() < 1e-4 && (p1.1 - p0.1).abs() > 1e-4
+        } else {
+            (p1.1 - p0.1).abs() < 1e-4 && (p1.0 - p0.0).abs() > 1e-4
+        };
+        let p2_p3_perp = if is_horiz {
+            (p3.0 - p2.0).abs() < 1e-4 && (p3.1 - p2.1).abs() > 1e-4
+        } else {
+            (p3.1 - p2.1).abs() < 1e-4 && (p3.0 - p2.0).abs() > 1e-4
+        };
+
+        if !p0_p1_perp || !p2_p3_perp {
+            i += 1;
+            continue;
+        }
+
+        let normal = if is_horiz { (0.0, 1.0) } else { (1.0, 0.0) };
+        let d_curr = sample_min_obstacle_dist(p1, p2);
+
+        let candidate_offsets = [0.10, 0.05, -0.05, -0.10];
+        let mut best_shift = None;
+        let mut best_dist = d_curr;
+
+        for &shift in &candidate_offsets {
+            let p1_new = (p1.0 + normal.0 * shift, p1.1 + normal.1 * shift);
+            let p2_new = (p2.0 + normal.0 * shift, p2.1 + normal.1 * shift);
+
+            let l_in = (p1_new.0 - p0.0).hypot(p1_new.1 - p0.1);
+            let l_out = (p3.0 - p2_new.0).hypot(p3.1 - p2_new.1);
+            if l_in < 0.05 || l_out < 0.05 {
+                continue;
+            }
+
+            if !is_segment_clear(board, Some(grid), p0, p1_new, chain.layer, chain.net_id, chain.width) {
+                continue;
+            }
+            if !is_segment_clear(board, Some(grid), p1_new, p2_new, chain.layer, chain.net_id, chain.width) {
+                continue;
+            }
+            if !is_segment_clear(board, Some(grid), p2_new, p3, chain.layer, chain.net_id, chain.width) {
+                continue;
+            }
+
+            let d_cand = sample_min_obstacle_dist(p1_new, p2_new);
+            // Accept shift if it strictly increases clearance to the closest obstacle by >= 0.03mm
+            if d_cand > best_dist + 0.03 {
+                best_dist = d_cand;
+                best_shift = Some((p1_new, p2_new));
+            }
+        }
+
+        if let Some((p1_new, p2_new)) = best_shift {
+            chain.points[i + 1] = p1_new;
+            chain.points[i + 2] = p2_new;
+        }
+
+        i += 1;
+    }
+}
+
+pub fn smoothen_corners(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
+    if chain.points.len() < 3 {
+        return;
+    }
+    let is_pad_center = |pt: (f64, f64)| -> bool {
+        board.footprints.iter().any(|fp| {
+            fp.pads.iter().any(|p| {
+                let (px, py) = fp.pad_absolute_position(p);
+                (px - pt.0).hypot(py - pt.1) < 0.05
+            })
+        })
+    };
+    let is_special_point = |pt: (f64, f64)| -> bool {
+        is_pad_center(pt) || board.vias.iter().any(|v| (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05)
+    };
 
     let mut new_points = Vec::with_capacity(chain.points.len() * 2);
     new_points.push(chain.points[0]);
@@ -5752,6 +6147,11 @@ pub fn smooth_45_miters(chain: &mut TrackChain, board: &Board, grid: &RoutingGri
         let prev = *new_points.last().unwrap();
         let curr = chain.points[i];
         let next = chain.points[i + 1];
+
+        if is_special_point(curr) {
+            new_points.push(curr);
+            continue;
+        }
 
         let v1 = (curr.0 - prev.0, curr.1 - prev.1);
         let v2 = (next.0 - curr.0, next.1 - curr.1);
@@ -5769,18 +6169,28 @@ pub fn smooth_45_miters(chain: &mut TrackChain, board: &Board, grid: &RoutingGri
         let is_90_deg = dot.abs() < 0.05 && cross.abs() > 0.95;
 
         if is_90_deg {
-            let setback = (1.5 * chain.width).min(0.35 * l1).min(0.35 * l2);
-            let too_close_to_pad = (i == 1 && starts_at_pad && l1 - setback < 0.35)
-                || (i + 1 == chain.points.len() - 1 && ends_at_pad && l2 - setback < 0.35);
-            if setback > 0.03 && !too_close_to_pad {
+            // Adaptive 45° chamfering: try largest setback first, falling back to tighter clearances
+            let candidate_multipliers = [1.50, 1.25, 1.00, 0.75, 0.50, 0.35];
+            let mut chamfered = false;
+
+            for &mult in &candidate_multipliers {
+                let setback = (mult * chain.width).min(0.45 * l1).min(0.45 * l2);
+                if setback < 0.02 {
+                    continue;
+                }
                 let m1 = (curr.0 - setback * (v1.0 / l1), curr.1 - setback * (v1.1 / l1));
                 let m2 = (curr.0 + setback * (v2.0 / l2), curr.1 + setback * (v2.1 / l2));
 
                 if is_segment_clear(board, Some(grid), m1, m2, chain.layer, chain.net_id, chain.width) {
                     new_points.push(m1);
                     new_points.push(m2);
-                    continue;
+                    chamfered = true;
+                    break;
                 }
+            }
+
+            if chamfered {
+                continue;
             }
         }
 
@@ -5789,6 +6199,10 @@ pub fn smooth_45_miters(chain: &mut TrackChain, board: &Board, grid: &RoutingGri
 
     new_points.push(*chain.points.last().unwrap());
     chain.points = new_points;
+}
+
+pub fn smooth_45_miters(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
+    smoothen_corners(chain, board, grid);
 }
 
 pub fn reduce_vias(board: &mut Board, grid: &mut RoutingGrid) {
@@ -6048,10 +6462,17 @@ pub fn gloss_tracks(board: &mut Board, grid: &RoutingGrid) {
         let mut chains = extract_track_chains(&net_tracks, board);
         for chain in &mut chains {
             merge_collinear_points(&mut chain.points);
+            avoid_acid_traps(chain, board, grid);
+            merge_collinear_points(&mut chain.points);
             rubber_band_straighten(chain, board, grid);
             eliminate_stair_steps(chain, board, grid);
             reduce_jogs(chain, board, grid);
-            smooth_45_miters(chain, board, grid);
+            reduce_corners(chain, board, grid);
+            merge_collinear_points(&mut chain.points);
+            reposition_lines(chain, board, grid);
+            merge_collinear_points(&mut chain.points);
+            smoothen_corners(chain, board, grid);
+            avoid_acid_traps(chain, board, grid);
             merge_collinear_points(&mut chain.points);
         }
 
@@ -6307,6 +6728,13 @@ pub fn is_track_segment_legal(
 
     // 3. Foreign pads (SMD on same layer, through-hole on all layers, including net 0)
     for fp in &board.footprints {
+        let is_origin_fp = fp.pads.iter().any(|p| {
+            let (px, py) = fp.pad_absolute_position(p);
+            (px - start.0).hypot(py - start.1) < 1e-3 || (px - end.0).hypot(py - end.1) < 1e-3
+        });
+        if is_origin_fp {
+            continue;
+        }
         for pad in &fp.pads {
             if pad.net_id != net_id {
                 if pad.is_through_hole || fp.layer == layer {
@@ -9000,6 +9428,127 @@ mod tests {
 
         assert_eq!(total, 1);
         assert_eq!(routed, 1, "Router must route between through-hole pins of 2.54mm header");
+    }
+
+    #[test]
+    fn test_side_and_diagonal_escape_stubs_for_dense_ic_corners() {
+        let mut board = make_router_test_board();
+        // In make_router_test_board, U1 is at (145.0, 102.0).
+        // Pad 6 on U1 is the corner pad at (-1.5, 1.0), so absolute position is (143.5, 103.0).
+        // Place a target destination footprint for net 2 ("SIG1") South-West of Pad 6 at (140.0, 106.5).
+        let target_fp = make_fp(
+            "TARGET_SW",
+            140.0,
+            106.5,
+            false,
+            vec![Pad::new("1", 0.0, 0.0, 0.5, 0.5, 2, "SIG1", false)],
+        );
+        board.footprints.push(target_fp);
+
+        let router = AutoRouter::new(3);
+        let stubs = router.generate_escape_stubs(&board);
+
+        // Find the escape stub for Pad 6 on U1
+        let pad6_stub = stubs.iter().find(|s| {
+            s.net_id == 2 && (s.pad_pos.0 - 143.5).hypot(s.pad_pos.1 - 103.0) < 0.1
+        });
+        assert!(pad6_stub.is_some(), "Pad 6 on U1 must generate an escape stub");
+        let stub = pad6_stub.unwrap();
+
+        // Vector from pad to tip
+        let dx = stub.tip_pos.0 - stub.pad_pos.0;
+        let dy = stub.tip_pos.1 - stub.pad_pos.1;
+        
+        // Pad 6 at bottom-left corner with target to the South-West should escape diagonally towards the destination
+        assert!(dx < -1e-4, "Escape stub must project westward towards target: dx={}", dx);
+        assert!(dy > 1e-4, "Escape stub must project southward towards target (diagonal escape): dy={}", dy);
+        assert!((dx.abs() - dy.abs()).abs() < 1e-3, "Diagonal escape stub must be 45-degree octilinear (|dx| == |dy|): dx={}, dy={}", dx, dy);
+    }
+
+    #[test]
+    fn test_avoid_acid_traps_eliminates_acute_angles() {
+        let board = make_router_test_board();
+        let grid = RoutingGrid::new(&board, 0.10, None);
+
+        // Create a chain with an acute angle (135° turn / 45° acute interior wedge)
+        // (0.0, 0.0) -> (2.0, 0.0) -> (1.0, 1.0)
+        // v1 = (2.0, 0.0), v2 = (-1.0, 1.0). dot = -2.0 / (2.0 * sqrt(2)) = -0.707 < -0.05
+        let mut chain = TrackChain {
+            net_id: 2,
+            layer: 0,
+            width: 0.20,
+            points: vec![(0.0, 0.0), (2.0, 0.0), (1.0, 1.0)],
+        };
+
+        avoid_acid_traps(&mut chain, &board, &grid);
+
+        // Verify no consecutive segments form an acute angle (dot product < -0.05)
+        for i in 1..chain.points.len() - 1 {
+            let p0 = chain.points[i - 1];
+            let p1 = chain.points[i];
+            let p2 = chain.points[i + 1];
+            let v1 = (p1.0 - p0.0, p1.1 - p0.1);
+            let v2 = (p2.0 - p1.0, p2.1 - p1.1);
+            let l1 = v1.0.hypot(v1.1);
+            let l2 = v2.0.hypot(v2.1);
+            if l1 > 1e-4 && l2 > 1e-4 {
+                let dot = (v1.0 * v2.0 + v1.1 * v2.1) / (l1 * l2);
+                assert!(dot >= -0.05, "Angle at {:?} must not be acute (dot = {})", p1, dot);
+            }
+        }
+    }
+
+    #[test]
+    fn test_reduce_corners_simplifies_dogleg() {
+        let board = make_router_test_board();
+        let grid = RoutingGrid::new(&board, 0.10, None);
+
+        // 4 points where p0 -> p3 can connect directly via an octilinear segment:
+        // (0.0, 0.0) -> (0.0, 1.0) -> (1.0, 1.0) -> (2.0, 2.0)
+        // Notice p0 -> p3 is (0, 0) -> (2, 2) which is a direct 45° octilinear connection!
+        let mut chain = TrackChain {
+            net_id: 2,
+            layer: 0,
+            width: 0.20,
+            points: vec![(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (2.0, 2.0)],
+        };
+
+        reduce_corners(&mut chain, &board, &grid);
+
+        // Intermediate corners should be collapsed directly into p0 -> p3
+        assert_eq!(chain.points.len(), 2, "Chain must be simplified to [p0, p3]");
+        assert_eq!(chain.points[0], (0.0, 0.0));
+        assert_eq!(chain.points[1], (2.0, 2.0));
+    }
+
+    #[test]
+    fn test_smoothen_corners_adaptive_chamfering() {
+        let board = make_router_test_board();
+        let grid = RoutingGrid::new(&board, 0.10, None);
+
+        // A simple 90-degree corner: (0.0, 0.0) -> (1.0, 0.0) -> (1.0, 1.0)
+        let mut chain = TrackChain {
+            net_id: 2,
+            layer: 0,
+            width: 0.20,
+            points: vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+        };
+
+        smoothen_corners(&mut chain, &board, &grid);
+
+        // The 90-degree corner at (1.0, 0.0) should be chamfered with 2 miter points at 45 degrees
+        assert_eq!(chain.points.len(), 4, "90-degree corner must be chamfered into 4 points");
+        assert_eq!(chain.points[0], (0.0, 0.0));
+        assert_eq!(chain.points[3], (1.0, 1.0));
+
+        let m1 = chain.points[1];
+        let m2 = chain.points[2];
+        assert!(m1.0 < 1.0 && m1.1 == 0.0, "m1 must be set back on horizontal segment: {:?}", m1);
+        assert!(m2.0 == 1.0 && m2.1 > 0.0, "m2 must be set back on vertical segment: {:?}", m2);
+
+        let dx = (m2.0 - m1.0).abs();
+        let dy = (m2.1 - m1.1).abs();
+        assert!((dx - dy).abs() < 1e-4, "Miter segment must be 45 degrees: dx={}, dy={}", dx, dy);
     }
 }
 
