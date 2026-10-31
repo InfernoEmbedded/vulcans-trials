@@ -1671,6 +1671,101 @@ pub fn place_all_holding_components_at_best_locations(
     count
 }
 
+/// Precompute functional component clusters for rigid group moves (e.g. IC + tied decoupling caps/resistors).
+pub fn build_component_clusters(
+    board: &Board,
+    ties: &[PassiveTie],
+    movable: &[usize],
+) -> Vec<Vec<usize>> {
+    let mut clusters: Vec<Vec<usize>> = (0..board.footprints.len()).map(|i| vec![i]).collect();
+    for tie in ties {
+        if movable.contains(&tie.anchor_idx) && movable.contains(&tie.passive_idx) {
+            if !clusters[tie.anchor_idx].contains(&tie.passive_idx) {
+                clusters[tie.anchor_idx].push(tie.passive_idx);
+            }
+        }
+    }
+    for tie in ties {
+        if movable.contains(&tie.anchor_idx) && movable.contains(&tie.passive_idx) {
+            let anchor_cluster = clusters[tie.anchor_idx].clone();
+            clusters[tie.passive_idx] = anchor_cluster;
+        }
+    }
+    clusters
+}
+
+/// Rigidly translate an entire cluster of components by (dx, dy) if all members stay within board bounds.
+pub fn apply_cluster_group_move(
+    state: &mut PlacementState,
+    board: &Board,
+    config: &PlacementConfig,
+    cluster: &[usize],
+    dx: f64,
+    dy: f64,
+    boundary: &AABB,
+) -> bool {
+    if cluster.is_empty() || (dx.abs() <= 1e-4 && dy.abs() <= 1e-4) {
+        return false;
+    }
+    let all_fit = cluster.iter().all(|&m| {
+        let (cx_min, cx_max, cy_min, cy_max) = board.footprints[m]
+            .origin_clamp_range(state.rotations[m], state.layers[m], config.min_spacing_mm, boundary);
+        let nx = state.positions[m].x + dx;
+        let ny = state.positions[m].y + dy;
+        nx >= cx_min && nx <= cx_max && ny >= cy_min && ny <= cy_max
+    });
+    if all_fit {
+        for &m in cluster {
+            state.positions[m].x += dx;
+            state.positions[m].y += dy;
+            state.update_component(m, board, config);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Metropolis-Hastings replica exchange between adjacent temperature rungs in Parallel Tempering.
+/// Swaps configurations between adjacent rungs (i, i+1) with acceptance probability:
+/// P_swap = min(1, exp((beta_i - beta_{i+1}) * (E_i - E_{i+1})))
+pub fn metropolis_replica_exchange(
+    replicas: &mut [PlacementState],
+    num_threads: usize,
+    epoch: usize,
+    progress: f64,
+    temp_scale: f64,
+    thermal_boost: f64,
+    rng: &mut impl rand::Rng,
+) -> usize {
+    if replicas.len() < 2 {
+        return 0;
+    }
+    let cooling = (1.0 - progress * 0.85).max(0.05);
+    let start_idx = epoch % 2;
+    let mut accepted_swaps = 0;
+    for i in (start_idx..replicas.len().saturating_sub(1)).step_by(2) {
+        let j = i + 1;
+        let t_i = 8.0 * (350.0f64 / 8.0).powf((i as f64) / ((num_threads - 1).max(1) as f64)) * temp_scale * cooling * thermal_boost;
+        let t_j = 8.0 * (350.0f64 / 8.0).powf((j as f64) / ((num_threads - 1).max(1) as f64)) * temp_scale * cooling * thermal_boost;
+        let beta_i = 1.0 / t_i.max(1e-4);
+        let beta_j = 1.0 / t_j.max(1e-4);
+        let delta_beta = beta_i - beta_j; // beta_i > beta_j since rung i has lower temp than rung j
+        let delta_energy = replicas[i].cost - replicas[j].cost;
+        let log_p = delta_beta * delta_energy;
+        let swap = if log_p >= 0.0 {
+            true
+        } else {
+            rng.gen::<f64>() < log_p.exp()
+        };
+        if swap {
+            replicas.swap(i, j);
+            accepted_swaps += 1;
+        }
+    }
+    accepted_swaps
+}
+
 pub fn run_auto_placer(
     board: &mut Board,
     config: &PlacementConfig,
@@ -1743,6 +1838,11 @@ pub fn run_auto_placer(
         }
     }
     let connected_pins = Arc::new(connected_pins);
+    let component_clusters = Arc::new(build_component_clusters(board, &ties, &movable));
+    let board_center = Point::new(
+        (boundary.min_x + boundary.max_x) * 0.5,
+        (boundary.min_y + boundary.max_y) * 0.5,
+    );
 
     if let Some(ref st) = live {
         if let Ok(mut g) = st.lock() {
@@ -1762,7 +1862,77 @@ pub fn run_auto_placer(
 
     let num_epochs = (config.duration_secs * 4).max(1) as usize;
     let epoch_dur = Duration::from_millis(250);
-    let mut replicas: Vec<PlacementState> = (0..num_threads).map(|_| legalized.clone()).collect();
+    let mut replicas: Vec<PlacementState> = (0..num_threads)
+        .map(|tid| {
+            if tid == 0 {
+                legalized.clone()
+            } else {
+                let mut rep = legalized.clone();
+                let mut init_rng = StdRng::seed_from_u64(0xD15EA5Eu64.wrapping_mul((tid as u64) + 1));
+                if tid == 1 {
+                    // Horizontal mirror across board center
+                    for &m in &movable {
+                        let (cx_min, cx_max, cy_min, cy_max) = board.footprints[m]
+                            .origin_clamp_range(rep.rotations[m], rep.layers[m], config.min_spacing_mm, &boundary);
+                        let nx = snap_to_grid(2.0 * board_center.x - rep.positions[m].x, config.grid_step_mm).clamp(cx_min, cx_max);
+                        rep.positions[m].x = nx;
+                        rep.positions[m].y = rep.positions[m].y.clamp(cy_min, cy_max);
+                        rep.update_component(m, board, config);
+                    }
+                } else if tid == 2 {
+                    // Vertical mirror across board center
+                    for &m in &movable {
+                        let (cx_min, cx_max, cy_min, cy_max) = board.footprints[m]
+                            .origin_clamp_range(rep.rotations[m], rep.layers[m], config.min_spacing_mm, &boundary);
+                        let ny = snap_to_grid(2.0 * board_center.y - rep.positions[m].y, config.grid_step_mm).clamp(cy_min, cy_max);
+                        rep.positions[m].x = rep.positions[m].x.clamp(cx_min, cx_max);
+                        rep.positions[m].y = ny;
+                        rep.update_component(m, board, config);
+                    }
+                } else if tid == 3 {
+                    // 180-degree inversion across board center
+                    for &m in &movable {
+                        let new_rot = (rep.rotations[m] + 180.0) % 360.0;
+                        rep.rotations[m] = new_rot;
+                        let (cx_min, cx_max, cy_min, cy_max) = board.footprints[m]
+                            .origin_clamp_range(new_rot, rep.layers[m], config.min_spacing_mm, &boundary);
+                        let nx = snap_to_grid(2.0 * board_center.x - rep.positions[m].x, config.grid_step_mm).clamp(cx_min, cx_max);
+                        let ny = snap_to_grid(2.0 * board_center.y - rep.positions[m].y, config.grid_step_mm).clamp(cy_min, cy_max);
+                        rep.positions[m] = Point::new(nx, ny);
+                        rep.update_component(m, board, config);
+                    }
+                } else {
+                    // Randomized perturbations proportional to thread rung
+                    let perturb_frac = ((tid as f64) / (num_threads as f64)).clamp(0.2, 0.8);
+                    let num_to_move = ((movable.len() as f64 * perturb_frac) as usize).max(1);
+                    for _ in 0..num_to_move {
+                        let m = movable[init_rng.gen_range(0..movable.len())];
+                        let (cx_min, cx_max, cy_min, cy_max) = board.footprints[m]
+                            .origin_clamp_range(rep.rotations[m], rep.layers[m], config.min_spacing_mm, &boundary);
+                        let jx = init_rng.gen_range(-config.max_jump_radius_mm..=config.max_jump_radius_mm);
+                        let jy = init_rng.gen_range(-config.max_jump_radius_mm..=config.max_jump_radius_mm);
+                        rep.positions[m] = Point::new(
+                            snap_to_grid((rep.positions[m].x + jx).clamp(cx_min, cx_max), config.grid_step_mm),
+                            snap_to_grid((rep.positions[m].y + jy).clamp(cy_min, cy_max), config.grid_step_mm),
+                        );
+                        if init_rng.gen_bool(0.3) {
+                            rep.rotations[m] = (rep.rotations[m] + 90.0 * init_rng.gen_range(1..4) as f64) % 360.0;
+                        }
+                        rep.update_component(m, board, config);
+                    }
+                }
+                rep.evaluate(board, config, &ties);
+                if rep.boundary_violations == 0 && (rep.overlaps < legalized.overlaps || (rep.overlaps == legalized.overlaps && rep.cost < legalized.cost)) {
+                    if let Ok(mut g) = global_best.lock() {
+                        if rep.cost < g.cost {
+                            *g = rep.clone();
+                        }
+                    }
+                }
+                rep
+            }
+        })
+        .collect();
     let gpu_done = AtomicBool::new(false);
 
     std::thread::scope(|scope| {
@@ -1822,10 +1992,64 @@ pub fn run_auto_placer(
             }
         }
 
+        let mut last_best_cost = f64::MAX;
+        let mut stagnant_epochs = 0usize;
+        let mut thermal_pulse_epochs = 0usize;
+
         for epoch in 0..num_epochs {
             if stop_flag.load(Ordering::Relaxed) || start_time.elapsed() >= total_dur {
                 break;
             }
+
+            let cur_best_cost = global_best.lock().unwrap().cost;
+            if cur_best_cost < last_best_cost - (last_best_cost.abs() * 0.005) {
+                last_best_cost = cur_best_cost;
+                stagnant_epochs = 0;
+            } else {
+                stagnant_epochs += 1;
+            }
+
+            if stagnant_epochs >= 4 {
+                thermal_pulse_epochs = 2;
+                stagnant_epochs = 0;
+                if let Some(ref st) = live {
+                    if let Ok(mut g) = st.lock() {
+                        g.push_log(format!(
+                            "[Auto-Placer] Stagnation detected at cost {:.1}: triggering thermal pulse & basin hop...",
+                            cur_best_cost
+                        ));
+                    }
+                }
+                // Basin Hop: Macro-perturb the hottest replica (last index) to jump out of the local energy basin
+                if let Some(hottest) = replicas.last_mut() {
+                    let mut hop_rng = StdRng::seed_from_u64(0xBA510_709u64.wrapping_add(epoch as u64));
+                    let hop_count = (movable.len() / 4).max(1);
+                    for _ in 0..hop_count {
+                        let m = movable[hop_rng.gen_range(0..movable.len())];
+                        let (cx_min, cx_max, cy_min, cy_max) = board.footprints[m]
+                            .origin_clamp_range(hottest.rotations[m], hottest.layers[m], config.min_spacing_mm, &boundary);
+                        let jx = hop_rng.gen_range(-config.max_jump_radius_mm..=config.max_jump_radius_mm);
+                        let jy = hop_rng.gen_range(-config.max_jump_radius_mm..=config.max_jump_radius_mm);
+                        hottest.positions[m] = Point::new(
+                            snap_to_grid((hottest.positions[m].x + jx).clamp(cx_min, cx_max), config.grid_step_mm),
+                            snap_to_grid((hottest.positions[m].y + jy).clamp(cy_min, cy_max), config.grid_step_mm),
+                        );
+                        if hop_rng.gen_bool(0.3) {
+                            hottest.rotations[m] = (hottest.rotations[m] + 90.0 * hop_rng.gen_range(1..4) as f64) % 360.0;
+                        }
+                        hottest.update_component(m, board, config);
+                    }
+                    hottest.evaluate(board, config, &ties);
+                }
+            }
+
+            let thermal_boost = if thermal_pulse_epochs > 0 {
+                thermal_pulse_epochs -= 1;
+                2.5
+            } else {
+                1.0
+            };
+
             let progress = (start_time.elapsed().as_secs_f64() / total_dur.as_secs_f64()).clamp(0.0, 1.0);
             let ep_end = (Instant::now() + epoch_dur).min(start_time + total_dur);
 
@@ -1841,11 +2065,12 @@ pub fn run_auto_placer(
                     let temp_ratio = (tid as f64) / ((num_threads - 1).max(1) as f64);
                     let t_base = 8.0 * (350.0f64 / 8.0).powf(temp_ratio) * config.temp_scale;
                     let cooling = (1.0 - progress * 0.85).max(0.05);
-                    let temp = t_base * cooling;
+                    let temp = t_base * cooling * thermal_boost;
                     let mut local_evals = 0usize;
 
-                    let p_swap = (config.pair_swap_prob * 100.0).clamp(0.0, 40.0) as usize;
-                    let p_centroid = (config.centroid_pull_prob * 100.0).clamp(0.0, 50.0) as usize;
+                    let p_swap = (config.pair_swap_prob * 100.0).clamp(0.0, 30.0) as usize;
+                    let p_centroid = (config.centroid_pull_prob * 100.0).clamp(0.0, 40.0) as usize;
+                    let p_cluster = 15usize;
                     let p_rot = 16usize;
                     let p_flip = if config.allow_layer_flip { 8usize } else { 0usize };
                     let p_affinity = if !ties.is_empty() { 12usize } else { 0usize };
@@ -1860,14 +2085,15 @@ pub fn run_auto_placer(
                             let old_wl = current.wirelength;
                             let old_ov = current.overlaps;
                             let old_bv = current.boundary_violations;
-                            let mut modified: Vec<usize> = Vec::with_capacity(2);
+                            let mut modified: Vec<usize> = Vec::with_capacity(8);
 
                             let roll = rng.gen_range(0..100);
                             let t1 = p_swap;
                             let t2 = t1 + p_centroid;
-                            let t3 = t2 + p_rot;
-                            let t4 = t3 + p_flip;
-                            let t5 = t4 + p_affinity;
+                            let t3 = t2 + p_cluster;
+                            let t4 = t3 + p_rot;
+                            let t5 = t4 + p_flip;
+                            let t6 = t5 + p_affinity;
 
                             if roll < t1 && movable.len() >= 2 {
                                 // 1. Component Pair Swap
@@ -1912,7 +2138,63 @@ pub fn run_auto_placer(
                                     modified.push(idx);
                                 }
                             } else if roll < t3 {
-                                // 3. Rotation (90°, 180°, 270°)
+                                // 3. Cluster Rigid Group Move (move IC and tied decoupling passives together)
+                                let idx = movable[rng.gen_range(0..movable.len())];
+                                let cluster = &component_clusters[idx];
+                                if cluster.len() > 1 {
+                                    let max_shift = (config.max_jump_radius_mm * cooling).max(config.grid_step_mm * 2.0);
+                                    let (shift_x, shift_y) = if rng.gen_bool(0.08) {
+                                        (
+                                            rng.gen_range(-config.max_jump_radius_mm..=config.max_jump_radius_mm),
+                                            rng.gen_range(-config.max_jump_radius_mm..=config.max_jump_radius_mm),
+                                        )
+                                    } else {
+                                        (
+                                            rng.gen_range(-max_shift..=max_shift),
+                                            rng.gen_range(-max_shift..=max_shift),
+                                        )
+                                    };
+                                    let dx = snap_to_grid(shift_x, config.grid_step_mm);
+                                    let dy = snap_to_grid(shift_y, config.grid_step_mm);
+                                    if dx.abs() > 1e-4 || dy.abs() > 1e-4 {
+                                        let all_fit = cluster.iter().all(|&m| {
+                                            let (cx_min, cx_max, cy_min, cy_max) = board.footprints[m]
+                                                .origin_clamp_range(current.rotations[m], current.layers[m], config.min_spacing_mm, &boundary);
+                                            let nx = current.positions[m].x + dx;
+                                            let ny = current.positions[m].y + dy;
+                                            nx >= cx_min && nx <= cx_max && ny >= cy_min && ny <= cy_max
+                                        });
+                                        if all_fit {
+                                            for &m in cluster {
+                                                current.positions[m].x += dx;
+                                                current.positions[m].y += dy;
+                                                modified.push(m);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Single component shift fallback
+                                    let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
+                                        .origin_clamp_range(current.rotations[idx], current.layers[idx], config.min_spacing_mm, &boundary);
+                                    let max_shift = (config.max_jump_radius_mm * cooling).max(config.grid_step_mm * 2.0);
+                                    let (shift_x, shift_y) = if rng.gen_bool(0.06) {
+                                        (
+                                            rng.gen_range(-config.max_jump_radius_mm..=config.max_jump_radius_mm),
+                                            rng.gen_range(-config.max_jump_radius_mm..=config.max_jump_radius_mm),
+                                        )
+                                    } else {
+                                        (
+                                            rng.gen_range(-max_shift..=max_shift),
+                                            rng.gen_range(-max_shift..=max_shift),
+                                        )
+                                    };
+                                    let nx = snap_to_grid((current.positions[idx].x + shift_x).clamp(cx_min, cx_max), config.grid_step_mm);
+                                    let ny = snap_to_grid((current.positions[idx].y + shift_y).clamp(cy_min, cy_max), config.grid_step_mm);
+                                    current.positions[idx] = Point::new(nx, ny);
+                                    modified.push(idx);
+                                }
+                            } else if roll < t4 {
+                                // 4. Rotation (90°, 180°, 270°)
                                 let idx = movable[rng.gen_range(0..movable.len())];
                                 let deltas = [90.0, 180.0, 270.0];
                                 let new_rot =
@@ -1923,8 +2205,8 @@ pub fn run_auto_placer(
                                 current.positions[idx].x = current.positions[idx].x.clamp(cx_min, cx_max);
                                 current.positions[idx].y = current.positions[idx].y.clamp(cy_min, cy_max);
                                 modified.push(idx);
-                            } else if roll < t4 && config.allow_layer_flip {
-                                // 4. Layer Flip (F.Cu <-> B.Cu)
+                            } else if roll < t5 && config.allow_layer_flip {
+                                // 5. Layer Flip (F.Cu <-> B.Cu)
                                 let idx = movable[rng.gen_range(0..movable.len())];
                                 if board.footprints[idx].is_smd_only() {
                                     let new_layer = 1 - current.layers[idx];
@@ -1935,8 +2217,8 @@ pub fn run_auto_placer(
                                     current.positions[idx].y = current.positions[idx].y.clamp(cy_min, cy_max);
                                     modified.push(idx);
                                 }
-                            } else if roll < t5 && !ties.is_empty() {
-                                // 5. Decoupling & Passive Tie Affinity Move
+                            } else if roll < t6 && !ties.is_empty() {
+                                // 6. Decoupling & Passive Tie Affinity Move
                                 let tie = &ties[rng.gen_range(0..ties.len())];
                                 let idx = tie.passive_idx;
                                 let anchor_pt = current.cached_pads[tie.anchor_idx][tie.anchor_pad_idx];
@@ -1986,7 +2268,7 @@ pub fn run_auto_placer(
                                     modified.push(idx);
                                 }
                             } else {
-                                // 6. Positional Shift & Long-Range Jumps
+                                // 7. Positional Shift & Long-Range Jumps
                                 let idx = movable[rng.gen_range(0..movable.len())];
                                 let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
                                     .origin_clamp_range(current.rotations[idx], current.layers[idx], config.min_spacing_mm, &boundary);
@@ -2064,11 +2346,35 @@ pub fn run_auto_placer(
                     total_evals.fetch_add(local_evals, Ordering::Relaxed);
                 });
 
-            // Re-seed highest-cost replica from global best and update GUI state
-            let best_snap = global_best.lock().unwrap().clone();
-            if let Some(worst) = replicas.iter_mut().max_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap()) {
-                *worst = best_snap.clone();
+            // Parallel Tempering Metropolis-Hastings Replica Exchange:
+            let mut exchange_rng = StdRng::seed_from_u64(0x5EA7_E7C4u64.wrapping_add(epoch as u64));
+            metropolis_replica_exchange(
+                &mut replicas,
+                num_threads,
+                epoch,
+                progress,
+                config.temp_scale,
+                thermal_boost,
+                &mut exchange_rng,
+            );
+
+            // Sync global_best if any replica discovered a lower cost or fewer violations
+            {
+                let mut g = global_best.lock().unwrap();
+                for rep in &replicas {
+                    let is_better = if rep.boundary_violations != g.boundary_violations {
+                        rep.boundary_violations < g.boundary_violations
+                    } else if rep.overlaps != g.overlaps {
+                        rep.overlaps < g.overlaps
+                    } else {
+                        rep.cost < g.cost
+                    };
+                    if is_better {
+                        *g = rep.clone();
+                    }
+                }
             }
+            let best_snap = global_best.lock().unwrap().clone();
 
             let elapsed = start_time.elapsed().as_secs_f64().max(1e-3);
             let rate = total_evals.load(Ordering::Relaxed) as f64 / elapsed;
@@ -3647,6 +3953,135 @@ mod tests {
         // Verify C1 is not in the antenna keepout
         let in_ko = c1_final.x >= 172.1 && c1_final.x <= 183.1 && c1_final.y >= 91.0 && c1_final.y <= 119.0;
         assert!(!in_ko, "Final placement must not place component in antenna keepout");
+    }
+
+    #[test]
+    fn test_metropolis_replica_exchange_accepts_uphill_and_downhill() {
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        let board = make_synthetic_board();
+        let cfg = PlacementConfig::default();
+        let base_st = PlacementState::from_board(&board, &cfg);
+
+        // Case 1: Downhill move (Hotter replica has LOWER cost than colder replica)
+        // Must swap 100% of the time (P = 1.0)
+        let mut st0 = base_st.clone();
+        st0.cost = 500.0;
+        let mut st1 = base_st.clone();
+        st1.cost = 300.0;
+
+        let mut replicas = vec![st0, st1];
+        let mut rng = StdRng::seed_from_u64(42);
+        let swaps = metropolis_replica_exchange(
+            &mut replicas,
+            2,
+            0, // epoch 0 -> starts with pair (0, 1)
+            0.5,
+            1.0,
+            1.0,
+            &mut rng,
+        );
+        assert_eq!(swaps, 1, "Downhill swap where hotter replica is better must always be accepted");
+        assert_eq!(replicas[0].cost, 300.0, "Colder replica must receive the better configuration");
+        assert_eq!(replicas[1].cost, 500.0, "Hotter replica receives the prior state to continue exploring");
+
+        // Case 2: Uphill move (Hotter replica has HIGHER cost than colder replica)
+        // At low temperature (cooling = 0.05, thermal_boost = 1.0), large uphill moves (delta = 500.0) should rarely or never swap.
+        // At high temperature (thermal_boost = 10.0), uphill moves have significantly higher probability of acceptance.
+        let mut cold_swaps = 0;
+        let mut hot_swaps = 0;
+        for seed in 0..100 {
+            let mut cold_reps = vec![
+                { let mut s = base_st.clone(); s.cost = 100.0; s },
+                { let mut s = base_st.clone(); s.cost = 300.0; s },
+            ];
+            let mut rng_cold = StdRng::seed_from_u64(seed);
+            cold_swaps += metropolis_replica_exchange(&mut cold_reps, 2, 0, 0.95, 1.0, 1.0, &mut rng_cold);
+
+            let mut hot_reps = vec![
+                { let mut s = base_st.clone(); s.cost = 100.0; s },
+                { let mut s = base_st.clone(); s.cost = 300.0; s },
+            ];
+            let mut rng_hot = StdRng::seed_from_u64(seed);
+            hot_swaps += metropolis_replica_exchange(&mut hot_reps, 2, 0, 0.0, 1.0, 5.0, &mut rng_hot);
+        }
+        assert!(hot_swaps > cold_swaps, "Elevated temperature must accept significantly more uphill replica swaps (hot={}, cold={})", hot_swaps, cold_swaps);
+    }
+
+    #[test]
+    fn test_build_component_clusters_and_rigid_group_move() {
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 100.0;
+        board.max_y = 100.0;
+        let boundary = board.boundary_aabb();
+
+        let u1 = make_test_fp("U1", 50.0, 50.0, false, vec![
+            Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "VCC", false),
+        ]);
+        let c1 = make_test_fp("C1", 48.0, 50.0, false, vec![
+            Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "VCC", false),
+        ]);
+        let c2 = make_test_fp("C2", 52.0, 50.0, false, vec![
+            Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "VCC", false),
+        ]);
+        board.footprints = vec![u1, c1, c2];
+
+        let ties = vec![
+            PassiveTie {
+                anchor_idx: 0,
+                anchor_pad_idx: 0,
+                passive_idx: 1,
+                passive_pad_idx: 0,
+                max_dist: 5.0,
+                weight_mult: 2.0,
+                is_decoupling: true,
+            },
+            PassiveTie {
+                anchor_idx: 0,
+                anchor_pad_idx: 0,
+                passive_idx: 2,
+                passive_pad_idx: 0,
+                max_dist: 5.0,
+                weight_mult: 2.0,
+                is_decoupling: true,
+            },
+        ];
+        let movable = vec![0, 1, 2];
+        let clusters = build_component_clusters(&board, &ties, &movable);
+
+        // U1 cluster should contain U1, C1, and C2
+        assert_eq!(clusters[0].len(), 3, "U1 cluster must contain anchor and both passives");
+        assert!(clusters[0].contains(&0));
+        assert!(clusters[0].contains(&1));
+        assert!(clusters[0].contains(&2));
+        // C1 and C2 should point to the same group
+        assert_eq!(clusters[1], clusters[0]);
+        assert_eq!(clusters[2], clusters[0]);
+
+        let cfg = PlacementConfig { min_spacing_mm: 0.25, grid_step_mm: 0.1, ..Default::default() };
+        let mut state = PlacementState::from_board(&board, &cfg);
+
+        // Apply a legal rigid group move: dx = 10.0, dy = -5.0
+        let success = apply_cluster_group_move(&mut state, &board, &cfg, &clusters[0], 10.0, -5.0, &boundary);
+        assert!(success, "Cluster move within board bounds must succeed");
+        assert!((state.positions[0].x - 60.0).abs() < 1e-6);
+        assert!((state.positions[0].y - 45.0).abs() < 1e-6);
+        assert!((state.positions[1].x - 58.0).abs() < 1e-6);
+        assert!((state.positions[1].y - 45.0).abs() < 1e-6);
+        assert!((state.positions[2].x - 62.0).abs() < 1e-6);
+        assert!((state.positions[2].y - 45.0).abs() < 1e-6);
+
+        // Relative distances between U1 and C1/C2 are preserved exactly
+        let dist_u1_c1 = ((state.positions[0].x - state.positions[1].x).powi(2) + (state.positions[0].y - state.positions[1].y).powi(2)).sqrt();
+        assert!((dist_u1_c1 - 2.0).abs() < 1e-6, "Relative decoupling distance must be strictly preserved");
+
+        // Attempt out-of-bounds group move: dx = 60.0 (would push U1 to x=120 > max_x=100)
+        let oob_success = apply_cluster_group_move(&mut state, &board, &cfg, &clusters[0], 60.0, 0.0, &boundary);
+        assert!(!oob_success, "Out of bounds cluster move must be rejected");
+        assert!((state.positions[0].x - 60.0).abs() < 1e-6, "Positions must remain unchanged when rejected");
     }
 }
 
