@@ -13,11 +13,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 // KiCad default colour theme (KiCad 8/9/10 "default"; pcbnew builtin scheme, inner layers per user spec).
-// ponytail: values transcribed, not read from an installed theme file (none shipped in /usr/share/kicad).
+// ponytail: F.Cu/In1/In2/B.Cu sampled from a KiCad 10 PCB Editor screenshot; remaining values transcribed, not read from a theme file.
 pub const COL_F_CU: Color32 = Color32::from_rgb(0xC8, 0x34, 0x34);
 pub const COL_B_CU: Color32 = Color32::from_rgb(0x4D, 0x7F, 0xC4);
-pub const COL_IN1_CU: Color32 = Color32::from_rgb(0xC2, 0xC2, 0x00);
-pub const COL_IN2_CU: Color32 = Color32::from_rgb(0xC2, 0x00, 0xC2);
+pub const COL_IN1_CU: Color32 = Color32::from_rgb(0x7F, 0xC8, 0x7F);
+pub const COL_IN2_CU: Color32 = Color32::from_rgb(0xCE, 0x7D, 0x2C);
 pub const COL_PAD_TH: Color32 = Color32::from_rgb(0xE3, 0xB7, 0x2E);
 pub const COL_VIA: Color32 = Color32::from_rgb(0xEC, 0xEC, 0xEC);
 pub const COL_F_CRTYD: Color32 = Color32::from_rgb(0xFF, 0x26, 0xE2);
@@ -1608,8 +1608,8 @@ mod tests {
     fn test_kicad_layer_colours_and_order() {
         assert_eq!(COL_F_CU, Color32::from_rgb(0xC8, 0x34, 0x34));
         assert_eq!(COL_B_CU, Color32::from_rgb(0x4D, 0x7F, 0xC4));
-        assert_eq!(COL_IN1_CU, Color32::from_rgb(0xC2, 0xC2, 0x00));
-        assert_eq!(COL_IN2_CU, Color32::from_rgb(0xC2, 0x00, 0xC2));
+        assert_eq!(COL_IN1_CU, Color32::from_rgb(0x7F, 0xC8, 0x7F));
+        assert_eq!(COL_IN2_CU, Color32::from_rgb(0xCE, 0x7D, 0x2C));
         assert_eq!(COL_F_CRTYD, Color32::from_rgb(0xFF, 0x26, 0xE2));
         assert_eq!(COL_B_CRTYD, Color32::from_rgb(0x26, 0xE2, 0xFF));
         assert_eq!(COL_EDGE_CUTS, Color32::from_rgb(0xD0, 0xD2, 0xCD));
