@@ -1209,14 +1209,24 @@ impl VulcansTrialsApp {
             let to_screen = |wx: f64, wy: f64| -> Pos2 { self.board_to_screen(b, rect, wx, wy).0 };
 
             // 1. Draw Board Outline (Edge.Cuts)
-            let edge_min = to_screen(b.min_x + 1.0, b.min_y + 1.0);
-            let edge_max = to_screen(b.max_x - 1.0, b.max_y - 1.0);
-            painter.rect_stroke(
-                Rect::from_min_max(edge_min, edge_max),
-                0.0,
-                Stroke::new(2.0_f32, COL_EDGE_CUTS),
-                egui::StrokeKind::Middle,
-            );
+            if let Some(ref poly) = b.outline_polygon {
+                let n = poly.vertices.len();
+                for i in 0..n {
+                    let p0 = to_screen(poly.vertices[i].x, poly.vertices[i].y);
+                    let p1 = to_screen(poly.vertices[(i + 1) % n].x, poly.vertices[(i + 1) % n].y);
+                    painter.line_segment([p0, p1], Stroke::new(2.0_f32, COL_EDGE_CUTS));
+                }
+            } else {
+                let b_aabb = b.boundary_aabb();
+                let edge_min = to_screen(b_aabb.min_x, b_aabb.min_y);
+                let edge_max = to_screen(b_aabb.max_x, b_aabb.max_y);
+                painter.rect_stroke(
+                    Rect::from_min_max(edge_min, edge_max),
+                    0.0,
+                    Stroke::new(2.0_f32, COL_EDGE_CUTS),
+                    egui::StrokeKind::Middle,
+                );
+            }
 
             // 2. Draw Keepout Zones
             for ko in &b.keepouts {

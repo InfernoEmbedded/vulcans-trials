@@ -131,6 +131,26 @@ impl Polygon {
         )
     }
 
+    pub fn contains_point(&self, p: &Point) -> bool {
+        let n = self.vertices.len();
+        if n < 3 {
+            return false;
+        }
+        let mut inside = false;
+        let mut j = n - 1;
+        for i in 0..n {
+            let pi = self.vertices[i];
+            let pj = self.vertices[j];
+            if ((pi.y > p.y) != (pj.y > p.y))
+                && (p.x < (pj.x - pi.x) * (p.y - pi.y) / (pj.y - pi.y) + pi.x)
+            {
+                inside = !inside;
+            }
+            j = i;
+        }
+        inside
+    }
+
     pub fn is_convex(&self) -> bool {
         let n = self.vertices.len();
         if n <= 3 {
@@ -566,6 +586,94 @@ impl Footprint {
             .collect()
     }
 
+    pub fn pad_corners_at(&self, pad: &Pad, pos: Point, rot: f64, layer: usize) -> Vec<Point> {
+        let flipped = layer != self.orig_layer;
+        let pad_rot = if flipped { -pad.rotation } else { pad.rotation };
+        let hw = pad.width / 2.0;
+        let hh = pad.height / 2.0;
+        let local_corners = [
+            Point::new(-hw, -hh),
+            Point::new(hw, -hh),
+            Point::new(hw, hh),
+            Point::new(-hw, hh),
+        ];
+        let oy = if flipped { -pad.offset_y } else { pad.offset_y };
+        local_corners
+            .iter()
+            .map(|c| {
+                let rot_c = c.rotate_ccw(pad_rot);
+                let fp_c = Point::new(rot_c.x + pad.offset_x, rot_c.y + oy);
+                let world_c = fp_c.rotate_ccw(rot);
+                Point::new(pos.x + world_c.x, pos.y + world_c.y)
+            })
+            .collect()
+    }
+
+    /// Computes the bounding box of the footprint relative to its origin (0, 0),
+    /// taking into account transformed courtyards (with spacing) and all pad corners.
+    pub fn relative_bounds(&self, rot: f64, layer: usize, spacing: f64) -> AABB {
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+
+        let origin = Point::new(0.0, 0.0);
+        let polys = self.transformed_courtyards_layered(origin, rot, layer, spacing);
+        for poly in &polys {
+            for v in &poly.vertices {
+                min_x = min_x.min(v.x);
+                max_x = max_x.max(v.x);
+                min_y = min_y.min(v.y);
+                max_y = max_y.max(v.y);
+            }
+        }
+
+        for pad in &self.pads {
+            for c in self.pad_corners_at(pad, origin, rot, layer) {
+                min_x = min_x.min(c.x);
+                max_x = max_x.max(c.x);
+                min_y = min_y.min(c.y);
+                max_y = max_y.max(c.y);
+            }
+        }
+
+        if min_x > max_x {
+            let hw = self.width.max(1.0) * 0.5;
+            let hh = self.height.max(1.0) * 0.5;
+            AABB::new(-hw, -hh, hw, hh)
+        } else {
+            AABB::new(min_x, min_y, max_x, max_y)
+        }
+    }
+
+    /// Computes the strictly legal [min_x, max_x, min_y, max_y] clamping range for the component origin
+    /// so that courtyards and copper pads remain entirely inside `boundary`.
+    pub fn origin_clamp_range(
+        &self,
+        rot: f64,
+        layer: usize,
+        spacing: f64,
+        boundary: &AABB,
+    ) -> (f64, f64, f64, f64) {
+        let rel_b = self.relative_bounds(rot, layer, spacing);
+        let mut min_x = boundary.min_x - rel_b.min_x;
+        let mut max_x = boundary.max_x - rel_b.max_x;
+        let mut min_y = boundary.min_y - rel_b.min_y;
+        let mut max_y = boundary.max_y - rel_b.max_y;
+
+        if min_x > max_x {
+            let mid = (min_x + max_x) * 0.5;
+            min_x = mid;
+            max_x = mid;
+        }
+        if min_y > max_y {
+            let mid = (min_y + max_y) * 0.5;
+            min_y = mid;
+            max_y = mid;
+        }
+        (min_x, max_x, min_y, max_y)
+    }
+
     pub fn pad_absolute_position(&self, pad: &Pad) -> (f64, f64) {
         let oy = if self.layer != self.orig_layer {
             -pad.offset_y
@@ -819,6 +927,7 @@ pub struct Board {
     pub vias: Vec<Via>,
     pub clusters: Vec<CompiledCluster>,
     pub schematic_positions: HashMap<String, (f64, f64)>,
+    pub outline_polygon: Option<Polygon>,
 }
 
 pub const INTERNAL_COPPER_LAYERS: [&str; 30] = [
@@ -909,14 +1018,16 @@ impl Board {
         let len = bytes.len();
         let mut i = 0;
 
+        let mut edge_cuts_lines: Vec<(Point, Point)> = Vec::new();
+
         while i < len {
             if bytes[i] == b'(' {
                 let word = next_token(&content, i + 1);
-                if word == "gr_rect" || word == "gr_line" {
+                if word.starts_with("gr_") {
                     if let Some(end) = find_closing_paren(bytes, i) {
                         let block = &content[i..end];
                         if block.contains("\"Edge.Cuts\"") {
-                            extract_coords_into_bounds(block, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
+                            parse_edge_cuts_element(block, word, &mut edge_cuts_lines, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
                         }
                         i = end;
                         continue;
@@ -1005,6 +1116,13 @@ impl Board {
             net_to_class.insert(net.clone(), class.to_string());
         }
 
+        let outline_polygon = if !edge_cuts_lines.is_empty() {
+            let chained = chain_lines_into_polygons(edge_cuts_lines);
+            chained.into_iter().max_by(|a, b| a.vertices.len().cmp(&b.vertices.len()))
+        } else {
+            None
+        };
+
         if min_x >= max_x || min_y >= max_y {
             min_x = 125.0;
             min_y = 86.0;
@@ -1041,6 +1159,7 @@ impl Board {
             vias,
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
+            outline_polygon,
         };
 
         // Auto-load project netclasses if sibling .kicad_pro exists
@@ -1155,7 +1274,24 @@ impl Board {
     }
 
     pub fn boundary_aabb(&self) -> AABB {
-        AABB::new(self.min_x + 1.0, self.min_y + 1.0, self.max_x - 1.0, self.max_y - 1.0)
+        if let Some(ref poly) = self.outline_polygon {
+            poly.aabb()
+        } else {
+            AABB::new(self.min_x + 1.5, self.min_y + 1.5, self.max_x - 1.5, self.max_y - 1.5)
+        }
+    }
+
+    /// Verifies if a point is strictly inside the physical board boundary and outline contour.
+    pub fn contains_point_in_boundary(&self, p: &Point) -> bool {
+        if !self.boundary_aabb().contains_point(p) {
+            return false;
+        }
+        if let Some(ref poly) = self.outline_polygon {
+            if !poly.contains_point(p) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Rips up all unlocked tracks and vias, and moves all unlocked footprints
@@ -1672,6 +1808,143 @@ fn find_closing_paren(bytes: &[u8], open_pos: usize) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+fn parse_point_tag(s: &str, tag: &str) -> Option<Point> {
+    let p = s.find(tag)?;
+    let rest = &s[p + tag.len()..];
+    let e = rest.find(')')?;
+    let mut parts = rest[..e].split_whitespace();
+    let x = parts.next()?.parse::<f64>().ok()?;
+    let y = parts.next()?.parse::<f64>().ok()?;
+    Some(Point::new(x, y))
+}
+
+fn discretize_arc(p1: Point, pm: Point, p2: Point, steps: usize) -> Vec<Point> {
+    let x1 = p1.x;
+    let y1 = p1.y;
+    let xm = pm.x;
+    let ym = pm.y;
+    let x2 = p2.x;
+    let y2 = p2.y;
+    let d = 2.0 * (x1 * (ym - y2) + xm * (y2 - y1) + x2 * (y1 - ym));
+    if d.abs() < 1e-8 {
+        return vec![p1, p2];
+    }
+    let cx = ((x1 * x1 + y1 * y1) * (ym - y2) + (xm * xm + ym * ym) * (y2 - y1) + (x2 * x2 + y2 * y2) * (y1 - ym)) / d;
+    let cy = ((x1 * x1 + y1 * y1) * (x2 - xm) + (xm * xm + ym * ym) * (x1 - x2) + (x2 * x2 + y2 * y2) * (xm - x1)) / d;
+    let r = (x1 - cx).hypot(y1 - cy);
+    let a1 = (y1 - cy).atan2(x1 - cx);
+    let am = (ym - cy).atan2(xm - cx);
+    let a2 = (y2 - cy).atan2(x2 - cx);
+    let dm = (am - a1).rem_euclid(2.0 * std::f64::consts::PI);
+    let d2 = (a2 - a1).rem_euclid(2.0 * std::f64::consts::PI);
+    let sweep = if dm < d2 { d2 } else { d2 - 2.0 * std::f64::consts::PI };
+
+    let mut pts = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let t = i as f64 / steps as f64;
+        let ang = a1 + t * sweep;
+        pts.push(Point::new(cx + r * ang.cos(), cy + r * ang.sin()));
+    }
+    pts
+}
+
+fn parse_edge_cuts_element(
+    block: &str,
+    tag: &str,
+    lines: &mut Vec<(Point, Point)>,
+    min_x: &mut f64,
+    min_y: &mut f64,
+    max_x: &mut f64,
+    max_y: &mut f64,
+) {
+    if tag == "gr_line" {
+        if let (Some(p1), Some(p2)) = (parse_point_tag(block, "(start "), parse_point_tag(block, "(end ")) {
+            *min_x = min_x.min(p1.x).min(p2.x);
+            *max_x = max_x.max(p1.x).max(p2.x);
+            *min_y = min_y.min(p1.y).min(p2.y);
+            *max_y = max_y.max(p1.y).max(p2.y);
+            lines.push((p1, p2));
+        }
+    } else if tag == "gr_arc" {
+        if let (Some(p1), Some(pm), Some(p2)) = (
+            parse_point_tag(block, "(start "),
+            parse_point_tag(block, "(mid "),
+            parse_point_tag(block, "(end "),
+        ) {
+            let arc_pts = discretize_arc(p1, pm, p2, 8);
+            for pt in &arc_pts {
+                *min_x = min_x.min(pt.x);
+                *max_x = max_x.max(pt.x);
+                *min_y = min_y.min(pt.y);
+                *max_y = max_y.max(pt.y);
+            }
+            for k in 0..(arc_pts.len() - 1) {
+                lines.push((arc_pts[k], arc_pts[k + 1]));
+            }
+        }
+    } else if tag == "gr_rect" {
+        if let (Some(p1), Some(p2)) = (parse_point_tag(block, "(start "), parse_point_tag(block, "(end ")) {
+            let x0 = p1.x.min(p2.x);
+            let x1 = p1.x.max(p2.x);
+            let y0 = p1.y.min(p2.y);
+            let y1 = p1.y.max(p2.y);
+            *min_x = min_x.min(x0);
+            *max_x = max_x.max(x1);
+            *min_y = min_y.min(y0);
+            *max_y = max_y.max(y1);
+            lines.push((Point::new(x0, y0), Point::new(x1, y0)));
+            lines.push((Point::new(x1, y0), Point::new(x1, y1)));
+            lines.push((Point::new(x1, y1), Point::new(x0, y1)));
+            lines.push((Point::new(x0, y1), Point::new(x0, y0)));
+        }
+    } else if tag == "gr_poly" {
+        let mut poly_pts = Vec::new();
+        let tag_xy = "(xy ";
+        let mut idx = 0;
+        while let Some(pos) = block[idx..].find(tag_xy) {
+            let s = idx + pos + tag_xy.len();
+            if let Some(e) = block[s..].find(')') {
+                let mut parts = block[s..s + e].split_whitespace();
+                if let (Some(xs), Some(ys)) = (parts.next(), parts.next()) {
+                    if let (Ok(x), Ok(y)) = (xs.parse::<f64>(), ys.parse::<f64>()) {
+                        poly_pts.push(Point::new(x, y));
+                        *min_x = min_x.min(x);
+                        *max_x = max_x.max(x);
+                        *min_y = min_y.min(y);
+                        *max_y = max_y.max(y);
+                    }
+                }
+                idx = s + e;
+            } else {
+                break;
+            }
+        }
+        for k in 0..poly_pts.len() {
+            let next = (k + 1) % poly_pts.len();
+            lines.push((poly_pts[k], poly_pts[next]));
+        }
+    } else if tag == "gr_circle" {
+        if let (Some(center), Some(end_pt)) = (parse_point_tag(block, "(center "), parse_point_tag(block, "(end ")) {
+            let r = center.distance_to(&end_pt);
+            *min_x = min_x.min(center.x - r);
+            *max_x = max_x.max(center.x + r);
+            *min_y = min_y.min(center.y - r);
+            *max_y = max_y.max(center.y + r);
+            let steps = 16;
+            for k in 0..steps {
+                let a0 = (k as f64) * 2.0 * std::f64::consts::PI / (steps as f64);
+                let a1 = ((k + 1) as f64) * 2.0 * std::f64::consts::PI / (steps as f64);
+                lines.push((
+                    Point::new(center.x + r * a0.cos(), center.y + r * a0.sin()),
+                    Point::new(center.x + r * a1.cos(), center.y + r * a1.sin()),
+                ));
+            }
+        }
+    } else {
+        extract_coords_into_bounds(block, min_x, min_y, max_x, max_y);
+    }
 }
 
 fn extract_coords_into_bounds(block: &str, min_x: &mut f64, min_y: &mut f64, max_x: &mut f64, max_y: &mut f64) {
@@ -3218,6 +3491,95 @@ mod tests {
         assert_eq!(layers_32[1], "B.Cu");
         assert_eq!(layers_32[2], "In1.Cu");
         assert_eq!(layers_32[31], "In30.Cu");
+    }
+
+    #[test]
+    fn test_polygon_contains_point_and_contour() {
+        // Octagonal / chamfered corner polygon: [0, 10] x [0, 10] with corners cut at 2.0mm
+        let poly = Polygon::new(vec![
+            Point::new(2.0, 0.0),
+            Point::new(8.0, 0.0),
+            Point::new(10.0, 2.0),
+            Point::new(10.0, 8.0),
+            Point::new(8.0, 10.0),
+            Point::new(2.0, 10.0),
+            Point::new(0.0, 8.0),
+            Point::new(0.0, 2.0),
+        ]);
+
+        // Inside center
+        assert!(poly.contains_point(&Point::new(5.0, 5.0)));
+        // Inside near edges
+        assert!(poly.contains_point(&Point::new(2.5, 0.5)));
+        // Outside the chamfered corner (in the bounding box corner [0, 0])
+        assert!(!poly.contains_point(&Point::new(0.5, 0.5)));
+        assert!(!poly.contains_point(&Point::new(9.5, 0.5)));
+        assert!(!poly.contains_point(&Point::new(0.5, 9.5)));
+        assert!(!poly.contains_point(&Point::new(9.5, 9.5)));
+        // Completely outside
+        assert!(!poly.contains_point(&Point::new(-1.0, 5.0)));
+        assert!(!poly.contains_point(&Point::new(11.0, 5.0)));
+    }
+
+    #[test]
+    fn test_footprint_origin_clamp_range_asymmetrical() {
+        // Footprint with origin at pin 1 (0, 0) and 3 more pins extending in +Y: (0, 2.54), (0, 5.08), (0, 7.62)
+        // Courtyard spanning [-1.5, -1.0] to [1.5, 8.62]
+        let fp = Footprint {
+            reference: "J3".to_string(),
+            value: "HEADER".to_string(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: vec![
+                Pad::new("1", 0.0, 0.0, 1.6, 1.6, 1, "NET1", false),
+                Pad::new("2", 0.0, 2.54, 1.6, 1.6, 2, "NET2", false),
+                Pad::new("3", 0.0, 5.08, 1.6, 1.6, 3, "NET3", false),
+                Pad::new("4", 0.0, 7.62, 1.6, 1.6, 4, "NET4", false),
+            ],
+            width: 3.0,
+            height: 9.62,
+            courtyards: vec![Polygon::new(vec![
+                Point::new(-1.5, -1.0),
+                Point::new(1.5, -1.0),
+                Point::new(1.5, 8.62),
+                Point::new(-1.5, 8.62),
+            ])],
+            perimeters: Vec::new(),
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+
+        let boundary = AABB::new(10.0, 10.0, 50.0, 50.0);
+        let spacing = 0.5;
+
+        // At rotation 0.0
+        let (min_x, max_x, min_y, max_y) = fp.origin_clamp_range(0.0, 0, spacing, &boundary);
+        // Courtyard [-1.5, -1.0] to [1.5, 8.62] expanded by spacing / 2.0 (0.25):
+        // rel_b min_x = -1.75, max_x = 1.75; min_y = -1.25, max_y = 8.87
+        assert!((min_x - 11.75).abs() < 1e-4, "min_x was {}", min_x);
+        assert!((max_x - 48.25).abs() < 1e-4, "max_x was {}", max_x);
+        assert!((min_y - 11.25).abs() < 1e-4, "min_y was {}", min_y);
+        assert!((max_y - 41.13).abs() < 1e-4, "max_y was {}", max_y);
+
+        // At max allowed origin (max_x, max_y), check that pad 4 corner is within boundary
+        let pad4 = &fp.pads[3];
+        let corners = fp.pad_corners_at(pad4, Point::new(max_x, max_y), 0.0, 0);
+        for c in corners {
+            assert!(c.x <= boundary.max_x + 1e-4);
+            assert!(c.y <= boundary.max_y + 1e-4);
+            assert!(c.x >= boundary.min_x - 1e-4);
+            assert!(c.y >= boundary.min_y - 1e-4);
+        }
+
+        // At rotation 90.0, footprint extends in +X (Y-down KiCad coords)
+        let (_r_min_x, r_max_x, _r_min_y, r_max_y) = fp.origin_clamp_range(90.0, 0, spacing, &boundary);
+        assert!(r_max_x < max_x); // Needs more room on the right
+        assert!(r_max_y > max_y); // Needs less room at bottom
     }
 }
 

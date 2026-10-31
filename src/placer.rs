@@ -75,6 +75,7 @@ pub struct PlacementState {
     pub crossings: usize,
     pub wirelength: f64,
     pub overlaps: usize,
+    pub boundary_violations: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -344,6 +345,7 @@ impl PlacementState {
             crossings: 0,
             wirelength: 0.0,
             overlaps: 0,
+            boundary_violations: 0,
         };
         let ties = build_passive_ties(board);
         st.evaluate(board, config, &ties);
@@ -418,6 +420,7 @@ impl PlacementState {
 
         let boundary = board.boundary_aabb();
         let mut boundary_cost = 0.0;
+        let mut boundary_violations = 0usize;
         let mut flip_cost = 0.0;
         for i in 0..n {
             if board.footprints[i].is_locked {
@@ -426,14 +429,27 @@ impl PlacementState {
             if self.layers[i] != board.footprints[i].orig_layer {
                 flip_cost += 3.5;
             }
+            let mut fp_violated = false;
             for poly in &self.cached_courtyards[i] {
                 for v in &poly.vertices {
-                    if !boundary.contains_point(v) {
+                    if !board.contains_point_in_boundary(v) {
                         let dx = (boundary.min_x - v.x).max(0.0) + (v.x - boundary.max_x).max(0.0);
                         let dy = (boundary.min_y - v.y).max(0.0) + (v.y - boundary.max_y).max(0.0);
-                        boundary_cost += config.boundary_penalty * (1.0 + dx + dy);
+                        boundary_cost += config.boundary_penalty * (10.0 + dx * 10.0 + dy * 10.0);
+                        fp_violated = true;
                     }
                 }
+            }
+            for p in &self.cached_pads[i] {
+                if !board.contains_point_in_boundary(p) {
+                    let dx = (boundary.min_x - p.x).max(0.0) + (p.x - boundary.max_x).max(0.0);
+                    let dy = (boundary.min_y - p.y).max(0.0) + (p.y - boundary.max_y).max(0.0);
+                    boundary_cost += config.boundary_penalty * (10.0 + dx * 10.0 + dy * 10.0);
+                    fp_violated = true;
+                }
+            }
+            if fp_violated {
+                boundary_violations += 1;
             }
         }
 
@@ -494,6 +510,7 @@ impl PlacementState {
         self.wirelength = wirelength;
         self.crossings = crossings;
         self.overlaps = overlaps;
+        self.boundary_violations = boundary_violations;
         self.cost = wirelength * config.wirelength_weight
             + (crossings as f64) * config.crossing_weight
             + overlap_area_cost
@@ -721,7 +738,11 @@ fn run_gpu_placement_batch(
         }
         cand.evaluate(board, config, ties);
         if best_verified.as_ref().is_none_or(|b| {
-            cand.overlaps < b.overlaps || (cand.overlaps == b.overlaps && cand.cost < b.cost)
+            cand.boundary_violations < b.boundary_violations
+                || (cand.boundary_violations == b.boundary_violations && cand.overlaps < b.overlaps)
+                || (cand.boundary_violations == b.boundary_violations
+                    && cand.overlaps == b.overlaps
+                    && cand.cost < b.cost)
         }) {
             best_verified = Some(cand);
         }
@@ -736,7 +757,7 @@ pub fn legalize_placement(
     initial: PlacementState,
     live: Option<&Arc<Mutex<LiveTrialState>>>,
 ) -> PlacementState {
-    if initial.overlaps == 0 {
+    if initial.overlaps == 0 && initial.boundary_violations == 0 {
         return initial;
     }
     let num_threads = rayon::current_num_threads().max(2);
@@ -779,7 +800,7 @@ pub fn legalize_placement(
             let mut local_best = cur.clone();
 
             for step in 0..steps_per_thread {
-                if cur.overlaps == 0 {
+                if cur.overlaps == 0 && cur.boundary_violations == 0 {
                     solved.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -831,38 +852,70 @@ pub fn legalize_placement(
                 let old_layer = cur.layers[idx];
                 let old_cost = cur.cost;
                 let old_ov = cur.overlaps;
+                let old_bv = cur.boundary_violations;
 
                 let roll = rng.gen_range(0..100);
                 if roll < 70 {
                     let r = if step < steps_per_thread / 3 { 6.0 } else { 2.5 };
+                    let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx].origin_clamp_range(
+                        cur.rotations[idx],
+                        cur.layers[idx],
+                        config.min_spacing_mm,
+                        &boundary,
+                    );
                     let nx = snap_to_grid(
-                        (old_pos.x + rng.gen_range(-r..=r)).clamp(boundary.min_x + 1.5, boundary.max_x - 1.5),
+                        (old_pos.x + rng.gen_range(-r..=r)).clamp(cx_min, cx_max),
                         config.grid_step_mm,
                     );
                     let ny = snap_to_grid(
-                        (old_pos.y + rng.gen_range(-r..=r)).clamp(boundary.min_y + 1.5, boundary.max_y - 1.5),
+                        (old_pos.y + rng.gen_range(-r..=r)).clamp(cy_min, cy_max),
                         config.grid_step_mm,
                     );
                     cur.positions[idx] = Point::new(nx, ny);
                 } else if roll < 90 || !config.allow_layer_flip || !board.footprints[idx].is_smd_only() {
                     let angles = [0.0, 90.0, 180.0, 270.0];
-                    cur.rotations[idx] = angles[rng.gen_range(0..4)];
+                    let new_rot = angles[rng.gen_range(0..4)];
+                    cur.rotations[idx] = new_rot;
+                    let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx].origin_clamp_range(
+                        new_rot,
+                        cur.layers[idx],
+                        config.min_spacing_mm,
+                        &boundary,
+                    );
+                    cur.positions[idx].x = snap_to_grid(cur.positions[idx].x.clamp(cx_min, cx_max), config.grid_step_mm);
+                    cur.positions[idx].y = snap_to_grid(cur.positions[idx].y.clamp(cy_min, cy_max), config.grid_step_mm);
                 } else {
                     cur.layers[idx] = 1 - cur.layers[idx];
+                    let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx].origin_clamp_range(
+                        cur.rotations[idx],
+                        cur.layers[idx],
+                        config.min_spacing_mm,
+                        &boundary,
+                    );
+                    cur.positions[idx].x = snap_to_grid(cur.positions[idx].x.clamp(cx_min, cx_max), config.grid_step_mm);
+                    cur.positions[idx].y = snap_to_grid(cur.positions[idx].y.clamp(cy_min, cy_max), config.grid_step_mm);
                 }
                 cur.update_component(idx, board, config);
                 cur.evaluate(board, config, &ties);
 
-                let accept = cur.overlaps < old_ov
-                    || (cur.overlaps == old_ov && (cur.cost <= old_cost || rng.gen_bool(0.15)));
+                let accept = (cur.boundary_violations < old_bv)
+                    || (cur.boundary_violations == old_bv && (
+                        cur.overlaps < old_ov
+                            || (cur.overlaps == old_ov && cur.boundary_violations == 0 && (cur.cost <= old_cost || rng.gen_bool(0.15)))
+                    ));
 
                 if accept {
-                    if cur.overlaps < local_best.overlaps
-                        || (cur.overlaps == local_best.overlaps && cur.cost < local_best.cost)
-                    {
+                    let is_better = if cur.boundary_violations != local_best.boundary_violations {
+                        cur.boundary_violations < local_best.boundary_violations
+                    } else if cur.overlaps != local_best.overlaps {
+                        cur.overlaps < local_best.overlaps
+                    } else {
+                        cur.cost < local_best.cost
+                    };
+                    if is_better {
                         local_best = cur.clone();
                     }
-                    if local_best.overlaps == 0 {
+                    if local_best.overlaps == 0 && local_best.boundary_violations == 0 {
                         solved.store(true, Ordering::Relaxed);
                         break;
                     }
@@ -873,6 +926,7 @@ pub fn legalize_placement(
                     cur.update_component(idx, board, config);
                     cur.cost = old_cost;
                     cur.overlaps = old_ov;
+                    cur.boundary_violations = old_bv;
                 }
             }
             local_best
@@ -882,8 +936,9 @@ pub fn legalize_placement(
     results
         .into_iter()
         .min_by(|a, b| {
-            a.overlaps
-                .cmp(&b.overlaps)
+            a.boundary_violations
+                .cmp(&b.boundary_violations)
+                .then_with(|| a.overlaps.cmp(&b.overlaps))
                 .then_with(|| a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal))
         })
         .unwrap_or(initial)
@@ -954,12 +1009,18 @@ pub fn prioritize_and_position_initial_components(
             } else {
                 (anchor_pos.x + 12.0, anchor_pos.y)
             };
+            let (cx_min, cx_max, cy_min, cy_max) = board.footprints[diff_idx].origin_clamp_range(
+                board.footprints[diff_idx].rotation,
+                board.footprints[diff_idx].layer,
+                config.min_spacing_mm,
+                &boundary,
+            );
             board.footprints[diff_idx].x = snap_to_grid(
-                target_x.clamp(boundary.min_x + 3.0, boundary.max_x - 3.0),
+                target_x.clamp(cx_min, cx_max),
                 config.grid_step_mm,
             );
             board.footprints[diff_idx].y = snap_to_grid(
-                target_y.clamp(boundary.min_y + 3.0, boundary.max_y - 3.0),
+                target_y.clamp(cy_min, cy_max),
                 config.grid_step_mm,
             );
         }
@@ -1028,17 +1089,18 @@ pub fn prioritize_and_position_initial_components(
         'search: for &d in &dist_steps {
             for &da in &angle_deltas {
                 let angle = base_angle + da;
-                let cx = snap_to_grid(
-                    (pin_x + d * angle.cos()).clamp(boundary.min_x + 1.5, boundary.max_x - 1.5),
-                    config.grid_step_mm,
-                );
-                let cy = snap_to_grid(
-                    (pin_y + d * angle.sin()).clamp(boundary.min_y + 1.5, boundary.max_y - 1.5),
-                    config.grid_step_mm,
-                );
-                let c_pos = Point::new(cx, cy);
-
                 for &rot in &rotations {
+                    let (cx_min, cx_max, cy_min, cy_max) = cap.origin_clamp_range(rot, cap.layer, config.min_spacing_mm, &boundary);
+                    let cx = snap_to_grid(
+                        (pin_x + d * angle.cos()).clamp(cx_min, cx_max),
+                        config.grid_step_mm,
+                    );
+                    let cy = snap_to_grid(
+                        (pin_y + d * angle.sin()).clamp(cy_min, cy_max),
+                        config.grid_step_mm,
+                    );
+                    let c_pos = Point::new(cx, cy);
+
                     let polys = cap.transformed_courtyards_layered(c_pos, rot, cap.layer, cap_spacing);
                     let mut collides = false;
                     'check: for group in &placed_courtyards {
@@ -1051,7 +1113,7 @@ pub fn prioritize_and_position_initial_components(
                             }
                         }
                     }
-                    if !collides {
+                    if !collides && is_placement_legal(board, cap, c_pos, rot, cap.layer, config.min_spacing_mm) {
                         let cap_pad_world = cap.pad_world_point_layered(cap_pad_idx, c_pos, rot, cap.layer);
                         let pad_dist = cap_pad_world.distance_to(&pin_pt);
                         if best_cand.is_none_or(|b| pad_dist < b.0) {
@@ -1093,36 +1155,23 @@ pub fn is_placement_legal(
 ) -> bool {
     let cand_spacing = fp.placement_spacing(min_spacing_mm);
     let cand_polys = fp.transformed_courtyards_layered(pos, rot, layer, cand_spacing);
-    let boundary = board.boundary_aabb();
 
-    // 1. Must be entirely inside the board outline (both courtyards AND copper pads/legs)
+    // 1. Must be entirely inside the board outline (origin, courtyards, AND copper pads/legs)
+    if !board.contains_point_in_boundary(&pos) {
+        return false;
+    }
     let raw_polys = fp.transformed_courtyards_layered(pos, rot, layer, min_spacing_mm);
     for poly in &raw_polys {
         for v in &poly.vertices {
-            if !boundary.contains_point(v) {
+            if !board.contains_point_in_boundary(v) {
                 return false;
             }
         }
     }
 
-    let flipped = layer != fp.orig_layer;
     for pad in &fp.pads {
-        let pad_rot = if flipped { -pad.rotation } else { pad.rotation };
-        let hw = pad.width / 2.0;
-        let hh = pad.height / 2.0;
-        let local_corners = [
-            Point::new(-hw, -hh),
-            Point::new(hw, -hh),
-            Point::new(hw, hh),
-            Point::new(-hw, hh),
-        ];
-        let oy = if flipped { -pad.offset_y } else { pad.offset_y };
-        for c in &local_corners {
-            let rot_c = c.rotate_ccw(pad_rot);
-            let fp_c = Point::new(rot_c.x + pad.offset_x, rot_c.y + oy);
-            let world_c = fp_c.rotate_ccw(rot);
-            let corner_pt = Point::new(pos.x + world_c.x, pos.y + world_c.y);
-            if !boundary.contains_point(&corner_pt) {
+        for corner_pt in fp.pad_corners_at(pad, pos, rot, layer) {
+            if !board.contains_point_in_boundary(&corner_pt) {
                 return false;
             }
         }
@@ -1295,15 +1344,6 @@ pub fn find_most_favourable_placement(
     let grid_step = config.grid_step_mm.max(0.1);
     let rotations = [0.0, 90.0, 180.0, 270.0];
 
-    // Compute maximum pad/lead reach from footprint center to guarantee protruding legs stay on the board
-    let mut pad_reach_x = fp.width * 0.5;
-    let mut pad_reach_y = fp.height * 0.5;
-    for pad in &fp.pads {
-        pad_reach_x = pad_reach_x.max(pad.offset_x.abs() + pad.width * 0.5);
-        pad_reach_y = pad_reach_y.max(pad.offset_y.abs() + pad.height * 0.5);
-    }
-    let pad_margin = pad_reach_x.max(pad_reach_y) + 0.6;
-
     // Check if fp is a decoupling capacitor
     let is_cap = fp.reference.starts_with('C');
     let mut gnd_pad_idx = None;
@@ -1391,28 +1431,29 @@ pub fn find_most_favourable_placement(
             for &d in &dist_steps {
                 for &da in &angle_deltas {
                     let angle = base_angle + da;
+                    for &rot in &rotations {
+                    let (cx_min, cx_max, cy_min, cy_max) = fp.origin_clamp_range(rot, fp.layer, min_spacing, &boundary);
                     let cx = snap_to_grid(
-                        (pin_x + d * angle.cos()).clamp(boundary.min_x + pad_margin, boundary.max_x - pad_margin),
+                        (pin_x + d * angle.cos()).clamp(cx_min, cx_max),
                         grid_step,
                     );
                     let cy = snap_to_grid(
-                        (pin_y + d * angle.sin()).clamp(boundary.min_y + pad_margin, boundary.max_y - pad_margin),
+                        (pin_y + d * angle.sin()).clamp(cy_min, cy_max),
                         grid_step,
                     );
                     let c_pos = Point::new(cx, cy);
 
-                    for &rot in &rotations {
-                        if is_placement_legal(board, fp, c_pos, rot, fp.layer, min_spacing) {
-                            let pwr_pad_world = fp.pad_world_point_layered(pwr_idx, c_pos, rot, fp.layer);
-                            let pad_dist = pwr_pad_world.distance_to(&pin_pt);
-                            if best_cand.as_ref().map_or(true, |b| pad_dist < b.0) {
-                                best_cand = Some((pad_dist, cx, cy, rot, fp.layer));
-                                if pad_dist <= 1.0 {
-                                    return (cx, cy, rot, fp.layer);
-                                }
+                    if is_placement_legal(board, fp, c_pos, rot, fp.layer, min_spacing) {
+                        let pwr_pad_world = fp.pad_world_point_layered(pwr_idx, c_pos, rot, fp.layer);
+                        let pad_dist = pwr_pad_world.distance_to(&pin_pt);
+                        if best_cand.as_ref().map_or(true, |b| pad_dist < b.0) {
+                            best_cand = Some((pad_dist, cx, cy, rot, fp.layer));
+                            if pad_dist <= 1.0 {
+                                return (cx, cy, rot, fp.layer);
                             }
                         }
                     }
+                }
                 }
             }
 
@@ -1467,17 +1508,18 @@ pub fn find_most_favourable_placement(
 
         for s in 0..steps {
             let theta = (s as f64) * (2.0 * std::f64::consts::PI / steps as f64);
-            let cx = snap_to_grid(
-                (target_center.x + r * theta.cos()).clamp(boundary.min_x + pad_margin, boundary.max_x - pad_margin),
-                grid_step,
-            );
-            let cy = snap_to_grid(
-                (target_center.y + r * theta.sin()).clamp(boundary.min_y + pad_margin, boundary.max_y - pad_margin),
-                grid_step,
-            );
-            let c_pos = Point::new(cx, cy);
-
             for &rot in &rotations {
+                let (cx_min, cx_max, cy_min, cy_max) = fp.origin_clamp_range(rot, fp.layer, min_spacing, &boundary);
+                let cx = snap_to_grid(
+                    (target_center.x + r * theta.cos()).clamp(cx_min, cx_max),
+                    grid_step,
+                );
+                let cy = snap_to_grid(
+                    (target_center.y + r * theta.sin()).clamp(cy_min, cy_max),
+                    grid_step,
+                );
+                let c_pos = Point::new(cx, cy);
+
                 if is_placement_legal(board, fp, c_pos, rot, fp.layer, min_spacing) {
                     let mut cost = 0.1 * r;
                     for &(pidx, target_pt, w) in &targets {
@@ -1499,10 +1541,11 @@ pub fn find_most_favourable_placement(
         return (bx, by, brot, blayer);
     }
 
-    // Fallback: clamped within board outline with safe pad margin
+    // Fallback: clamped within board outline with component's exact bounds
+    let (cx_min, cx_max, cy_min, cy_max) = fp.origin_clamp_range(fp.rotation, fp.layer, min_spacing, &boundary);
     (
-        fp.x.clamp(boundary.min_x + pad_margin, boundary.max_x - pad_margin),
-        fp.y.clamp(boundary.min_y + pad_margin, boundary.max_y - pad_margin),
+        fp.x.clamp(cx_min, cx_max),
+        fp.y.clamp(cy_min, cy_max),
         fp.rotation,
         fp.layer,
     )
@@ -1674,11 +1717,16 @@ pub fn run_auto_placer(
                             cooling,
                         ) {
                             total_evals_ref.fetch_add(gpu_evals, Ordering::Relaxed);
-                            if cand.overlaps == 0 {
-                                if let Ok(mut g) = global_best_ref.lock() {
-                                    if cand.cost < g.cost || g.overlaps > 0 {
-                                        *g = cand;
-                                    }
+                            if let Ok(mut g) = global_best_ref.lock() {
+                                let is_better = if cand.boundary_violations != g.boundary_violations {
+                                    cand.boundary_violations < g.boundary_violations
+                                } else if cand.overlaps != g.overlaps {
+                                    cand.overlaps < g.overlaps
+                                } else {
+                                    cand.cost < g.cost
+                                };
+                                if is_better {
+                                    *g = cand;
                                 }
                             }
                         }
@@ -1719,20 +1767,23 @@ pub fn run_auto_placer(
                             let old_crossings = current.crossings;
                             let old_wl = current.wirelength;
                             let old_ov = current.overlaps;
+                            let old_bv = current.boundary_violations;
                             let mut modified: Vec<usize> = Vec::with_capacity(2);
 
                             let move_type = rng.gen_range(0..100);
                             if move_type < 48 {
                                 let idx = movable[rng.gen_range(0..movable.len())];
+                                let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
+                                    .origin_clamp_range(current.rotations[idx], current.layers[idx], config.min_spacing_mm, &boundary);
                                 let max_shift = (10.0 * cooling).max(config.grid_step_mm * 2.0);
                                 let nx = snap_to_grid(
                                     (current.positions[idx].x + rng.gen_range(-max_shift..=max_shift))
-                                        .clamp(boundary.min_x + 1.2, boundary.max_x - 1.2),
+                                        .clamp(cx_min, cx_max),
                                     config.grid_step_mm,
                                 );
                                 let ny = snap_to_grid(
                                     (current.positions[idx].y + rng.gen_range(-max_shift..=max_shift))
-                                        .clamp(boundary.min_y + 1.2, boundary.max_y - 1.2),
+                                        .clamp(cy_min, cy_max),
                                     config.grid_step_mm,
                                 );
                                 current.positions[idx] = Point::new(nx, ny);
@@ -1740,20 +1791,37 @@ pub fn run_auto_placer(
                             } else if move_type < 72 {
                                 let idx = movable[rng.gen_range(0..movable.len())];
                                 let deltas = [90.0, 180.0, 270.0];
-                                current.rotations[idx] =
+                                let new_rot =
                                     (current.rotations[idx] + deltas[rng.gen_range(0..3)]) % 360.0;
+                                current.rotations[idx] = new_rot;
+                                let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
+                                    .origin_clamp_range(new_rot, current.layers[idx], config.min_spacing_mm, &boundary);
+                                current.positions[idx].x = current.positions[idx].x.clamp(cx_min, cx_max);
+                                current.positions[idx].y = current.positions[idx].y.clamp(cy_min, cy_max);
                                 modified.push(idx);
                             } else if move_type < 80 && config.allow_layer_flip {
                                 let idx = movable[rng.gen_range(0..movable.len())];
                                 if board.footprints[idx].is_smd_only() {
-                                    current.layers[idx] = 1 - current.layers[idx];
+                                    let new_layer = 1 - current.layers[idx];
+                                    current.layers[idx] = new_layer;
+                                    let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
+                                        .origin_clamp_range(current.rotations[idx], new_layer, config.min_spacing_mm, &boundary);
+                                    current.positions[idx].x = current.positions[idx].x.clamp(cx_min, cx_max);
+                                    current.positions[idx].y = current.positions[idx].y.clamp(cy_min, cy_max);
                                     modified.push(idx);
                                 }
                             } else if move_type < 90 && movable.len() >= 2 {
                                 let a = movable[rng.gen_range(0..movable.len())];
                                 let b = movable[rng.gen_range(0..movable.len())];
                                 if a != b {
-                                    current.positions.swap(a, b);
+                                    let (a_min_x, a_max_x, a_min_y, a_max_y) = board.footprints[a]
+                                        .origin_clamp_range(current.rotations[a], current.layers[a], config.min_spacing_mm, &boundary);
+                                    let (b_min_x, b_max_x, b_min_y, b_max_y) = board.footprints[b]
+                                        .origin_clamp_range(current.rotations[b], current.layers[b], config.min_spacing_mm, &boundary);
+                                    let pos_a = current.positions[a];
+                                    let pos_b = current.positions[b];
+                                    current.positions[a] = Point::new(pos_b.x.clamp(a_min_x, a_max_x), pos_b.y.clamp(a_min_y, a_max_y));
+                                    current.positions[b] = Point::new(pos_a.x.clamp(b_min_x, b_max_x), pos_a.y.clamp(b_min_y, b_max_y));
                                     modified.push(a);
                                     modified.push(b);
                                 }
@@ -1761,6 +1829,12 @@ pub fn run_auto_placer(
                                 let tie = &ties[rng.gen_range(0..ties.len())];
                                 let idx = tie.passive_idx;
                                 let anchor_pt = current.cached_pads[tie.anchor_idx][tie.anchor_pad_idx];
+                                let angles = [0.0, 90.0, 180.0, 270.0];
+                                let new_rot = angles[rng.gen_range(0..4)];
+                                current.rotations[idx] = new_rot;
+                                let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
+                                    .origin_clamp_range(new_rot, current.layers[idx], config.min_spacing_mm, &boundary);
+
                                 if tie.is_decoupling {
                                     let anchor_center = current.positions[tie.anchor_idx];
                                     let outward_angle = (anchor_pt.y - anchor_center.y)
@@ -1776,32 +1850,28 @@ pub fn run_auto_placer(
                                     let r = rng.gen_range(min_r..=max_r);
                                     let nx = snap_to_grid(
                                         (anchor_pt.x + r * theta.cos())
-                                            .clamp(boundary.min_x + 1.2, boundary.max_x - 1.2),
+                                            .clamp(cx_min, cx_max),
                                         config.grid_step_mm,
                                     );
                                     let ny = snap_to_grid(
                                         (anchor_pt.y + r * theta.sin())
-                                            .clamp(boundary.min_y + 1.2, boundary.max_y - 1.2),
+                                            .clamp(cy_min, cy_max),
                                         config.grid_step_mm,
                                     );
                                     current.positions[idx] = Point::new(nx, ny);
-                                    let angles = [0.0, 90.0, 180.0, 270.0];
-                                    current.rotations[idx] = angles[rng.gen_range(0..4)];
                                     modified.push(idx);
                                 } else {
                                     let nx = snap_to_grid(
                                         (anchor_pt.x + rng.gen_range(-2.5..=2.5))
-                                            .clamp(boundary.min_x + 1.2, boundary.max_x - 1.2),
+                                            .clamp(cx_min, cx_max),
                                         config.grid_step_mm,
                                     );
                                     let ny = snap_to_grid(
                                         (anchor_pt.y + rng.gen_range(-2.5..=2.5))
-                                            .clamp(boundary.min_y + 1.2, boundary.max_y - 1.2),
+                                            .clamp(cy_min, cy_max),
                                         config.grid_step_mm,
                                     );
                                     current.positions[idx] = Point::new(nx, ny);
-                                    let angles = [0.0, 90.0, 180.0, 270.0];
-                                    current.rotations[idx] = angles[rng.gen_range(0..4)];
                                     modified.push(idx);
                                 }
                             }
@@ -1816,18 +1886,25 @@ pub fn run_auto_placer(
                             local_evals += 1;
 
                             let delta = current.cost - old_cost;
-                            let accept = if delta <= 0.0 {
+                            let accept = if current.boundary_violations > old_bv {
+                                false
+                            } else if delta <= 0.0 {
                                 true
                             } else {
-                                rng.gen::<f64>() < (-delta / temp).exp()
+                                current.boundary_violations == 0 && rng.gen::<f64>() < (-delta / temp).exp()
                             };
 
                             if accept {
-                                if current.overlaps == 0 {
-                                    if let Ok(mut g) = global_best.lock() {
-                                        if current.cost < g.cost || g.overlaps > 0 {
-                                            *g = current.clone();
-                                        }
+                                if let Ok(mut g) = global_best.lock() {
+                                    let is_better = if current.boundary_violations != g.boundary_violations {
+                                        current.boundary_violations < g.boundary_violations
+                                    } else if current.overlaps != g.overlaps {
+                                        current.overlaps < g.overlaps
+                                    } else {
+                                        current.cost < g.cost
+                                    };
+                                    if is_better {
+                                        *g = current.clone();
                                     }
                                 }
                             } else {
@@ -1841,6 +1918,7 @@ pub fn run_auto_placer(
                                 current.crossings = old_crossings;
                                 current.wirelength = old_wl;
                                 current.overlaps = old_ov;
+                                current.boundary_violations = old_bv;
                             }
                         }
                     }
@@ -1876,7 +1954,135 @@ pub fn run_auto_placer(
         gpu_done.store(true, Ordering::Relaxed);
     });
 
-    let final_best = global_best.lock().unwrap().clone();
+    let mut final_best = global_best.lock().unwrap().clone();
+
+    // Final containment verification pass:
+    // Guarantee that every component's origin, courtyard vertices, and pad corners stay strictly inside board outline.
+    let boundary = board.boundary_aabb();
+    let min_spacing = config.min_spacing_mm;
+    let board_center = Point::new(
+        (boundary.min_x + boundary.max_x) * 0.5,
+        (boundary.min_y + boundary.max_y) * 0.5,
+    );
+
+    let mut needs_relegalize = false;
+    for (i, fp) in board.footprints.iter().enumerate() {
+        if fp.is_locked {
+            continue;
+        }
+        let rot = final_best.rotations[i];
+        let layer = final_best.layers[i];
+        let (cx_min, cx_max, cy_min, cy_max) = fp.origin_clamp_range(rot, layer, min_spacing, &boundary);
+        let mut pos = final_best.positions[i];
+        let clamped_x = pos.x.clamp(cx_min, cx_max);
+        let clamped_y = pos.y.clamp(cy_min, cy_max);
+        if clamped_x != pos.x || clamped_y != pos.y {
+            pos = Point::new(clamped_x, clamped_y);
+            final_best.positions[i] = pos;
+            final_best.update_component(i, board, config);
+            needs_relegalize = true;
+        }
+
+        // Nudge towards center if any pad or courtyard vertex still violates board contour (e.g. rounded corners)
+        let is_contained = {
+            let mut ok = board.contains_point_in_boundary(&pos);
+            if ok {
+                let polys = fp.transformed_courtyards_layered(pos, rot, layer, min_spacing);
+                for poly in &polys {
+                    for v in &poly.vertices {
+                        if !board.contains_point_in_boundary(v) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                }
+            }
+            if ok {
+                for pad in &fp.pads {
+                    for corner_pt in fp.pad_corners_at(pad, pos, rot, layer) {
+                        if !board.contains_point_in_boundary(&corner_pt) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                }
+            }
+            ok
+        };
+
+        if !is_contained {
+            let dx = board_center.x - pos.x;
+            let dy = board_center.y - pos.y;
+            let dist = dx.hypot(dy).max(1e-4);
+            let ux = dx / dist;
+            let uy = dy / dist;
+
+            let mut step = 0.25;
+            let mut resolved = false;
+            while step <= 15.0 {
+                let cand_pos = Point::new(
+                    snap_to_grid(pos.x + ux * step, config.grid_step_mm),
+                    snap_to_grid(pos.y + uy * step, config.grid_step_mm),
+                );
+                let cand_contained = {
+                    let mut ok = board.contains_point_in_boundary(&cand_pos);
+                    if ok {
+                        let polys = fp.transformed_courtyards_layered(cand_pos, rot, layer, min_spacing);
+                        for poly in &polys {
+                            for v in &poly.vertices {
+                                if !board.contains_point_in_boundary(v) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if !ok {
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        for pad in &fp.pads {
+                            for corner_pt in fp.pad_corners_at(pad, cand_pos, rot, layer) {
+                                if !board.contains_point_in_boundary(&corner_pt) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if !ok {
+                                break;
+                            }
+                        }
+                    }
+                    ok
+                };
+                if cand_contained {
+                    final_best.positions[i] = cand_pos;
+                    final_best.update_component(i, board, config);
+                    resolved = true;
+                    needs_relegalize = true;
+                    break;
+                }
+                step += 0.25;
+            }
+            if !resolved {
+                // ponytail: In extreme geometries fallback to clamped boundary
+                final_best.positions[i] = Point::new(clamped_x, clamped_y);
+                final_best.update_component(i, board, config);
+            }
+        }
+    }
+
+    final_best.evaluate(board, config, &ties);
+    if needs_relegalize || final_best.overlaps > 0 || final_best.boundary_violations > 0 {
+        final_best = legalize_placement(board, config, final_best, live.as_ref());
+    }
+
     final_best.apply_to_board(board);
     if let Some(ref st) = live {
         if let Ok(mut g) = st.lock() {
@@ -2023,6 +2229,7 @@ mod tests {
                 },
             ],
             schematic_positions: HashMap::new(),
+            outline_polygon: None,
         }
     }
 
@@ -2244,6 +2451,7 @@ mod tests {
             vias: Vec::new(),
             clusters: Vec::new(),
             schematic_positions,
+            outline_polygon: None,
         };
 
         let ties = build_passive_ties(&board);
@@ -2335,6 +2543,7 @@ mod tests {
             vias: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
+            outline_polygon: None,
         };
 
         let ties = build_passive_ties(&board);
@@ -2406,6 +2615,7 @@ mod tests {
             vias: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
+            outline_polygon: None,
         };
 
         let cfg = PlacementConfig::default();
@@ -2906,6 +3116,161 @@ mod tests {
         assert!(dist_to_u1 >= 4.2, "Legalized C1 must maintain at least 4.2mm distance (2.0 + 1.0 + 1.2), got {:.2}mm", dist_to_u1);
 
         let _ = fs::remove_file(pcb_path);
+    }
+
+    #[test]
+    fn test_board_outline_boundary_containment_and_legalization() {
+        // Octagonal outline: [100, 150] x [100, 150] with 5mm corner chamfers
+        let outline = Polygon::new(vec![
+            Point::new(105.0, 100.0),
+            Point::new(145.0, 100.0),
+            Point::new(150.0, 105.0),
+            Point::new(150.0, 145.0),
+            Point::new(145.0, 150.0),
+            Point::new(105.0, 150.0),
+            Point::new(100.0, 145.0),
+            Point::new(100.0, 105.0),
+        ]);
+
+        let j3 = Footprint {
+            reference: "J3".to_string(),
+            value: "HEADER".to_string(),
+            x: 120.0,
+            y: 145.0, // Pin 4 extends to 145 + 7.62 = 152.62 > max_y 150.0!
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: vec![
+                Pad::new("1", 0.0, 0.0, 1.4, 1.4, 1, "GND", false),
+                Pad::new("2", 0.0, 2.54, 1.4, 1.4, 1, "GND", false),
+                Pad::new("3", 0.0, 5.08, 1.4, 1.4, 1, "GND", false),
+                Pad::new("4", 0.0, 7.62, 1.4, 1.4, 1, "GND", false),
+            ],
+            width: 2.5,
+            height: 9.62,
+            courtyards: vec![Polygon::new(vec![
+                Point::new(-1.25, -1.0),
+                Point::new(1.25, -1.0),
+                Point::new(1.25, 8.62),
+                Point::new(-1.25, 8.62),
+            ])],
+            perimeters: Vec::new(),
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+
+        // Small 0603 passive in the chamfered corner: (101, 101) is inside AABB [100, 150], but outside chamfered contour
+        let c1 = Footprint {
+            reference: "C1".to_string(),
+            value: "100nF".to_string(),
+            x: 101.5,
+            y: 101.5,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: vec![
+                Pad::new("1", -0.7, 0.0, 0.6, 0.6, 1, "GND", false),
+                Pad::new("2", 0.7, 0.0, 0.6, 0.6, 2, "VCC", false),
+            ],
+            width: 2.0,
+            height: 1.2,
+            courtyards: vec![Polygon::new(vec![
+                Point::new(-1.0, -0.6),
+                Point::new(1.0, -0.6),
+                Point::new(1.0, 0.6),
+                Point::new(-1.0, 0.6),
+            ])],
+            perimeters: Vec::new(),
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+        };
+
+        let nets = vec!["".to_string(), "GND".to_string(), "VCC".to_string()];
+        let mut net_name_to_id = HashMap::new();
+        for (i, n) in nets.iter().enumerate() {
+            net_name_to_id.insert(n.clone(), i);
+        }
+        let mut netclasses = HashMap::new();
+        netclasses.insert("Default".to_string(), NetClass::default());
+        let mut net_to_class = HashMap::new();
+        for n in &nets {
+            net_to_class.insert(n.clone(), "Default".to_string());
+        }
+
+        let mut board = Board {
+            file_path: String::new(),
+            raw_content: "()".to_string(),
+            min_x: 100.0,
+            min_y: 100.0,
+            max_x: 150.0,
+            max_y: 150.0,
+            footprints: vec![j3.clone(), c1.clone()],
+            holding_palette: Vec::new(),
+            nets,
+            net_name_to_id,
+            netclasses,
+            net_to_class,
+            keepouts: Vec::new(),
+            tracks: Vec::new(),
+            vias: Vec::new(),
+            clusters: Vec::new(),
+            schematic_positions: HashMap::new(),
+            outline_polygon: Some(outline),
+        };
+
+        let cfg = PlacementConfig {
+            grid_step_mm: 0.25,
+            min_spacing_mm: 0.25,
+            duration_secs: 1,
+            ..PlacementConfig::default()
+        };
+
+        // 1. Verify that J3 at (120, 145) is rejected because pin 4 exceeds the boundary
+        assert!(
+            !is_placement_legal(&board, &j3, Point::new(120.0, 145.0), 0.0, 0, cfg.min_spacing_mm),
+            "J3 with pin 4 protruding past boundary must be illegal"
+        );
+
+        // 2. Verify that C1 at (101.5, 101.5) is rejected because it is inside the chamfer corner
+        assert!(
+            !is_placement_legal(&board, &c1, Point::new(101.5, 101.5), 0.0, 0, cfg.min_spacing_mm),
+            "C1 inside corner chamfer cutout must be illegal"
+        );
+
+        // 3. Verify that initial state has boundary violations
+        let init_st = PlacementState::from_board(&board, &cfg);
+        assert!(
+            init_st.boundary_violations > 0,
+            "Initial placement must register boundary violations"
+        );
+
+        // 4. Legalize placement and verify that all boundary violations are eliminated
+        let legalized = legalize_placement(&mut board, &cfg, init_st, None);
+        assert_eq!(
+            legalized.boundary_violations, 0,
+            "Legalizer must eliminate all boundary violations"
+        );
+        assert_eq!(legalized.overlaps, 0, "Legalizer must eliminate overlaps");
+
+        // Verify every pad corner of both components is inside the board outline polygon
+        legalized.apply_to_board(&mut board);
+        for fp in &board.footprints {
+            let pos = Point::new(fp.x, fp.y);
+            assert!(board.contains_point_in_boundary(&pos), "Footprint origin {} must be inside", fp.reference);
+            for pad in &fp.pads {
+                for corner in fp.pad_corners_at(pad, pos, fp.rotation, fp.layer) {
+                    assert!(
+                        board.contains_point_in_boundary(&corner),
+                        "Pad {} corner ({:.2}, {:.2}) of {} must be inside board outline",
+                        pad.number, corner.x, corner.y, fp.reference
+                    );
+                }
+            }
+        }
     }
 }
 
