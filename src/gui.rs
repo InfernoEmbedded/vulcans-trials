@@ -102,47 +102,8 @@ pub fn copper_layers_draw_order<'a>(active_layers: &[&'a str]) -> Vec<&'a str> {
     order
 }
 
-/// KiCad-standard 45° dogleg corner computation.
-/// When `diagonal_first` is false: straight horizontal/vertical segment first, then 45° diagonal to p1.
-/// When `diagonal_first` is true: 45° diagonal segment first, then straight horizontal/vertical to p1.
-pub fn compute_45_dogleg(p0: (f64, f64), p1: (f64, f64), diagonal_first: bool) -> Vec<(f64, f64)> {
-    let dx = p1.0 - p0.0;
-    let dy = p1.1 - p0.1;
-    let abs_dx = dx.abs();
-    let abs_dy = dy.abs();
+pub use crate::router::{compute_45_dogleg, is_octilinear_segment};
 
-    if abs_dx < 1e-6 && abs_dy < 1e-6 {
-        return vec![p0];
-    }
-
-    let sign_x = if dx >= 0.0 { 1.0 } else { -1.0 };
-    let sign_y = if dy >= 0.0 { 1.0 } else { -1.0 };
-
-    let corner = if abs_dx > abs_dy {
-        // Dominant direction: horizontal
-        if diagonal_first {
-            (p0.0 + sign_x * abs_dy, p1.1)
-        } else {
-            (p1.0 - sign_x * abs_dy, p0.1)
-        }
-    } else {
-        // Dominant direction: vertical (or equal)
-        if diagonal_first {
-            (p1.0, p0.1 + sign_y * abs_dx)
-        } else {
-            (p0.0, p1.1 - sign_y * abs_dx)
-        }
-    };
-
-    let dist_to_p0 = (corner.0 - p0.0).hypot(corner.1 - p0.1);
-    let dist_to_p1 = (corner.0 - p1.0).hypot(corner.1 - p1.1);
-
-    if dist_to_p0 < 1e-6 || dist_to_p1 < 1e-6 {
-        vec![p0, p1]
-    } else {
-        vec![p0, corner, p1]
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct ActiveRoute {

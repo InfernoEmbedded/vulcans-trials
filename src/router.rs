@@ -40,6 +40,56 @@ pub struct RoutingGrid {
     pub vulkan: Option<Arc<VulkanEngine>>,
 }
 
+/// Checks whether a segment conforms to the standard octilinear 45-degree grid (0°, 45°, 90°, etc.).
+#[inline]
+pub fn is_octilinear_segment(p1: (f64, f64), p2: (f64, f64)) -> bool {
+    let dx = (p2.0 - p1.0).abs();
+    let dy = (p2.1 - p1.1).abs();
+    dx < 1e-4 || dy < 1e-4 || (dx - dy).abs() < 1e-4
+}
+
+/// KiCad-standard 45° dogleg corner computation.
+/// When `diagonal_first` is false: straight horizontal/vertical segment first, then 45° diagonal to p1.
+/// When `diagonal_first` is true: 45° diagonal segment first, then straight horizontal/vertical to p1.
+pub fn compute_45_dogleg(p0: (f64, f64), p1: (f64, f64), diagonal_first: bool) -> Vec<(f64, f64)> {
+    let dx = p1.0 - p0.0;
+    let dy = p1.1 - p0.1;
+    let abs_dx = dx.abs();
+    let abs_dy = dy.abs();
+
+    if abs_dx < 1e-6 && abs_dy < 1e-6 {
+        return vec![p0];
+    }
+
+    let sign_x = if dx >= 0.0 { 1.0 } else { -1.0 };
+    let sign_y = if dy >= 0.0 { 1.0 } else { -1.0 };
+
+    let corner = if abs_dx > abs_dy {
+        // Dominant direction: horizontal
+        if diagonal_first {
+            (p0.0 + sign_x * abs_dy, p1.1)
+        } else {
+            (p1.0 - sign_x * abs_dy, p0.1)
+        }
+    } else {
+        // Dominant direction: vertical (or equal)
+        if diagonal_first {
+            (p1.0, p0.1 + sign_y * abs_dx)
+        } else {
+            (p0.0, p1.1 - sign_y * abs_dx)
+        }
+    };
+
+    let dist_to_p0 = (corner.0 - p0.0).hypot(corner.1 - p0.1);
+    let dist_to_p1 = (corner.0 - p1.0).hypot(corner.1 - p1.1);
+
+    if dist_to_p0 < 1e-6 || dist_to_p1 < 1e-6 {
+        vec![p0, p1]
+    } else {
+        vec![p0, corner, p1]
+    }
+}
+
 impl RoutingGrid {
     pub fn new(board: &Board, res: f64, vulkan: Option<Arc<VulkanEngine>>) -> Self {
         let min_x = board.min_x;
@@ -1068,6 +1118,11 @@ impl NudgeEngine {
             let m = ((a.0 + b.0) * 0.5 + d.0, (a.1 + b.1) * 0.5 + d.1);
             vec![(a, m), (m, b)]
         };
+
+        // Guard: do not introduce non-octilinear track segments during continuous shove
+        if candidate_segments.iter().any(|&(p1, p2)| !is_octilinear_segment(p1, p2)) {
+            return false;
+        }
 
         let backup_tracks = board.tracks.clone();
 
@@ -3704,19 +3759,37 @@ impl AutoRouter {
                     run_end_idx += 1;
                 }
 
+                let is_start_terminal = run_start_idx == 0
+                    && (conn.start.2 == current_layer || is_tht_start);
+                let is_end_terminal = run_end_idx + 1 == path.len()
+                    && (conn.end.2 == current_layer || is_tht_end);
+
+                let w_start = if let Some(lv) = last_trans_via.take() {
+                    lv
+                } else {
+                    grid.grid_to_world(path[run_start_idx].gx, path[run_start_idx].gy)
+                };
+
                 if run_end_idx > run_start_idx {
-                    let w_start = if let Some(lv) = last_trans_via.take() {
-                        lv
-                    } else {
-                        grid.grid_to_world(path[run_start_idx].gx, path[run_start_idx].gy)
-                    };
-                    let mut seg_start = if run_start_idx == 0
-                        && (conn.start.2 == current_layer || is_tht_start)
-                    {
-                        (conn.start.0, conn.start.1)
-                    } else {
-                        w_start
-                    };
+                    // 1. Connect start pad/terminal to w_start via 45° dogleg
+                    if is_start_terminal {
+                        let dogleg = compute_45_dogleg((conn.start.0, conn.start.1), w_start, false);
+                        for w in dogleg.windows(2) {
+                            if (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) > 1e-4 {
+                                board.tracks.push(TrackSegment {
+                                    start: w[0],
+                                    end: w[1],
+                                    width,
+                                    layer: current_layer,
+                                    net_id: conn.net_id,
+                                    is_locked: false,
+                                });
+                            }
+                        }
+                    }
+
+                    // 2. On-grid path segments (strictly octilinear 0°, 45°, 90°)
+                    let mut seg_start = w_start;
                     let mut prev_dx = path[run_start_idx + 1].gx as isize - path[run_start_idx].gx as isize;
                     let mut prev_dy = path[run_start_idx + 1].gy as isize - path[run_start_idx].gy as isize;
 
@@ -3725,14 +3798,16 @@ impl AutoRouter {
                         let cur_dy = path[i + 1].gy as isize - path[i].gy as isize;
                         if cur_dx != prev_dx || cur_dy != prev_dy {
                             let corner = grid.grid_to_world(path[i].gx, path[i].gy);
-                            board.tracks.push(TrackSegment {
-                                start: seg_start,
-                                end: corner,
-                                width,
-                                layer: current_layer,
-                                net_id: conn.net_id,
-                                is_locked: false,
-                            });
+                            if (seg_start.0 - corner.0).hypot(seg_start.1 - corner.1) > 1e-4 {
+                                board.tracks.push(TrackSegment {
+                                    start: seg_start,
+                                    end: corner,
+                                    width,
+                                    layer: current_layer,
+                                    net_id: conn.net_id,
+                                    is_locked: false,
+                                });
+                            }
                             seg_start = corner;
                             prev_dx = cur_dx;
                             prev_dy = cur_dy;
@@ -3740,46 +3815,63 @@ impl AutoRouter {
                     }
 
                     let w_end = grid.grid_to_world(path[run_end_idx].gx, path[run_end_idx].gy);
-                    let end_pt = if run_end_idx + 1 == path.len()
-                        && (conn.end.2 == current_layer || is_tht_end)
-                    {
-                        (conn.end.0, conn.end.1)
-                    } else {
-                        w_end
-                    };
-                    if (seg_start.0 - end_pt.0).hypot(seg_start.1 - end_pt.1) > 1e-4 {
+                    if (seg_start.0 - w_end.0).hypot(seg_start.1 - w_end.1) > 1e-4 {
                         board.tracks.push(TrackSegment {
                             start: seg_start,
-                            end: end_pt,
+                            end: w_end,
                             width,
                             layer: current_layer,
                             net_id: conn.net_id,
                             is_locked: false,
                         });
                     }
+
+                    // 3. Connect w_end to end pad/terminal via 45° dogleg
+                    if is_end_terminal {
+                        let dogleg = compute_45_dogleg(w_end, (conn.end.0, conn.end.1), false);
+                        for w in dogleg.windows(2) {
+                            if (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) > 1e-4 {
+                                board.tracks.push(TrackSegment {
+                                    start: w[0],
+                                    end: w[1],
+                                    width,
+                                    layer: current_layer,
+                                    net_id: conn.net_id,
+                                    is_locked: false,
+                                });
+                            }
+                        }
+                    }
                 } else {
-                    let w_pt = if let Some(lv) = last_trans_via.take() {
-                        lv
-                    } else {
-                        grid.grid_to_world(path[run_start_idx].gx, path[run_start_idx].gy)
-                    };
-                    let target_pt = if run_start_idx == 0 && (conn.start.2 == current_layer || is_tht_start) {
-                        Some((conn.start.0, conn.start.1))
-                    } else if run_end_idx + 1 == path.len() && (conn.end.2 == current_layer || is_tht_end) {
-                        Some((conn.end.0, conn.end.1))
-                    } else {
-                        None
-                    };
-                    if let Some(t_pt) = target_pt {
-                        if (t_pt.0 - w_pt.0).hypot(t_pt.1 - w_pt.1) > 1e-4 {
-                            board.tracks.push(TrackSegment {
-                                start: t_pt,
-                                end: w_pt,
-                                width,
-                                layer: current_layer,
-                                net_id: conn.net_id,
-                                is_locked: false,
-                            });
+                    let w_pt = w_start;
+                    if is_start_terminal {
+                        let dogleg = compute_45_dogleg((conn.start.0, conn.start.1), w_pt, false);
+                        for w in dogleg.windows(2) {
+                            if (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) > 1e-4 {
+                                board.tracks.push(TrackSegment {
+                                    start: w[0],
+                                    end: w[1],
+                                    width,
+                                    layer: current_layer,
+                                    net_id: conn.net_id,
+                                    is_locked: false,
+                                });
+                            }
+                        }
+                    }
+                    if is_end_terminal {
+                        let dogleg = compute_45_dogleg(w_pt, (conn.end.0, conn.end.1), false);
+                        for w in dogleg.windows(2) {
+                            if (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) > 1e-4 {
+                                board.tracks.push(TrackSegment {
+                                    start: w[0],
+                                    end: w[1],
+                                    width,
+                                    layer: current_layer,
+                                    net_id: conn.net_id,
+                                    is_locked: false,
+                                });
+                            }
                         }
                     }
                 }
@@ -4315,6 +4407,7 @@ impl AutoRouter {
                                 true
                             };
                             if in_bounds
+                                && is_octilinear_segment((px, py), cand_tip)
                                 && !collides_own(cand_tip)
                                 && !collides_foreign(cand_tip)
                                 && is_track_segment_legal(board, (px, py), cand_tip, stub_w, fp.layer, pad.net_id, eff_clearance)
@@ -4439,7 +4532,10 @@ impl AutoRouter {
                     // Try to connect to an existing nearby GND via first
                     let mut connected_to_existing = false;
                     for v in &board.vias {
-                        if v.net_id == gnd_net_id && (v.position.0 - px).hypot(v.position.1 - py) < 1.5 {
+                        if v.net_id == gnd_net_id
+                            && (v.position.0 - px).hypot(v.position.1 - py) < 1.5
+                            && is_octilinear_segment((px, py), v.position)
+                        {
                             if is_track_segment_legal(board, (px, py), v.position, track_w, fp.layer, gnd_net_id, gnd_c) {
                                 board.tracks.push(TrackSegment {
                                     start: (px, py),
@@ -4499,10 +4595,15 @@ impl AutoRouter {
 
         let mut offsets = Vec::new();
         for &dist in &[min_d, min_d + 0.25, min_d + 0.50, min_d + 0.75, min_d + 1.0, min_d + 1.25] {
-            for step in 0..16 {
-                let angle = (step as f64) * std::f64::consts::PI / 8.0;
-                offsets.push((dist * angle.cos(), dist * angle.sin()));
-            }
+            let diag_d = dist * std::f64::consts::FRAC_1_SQRT_2;
+            offsets.push((dist, 0.0));
+            offsets.push((-dist, 0.0));
+            offsets.push((0.0, dist));
+            offsets.push((0.0, -dist));
+            offsets.push((diag_d, diag_d));
+            offsets.push((diag_d, -diag_d));
+            offsets.push((-diag_d, diag_d));
+            offsets.push((-diag_d, -diag_d));
         }
 
         let via_r = 0.35;
@@ -5644,10 +5745,7 @@ pub fn rubber_band_straighten(chain: &mut TrackChain, board: &Board, grid: &Rout
                 }
                 let p1 = chain.points[i];
                 let p2 = chain.points[j];
-                let dx = p2.0 - p1.0;
-                let dy = p2.1 - p1.1;
-                let is_octilinear = dx.abs() < 1e-4 || dy.abs() < 1e-4 || (dx.abs() - dy.abs()).abs() < 1e-4;
-                if is_octilinear && is_segment_clear(board, Some(grid), p1, p2, chain.layer, chain.net_id, chain.width) {
+                if is_octilinear_segment(p1, p2) && is_segment_clear(board, Some(grid), p1, p2, chain.layer, chain.net_id, chain.width) {
                     best_j = Some(j);
                     break;
                 }
@@ -5765,11 +5863,7 @@ pub fn reduce_jogs(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
     let mut pass = 0;
     let max_jog_offset = (2.0 * chain.width).max(0.30);
 
-    let is_oct = |a: (f64, f64), b: (f64, f64)| -> bool {
-        let dx = b.0 - a.0;
-        let dy = b.1 - a.1;
-        dx.abs() < 1e-4 || dy.abs() < 1e-4 || (dx.abs() - dy.abs()).abs() < 1e-4
-    };
+    let is_oct = is_octilinear_segment;
 
     let is_special_point = |pt: (f64, f64)| -> bool {
         board.footprints.iter().any(|fp| {
@@ -5838,11 +5932,7 @@ pub fn avoid_acid_traps(chain: &mut TrackChain, board: &Board, grid: &RoutingGri
     let is_special_point = |pt: (f64, f64)| -> bool {
         is_pad_center(pt) || board.vias.iter().any(|v| (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05)
     };
-    let is_oct = |a: (f64, f64), b: (f64, f64)| -> bool {
-        let dx = b.0 - a.0;
-        let dy = b.1 - a.1;
-        dx.abs() < 1e-4 || dy.abs() < 1e-4 || (dx.abs() - dy.abs()).abs() < 1e-4
-    };
+    let is_oct = is_octilinear_segment;
 
     let mut changed = true;
     let mut pass = 0;
@@ -5945,11 +6035,7 @@ pub fn reduce_corners(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid)
     let is_special_point = |pt: (f64, f64)| -> bool {
         is_pad_center(pt) || board.vias.iter().any(|v| (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05)
     };
-    let is_oct = |a: (f64, f64), b: (f64, f64)| -> bool {
-        let dx = b.0 - a.0;
-        let dy = b.1 - a.1;
-        dx.abs() < 1e-4 || dy.abs() < 1e-4 || (dx.abs() - dy.abs()).abs() < 1e-4
-    };
+    let is_oct = is_octilinear_segment;
 
     let mut changed = true;
     let mut pass = 0;
@@ -6181,7 +6267,9 @@ pub fn smoothen_corners(chain: &mut TrackChain, board: &Board, grid: &RoutingGri
                 let m1 = (curr.0 - setback * (v1.0 / l1), curr.1 - setback * (v1.1 / l1));
                 let m2 = (curr.0 + setback * (v2.0 / l2), curr.1 + setback * (v2.1 / l2));
 
-                if is_segment_clear(board, Some(grid), m1, m2, chain.layer, chain.net_id, chain.width) {
+                if is_octilinear_segment(m1, m2)
+                    && is_segment_clear(board, Some(grid), m1, m2, chain.layer, chain.net_id, chain.width)
+                {
                     new_points.push(m1);
                     new_points.push(m2);
                     chamfered = true;
@@ -6370,9 +6458,10 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid) -> bool {
 
                 let mut winner_path = None;
 
-                // Priority 1: Direct segment on l_orig
+                // Priority 1: Direct segment on l_orig (strictly octilinear 0°, 45°, 90°)
                 let direct_len = (v2_pos.0 - v1_pos.0).hypot(v2_pos.1 - v1_pos.1);
-                if direct_len <= orig_len * 1.25 + 1e-4
+                if is_octilinear_segment(v1_pos, v2_pos)
+                    && direct_len <= orig_len * 1.25 + 1e-4
                     && (direct_len - orig_len) <= 5.0 + 1e-4
                     && is_segment_clear(board, Some(grid), v1_pos, v2_pos, l_orig, net_id, track_width)
                 {
@@ -6612,9 +6701,10 @@ fn consolidate_single_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
 
                 let mut winner_path = None;
 
-                // Priority 1: Direct segment on l_prim
+                // Priority 1: Direct segment on l_prim (strictly octilinear 0°, 45°, 90°)
                 let direct_len = (curr_pt.0 - v_pos.0).hypot(curr_pt.1 - v_pos.1);
-                if direct_len <= orig_len * 1.25 + 1e-4
+                if is_octilinear_segment(v_pos, curr_pt)
+                    && direct_len <= orig_len * 1.25 + 1e-4
                     && (direct_len - orig_len) <= 5.0 + 1e-4
                     && is_segment_clear(board, Some(grid), v_pos, curr_pt, l_prim, net_id, track_width)
                     && is_track_segment_legal(board, v_pos, curr_pt, track_width, l_prim, net_id, clearance)
@@ -6758,10 +6848,7 @@ fn slide_and_align_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
                     let d = (v_pos.0 - px).hypot(v_pos.1 - py);
                     if d > 1e-4 && d < 0.50 {
                         let all_clear = incident.iter().all(|&(_, l, other, w)| {
-                            let dx = (other.0 - px).abs();
-                            let dy = (other.1 - py).abs();
-                            let is_octilinear = dx < 1e-4 || dy < 1e-4 || (dx - dy).abs() < 1e-4;
-                            is_octilinear
+                            is_octilinear_segment((px, py), other)
                                 && is_track_segment_legal(board, (px, py), other, w, l, net_id, clearance)
                                 && is_segment_clear(board, Some(grid), (px, py), other, l, net_id, w)
                         });
@@ -6812,10 +6899,7 @@ fn slide_and_align_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
                                 } else if (ot_other.0 - other_pt.0).hypot(ot_other.1 - other_pt.1) < 1e-4 {
                                     true
                                 } else {
-                                    let dx = (ot_other.0 - other_pt.0).abs();
-                                    let dy = (ot_other.1 - other_pt.1).abs();
-                                    let is_octilinear = dx < 1e-4 || dy < 1e-4 || (dx - dy).abs() < 1e-4;
-                                    is_octilinear
+                                    is_octilinear_segment(other_pt, ot_other)
                                         && is_track_segment_legal(board, other_pt, ot_other, ot_w, ot_layer, net_id, clearance)
                                         && is_segment_clear(board, Some(grid), other_pt, ot_other, ot_layer, net_id, ot_w)
                                 }
@@ -6869,10 +6953,7 @@ fn slide_and_align_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
                     if (other.0 - cand.0).hypot(other.1 - cand.1) < 1e-4 {
                         true
                     } else {
-                        let dx = (other.0 - cand.0).abs();
-                        let dy = (other.1 - cand.1).abs();
-                        let is_octilinear = dx < 1e-4 || dy < 1e-4 || (dx - dy).abs() < 1e-4;
-                        is_octilinear
+                        is_octilinear_segment(cand, other)
                             && is_track_segment_legal(board, cand, other, w, l, net_id, clearance)
                             && is_segment_clear(board, Some(grid), cand, other, l, net_id, w)
                     }
@@ -6908,6 +6989,36 @@ fn slide_and_align_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
     false
 }
 
+/// Decomposes any non-octilinear segment in a track chain into standard 45° doglegs.
+pub fn enforce_45_grid(chain: &mut TrackChain) {
+    if chain.points.len() < 2 {
+        return;
+    }
+    let mut new_points = Vec::with_capacity(chain.points.len() * 2);
+    new_points.push(chain.points[0]);
+
+    for k in 0..chain.points.len() - 1 {
+        let p0 = *new_points.last().unwrap();
+        let p1 = chain.points[k + 1];
+        if (p0.0 - p1.0).hypot(p0.1 - p1.1) < 1e-5 {
+            continue;
+        }
+        if is_octilinear_segment(p0, p1) {
+            new_points.push(p1);
+        } else {
+            let dogleg = compute_45_dogleg(p0, p1, false);
+            for &dp in &dogleg[1..] {
+                if (dp.0 - new_points.last().unwrap().0).hypot(dp.1 - new_points.last().unwrap().1) > 1e-5 {
+                    new_points.push(dp);
+                }
+            }
+        }
+    }
+
+    chain.points = new_points;
+    merge_collinear_points(&mut chain.points);
+}
+
 pub fn gloss_tracks(board: &mut Board, grid: &RoutingGrid) {
     let mut net_ids: Vec<usize> = board
         .tracks
@@ -6933,6 +7044,7 @@ pub fn gloss_tracks(board: &mut Board, grid: &RoutingGrid) {
 
         let mut chains = extract_track_chains(&net_tracks, board);
         for chain in &mut chains {
+            enforce_45_grid(chain);
             merge_collinear_points(&mut chain.points);
             avoid_acid_traps(chain, board, grid);
             merge_collinear_points(&mut chain.points);
@@ -6945,6 +7057,7 @@ pub fn gloss_tracks(board: &mut Board, grid: &RoutingGrid) {
             merge_collinear_points(&mut chain.points);
             smoothen_corners(chain, board, grid);
             avoid_acid_traps(chain, board, grid);
+            enforce_45_grid(chain);
             merge_collinear_points(&mut chain.points);
         }
 
@@ -10214,6 +10327,66 @@ mod tests {
         let dx = (m2.0 - m1.0).abs();
         let dy = (m2.1 - m1.1).abs();
         assert!((dx - dy).abs() < 1e-4, "Miter segment must be 45 degrees: dx={}, dy={}", dx, dy);
+    }
+
+    #[test]
+    fn test_octilinear_segment_math_and_doglegs() {
+        // 1. Horizontal & Vertical segments
+        assert!(is_octilinear_segment((0.0, 0.0), (10.0, 0.0)));
+        assert!(is_octilinear_segment((0.0, 0.0), (0.0, -5.5)));
+        assert!(is_octilinear_segment((141.0, 102.65), (142.95, 102.65)));
+
+        // 2. 45-degree diagonal segments
+        assert!(is_octilinear_segment((0.0, 0.0), (3.0, 3.0)));
+        assert!(is_octilinear_segment((10.0, 10.0), (5.0, 15.0)));
+        assert!(is_octilinear_segment((142.92, 102.62), (142.95, 102.65)));
+
+        // 3. Non-octilinear segments (should be rejected)
+        assert!(!is_octilinear_segment((141.0, 102.62), (142.95, 102.65))); // 0.88° tilt
+        assert!(!is_octilinear_segment((0.0, 0.0), (1.0, 2.0))); // ~63.4°
+        assert!(!is_octilinear_segment((10.0, 10.0), (12.0, 13.0))); // non-45°
+
+        // 4. compute_45_dogleg decomposes non-octilinear points into strictly octilinear segments
+        let dogleg = compute_45_dogleg((141.0, 102.62), (142.95, 102.65), false);
+        assert_eq!(dogleg.len(), 3);
+        assert!(is_octilinear_segment(dogleg[0], dogleg[1]));
+        assert!(is_octilinear_segment(dogleg[1], dogleg[2]));
+
+        let dogleg_diag = compute_45_dogleg((141.0, 102.62), (142.95, 102.65), true);
+        assert_eq!(dogleg_diag.len(), 3);
+        assert!(is_octilinear_segment(dogleg_diag[0], dogleg_diag[1]));
+        assert!(is_octilinear_segment(dogleg_diag[1], dogleg_diag[2]));
+    }
+
+    #[test]
+    fn test_enforce_45_grid_decomposes_arbitrary_angles() {
+        // A track chain with intentional non-octilinear segments (e.g. from off-grid pad to grid corner)
+        let mut chain = TrackChain {
+            net_id: 1,
+            layer: 0,
+            width: 0.20,
+            points: vec![
+                (141.000, 102.620), // off-grid pad
+                (142.950, 102.650), // grid corner (0.88 deg tilt)
+                (150.000, 102.650), // horizontal
+                (152.000, 104.650), // 45 degree
+                (153.250, 105.388), // weird angle ~48.4 deg
+            ],
+        };
+
+        enforce_45_grid(&mut chain);
+
+        // Every segment in the chain must strictly conform to 0°, 45°, or 90°
+        for w in chain.points.windows(2) {
+            let p1 = w[0];
+            let p2 = w[1];
+            assert!(
+                is_octilinear_segment(p1, p2),
+                "Segment from {:?} to {:?} must be octilinear (0°, 45°, 90°)",
+                p1,
+                p2
+            );
+        }
     }
 }
 
