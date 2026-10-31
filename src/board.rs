@@ -282,6 +282,47 @@ impl Polygon {
         }
     }
 
+    pub fn convex_hull(&self) -> Polygon {
+        if self.vertices.len() <= 3 {
+            return self.clone();
+        }
+        let mut pts = self.vertices.clone();
+        pts.sort_by(|a, b| {
+            a.x.partial_cmp(&b.x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        pts.dedup_by(|a, b| (a.x - b.x).hypot(a.y - b.y) < 1e-5);
+        if pts.len() <= 3 {
+            return Polygon::new(pts);
+        }
+
+        let cross = |o: Point, a: Point, b: Point| -> f64 {
+            (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+        };
+
+        let mut lower = Vec::new();
+        for &p in &pts {
+            while lower.len() >= 2 && cross(lower[lower.len() - 2], lower[lower.len() - 1], p) <= 1e-6 {
+                lower.pop();
+            }
+            lower.push(p);
+        }
+
+        let mut upper = Vec::new();
+        for &p in pts.iter().rev() {
+            while upper.len() >= 2 && cross(upper[upper.len() - 2], upper[upper.len() - 1], p) <= 1e-6 {
+                upper.pop();
+            }
+            upper.push(p);
+        }
+
+        lower.pop();
+        upper.pop();
+        lower.extend(upper);
+        Polygon::new(lower)
+    }
+
     pub fn intersects_convex(&self, other: &Polygon) -> bool {
         if self.vertices.len() < 3 || other.vertices.len() < 3 || !self.aabb().overlaps(&other.aabb()) {
             return false;
@@ -1079,7 +1120,7 @@ impl Board {
                             extract_xy_into_bounds(block, &mut kmin_x, &mut kmin_y, &mut kmax_x, &mut kmax_y);
                             if kmin_x < kmax_x && kmin_y < kmax_y {
                                 keepouts.push(KeepoutZone {
-                                    min_x: if kmin_x > 170.0 { kmin_x.max(172.1) } else { kmin_x },
+                                    min_x: kmin_x,
                                     min_y: kmin_y,
                                     max_x: kmax_x,
                                     max_y: kmax_y,
@@ -1095,6 +1136,34 @@ impl Board {
                         let block = &content[i..end];
                         if let Some(fp) = parse_footprint(block, i, &mut nets, &mut net_name_to_id, extra_locked) {
                             footprints.push(fp);
+                        }
+                        if block.contains("(keepout") {
+                            let mut k_idx = 0;
+                            while let Some(z_pos) = block[k_idx..].find("(zone") {
+                                let abs_z = k_idx + z_pos;
+                                if let Some(z_end) = find_closing_paren(block.as_bytes(), abs_z) {
+                                    let z_block = &block[abs_z..z_end];
+                                    if z_block.contains("(keepout") {
+                                        let mut kmin_x = f64::INFINITY;
+                                        let mut kmin_y = f64::INFINITY;
+                                        let mut kmax_x = f64::NEG_INFINITY;
+                                        let mut kmax_y = f64::NEG_INFINITY;
+                                        extract_xy_into_bounds(z_block, &mut kmin_x, &mut kmin_y, &mut kmax_x, &mut kmax_y);
+                                        if kmin_x < kmax_x && kmin_y < kmax_y {
+                                            keepouts.push(KeepoutZone {
+                                                min_x: kmin_x,
+                                                min_y: kmin_y,
+                                                max_x: kmax_x,
+                                                max_y: kmax_y,
+                                                layers: (0..active_layers.len()).collect(),
+                                            });
+                                        }
+                                    }
+                                    k_idx = z_end;
+                                } else {
+                                    break;
+                                }
+                            }
                         }
                         i = end;
                         continue;
@@ -2484,8 +2553,6 @@ fn parse_footprint(
 
     let perimeters = courtyards.clone();
 
-    // Decompose any non-convex polygons into convex sub-polygons so SAT
-    // does not falsely treat concave notches (e.g. ESP32 module pins) as collisions.
     let mut convex_courtyards = Vec::new();
     for poly in courtyards {
         convex_courtyards.extend(poly.decompose_convex());

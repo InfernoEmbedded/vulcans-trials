@@ -456,6 +456,34 @@ impl PlacementState {
                     fp_violated = true;
                 }
             }
+            if !fp_violated {
+                let fp_layer = self.layers[i];
+                for ko in &board.keepouts {
+                    if !ko.layers.contains(&fp_layer) {
+                        continue;
+                    }
+                    let ko_poly = Polygon::from_rect(ko.min_x, ko.min_y, ko.max_x - ko.min_x, ko.max_y - ko.min_y);
+                    for poly in &self.cached_courtyards[i] {
+                        if poly.intersects_convex(&ko_poly) {
+                            boundary_cost += config.boundary_penalty * 20.0;
+                            fp_violated = true;
+                            break;
+                        }
+                    }
+                    if !fp_violated {
+                        for p in &self.cached_pads[i] {
+                            if ko_poly.contains_point(p) {
+                                boundary_cost += config.boundary_penalty * 20.0;
+                                fp_violated = true;
+                                break;
+                            }
+                        }
+                    }
+                    if fp_violated {
+                        break;
+                    }
+                }
+            }
             if fp_violated {
                 boundary_violations += 1;
             }
@@ -1667,10 +1695,11 @@ pub fn run_auto_placer(
     let boundary = board.boundary_aabb();
     let ties = Arc::new(build_passive_ties(board));
 
-    // Precompute connected foreign pad references for barycentric centroid pull moves
+    // Precompute connected foreign pad references for barycentric centroid pull moves.
+    // Exclude plane ground and wide distribution nets so components are not pulled into central IC ground pads.
     let mut connected_pins: Vec<Vec<(usize, usize)>> = vec![Vec::new(); board.footprints.len()];
-    for (net_id, _) in board.nets.iter().enumerate() {
-        if net_id == 0 {
+    for (net_id, net_name) in board.nets.iter().enumerate() {
+        if net_id == 0 || is_ground_net(net_name) {
             continue;
         }
         let mut net_pads: Vec<(usize, usize)> = Vec::new();
@@ -1680,6 +1709,9 @@ pub fn run_auto_placer(
                     net_pads.push((f_idx, p_idx));
                 }
             }
+        }
+        if net_pads.len() > 8 {
+            continue;
         }
         for &(fa, _) in &net_pads {
             for &(fb, pb) in &net_pads {
@@ -2168,7 +2200,6 @@ pub fn run_auto_placer(
     if needs_relegalize || final_best.overlaps > 0 || final_best.boundary_violations > 0 {
         final_best = legalize_placement(board, config, final_best, live.as_ref());
     }
-
     final_best.apply_to_board(board);
     if let Some(ref st) = live {
         if let Ok(mut g) = st.lock() {
@@ -3498,6 +3529,103 @@ mod tests {
             let p = Point::new(fp.x, fp.y);
             assert!(board.contains_point_in_boundary(&p), "Footprint {} must be within boundary", fp.reference);
         }
+    }
+
+    #[test]
+    fn test_esp32_footprint_and_keepout_exclusion() {
+        let mut board = make_synthetic_board();
+        board.clusters.clear();
+        board.min_x = 100.0;
+        board.min_y = 80.0;
+        board.max_x = 190.0;
+        board.max_y = 130.0;
+
+        let esp32_t_poly = Polygon::new(vec![
+            Point::new(-9.75, 7.15),
+            Point::new(9.75, 7.15),
+            Point::new(9.75, -6.85),
+            Point::new(14.25, -6.85),
+            Point::new(14.25, -18.35),
+            Point::new(-14.25, -18.35),
+            Point::new(-14.25, -6.85),
+            Point::new(-9.75, -6.85),
+        ]);
+        let esp32_courtyards = esp32_t_poly.decompose_convex();
+
+        let u4 = Footprint {
+            reference: "U4".to_string(),
+            value: "ESP32-C3-WROOM-02".to_string(),
+            x: 165.0,
+            y: 105.0,
+            rotation: -90.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: true,
+            pads: vec![
+                Pad::new("1", -9.0, 6.7, 0.4, 0.8, 1, "+3.3V", false),
+                Pad::new("19", 0.0, 0.0, 3.0, 3.0, 0, "GND", false),
+            ],
+            width: 18.0,
+            height: 20.0,
+            courtyards: esp32_courtyards,
+            perimeters: Vec::new(),
+            escape_margin: 0.70,
+            at_span: None,
+            fp_span: None,
+        };
+
+        let mut c1 = make_test_fp(
+            "C1",
+            165.0,
+            105.0, // directly on ESP32 center
+            false,
+            vec![Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "+3.3V", false)],
+        );
+
+        board.footprints = vec![u4, c1.clone()];
+        board.keepouts = vec![crate::board::KeepoutZone {
+            min_x: 172.1,
+            min_y: 91.0,
+            max_x: 183.1,
+            max_y: 119.0,
+            layers: vec![0, 1],
+        }];
+
+        let cfg = PlacementConfig {
+            duration_secs: 1,
+            grid_step_mm: 0.1,
+            min_spacing_mm: 0.25,
+            ..PlacementConfig::default()
+        };
+
+        // 1. Placing C1 directly on ESP32 module body causes overlap
+        let st_body = PlacementState::from_board(&board, &cfg);
+        assert!(st_body.overlaps > 0, "Placing on ESP32 body must cause courtyard overlap");
+
+        // 2. Placing C1 inside ESP32 antenna keepout zone causes boundary/keepout violation
+        c1.x = 175.0;
+        c1.y = 105.0;
+        board.footprints[1] = c1.clone();
+        let st_ko = PlacementState::from_board(&board, &cfg);
+        assert!(st_ko.boundary_violations > 0, "Placing in antenna keepout must cause keepout violation");
+
+        // 3. Placing C1 in the legitimate concave notch outside the module body has 0 overlap
+        c1.x = 160.0;
+        c1.y = 93.0;
+        board.footprints[1] = c1;
+        let st_notch = PlacementState::from_board(&board, &cfg);
+        assert_eq!(st_notch.boundary_violations, 0, "Notch outside module body must not violate keepout");
+
+        // 4. Auto-placer resolves any initial overlap and keeps C1 outside module body and keepout
+        let stop = Arc::new(AtomicBool::new(false));
+        let solved = run_auto_placer(&mut board, &cfg, None, stop);
+        assert_eq!(solved.overlaps, 0, "Auto-placer must achieve 0 overlaps");
+        assert_eq!(solved.boundary_violations, 0, "Auto-placer must achieve 0 keepout violations");
+
+        let c1_final = board.footprints.iter().find(|f| f.reference == "C1").unwrap();
+        // Verify C1 is not in the antenna keepout
+        let in_ko = c1_final.x >= 172.1 && c1_final.x <= 183.1 && c1_final.y >= 91.0 && c1_final.y <= 119.0;
+        assert!(!in_ko, "Final placement must not place component in antenna keepout");
     }
 }
 
