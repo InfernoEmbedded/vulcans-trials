@@ -6,4 +6,5 @@ pub mod cuda;
 pub mod gui;
 pub mod placer;
 pub mod router;
+pub mod swap;
 pub mod vulkan;

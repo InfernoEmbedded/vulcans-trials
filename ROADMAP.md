@@ -64,7 +64,7 @@ Below is a comprehensive breakdown of features offered by flagship commercial PC
 
 ### Phase 4: v0.4 — HDI, BGA Fanout & Pin/Gate Swapping
 - [ ] **Automated BGA Escape Solver:** Quadrant dog-bone fanout, channel-routing, and blind/buried microvia stack support for $0.4\text{ mm}$–$0.8\text{ mm}$ pitch BGAs.
-- [ ] **Pin & Gate Swapping:** Bipartite matching (Hungarian algorithm) on swappable MCU GPIO banks and multi-unit logic/op-amp gates during placement to untangle ratsnest crossings before routing begins.
+- [x] **Pin & Gate Swapping:** Bipartite matching (Hungarian algorithm) on swappable MCU GPIO banks and multi-unit logic/op-amp gates during placement to untangle ratsnest crossings before routing begins.
 - [ ] **Multi-Board & Rigid-Flex Zones:** Layer stackup regions with bend-area trace perpendicularity constraints.
 
 ### Phase 5: v0.5 — Signal Integrity (SI), Power Integrity (PI) & DFM

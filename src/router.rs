@@ -8302,6 +8302,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         }
     }
 
@@ -8430,6 +8432,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         }
     }
 
@@ -8966,6 +8969,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -9063,6 +9067,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&route_board, 0.20, None);
@@ -9173,6 +9178,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -9357,6 +9363,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let grid = RoutingGrid::new(&board, 0.20, None);
@@ -9426,6 +9433,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let grid = RoutingGrid::new(&board, 0.20, None);
@@ -9503,6 +9511,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -9597,6 +9606,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -9671,6 +9681,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -9752,6 +9763,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let grid = RoutingGrid::new(&board, 0.20, None);
@@ -9852,6 +9864,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -9951,6 +9964,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -9996,6 +10010,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let nudge = NudgeEngine::new();
@@ -10072,6 +10087,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let nudge = NudgeEngine::new();
@@ -10140,6 +10156,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let orig_tracks = board.tracks.clone();
@@ -10239,6 +10256,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         prune_dangling_tracks_and_vias(&mut board);
@@ -10289,6 +10307,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let via_dia = 0.60;
@@ -10456,6 +10475,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.10, None);
@@ -10554,6 +10574,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.10, None);
@@ -10643,6 +10664,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.10, None);

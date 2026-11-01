@@ -2797,6 +2797,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
         board.footprints.push(complex_fp);
 
@@ -3111,6 +3113,7 @@ mod tests {
                     rotation: 0.0,
                     is_through_hole: false,
                     drill: None,
+                    ..Default::default()
                 },
                 // Thermal through-hole via
                 crate::board::Pad {
@@ -3125,6 +3128,7 @@ mod tests {
                     rotation: 0.0,
                     is_through_hole: true,
                     drill: Some(0.3),
+                    ..Default::default()
                 },
             ],
             width: 5.0,
@@ -3134,6 +3138,8 @@ mod tests {
             escape_margin: 0.25,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         // Two passes: SMD (is_th=false) must be processed first, TH (is_th=true) second
