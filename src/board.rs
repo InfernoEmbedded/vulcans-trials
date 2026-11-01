@@ -3215,9 +3215,9 @@ fn parse_footprint(
                 let mut net_span = None;
                 if let Some(n_pos) = p_str.find("(net ") {
                     let after = &p_str[n_pos + 5..];
-                    if let Some(close_rel) = after.find(')') {
+                    if let Some(close_end) = find_closing_paren(p_str.as_bytes(), n_pos) {
                         let abs_n_start = fp_byte_offset + p_idx + n_pos;
-                        let abs_n_end = abs_n_start + 5 + close_rel + 1;
+                        let abs_n_end = fp_byte_offset + p_idx + close_end;
                         net_span = Some((abs_n_start, abs_n_end));
                     }
                     if let Some(q1) = after.find('"') {
