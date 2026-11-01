@@ -23,11 +23,11 @@ Below is a comprehensive breakdown of features offered by flagship commercial PC
 | **Design Rules** | Keepout zones (per-layer copper, via, and antenna overhang keepouts) | All | **Implemented (v0.1)** |
 | **IC Escape** | Deterministic fine-pitch QFN / USB-C escape generator with staggered vias | Allegro, Xpedition | **Implemented (v0.1)** |
 | **Power & GND** | Automated SMD-to-plane ground stitching via placement | Altium, Allegro | **Implemented (v0.1)** |
-| **High-Speed** | Coupled Differential Pair routing (constant gap, coupled turns, via symmetry) | Allegro, Altium, Xpedition | **Phase 2 (v0.2)** |
-| **High-Speed** | Serpentine / Trombone delay & phase length tuning (ps / mm matching) | Allegro, Xpedition, Zuken | **Phase 2 (v0.2)** |
-| **High-Speed** | Impedance-controlled layer-specific track width adjustment | Allegro, Altium | **Phase 2 (v0.2)** |
+| **High-Speed** | Coupled Differential Pair routing (constant gap, coupled turns, via symmetry) | Allegro, Altium, Xpedition | **Implemented (v0.2)** |
+| **High-Speed** | Serpentine / Trombone delay & phase length tuning (ps / mm matching) | Allegro, Xpedition, Zuken | **Implemented (v0.2)** |
+| **High-Speed** | Impedance-controlled layer-specific track width adjustment | Allegro, Altium | **Implemented (v0.2)** |
 | **Topological** | Any-angle / Arc / Teardrop topological rubber-band routing | Eremex TopoR, Xpedition | **Implemented (v0.3)** |
-| **Topological** | Post-route trace glossing, corner mitering, and via minimization pass | Specctra, Altium | **Phase 3 (v0.3)** |
+| **Topological** | Post-route trace glossing, corner mitering, and via minimization pass | Specctra, Altium | **Implemented (v0.3)** |
 | **HDI & BGA** | Dog-bone, via-in-pad, blind/buried & microvia BGA fanout solver | Allegro, Zuken, Xpedition | **Implemented (v0.4)** |
 | **HDI & BGA** | Pin & gate swapping optimization (FPGA / MCU / multi-unit op-amps) | Allegro, Xpedition | **Implemented (v0.4)** |
 | **SI / PI / DFM** | Crosstalk-aware parallel run-length limit & guard-trace insertion | Allegro, HyperLynx | **Implemented (v0.5)** |
