@@ -5,6 +5,7 @@ pub mod board;
 pub mod cuda;
 pub mod gui;
 pub mod ipc;
+pub mod mcp;
 pub mod placer;
 pub mod router;
 pub mod swap;

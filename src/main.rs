@@ -75,6 +75,14 @@ struct Args {
     /// Optional KiCad IPC streaming socket endpoint or named pipe
     #[arg(long)]
     ipc: Option<String>,
+
+    /// Run as a Model Context Protocol (MCP) server over standard I/O (JSON-RPC 2.0)
+    #[arg(long)]
+    mcp: bool,
+
+    /// Run as a Model Context Protocol (MCP) server over TCP listening on <bind_addr> (e.g. 127.0.0.1:8765)
+    #[arg(long, value_name = "BIND_ADDR")]
+    mcp_tcp: Option<String>,
 }
 
 fn parse_locked_refs(lock_arg: &str) -> HashSet<String> {
@@ -308,12 +316,49 @@ fn main() {
 
     let vulkan = VulkanEngine::new();
     if let Some(ref vk) = vulkan {
-        println!(
-            "=== Vulcan's Trials (InfernoEmbedded) — Vulkan GPU: {} [{}] ===",
-            vk.device_name, vk.backend_name
-        );
-    } else {
+        if !args.mcp {
+            println!(
+                "=== Vulcan's Trials (InfernoEmbedded) — Vulkan GPU: {} [{}] ===",
+                vk.device_name, vk.backend_name
+            );
+        }
+    } else if !args.mcp {
         println!("=== Vulcan's Trials (InfernoEmbedded) — CPU Fallback Mode ===");
+    }
+
+    if args.mcp || args.mcp_tcp.is_some() {
+        let initial_board = if Path::new(&args.input).exists() {
+            match Board::load(&args.input, &extra_locked) {
+                Ok(b) => {
+                    eprintln!("[Vulcan's Trials MCP] Pre-loaded PCB '{}': {} footprints, {} nets", args.input, b.footprints.len(), b.nets.len());
+                    Some(b)
+                }
+                Err(e) => {
+                    eprintln!("[Vulcan's Trials MCP] Note: Could not pre-load PCB '{}': {}", args.input, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let server = Arc::new(vulcans_trials::mcp::McpServer::new(initial_board, vulkan.clone()));
+
+        if let Some(ref bind_addr) = args.mcp_tcp {
+            if let Err(e) = vulcans_trials::mcp::run_mcp_tcp(server, bind_addr) {
+                eprintln!("[FAIL] MCP TCP server error: {}", e);
+                std::process::exit(1);
+            }
+            return;
+        }
+
+        if args.mcp {
+            if let Err(e) = vulcans_trials::mcp::run_mcp_stdio(server) {
+                eprintln!("[FAIL] MCP Stdio server error: {}", e);
+                std::process::exit(1);
+            }
+            return;
+        }
     }
 
     let mut board = match Board::load(&args.input, &extra_locked) {
@@ -388,8 +433,16 @@ mod tests {
         assert_eq!(def.duration, 10);
         assert!((def.res - 0.10).abs() < 1e-6);
         assert_eq!(def.passes, 15);
+        assert!(!def.mcp);
+        assert!(def.mcp_tcp.is_none());
         assert!(parse_locked_refs(&def.lock).is_empty());
         assert_eq!(def.kicad_ipc, None);
+
+        let mcp_stdio = Args::try_parse_from(["vulcans-trials", "--mcp"]).unwrap();
+        assert!(mcp_stdio.mcp);
+
+        let mcp_tcp = Args::try_parse_from(["vulcans-trials", "--mcp-tcp", "127.0.0.1:8765"]).unwrap();
+        assert_eq!(mcp_tcp.mcp_tcp, Some("127.0.0.1:8765".to_string()));
 
         let custom = Args::try_parse_from([
             "vulcans-trials",
@@ -465,6 +518,8 @@ mod tests {
             kicad_ipc: None,
             self_test: false,
             ipc: None,
+            mcp: false,
+            mcp_tcp: None,
         };
         assert!(run_headless_trial(&args, &mut board, None, None).is_ok());
         assert!(Path::new(out_pcb).exists());

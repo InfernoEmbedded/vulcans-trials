@@ -2888,7 +2888,7 @@ impl Board {
         }
     }
 
-    fn load_schematic_clusters(&mut self, sch_path: &Path) {
+    pub fn load_schematic_clusters(&mut self, sch_path: &Path) {
         let Ok(content) = fs::read_to_string(sch_path) else { return };
         let mut headers: Vec<(String, f64, f64)> = Vec::new();
         let text_tag = "(text \"";
