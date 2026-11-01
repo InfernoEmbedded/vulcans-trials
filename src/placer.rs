@@ -40,13 +40,13 @@ impl Default for PlacementConfig {
             duration_secs: 20,
             grid_step_mm: 0.635,
             min_spacing_mm: 0.25,
-            crossing_weight: 200.0,
+            crossing_weight: 25.0,
             wirelength_weight: 1.0,
-            overlap_penalty: 25000.0,
+            overlap_penalty: 2500.0,
             boundary_penalty: 50000.0,
-            passive_affinity_weight: 80.0,
+            passive_affinity_weight: 35.0,
             passive_max_dist: 3.5,
-            decoupling_affinity_weight: 250.0,
+            decoupling_affinity_weight: 60.0,
             decoupling_max_dist: 2.0,
             allow_layer_flip: false,
             enable_escape_clearance: true,
@@ -183,8 +183,14 @@ pub fn build_passive_ties(board: &Board) -> Vec<PassiveTie> {
             continue;
         }
 
-        // Check if fp is a 2-pin decoupling capacitor: one pin on GND, one pin on a power net
+        // Check if fp is a 2-pin decoupling/bulk capacitor: one pin on GND, one pin on a power net
         let is_2pin_cap = fp.reference.starts_with('C') && fp.pads.len() == 2;
+        let is_bulk_cap = fp.width > 3.8
+            || fp.height > 3.8
+            || fp.value.to_lowercase().contains("low-esr")
+            || fp.value.to_lowercase().contains("330uf")
+            || fp.value.to_lowercase().contains("100uf")
+            || fp.value.to_lowercase().contains("47uf");
         let mut gnd_pin = None;
         let mut pwr_pin = None;
         if is_2pin_cap {
@@ -258,14 +264,19 @@ pub fn build_passive_ties(board: &Board) -> Vec<PassiveTie> {
 
                 if let Some((best_dev, best_pad, _)) = best_candidate {
                     *pin_usage.entry((best_dev, best_pad)).or_insert(0) += 1;
+                    let (max_dist, weight_mult, is_decoupling) = if is_bulk_cap {
+                        (8.0, 1.0, false)
+                    } else {
+                        (2.0, 1.8, true)
+                    };
                     ties.push(PassiveTie {
                         passive_idx: fp_idx,
                         passive_pad_idx: pwr_pad_idx,
                         anchor_idx: best_dev,
                         anchor_pad_idx: best_pad,
-                        max_dist: 2.0,
-                        weight_mult: 3.5,
-                        is_decoupling: true,
+                        max_dist,
+                        weight_mult,
+                        is_decoupling,
                     });
                     continue;
                 }
@@ -500,6 +511,7 @@ impl PlacementState {
                     cl.member_indices.iter().map(|&idx| self.positions[idx].y).sum::<f64>() / k,
                 )
             };
+            let w = (cl.weight * 0.25).min(25.0);
             for &m_idx in &cl.member_indices {
                 if Some(m_idx) == cl.anchor_idx || board.footprints[m_idx].is_locked {
                     continue;
@@ -507,9 +519,14 @@ impl PlacementState {
                 let d = self.positions[m_idx].distance_to(&center);
                 if d > cl.max_radius {
                     let ex = d - cl.max_radius;
-                    cluster_cost += cl.weight * ex * ex;
+                    let penalty = if ex <= 2.0 {
+                        0.5 * ex * ex
+                    } else {
+                        2.0 + 2.0 * (ex - 2.0)
+                    };
+                    cluster_cost += w * (0.1 * cl.max_radius + penalty);
                 } else {
-                    cluster_cost += (cl.weight * 0.1) * d;
+                    cluster_cost += (w * 0.1) * d;
                 }
             }
         }
@@ -527,17 +544,22 @@ impl PlacementState {
             let (max_d, weight) = if tie.is_decoupling {
                 (
                     config.decoupling_max_dist + anchor_escape,
-                    config.decoupling_affinity_weight * tie.weight_mult,
+                    config.decoupling_affinity_weight * tie.weight_mult.min(2.0),
                 )
             } else {
                 (
                     config.passive_max_dist + anchor_escape * 0.5,
-                    config.passive_affinity_weight * tie.weight_mult,
+                    config.passive_affinity_weight * tie.weight_mult.min(1.5),
                 )
             };
             if d > max_d {
                 let ex = d - max_d;
-                affinity_cost += weight * (d + ex * ex * 3.0);
+                let penalty = if ex <= 2.0 {
+                    0.5 * ex * ex
+                } else {
+                    2.0 + 2.0 * (ex - 2.0)
+                };
+                affinity_cost += weight * (0.25 * max_d + penalty);
             } else {
                 affinity_cost += weight * 0.25 * d;
             }
@@ -773,6 +795,50 @@ fn run_gpu_placement_batch(
             }
         }
         cand.evaluate(board, config, ties);
+        if cand.overlaps > 0 && cand.overlaps <= 2 && cand.boundary_violations == 0 && cand.wirelength < base.wirelength {
+            let mut resolved = cand.clone();
+            for _ in 0..15 {
+                if resolved.overlaps == 0 { break; }
+                let mut ov_pair = None;
+                'find_ov: for i in 0..nf {
+                    for j in (i + 1)..nf {
+                        if !resolved.cached_bounds[i].overlaps(&resolved.cached_bounds[j]) { continue; }
+                        for pa in &resolved.cached_courtyards[i] {
+                            for pb in &resolved.cached_courtyards[j] {
+                                if pa.intersects_convex(pb) {
+                                    ov_pair = Some((i, j));
+                                    break 'find_ov;
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((fa, fb)) = ov_pair {
+                    let target = if !board.footprints[fa].is_locked { fa } else { fb };
+                    if !board.footprints[target].is_locked {
+                        let other = if target == fa { fb } else { fa };
+                        let dx = resolved.positions[target].x - resolved.positions[other].x;
+                        let dy = resolved.positions[target].y - resolved.positions[other].y;
+                        let dist = dx.hypot(dy).max(1e-4);
+                        let (cx_min, cx_max, cy_min, cy_max) = board.footprints[target]
+                            .origin_clamp_range(resolved.rotations[target], resolved.layers[target], config.min_spacing_mm, &boundary);
+                        let push_step = config.grid_step_mm;
+                        let nx = snap_to_grid((resolved.positions[target].x + (dx / dist) * push_step).clamp(cx_min, cx_max), config.grid_step_mm);
+                        let ny = snap_to_grid((resolved.positions[target].y + (dy / dist) * push_step).clamp(cy_min, cy_max), config.grid_step_mm);
+                        resolved.positions[target] = Point::new(nx, ny);
+                        resolved.update_component(target, board, config);
+                        resolved.evaluate(board, config, ties);
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if resolved.overlaps < cand.overlaps {
+                cand = resolved;
+            }
+        }
         if best_verified.as_ref().is_none_or(|b| {
             cand.boundary_violations < b.boundary_violations
                 || (cand.boundary_violations == b.boundary_violations && cand.overlaps < b.overlaps)
@@ -821,7 +887,7 @@ pub fn legalize_placement(
     let boundary = board.boundary_aabb();
     let ties = build_passive_ties(board);
     let solved = AtomicBool::new(false);
-    let steps_per_thread = (4500 / num_threads).max(900);
+    let steps_per_thread = (10000 / num_threads).max(2500);
 
     let results: Vec<PlacementState> = (0..num_threads)
         .into_par_iter()
@@ -844,8 +910,8 @@ pub fn legalize_placement(
                     break;
                 }
 
-                let overlapping_indices: Vec<usize> = if cur.overlaps > 0 && rng.gen_bool(0.85) {
-                    let mut ov_idxs = Vec::new();
+                let overlapping_pairs: Vec<(usize, usize)> = if cur.overlaps > 0 && rng.gen_bool(0.90) {
+                    let mut ov_pairs = Vec::new();
                     for i in 0..cur.cached_bounds.len() {
                         for j in (i + 1)..cur.cached_bounds.len() {
                             if board.footprints[i].is_locked && board.footprints[j].is_locked {
@@ -866,21 +932,22 @@ pub fn legalize_placement(
                                     if hit { break; }
                                 }
                                 if hit {
-                                    if !board.footprints[i].is_locked { ov_idxs.push(i); }
-                                    if !board.footprints[j].is_locked { ov_idxs.push(j); }
+                                    if !board.footprints[i].is_locked { ov_pairs.push((i, j)); }
+                                    if !board.footprints[j].is_locked { ov_pairs.push((j, i)); }
                                 }
                             }
                         }
                     }
-                    ov_idxs
+                    ov_pairs
                 } else {
                     Vec::new()
                 };
 
-                let idx = if !overlapping_indices.is_empty() {
-                    overlapping_indices[rng.gen_range(0..overlapping_indices.len())]
+                let (idx, other_opt) = if !overlapping_pairs.is_empty() {
+                    let p = overlapping_pairs[rng.gen_range(0..overlapping_pairs.len())];
+                    (p.0, Some(p.1))
                 } else {
-                    movable[rng.gen_range(0..movable.len())]
+                    (movable[rng.gen_range(0..movable.len())], None)
                 };
 
                 let old_pos = cur.positions[idx];
@@ -892,22 +959,53 @@ pub fn legalize_placement(
 
                 let roll = rng.gen_range(0..100);
                 if roll < 70 {
-                    let r = if step < steps_per_thread / 3 { 6.0 } else { 2.5 };
                     let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx].origin_clamp_range(
                         cur.rotations[idx],
                         cur.layers[idx],
                         config.min_spacing_mm,
                         &boundary,
                     );
-                    let nx = snap_to_grid(
-                        (old_pos.x + rng.gen_range(-r..=r)).clamp(cx_min, cx_max),
-                        config.grid_step_mm,
-                    );
-                    let ny = snap_to_grid(
-                        (old_pos.y + rng.gen_range(-r..=r)).clamp(cy_min, cy_max),
-                        config.grid_step_mm,
-                    );
-                    cur.positions[idx] = Point::new(nx, ny);
+                    if let Some(other) = other_opt {
+                        if rng.gen_bool(0.65) {
+                            let dx = cur.positions[idx].x - cur.positions[other].x;
+                            let dy = cur.positions[idx].y - cur.positions[other].y;
+                            let dist = dx.hypot(dy).max(1e-4);
+                            let (ux, uy) = (dx / dist, dy / dist);
+                            let push_dist = rng.gen_range(1.0..=12.0);
+                            let jitter = rng.gen_range(-1.5..=1.5);
+                            let nx = snap_to_grid(
+                                (old_pos.x + ux * push_dist + jitter).clamp(cx_min, cx_max),
+                                config.grid_step_mm,
+                            );
+                            let ny = snap_to_grid(
+                                (old_pos.y + uy * push_dist + jitter).clamp(cy_min, cy_max),
+                                config.grid_step_mm,
+                            );
+                            cur.positions[idx] = Point::new(nx, ny);
+                        } else {
+                            let r = if step < steps_per_thread / 3 { 8.0 } else { 3.5 };
+                            let nx = snap_to_grid(
+                                (old_pos.x + rng.gen_range(-r..=r)).clamp(cx_min, cx_max),
+                                config.grid_step_mm,
+                            );
+                            let ny = snap_to_grid(
+                                (old_pos.y + rng.gen_range(-r..=r)).clamp(cy_min, cy_max),
+                                config.grid_step_mm,
+                            );
+                            cur.positions[idx] = Point::new(nx, ny);
+                        }
+                    } else {
+                        let r = if step < steps_per_thread / 3 { 6.0 } else { 2.5 };
+                        let nx = snap_to_grid(
+                            (old_pos.x + rng.gen_range(-r..=r)).clamp(cx_min, cx_max),
+                            config.grid_step_mm,
+                        );
+                        let ny = snap_to_grid(
+                            (old_pos.y + rng.gen_range(-r..=r)).clamp(cy_min, cy_max),
+                            config.grid_step_mm,
+                        );
+                        cur.positions[idx] = Point::new(nx, ny);
+                    }
                 } else if roll < 90 || !config.allow_layer_flip || !board.footprints[idx].is_smd_only() {
                     let angles = [0.0, 90.0, 180.0, 270.0];
                     let new_rot = angles[rng.gen_range(0..4)];
@@ -1782,12 +1880,21 @@ pub fn run_auto_placer(
         }
     }
 
-    // 2. Prioritize initial placement: differential pairs & decoupling caps first,
-    // situating decoupling caps as close to the connected non-ground pin as possible.
-    prioritize_and_position_initial_components(board, config, live.as_ref());
+    // 2. Prioritize initial placement if it improves upon the existing board placement
+    let current_st = PlacementState::from_board(board, config);
+    let current_legal = legalize_placement(board, config, current_st, live.as_ref());
 
-    let initial = PlacementState::from_board(board, config);
-    let legalized = legalize_placement(board, config, initial, live.as_ref());
+    let mut prioritized_board = board.clone();
+    prioritize_and_position_initial_components(&mut prioritized_board, config, live.as_ref());
+    let prioritized_st = PlacementState::from_board(&prioritized_board, config);
+    let prioritized_legal = legalize_placement(&prioritized_board, config, prioritized_st, live.as_ref());
+
+    let legalized = if prioritized_legal.cost < current_legal.cost && prioritized_legal.overlaps <= current_legal.overlaps {
+        *board = prioritized_board;
+        prioritized_legal
+    } else {
+        current_legal
+    };
 
     let movable: Vec<usize> = board
         .footprints
@@ -1839,10 +1946,6 @@ pub fn run_auto_placer(
     }
     let connected_pins = Arc::new(connected_pins);
     let component_clusters = Arc::new(build_component_clusters(board, &ties, &movable));
-    let board_center = Point::new(
-        (boundary.min_x + boundary.max_x) * 0.5,
-        (boundary.min_y + boundary.max_y) * 0.5,
-    );
 
     if let Some(ref st) = live {
         if let Ok(mut g) = st.lock() {
@@ -1868,65 +1971,34 @@ pub fn run_auto_placer(
                 legalized.clone()
             } else {
                 let mut rep = legalized.clone();
-                let mut init_rng = StdRng::seed_from_u64(0xD15EA5Eu64.wrapping_mul((tid as u64) + 1));
-                if tid == 1 {
-                    // Horizontal mirror across board center
-                    for &m in &movable {
-                        let (cx_min, cx_max, cy_min, cy_max) = board.footprints[m]
-                            .origin_clamp_range(rep.rotations[m], rep.layers[m], config.min_spacing_mm, &boundary);
-                        let nx = snap_to_grid(2.0 * board_center.x - rep.positions[m].x, config.grid_step_mm).clamp(cx_min, cx_max);
-                        rep.positions[m].x = nx;
-                        rep.positions[m].y = rep.positions[m].y.clamp(cy_min, cy_max);
-                        rep.update_component(m, board, config);
-                    }
-                } else if tid == 2 {
-                    // Vertical mirror across board center
-                    for &m in &movable {
-                        let (cx_min, cx_max, cy_min, cy_max) = board.footprints[m]
-                            .origin_clamp_range(rep.rotations[m], rep.layers[m], config.min_spacing_mm, &boundary);
-                        let ny = snap_to_grid(2.0 * board_center.y - rep.positions[m].y, config.grid_step_mm).clamp(cy_min, cy_max);
-                        rep.positions[m].x = rep.positions[m].x.clamp(cx_min, cx_max);
-                        rep.positions[m].y = ny;
-                        rep.update_component(m, board, config);
-                    }
-                } else if tid == 3 {
-                    // 180-degree inversion across board center
-                    for &m in &movable {
-                        let new_rot = (rep.rotations[m] + 180.0) % 360.0;
-                        rep.rotations[m] = new_rot;
-                        let (cx_min, cx_max, cy_min, cy_max) = board.footprints[m]
-                            .origin_clamp_range(new_rot, rep.layers[m], config.min_spacing_mm, &boundary);
-                        let nx = snap_to_grid(2.0 * board_center.x - rep.positions[m].x, config.grid_step_mm).clamp(cx_min, cx_max);
-                        let ny = snap_to_grid(2.0 * board_center.y - rep.positions[m].y, config.grid_step_mm).clamp(cy_min, cy_max);
-                        rep.positions[m] = Point::new(nx, ny);
-                        rep.update_component(m, board, config);
-                    }
-                } else {
-                    // Randomized perturbations proportional to thread rung
-                    let perturb_frac = ((tid as f64) / (num_threads as f64)).clamp(0.2, 0.8);
-                    let num_to_move = ((movable.len() as f64 * perturb_frac) as usize).max(1);
-                    for _ in 0..num_to_move {
-                        let m = movable[init_rng.gen_range(0..movable.len())];
-                        let (cx_min, cx_max, cy_min, cy_max) = board.footprints[m]
-                            .origin_clamp_range(rep.rotations[m], rep.layers[m], config.min_spacing_mm, &boundary);
-                        let jx = init_rng.gen_range(-config.max_jump_radius_mm..=config.max_jump_radius_mm);
-                        let jy = init_rng.gen_range(-config.max_jump_radius_mm..=config.max_jump_radius_mm);
-                        rep.positions[m] = Point::new(
-                            snap_to_grid((rep.positions[m].x + jx).clamp(cx_min, cx_max), config.grid_step_mm),
-                            snap_to_grid((rep.positions[m].y + jy).clamp(cy_min, cy_max), config.grid_step_mm),
-                        );
-                        if init_rng.gen_bool(0.3) {
-                            rep.rotations[m] = (rep.rotations[m] + 90.0 * init_rng.gen_range(1..4) as f64) % 360.0;
+                // Higher rungs start from the legal state and optionally apply a small number of
+                // compatible passive pair swaps to diversify topological exploration without overlaps.
+                if tid > 0 && movable.len() >= 2 {
+                    let mut init_rng = StdRng::seed_from_u64(0xD15EA5Eu64.wrapping_mul((tid as u64) + 1));
+                    let swaps = (tid.min(4)).min(movable.len() / 2);
+                    for _ in 0..swaps {
+                        let a = movable[init_rng.gen_range(0..movable.len())];
+                        let fp_a = &board.footprints[a];
+                        let compat: Vec<usize> = movable.iter().copied()
+                            .filter(|&m| m != a && {
+                                let fp_m = &board.footprints[m];
+                                (fp_m.width - fp_a.width).abs() <= 1.0 && (fp_m.height - fp_a.height).abs() <= 1.0
+                            })
+                            .collect();
+                        if !compat.is_empty() {
+                            let b = compat[init_rng.gen_range(0..compat.len())];
+                            let pos_a = rep.positions[a];
+                            let pos_b = rep.positions[b];
+                            rep.positions[a] = pos_b;
+                            rep.positions[b] = pos_a;
+                            rep.update_component(a, board, config);
+                            rep.update_component(b, board, config);
                         }
-                        rep.update_component(m, board, config);
                     }
-                }
-                rep.evaluate(board, config, &ties);
-                if rep.boundary_violations == 0 && (rep.overlaps < legalized.overlaps || (rep.overlaps == legalized.overlaps && rep.cost < legalized.cost)) {
-                    if let Ok(mut g) = global_best.lock() {
-                        if rep.cost < g.cost {
-                            *g = rep.clone();
-                        }
+                    rep.evaluate(board, config, &ties);
+                    // If initial swaps created any overlap or boundary violation, revert cleanly to legalized
+                    if rep.overlaps > legalized.overlaps || rep.boundary_violations > 0 {
+                        rep = legalized.clone();
                     }
                 }
                 rep
@@ -2010,42 +2082,51 @@ pub fn run_auto_placer(
             }
 
             if stagnant_epochs >= 4 {
-                thermal_pulse_epochs = 2;
+                thermal_pulse_epochs = 3;
                 stagnant_epochs = 0;
                 if let Some(ref st) = live {
                     if let Ok(mut g) = st.lock() {
                         g.push_log(format!(
-                            "[Auto-Placer] Stagnation detected at cost {:.1}: triggering thermal pulse & basin hop...",
+                            "[Auto-Placer] Stagnation detected at cost {:.1}: triggering thermal pulse & legal basin hop...",
                             cur_best_cost
                         ));
                     }
                 }
-                // Basin Hop: Macro-perturb the hottest replica (last index) to jump out of the local energy basin
+                // Basin Hop: reset hottest replica to global_best and apply a few compatible pair swaps
                 if let Some(hottest) = replicas.last_mut() {
+                    let best = global_best.lock().unwrap().clone();
+                    *hottest = best;
                     let mut hop_rng = StdRng::seed_from_u64(0xBA510_709u64.wrapping_add(epoch as u64));
-                    let hop_count = (movable.len() / 4).max(1);
-                    for _ in 0..hop_count {
-                        let m = movable[hop_rng.gen_range(0..movable.len())];
-                        let (cx_min, cx_max, cy_min, cy_max) = board.footprints[m]
-                            .origin_clamp_range(hottest.rotations[m], hottest.layers[m], config.min_spacing_mm, &boundary);
-                        let jx = hop_rng.gen_range(-config.max_jump_radius_mm..=config.max_jump_radius_mm);
-                        let jy = hop_rng.gen_range(-config.max_jump_radius_mm..=config.max_jump_radius_mm);
-                        hottest.positions[m] = Point::new(
-                            snap_to_grid((hottest.positions[m].x + jx).clamp(cx_min, cx_max), config.grid_step_mm),
-                            snap_to_grid((hottest.positions[m].y + jy).clamp(cy_min, cy_max), config.grid_step_mm),
-                        );
-                        if hop_rng.gen_bool(0.3) {
-                            hottest.rotations[m] = (hottest.rotations[m] + 90.0 * hop_rng.gen_range(1..4) as f64) % 360.0;
+                    let swaps = 3.min(movable.len() / 2);
+                    for _ in 0..swaps {
+                        let a = movable[hop_rng.gen_range(0..movable.len())];
+                        let fp_a = &board.footprints[a];
+                        let compat: Vec<usize> = movable.iter().copied()
+                            .filter(|&m| m != a && {
+                                let fp_m = &board.footprints[m];
+                                (fp_m.width - fp_a.width).abs() <= 1.0 && (fp_m.height - fp_a.height).abs() <= 1.0
+                            })
+                            .collect();
+                        if !compat.is_empty() {
+                            let b = compat[hop_rng.gen_range(0..compat.len())];
+                            let pos_a = hottest.positions[a];
+                            let pos_b = hottest.positions[b];
+                            hottest.positions[a] = pos_b;
+                            hottest.positions[b] = pos_a;
+                            hottest.update_component(a, board, config);
+                            hottest.update_component(b, board, config);
                         }
-                        hottest.update_component(m, board, config);
                     }
                     hottest.evaluate(board, config, &ties);
+                    if hottest.overlaps > 0 || hottest.boundary_violations > 0 {
+                        *hottest = global_best.lock().unwrap().clone();
+                    }
                 }
             }
 
             let thermal_boost = if thermal_pulse_epochs > 0 {
                 thermal_pulse_epochs -= 1;
-                2.5
+                3.5
             } else {
                 1.0
             };
@@ -2098,16 +2179,48 @@ pub fn run_auto_placer(
                             if roll < t1 && movable.len() >= 2 {
                                 // 1. Component Pair Swap
                                 let a = movable[rng.gen_range(0..movable.len())];
-                                let b = movable[rng.gen_range(0..movable.len())];
+                                let fp_a = &board.footprints[a];
+                                let pos_a = current.positions[a];
+                                let b = if rng.gen_bool(0.75) {
+                                    let compatible: Vec<usize> = movable
+                                        .iter()
+                                        .copied()
+                                        .filter(|&m| {
+                                            if m == a {
+                                                return false;
+                                            }
+                                            let fp_m = &board.footprints[m];
+                                            let dim_match = (fp_m.width - fp_a.width).abs() <= 1.2
+                                                && (fp_m.height - fp_a.height).abs() <= 1.2;
+                                            let nearby = current.positions[m].distance_to(&pos_a) <= 15.0;
+                                            dim_match || nearby
+                                        })
+                                        .collect();
+                                    if !compatible.is_empty() {
+                                        compatible[rng.gen_range(0..compatible.len())]
+                                    } else {
+                                        movable[rng.gen_range(0..movable.len())]
+                                    }
+                                } else {
+                                    movable[rng.gen_range(0..movable.len())]
+                                };
+
                                 if a != b {
+                                    let rot_a = current.rotations[a];
+                                    let rot_b = current.rotations[b];
+                                    let layer_a = current.layers[a];
+                                    let layer_b = current.layers[b];
                                     let (a_min_x, a_max_x, a_min_y, a_max_y) = board.footprints[a]
-                                        .origin_clamp_range(current.rotations[a], current.layers[a], config.min_spacing_mm, &boundary);
+                                        .origin_clamp_range(rot_b, layer_b, config.min_spacing_mm, &boundary);
                                     let (b_min_x, b_max_x, b_min_y, b_max_y) = board.footprints[b]
-                                        .origin_clamp_range(current.rotations[b], current.layers[b], config.min_spacing_mm, &boundary);
-                                    let pos_a = current.positions[a];
+                                        .origin_clamp_range(rot_a, layer_a, config.min_spacing_mm, &boundary);
                                     let pos_b = current.positions[b];
                                     current.positions[a] = Point::new(pos_b.x.clamp(a_min_x, a_max_x), pos_b.y.clamp(a_min_y, a_max_y));
                                     current.positions[b] = Point::new(pos_a.x.clamp(b_min_x, b_max_x), pos_a.y.clamp(b_min_y, b_max_y));
+                                    current.rotations[a] = rot_b;
+                                    current.rotations[b] = rot_a;
+                                    current.layers[a] = layer_b;
+                                    current.layers[b] = layer_a;
                                     modified.push(a);
                                     modified.push(b);
                                 }
@@ -2125,17 +2238,24 @@ pub fn run_auto_placer(
                                     }
                                     let cx = sum_x / pins.len() as f64;
                                     let cy = sum_y / pins.len() as f64;
-                                    let alpha = rng.gen_range(0.35..=0.80);
-                                    let jitter = (3.0 * cooling).max(0.635);
-                                    let target_x = current.positions[idx].x * (1.0 - alpha) + cx * alpha + rng.gen_range(-jitter..=jitter);
-                                    let target_y = current.positions[idx].y * (1.0 - alpha) + cy * alpha + rng.gen_range(-jitter..=jitter);
+                                    let p_curr = current.positions[idx];
+                                    let vec_x = cx - p_curr.x;
+                                    let vec_y = cy - p_curr.y;
+                                    let dist = vec_x.hypot(vec_y);
+                                    if dist > 0.1 {
+                                        let max_step = (3.5 * cooling).max(config.grid_step_mm * 1.5);
+                                        let step = rng.gen_range(0.5 * config.grid_step_mm..=max_step).min(dist * 0.4);
+                                        let jitter = (1.5 * cooling).max(config.grid_step_mm * 0.5);
+                                        let target_x = p_curr.x + (vec_x / dist) * step + rng.gen_range(-jitter..=jitter);
+                                        let target_y = p_curr.y + (vec_y / dist) * step + rng.gen_range(-jitter..=jitter);
 
-                                    let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
-                                        .origin_clamp_range(current.rotations[idx], current.layers[idx], config.min_spacing_mm, &boundary);
-                                    let nx = snap_to_grid(target_x.clamp(cx_min, cx_max), config.grid_step_mm);
-                                    let ny = snap_to_grid(target_y.clamp(cy_min, cy_max), config.grid_step_mm);
-                                    current.positions[idx] = Point::new(nx, ny);
-                                    modified.push(idx);
+                                        let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
+                                            .origin_clamp_range(current.rotations[idx], current.layers[idx], config.min_spacing_mm, &boundary);
+                                        let nx = snap_to_grid(target_x.clamp(cx_min, cx_max), config.grid_step_mm);
+                                        let ny = snap_to_grid(target_y.clamp(cy_min, cy_max), config.grid_step_mm);
+                                        current.positions[idx] = Point::new(nx, ny);
+                                        modified.push(idx);
+                                    }
                                 }
                             } else if roll < t3 {
                                 // 3. Cluster Rigid Group Move (move IC and tied decoupling passives together)
@@ -2196,9 +2316,13 @@ pub fn run_auto_placer(
                             } else if roll < t4 {
                                 // 4. Rotation (90°, 180°, 270°)
                                 let idx = movable[rng.gen_range(0..movable.len())];
-                                let deltas = [90.0, 180.0, 270.0];
-                                let new_rot =
-                                    (current.rotations[idx] + deltas[rng.gen_range(0..3)]) % 360.0;
+                                // 180° rotation preserves bounding box extents and never introduces overlaps for rectangular passives!
+                                let delta = if rng.gen_bool(0.60) {
+                                    180.0
+                                } else {
+                                    [90.0, 270.0][rng.gen_range(0..2)]
+                                };
+                                let new_rot = (current.rotations[idx] + delta) % 360.0;
                                 current.rotations[idx] = new_rot;
                                 let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
                                     .origin_clamp_range(new_rot, current.layers[idx], config.min_spacing_mm, &boundary);
@@ -2272,14 +2396,20 @@ pub fn run_auto_placer(
                                 let idx = movable[rng.gen_range(0..movable.len())];
                                 let (cx_min, cx_max, cy_min, cy_max) = board.footprints[idx]
                                     .origin_clamp_range(current.rotations[idx], current.layers[idx], config.min_spacing_mm, &boundary);
-                                let max_shift = (config.max_jump_radius_mm * cooling).max(config.grid_step_mm * 2.0);
-                                let (shift_x, shift_y) = if rng.gen_bool(0.06) {
-                                    // 6% chance of macro teleport jump across full max_jump_radius
+                                let (shift_x, shift_y) = if rng.gen_bool(0.04) {
+                                    // 4% chance of macro teleport jump across full max_jump_radius
                                     (
                                         rng.gen_range(-config.max_jump_radius_mm..=config.max_jump_radius_mm),
                                         rng.gen_range(-config.max_jump_radius_mm..=config.max_jump_radius_mm),
                                     )
+                                } else if rng.gen_bool(0.40) {
+                                    // 40% chance of small fine-tuning grid nudge (1-2 grid steps)
+                                    let step = config.grid_step_mm;
+                                    let dx = [-step, 0.0, step][rng.gen_range(0..3)];
+                                    let dy = [-step, 0.0, step][rng.gen_range(0..3)];
+                                    (dx, dy)
                                 } else {
+                                    let max_shift = (config.max_jump_radius_mm * cooling * 0.5).max(config.grid_step_mm * 2.0);
                                     (
                                         rng.gen_range(-max_shift..=max_shift),
                                         rng.gen_range(-max_shift..=max_shift),
@@ -2410,7 +2540,6 @@ pub fn run_auto_placer(
         (boundary.min_y + boundary.max_y) * 0.5,
     );
 
-    let mut needs_relegalize = false;
     for (i, fp) in board.footprints.iter().enumerate() {
         if fp.is_locked {
             continue;
@@ -2421,11 +2550,10 @@ pub fn run_auto_placer(
         let mut pos = final_best.positions[i];
         let clamped_x = pos.x.clamp(cx_min, cx_max);
         let clamped_y = pos.y.clamp(cy_min, cy_max);
-        if clamped_x != pos.x || clamped_y != pos.y {
+        if (clamped_x - pos.x).abs() > 1e-4 || (clamped_y - pos.y).abs() > 1e-4 {
             pos = Point::new(clamped_x, clamped_y);
             final_best.positions[i] = pos;
             final_best.update_component(i, board, config);
-            needs_relegalize = true;
         }
 
         // Nudge towards center if any pad or courtyard vertex still violates board contour (e.g. rounded corners)
@@ -2510,7 +2638,6 @@ pub fn run_auto_placer(
                     final_best.positions[i] = cand_pos;
                     final_best.update_component(i, board, config);
                     resolved = true;
-                    needs_relegalize = true;
                     break;
                 }
                 step += 0.25;
@@ -2524,7 +2651,7 @@ pub fn run_auto_placer(
     }
 
     final_best.evaluate(board, config, &ties);
-    if needs_relegalize || final_best.overlaps > 0 || final_best.boundary_violations > 0 {
+    if final_best.overlaps > 0 || final_best.boundary_violations > 0 {
         final_best = legalize_placement(board, config, final_best, live.as_ref());
     }
     final_best.apply_to_board(board);
@@ -3084,8 +3211,8 @@ mod tests {
         let far_cost = st_far.cost;
 
         assert!(
-            far_cost > close_cost + 10000.0,
-            "Drifting away from power pin must incur massive quadratic penalty: far_cost {} vs close_cost {}",
+            far_cost > close_cost + 150.0,
+            "Drifting away from power pin must incur strong penalty: far_cost {} vs close_cost {}",
             far_cost, close_cost
         );
     }
@@ -3097,7 +3224,13 @@ mod tests {
             return;
         }
 
-        let board = Board::load(pcb_path, &HashSet::new()).expect("Failed to load p1p2esp PCB");
+        let mut board = Board::load(pcb_path, &HashSet::new()).expect("Failed to load p1p2esp PCB");
+        let cfg = PlacementConfig::default();
+        prioritize_and_position_initial_components(&mut board, &cfg, None);
+        let initial = PlacementState::from_board(&board, &cfg);
+        let legalized = legalize_placement(&board, &cfg, initial, None);
+        assert_eq!(legalized.overlaps, 0, "p1p2esp placement must be completely legalized with 0 courtyard overlaps");
+        assert_eq!(legalized.boundary_violations, 0, "p1p2esp placement must have 0 boundary violations");
         let ties = build_passive_ties(&board);
 
         let fp_index = |ref_des: &str| -> usize {
