@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub use crate::swap::optimize_pin_and_gate_swapping;
+
 #[derive(Debug, Clone)]
 pub struct PlacementConfig {
     pub duration_secs: u64,
@@ -1896,6 +1898,17 @@ pub fn run_auto_placer(
         current_legal
     };
 
+    // 3. Optimize pin and gate swapping on initial placement
+    let initial_swaps = optimize_pin_and_gate_swapping(board, config);
+    if initial_swaps > 0 {
+        if let Some(ref st) = live {
+            if let Ok(mut g) = st.lock() {
+                g.push_log(format!("[Auto-Placer] Initial pin/gate swapping untangled {} connections", initial_swaps));
+                g.refresh_ratsnest();
+            }
+        }
+    }
+
     let movable: Vec<usize> = board
         .footprints
         .iter()
@@ -2650,6 +2663,17 @@ pub fn run_auto_placer(
         }
     }
 
+    final_best.apply_to_board(board);
+    let final_swaps = optimize_pin_and_gate_swapping(board, config);
+    if final_swaps > 0 {
+        final_best = PlacementState::from_board(board, config);
+        if let Some(ref st) = live {
+            if let Ok(mut g) = st.lock() {
+                g.push_log(format!("[Auto-Placer] Final pin/gate swapping untangled {} connections", final_swaps));
+            }
+        }
+    }
+
     final_best.evaluate(board, config, &ties);
     if final_best.overlaps > 0 || final_best.boundary_violations > 0 {
         final_best = legalize_placement(board, config, final_best, live.as_ref());
@@ -2701,6 +2725,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         }
     }
 
@@ -2801,6 +2827,7 @@ mod tests {
             ],
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         }
     }
 
@@ -3023,6 +3050,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions,
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let ties = build_passive_ties(&board);
@@ -3115,6 +3143,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let ties = build_passive_ties(&board);
@@ -3187,6 +3216,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         };
 
         let cfg = PlacementConfig::default();
@@ -3521,6 +3551,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
         assert!((qfn.min_pad_pitch() - 0.50).abs() < 1e-4, "QFN pitch must be 0.50mm");
         assert!(qfn.pad_density() > 1.0, "QFN pad density must be > 1.0 pads/mm²");
@@ -3555,6 +3587,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
         assert!((esp32.min_pad_pitch() - 0.55).abs() < 1e-4);
         assert_eq!(esp32.compute_escape_margin(), 1.00, "ESP32 module must receive 1.00mm escape margin");
@@ -3587,6 +3621,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
         assert!((sot23_6.min_pad_pitch() - 0.95).abs() < 1e-4);
         assert_eq!(sot23_6.compute_escape_margin(), 0.75, "SOT-23-6 BUCK IC must receive 0.75mm escape margin");
@@ -3617,6 +3653,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
         assert_eq!(r0603.compute_escape_margin(), 0.0, "0603 passive must receive 0.0mm escape margin (standard clearance)");
         assert_eq!(r0603.placement_spacing(0.25), 0.25);
@@ -3736,6 +3774,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         // Small 0603 passive in the chamfered corner: (101, 101) is inside AABB [100, 150], but outside chamfered contour
@@ -3764,6 +3804,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         let nets = vec!["".to_string(), "GND".to_string(), "VCC".to_string()];
@@ -3797,6 +3839,7 @@ mod tests {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: Some(outline),
+            pin_swap_history: Vec::new(),
         };
 
         let cfg = PlacementConfig {
@@ -3886,6 +3929,7 @@ mod tests {
                 rotation: 0.0,
                 is_through_hole: false,
                 drill: None,
+                ..Default::default()
             }],
             width: 4.0,
             height: 4.0,
@@ -3894,6 +3938,8 @@ mod tests {
             escape_margin: 0.25,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         // U1: Unlocked IC initially at (10, 10)
@@ -3918,6 +3964,7 @@ mod tests {
                 rotation: 0.0,
                 is_through_hole: false,
                 drill: None,
+                ..Default::default()
             }],
             width: 5.0,
             height: 5.0,
@@ -3926,6 +3973,8 @@ mod tests {
             escape_margin: 0.25,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         // C1: Unlocked capacitor initially at (15, 10)
@@ -3950,6 +3999,7 @@ mod tests {
                 rotation: 0.0,
                 is_through_hole: false,
                 drill: None,
+                ..Default::default()
             }],
             width: 2.0,
             height: 1.5,
@@ -3958,6 +4008,8 @@ mod tests {
             escape_margin: 0.25,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         board.footprints = vec![j1, u1, c1];
@@ -4032,6 +4084,8 @@ mod tests {
             escape_margin: 0.70,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         let mut c1 = make_test_fp(

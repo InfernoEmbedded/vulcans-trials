@@ -511,6 +511,28 @@ impl NetClass {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SwappablePinGroup {
+    pub name: String,
+    pub pin_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SwappableGateGroup {
+    pub name: String,
+    pub gate_units: Vec<Vec<usize>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinSwapRecord {
+    pub footprint_ref: String,
+    pub pad1_number: String,
+    pub pad1_net: String,
+    pub pad2_number: String,
+    pub pad2_net: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pad {
     pub number: String,
@@ -524,6 +546,12 @@ pub struct Pad {
     pub net_id: usize,
     pub net_name: String,
     pub is_through_hole: bool,
+    #[serde(default)]
+    pub pin_name: String,
+    #[serde(default)]
+    pub swap_group: Option<usize>,
+    #[serde(default)]
+    pub net_span: Option<(usize, usize)>,
 }
 
 impl Default for Pad {
@@ -540,6 +568,9 @@ impl Default for Pad {
             net_id: 0,
             net_name: String::new(),
             is_through_hole: false,
+            pin_name: String::new(),
+            swap_group: None,
+            net_span: None,
         }
     }
 }
@@ -567,6 +598,9 @@ impl Pad {
             net_id,
             net_name: net_name.into(),
             is_through_hole,
+            pin_name: String::new(),
+            swap_group: None,
+            net_span: None,
         }
     }
 }
@@ -591,9 +625,140 @@ pub struct Footprint {
     pub escape_margin: f64,
     pub at_span: Option<(usize, usize)>,
     pub fp_span: Option<(usize, usize)>,
+    #[serde(default)]
+    pub pin_swap_groups: Vec<Vec<usize>>,
+    #[serde(default)]
+    pub gate_swap_groups: Vec<SwappableGateGroup>,
+}
+
+pub fn extract_swappable_prefix(s: &str) -> Option<String> {
+    let clean = s.trim();
+    if clean.is_empty() {
+        return None;
+    }
+    let upper = clean.to_ascii_uppercase();
+    let candidate_prefixes = [
+        "GPIO_", "GPIO", "P0_", "P1_", "P2_", "P3_",
+        "PA", "PB", "PC", "PD", "PE", "PF",
+        "IO_", "IO", "DATA", "DIN", "DOUT",
+        "IN", "OUT", "CH", "PIN",
+    ];
+    for &cp in &candidate_prefixes {
+        if upper.starts_with(cp) {
+            let remainder = &upper[cp.len()..];
+            if !remainder.is_empty() && remainder.chars().all(|c| c.is_ascii_digit() || c == '_') {
+                return Some(cp.to_string());
+            }
+        }
+    }
+    None
+}
+
+impl Default for Footprint {
+    fn default() -> Self {
+        Self {
+            reference: String::new(),
+            value: String::new(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: Vec::new(),
+            width: 1.0,
+            height: 1.0,
+            courtyards: Vec::new(),
+            perimeters: Vec::new(),
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
+        }
+    }
 }
 
 impl Footprint {
+    pub fn is_symmetric_passive(&self) -> bool {
+        if self.pads.len() != 2 {
+            return false;
+        }
+        let ref_upper = self.reference.to_ascii_uppercase();
+        let second_char = ref_upper.chars().nth(1);
+
+        // Resistors: R1, R2, R_1, RN1, RP1 (not REL, RY, REMOTE, RESET)
+        let is_resistor = ref_upper.starts_with('R')
+            && (second_char.map_or(false, |c| c.is_ascii_digit())
+                || ref_upper.starts_with("R_")
+                || ref_upper.starts_with("RN")
+                || ref_upper.starts_with("RP"))
+            && !ref_upper.starts_with("REL")
+            && !ref_upper.starts_with("RY")
+            && !ref_upper.starts_with("REMOTE")
+            && !ref_upper.starts_with("RESET");
+
+        // Inductors / Ferrites: L1, L_1, FB1, FL1 (not LED)
+        let is_inductor = (ref_upper.starts_with('L')
+            && (second_char.map_or(false, |c| c.is_ascii_digit()) || ref_upper.starts_with("L_"))
+            && !ref_upper.starts_with("LED"))
+            || ref_upper.starts_with("FB")
+            || ref_upper.starts_with("FL");
+
+        // Capacitors: C1, C2, C_1 (not CP, CONN, CLK, CHIP) and non-polarized
+        let is_non_pol_cap = ref_upper.starts_with('C')
+            && (second_char.map_or(false, |c| c.is_ascii_digit()) || ref_upper.starts_with("C_"))
+            && !ref_upper.starts_with("CP")
+            && !ref_upper.starts_with("CONN")
+            && !ref_upper.starts_with("CLK")
+            && {
+                let val_upper = self.value.to_ascii_uppercase();
+                !val_upper.contains("POL")
+                    && !val_upper.contains("TANT")
+                    && !val_upper.contains("ELECT")
+                    && !val_upper.contains('+')
+            };
+
+        (is_resistor || is_inductor || is_non_pol_cap)
+            && (self.pads[0].width - self.pads[1].width).abs() < 1e-3
+            && (self.pads[0].height - self.pads[1].height).abs() < 1e-3
+    }
+
+    pub fn infer_swap_groups(&mut self) {
+        if !self.pin_swap_groups.is_empty() {
+            return;
+        }
+
+        if self.is_symmetric_passive() {
+            self.pin_swap_groups.push(vec![0, 1]);
+            return;
+        }
+
+        let mut prefix_groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, pad) in self.pads.iter().enumerate() {
+            let identifier = if !pad.pin_name.is_empty() {
+                &pad.pin_name
+            } else if !pad.net_name.is_empty() {
+                &pad.net_name
+            } else {
+                &pad.number
+            };
+
+            if let Some(prefix) = extract_swappable_prefix(identifier) {
+                prefix_groups.entry(prefix).or_default().push(i);
+            }
+        }
+
+        let mut sorted_keys: Vec<String> = prefix_groups.keys().cloned().collect();
+        sorted_keys.sort();
+        for key in sorted_keys {
+            let indices = prefix_groups.remove(&key).unwrap();
+            if indices.len() >= 2 {
+                self.pin_swap_groups.push(indices);
+            }
+        }
+    }
+
     pub fn is_smd_only(&self) -> bool {
         !self.pads.is_empty() && self.pads.iter().all(|p| !p.is_through_hole)
     }
@@ -980,6 +1145,7 @@ pub struct Board {
     pub clusters: Vec<CompiledCluster>,
     pub schematic_positions: HashMap<String, (f64, f64)>,
     pub outline_polygon: Option<Polygon>,
+    pub pin_swap_history: Vec<PinSwapRecord>,
 }
 
 impl Default for Board {
@@ -1003,6 +1169,7 @@ impl Default for Board {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
+            pin_swap_history: Vec::new(),
         }
     }
 }
@@ -1265,6 +1432,7 @@ impl Board {
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon,
+            pin_swap_history: Vec::new(),
         };
 
         // Auto-load project netclasses if sibling .kicad_pro exists
@@ -1280,6 +1448,10 @@ impl Board {
         let sch_path = Path::new(path).with_extension("kicad_sch");
         if sch_path.exists() {
             board.load_schematic_clusters(&sch_path);
+        }
+
+        for fp in &mut board.footprints {
+            fp.infer_swap_groups();
         }
 
         Ok(board)
@@ -1823,6 +1995,22 @@ impl Board {
             }
         }
 
+        // Also update any swapped pad nets in place
+        for fp in &self.footprints {
+            if fp.layer == fp.orig_layer {
+                for pad in &fp.pads {
+                    if let Some((n_start, n_end)) = pad.net_span {
+                        let expected_net_str = format!("(net {} \"{}\")", pad.net_id, pad.net_name);
+                        if n_start < n_end && n_end <= self.raw_content.len() {
+                            if &self.raw_content[n_start..n_end] != expected_net_str {
+                                replacements.push((n_start, n_end, expected_net_str));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Strip out existing (segment ...) and (via ...) so we don't duplicate or retain old tracks
         let bytes = self.raw_content.as_bytes();
         let mut i = 0;
@@ -1929,6 +2117,24 @@ impl Board {
         }
 
         Ok(())
+    }
+
+    pub fn generate_back_annotation_report(&self) -> String {
+        let mut report = String::new();
+        report.push_str("# Vulcan's Trials Pin & Gate Swapping Back-Annotation Report\n");
+        report.push_str(&format!("# Total Swaps: {}\n\n", self.pin_swap_history.len()));
+        for (i, rec) in self.pin_swap_history.iter().enumerate() {
+            report.push_str(&format!(
+                "{:3}. Component {}: Swap Pad {} ({}) <-> Pad {} ({}) [{}]\n",
+                i + 1, rec.footprint_ref, rec.pad1_number, rec.pad1_net, rec.pad2_number, rec.pad2_net, rec.reason
+            ));
+        }
+        report
+    }
+
+    pub fn save_back_annotation_eco(&self, path: &Path) -> std::io::Result<()> {
+        let report = self.generate_back_annotation_report();
+        fs::write(path, report)
     }
 
     pub fn save_ses(&self, ses_path: &Path) -> Result<(), String> {
@@ -2704,8 +2910,14 @@ fn parse_footprint(
                 };
                 let mut net_name = String::new();
                 let mut net_id = 0usize;
+                let mut net_span = None;
                 if let Some(n_pos) = p_str.find("(net ") {
                     let after = &p_str[n_pos + 5..];
+                    if let Some(close_rel) = after.find(')') {
+                        let abs_n_start = fp_byte_offset + p_idx + n_pos;
+                        let abs_n_end = abs_n_start + 5 + close_rel + 1;
+                        net_span = Some((abs_n_start, abs_n_end));
+                    }
                     if let Some(q1) = after.find('"') {
                         if let Some(q2) = after[q1 + 1..].find('"') {
                             net_name = after[q1 + 1..q1 + 1 + q2].to_string();
@@ -2722,6 +2934,35 @@ fn parse_footprint(
                         }
                     }
                 }
+
+                let mut pin_name = String::new();
+                if let Some(pf_pos) = p_str.find("(pinfunction ") {
+                    let after = &p_str[pf_pos + 13..];
+                    if let Some(q1) = after.find('"') {
+                        if let Some(q2) = after[q1 + 1..].find('"') {
+                            pin_name = after[q1 + 1..q1 + 1 + q2].to_string();
+                        }
+                    } else if let Some(end) = after.find(')') {
+                        pin_name = after[..end].trim().to_string();
+                    }
+                } else if let Some(pn_pos) = p_str.find("(name ") {
+                    let after = &p_str[pn_pos + 6..];
+                    if let Some(q1) = after.find('"') {
+                        if let Some(q2) = after[q1 + 1..].find('"') {
+                            pin_name = after[q1 + 1..q1 + 1 + q2].to_string();
+                        }
+                    }
+                }
+
+                let mut pad_swap_group = None;
+                if let Some(sg_pos) = p_str.find("(swap_group ") {
+                    let after = &p_str[sg_pos + 12..];
+                    if let Some(end) = after.find(')') {
+                        let token = after[..end].trim().trim_matches('"');
+                        pad_swap_group = token.parse::<usize>().ok();
+                    }
+                }
+
                 pads.push(Pad {
                     number: p_num,
                     shape,
@@ -2734,6 +2975,9 @@ fn parse_footprint(
                     net_id,
                     net_name,
                     is_through_hole: is_th,
+                    pin_name,
+                    swap_group: pad_swap_group,
+                    net_span,
                 });
                 p_idx = p_end;
                 continue;
@@ -2871,6 +3115,98 @@ fn parse_footprint(
         max_cy = max_cy.max(a.max_y);
     }
 
+    let mut pin_swap_groups: Vec<Vec<usize>> = Vec::new();
+    let mut gate_swap_groups: Vec<SwappableGateGroup> = Vec::new();
+
+    let mut sg_map: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (idx, p) in pads.iter().enumerate() {
+        if let Some(sg) = p.swap_group {
+            sg_map.entry(sg).or_default().push(idx);
+        }
+    }
+    let mut sorted_sgs: Vec<usize> = sg_map.keys().copied().collect();
+    sorted_sgs.sort_unstable();
+    for sg in sorted_sgs {
+        let indices = sg_map.remove(&sg).unwrap();
+        if indices.len() >= 2 {
+            pin_swap_groups.push(indices);
+        }
+    }
+
+    let mut search_idx = 0;
+    while search_idx < bytes.len() {
+        if bytes[search_idx] == b'(' && fp_str[search_idx..].starts_with("(swap_group ") {
+            if let Some(sg_end) = find_closing_paren(bytes, search_idx) {
+                let sg_str = &fp_str[search_idx + 12..sg_end];
+                let mut group_pads = Vec::new();
+                for token in sg_str.split_whitespace() {
+                    let clean = token.trim_matches(['(', ')', '"', ',']);
+                    if clean.is_empty() {
+                        continue;
+                    }
+                    if let Some(p_idx) = pads.iter().position(|p| p.number == clean) {
+                        group_pads.push(p_idx);
+                    } else if let Ok(idx) = clean.parse::<usize>() {
+                        if idx < pads.len() {
+                            group_pads.push(idx);
+                        }
+                    }
+                }
+                if group_pads.len() >= 2 {
+                    pin_swap_groups.push(group_pads);
+                }
+                search_idx = sg_end;
+                continue;
+            }
+        }
+        search_idx += 1;
+    }
+
+    let mut g_search = 0;
+    while g_search < bytes.len() {
+        if bytes[g_search] == b'(' && fp_str[g_search..].starts_with("(gate_swap ") {
+            if let Some(gs_end) = find_closing_paren(bytes, g_search) {
+                let gs_str = &fp_str[g_search + 11..gs_end];
+                let mut units = Vec::new();
+                let u_bytes = gs_str.as_bytes();
+                let mut ui = 0;
+                while ui < u_bytes.len() {
+                    if u_bytes[ui] == b'(' {
+                        if let Some(u_end) = find_closing_paren(u_bytes, ui) {
+                            let unit_str = &gs_str[ui + 1..u_end];
+                            let mut unit_pads = Vec::new();
+                            for token in unit_str.split_whitespace() {
+                                let clean = token.trim_matches(['(', ')', '"', ',']);
+                                if let Some(p_idx) = pads.iter().position(|p| p.number == clean) {
+                                    unit_pads.push(p_idx);
+                                } else if let Ok(idx) = clean.parse::<usize>() {
+                                    if idx < pads.len() {
+                                        unit_pads.push(idx);
+                                    }
+                                }
+                            }
+                            if !unit_pads.is_empty() {
+                                units.push(unit_pads);
+                            }
+                            ui = u_end;
+                            continue;
+                        }
+                    }
+                    ui += 1;
+                }
+                if units.len() >= 2 {
+                    gate_swap_groups.push(SwappableGateGroup {
+                        name: "gate_group".to_string(),
+                        gate_units: units,
+                    });
+                }
+                g_search = gs_end;
+                continue;
+            }
+        }
+        g_search += 1;
+    }
+
     let mut fp = Footprint {
         reference,
         value,
@@ -2888,7 +3224,10 @@ fn parse_footprint(
         escape_margin: 0.0,
         at_span,
         fp_span: Some((fp_byte_offset, fp_byte_offset + fp_str.len())),
+        pin_swap_groups,
+        gate_swap_groups,
     };
+    fp.infer_swap_groups();
     fp.escape_margin = fp.compute_escape_margin();
     Some(fp)
 }
@@ -3134,6 +3473,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
         assert!(fp.is_smd_only());
         // At -90 deg rotation, pad (0.30 x 1.45) must have world size (1.45 x 0.30)
@@ -3965,6 +4306,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         let boundary = AABB::new(10.0, 10.0, 50.0, 50.0);
@@ -4017,6 +4360,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         let fp_b = Footprint {
@@ -4036,6 +4381,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         board.footprints.push(fp_a);
@@ -4096,6 +4443,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         let fp_b = Footprint {
@@ -4115,6 +4464,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         board.footprints.push(fp_a);
@@ -4178,6 +4529,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         let fp_b = Footprint {
@@ -4197,6 +4550,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         let fp_c = Footprint {
@@ -4216,6 +4571,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         board.footprints.push(fp_a);
@@ -4274,6 +4631,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         let fp_b = Footprint {
@@ -4293,6 +4652,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         // Track connected to R1's original position at (10, 10)
@@ -4339,6 +4700,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         let fp_b = Footprint {
@@ -4358,6 +4721,8 @@ mod tests {
             escape_margin: 0.0,
             at_span: None,
             fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
         };
 
         board.footprints.push(fp_a);
