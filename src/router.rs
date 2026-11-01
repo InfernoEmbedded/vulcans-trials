@@ -3,6 +3,7 @@
 
 use crate::board::{ArcSegment, Board, Footprint, LiveTrialState, NetClass, NetTopology, Pad, Point, TrackSegment, TrialPhase, Via};
 pub use crate::board::BusBundle;
+use crate::ipc::KiCadIpcClient;
 use crate::vulkan::VulkanEngine;
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -2010,6 +2011,7 @@ pub struct AutoRouter {
     pub allow_component_nudge: bool,
     pub crosstalk_penalty: f64,
     pub config: RoutingConfig,
+    pub ipc: Option<Arc<Mutex<KiCadIpcClient>>>,
 }
 
 impl AutoRouter {
@@ -2023,7 +2025,13 @@ impl AutoRouter {
             allow_component_nudge: false,
             crosstalk_penalty: config.crosstalk_penalty,
             config,
+            ipc: None,
         }
+    }
+
+    pub fn with_ipc(mut self, ipc: Option<Arc<Mutex<KiCadIpcClient>>>) -> Self {
+        self.ipc = ipc;
+        self
     }
 
     pub fn with_crosstalk_penalty(mut self, pen: f64) -> Self {
@@ -2261,6 +2269,16 @@ impl AutoRouter {
         // Clear out any old unlocked tracks/vias before routing so they don't block stubs or grid
         board.tracks.retain(|t| t.is_locked);
         board.vias.retain(|v| v.is_locked);
+
+        if let Some(ref ipc_lock) = self.ipc {
+            if let Ok(mut client) = ipc_lock.lock() {
+                if client.is_connected() {
+                    let _ = client.clear_tracks();
+                    let _ = client.commit_batch();
+                }
+            }
+        }
+
         grid.obstacle_net_ids.fill(FREE_NET);
         grid.nudgeable_fp.fill(None);
         grid.smd_pad_cells.fill(false);
@@ -2704,6 +2722,14 @@ impl AutoRouter {
                         if let Some(ref st) = live {
                             let done = routed_paths.iter().filter(|p| p.is_some()).count();
                             self.reconstruct_tracks_and_vias(board, grid, &connections, &routed_paths, &escape_stubs);
+                            if let Some(ref ipc_lock) = self.ipc {
+                                if let Ok(mut client) = ipc_lock.lock() {
+                                    if client.is_connected() {
+                                        let _ = client.clear_tracks();
+                                        let _ = client.stream_tracks_and_vias(board);
+                                    }
+                                }
+                            }
                             let remaining_ratsnest: Vec<crate::board::Segment> = connections
                                 .iter()
                                 .enumerate()
@@ -2957,6 +2983,15 @@ impl AutoRouter {
         self.reduce_vias(board, grid);
         prune_dangling_tracks_and_vias(board);
 
+        if let Some(ref ipc_lock) = self.ipc {
+            if let Ok(mut client) = ipc_lock.lock() {
+                if client.is_connected() {
+                    let _ = client.clear_tracks();
+                    let _ = client.stream_tracks_and_vias(board);
+                }
+            }
+        }
+
         // Phase 3: Post-Route Glossing Pass (rubber-band straightening, stair-step elimination, 45-deg mitering)
         self.gloss_tracks(board, grid);
         prune_dangling_tracks_and_vias(board);
@@ -3038,6 +3073,15 @@ impl AutoRouter {
                     board.tracks.len(),
                     board.vias.len()
                 ));
+            }
+        }
+
+        if let Some(ref ipc_lock) = self.ipc {
+            if let Ok(mut client) = ipc_lock.lock() {
+                if client.is_connected() {
+                    let _ = client.clear_tracks();
+                    let _ = client.stream_tracks_and_vias(board);
+                }
             }
         }
 

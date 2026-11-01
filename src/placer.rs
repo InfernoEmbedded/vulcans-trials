@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
 use crate::board::{Board, LiveTrialState, Point, Polygon, TrialPhase, AABB};
+use crate::ipc::KiCadIpcClient;
 use crate::vulkan::{GpuSaParams, VulkanEngine};
 use rand::prelude::*;
 use rand::rngs::StdRng;
@@ -34,6 +35,7 @@ pub struct PlacementConfig {
     pub centroid_pull_prob: f64,
     pub temp_scale: f64,
     pub vulkan: Option<Arc<VulkanEngine>>,
+    pub ipc: Option<Arc<Mutex<KiCadIpcClient>>>,
 }
 
 impl Default for PlacementConfig {
@@ -58,6 +60,7 @@ impl Default for PlacementConfig {
             centroid_pull_prob: 0.20,
             temp_scale: 1.0,
             vulkan: None,
+            ipc: None,
         }
     }
 }
@@ -1976,8 +1979,12 @@ pub fn run_auto_placer(
         }
     }
 
-    let num_epochs = (config.duration_secs * 4).max(1) as usize;
-    let epoch_dur = Duration::from_millis(250);
+    let is_ipc = config.ipc.as_ref().map_or(false, |l| l.lock().map_or(false, |c| c.is_connected()));
+    let (num_epochs, epoch_dur, stagnant_threshold, thermal_pulse_reset) = if is_ipc {
+        ((config.duration_secs * 60).max(1) as usize, Duration::from_millis(16), 60usize, 45usize)
+    } else {
+        ((config.duration_secs * 4).max(1) as usize, Duration::from_millis(250), 4usize, 3usize)
+    };
     let mut replicas: Vec<PlacementState> = (0..num_threads)
         .map(|tid| {
             if tid == 0 {
@@ -2094,8 +2101,8 @@ pub fn run_auto_placer(
                 stagnant_epochs += 1;
             }
 
-            if stagnant_epochs >= 4 {
-                thermal_pulse_epochs = 3;
+            if stagnant_epochs >= stagnant_threshold {
+                thermal_pulse_epochs = thermal_pulse_reset;
                 stagnant_epochs = 0;
                 if let Some(ref st) = live {
                     if let Ok(mut g) = st.lock() {
@@ -2519,6 +2526,18 @@ pub fn run_auto_placer(
             }
             let best_snap = global_best.lock().unwrap().clone();
 
+            if let Some(ref ipc_lock) = config.ipc {
+                if let Ok(mut client) = ipc_lock.lock() {
+                    if client.is_connected() {
+                        client.stream_footprint_deltas(
+                            &board.footprints,
+                            &best_snap.positions,
+                            &best_snap.rotations,
+                        );
+                    }
+                }
+            }
+
             let elapsed = start_time.elapsed().as_secs_f64().max(1e-3);
             let rate = total_evals.load(Ordering::Relaxed) as f64 / elapsed;
 
@@ -2692,6 +2711,18 @@ pub fn run_auto_placer(
             ));
         }
     }
+
+    if let Some(ref ipc_lock) = config.ipc {
+        if let Ok(mut client) = ipc_lock.lock() {
+            if client.is_connected() {
+                for fp in &board.footprints {
+                    client.queue_move_footprint(&fp.reference, fp.x, fp.y, fp.rotation);
+                }
+                let _ = client.commit_batch();
+            }
+        }
+    }
+
     final_best
 }
 

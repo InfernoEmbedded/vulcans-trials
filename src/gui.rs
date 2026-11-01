@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
 use crate::board::{Board, LiveTrialState, Point, Polygon, TrackSegment, TrialPhase, Via};
+use crate::ipc::KiCadIpcClient;
 use crate::placer::{run_auto_placer, PlacementConfig};
 use crate::router::{AutoRouter, RoutingGrid};
 use crate::vulkan::{SystemTelemetry, VulkanEngine};
@@ -180,6 +181,9 @@ pub struct VulcansTrialsApp {
     pub bundle_selected_nets: Vec<usize>,
     pub bundle_track_width: f64,
     pub bundle_track_spacing: f64,
+    pub ipc: Option<Arc<Mutex<KiCadIpcClient>>>,
+    pub kicad_ipc_enabled: bool,
+    pub kicad_ipc_socket_path: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -248,7 +252,18 @@ impl VulcansTrialsApp {
             bundle_selected_nets: Vec::new(),
             bundle_track_width: 0.25,
             bundle_track_spacing: 0.25,
+            ipc: None,
+            kicad_ipc_enabled: false,
+            kicad_ipc_socket_path: String::new(),
         }
+    }
+
+    pub fn with_ipc(mut self, ipc: Option<Arc<Mutex<KiCadIpcClient>>>) -> Self {
+        if ipc.is_some() {
+            self.kicad_ipc_enabled = true;
+        }
+        self.ipc = ipc;
+        self
     }
 
     pub fn is_layer_visible(&self, layer_name: &str) -> bool {
@@ -306,6 +321,7 @@ impl VulcansTrialsApp {
         let esc_mult = self.escape_margin_mult;
         let cross_w = self.crossing_weight;
         let out_path = self.output_path.clone();
+        let ipc_client = if self.kicad_ipc_enabled { self.ipc.clone() } else { None };
 
         thread::spawn(move || {
             let mut working_board = {
@@ -322,6 +338,7 @@ impl VulcansTrialsApp {
                         escape_margin_mult: esc_mult,
                         crossing_weight: cross_w,
                         vulkan: vulkan.clone(),
+                        ipc: ipc_client.clone(),
                         ..PlacementConfig::default()
                     };
                     let count = crate::placer::place_all_holding_components_at_best_locations(&mut g.board, &cfg);
@@ -342,6 +359,7 @@ impl VulcansTrialsApp {
                     escape_margin_mult: esc_mult,
                     crossing_weight: cross_w,
                     vulkan: vulkan.clone(),
+                    ipc: ipc_client.clone(),
                     ..PlacementConfig::default()
                 };
                 run_auto_placer(&mut working_board, &cfg, Some(Arc::clone(&live)), Arc::clone(&stop_flag));
@@ -351,7 +369,8 @@ impl VulcansTrialsApp {
                 let mut grid = RoutingGrid::new(&working_board, grid_res, vulkan).with_inner_layer_penalty(inner_plane_pen);
                 let mut router = AutoRouter::new(max_passes)
                     .with_allow_component_nudge(allow_comp_nudge)
-                    .with_any_angle_mode(any_angle);
+                    .with_any_angle_mode(any_angle)
+                    .with_ipc(ipc_client.clone());
                 router.inner_layer_penalty = inner_plane_pen;
                 router.route_all(
                     &mut working_board,
@@ -1308,6 +1327,7 @@ impl VulcansTrialsApp {
         egui::SidePanel::left("vulcan_controls_panel")
             .resizable(true)
             .default_width(310.0)
+            .max_width(310.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.heading("Controls");
@@ -1494,6 +1514,40 @@ impl VulcansTrialsApp {
                     !is_running,
                     egui::Checkbox::new(&mut self.any_angle_mode, "Any-Angle Mode (TopoR Arcs)"),
                 );
+
+                ui.separator();
+                ui.heading("KiCad 10 IPC Live Sync");
+                if ui.checkbox(&mut self.kicad_ipc_enabled, "KiCad IPC Live Sync").changed() {
+                    if self.kicad_ipc_enabled && self.ipc.is_none() {
+                        let custom = if self.kicad_ipc_socket_path.is_empty() {
+                            None
+                        } else {
+                            Some(self.kicad_ipc_socket_path.as_str())
+                        };
+                        if let Some(client) = KiCadIpcClient::connect_or_discover(custom) {
+                            self.ipc = Some(Arc::new(Mutex::new(client)));
+                        }
+                    }
+                }
+
+                let (status_text, status_col) = match self.ipc.as_ref() {
+                    Some(client_lock) => {
+                        if let Ok(c) = client_lock.lock() {
+                            if c.is_connected() {
+                                ("Connected", Color32::from_rgb(0, 220, 100))
+                            } else {
+                                ("Disconnected", Color32::from_rgb(220, 80, 80))
+                            }
+                        } else {
+                            ("Locked", Color32::GRAY)
+                        }
+                    }
+                    None => ("Offline", Color32::GRAY),
+                };
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Status:").strong());
+                    ui.label(egui::RichText::new(status_text).color(status_col));
+                });
 
                 ui.collapsing("Aggressive Placement & Exploration", |ui| {
                     ui.add_enabled(
