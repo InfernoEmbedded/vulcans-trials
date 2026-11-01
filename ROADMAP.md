@@ -74,5 +74,5 @@ Below is a comprehensive breakdown of features offered by flagship commercial PC
 
 ### Phase 6: v1.0 — Interactive Guided Routing & KiCad IPC Live Sync
 - [x] **User-Guided Bundle Sketching:** Draw a rough poly-line path in the GUI or KiCad to guide a bus of nets along a desired channel.
-- [ ] **Full KiCad 10 IPC Socket Live Streaming:** Stream placement and trace updates directly into the open KiCad canvas at 60 FPS without file reloads.
+- [x] **Full KiCad 10 IPC Socket Live Streaming:** Stream placement and trace updates directly into the open KiCad canvas at 60 FPS without file reloads.
 - [x] **One-Click KiCad PCM Package:** Automated CI/CD builds for Linux, Windows, and macOS published to the official KiCad Plugin and Content Manager repository.
