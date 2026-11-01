@@ -29,10 +29,10 @@ Below is a comprehensive breakdown of features offered by flagship commercial PC
 | **Topological** | Any-angle / Arc / Teardrop topological rubber-band routing | Eremex TopoR, Xpedition | **Phase 3 (v0.3)** |
 | **Topological** | Post-route trace glossing, corner mitering, and via minimization pass | Specctra, Altium | **Phase 3 (v0.3)** |
 | **HDI & BGA** | Dog-bone, via-in-pad, blind/buried & microvia BGA fanout solver | Allegro, Zuken, Xpedition | **Phase 4 (v0.4)** |
-| **HDI & BGA** | Pin & gate swapping optimization (FPGA / MCU / multi-unit op-amps) | Allegro, Xpedition | **Phase 4 (v0.4)** |
-| **SI / PI / DFM** | Crosstalk-aware parallel run-length limit & guard-trace insertion | Allegro, HyperLynx | **Phase 5 (v0.5)** |
-| **SI / PI / DFM** | Return-path continuity & split-plane crossing avoidance | Allegro, Zuken | **Phase 5 (v0.5)** |
-| **SI / PI / DFM** | Acid-trap removal, solder-mask sliver prevention, and teardrop generation | Altium, Valor NPI | **Phase 5 (v0.5)** |
+| **HDI & BGA** | Pin & gate swapping optimization (FPGA / MCU / multi-unit op-amps) | Allegro, Xpedition | **Implemented (v0.4)** |
+| **SI / PI / DFM** | Crosstalk-aware parallel run-length limit & guard-trace insertion | Allegro, HyperLynx | **Implemented (v0.5)** |
+| **SI / PI / DFM** | Return-path continuity & split-plane crossing avoidance | Allegro, Zuken | **Implemented (v0.5)** |
+| **SI / PI / DFM** | Acid-trap removal, solder-mask sliver prevention, and teardrop generation | Altium, Valor NPI | **Implemented (v0.5)** |
 | **Interactive** | Guided River Routing / Bus Bundle sketching ("ActiveRoute" style) | Altium, Xpedition | **Phase 6 (v1.0)** |
 
 ---
