@@ -20,7 +20,7 @@ use vulcans_trials::vulkan::VulkanEngine;
 #[command(
     name = "vulcans-trials",
     author = "InfernoEmbedded",
-    version = "0.1.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Vulcan's Trials — Vulkan GPU + Multithreaded CPU Auto-Placer & Auto-Router for KiCad (GPLv3)"
 )]
 struct Args {
@@ -94,7 +94,7 @@ fn parse_locked_refs(lock_arg: &str) -> HashSet<String> {
 }
 
 fn run_self_test() -> Result<(), String> {
-    println!("=== Vulcan's Trials (InfernoEmbedded) — Self-Test Suite ===");
+    println!("=== Vulcan's Trials v{} (InfernoEmbedded) — Self-Test Suite ===", env!("CARGO_PKG_VERSION"));
 
     // 1. Verify Vulkan Compute Engine & WGSL Distance Field Shader
     let vk = VulkanEngine::new().ok_or("Failed to initialize Vulkan compute backend")?;
@@ -318,12 +318,14 @@ fn main() {
     if let Some(ref vk) = vulkan {
         if !args.mcp {
             println!(
-                "=== Vulcan's Trials (InfernoEmbedded) — Vulkan GPU: {} [{}] ===",
-                vk.device_name, vk.backend_name
+                "=== Vulcan's Trials v{} (InfernoEmbedded) — Vulkan GPU: {} [{}] ===",
+                env!("CARGO_PKG_VERSION"),
+                vk.device_name,
+                vk.backend_name
             );
         }
     } else if !args.mcp {
-        println!("=== Vulcan's Trials (InfernoEmbedded) — CPU Fallback Mode ===");
+        println!("=== Vulcan's Trials v{} (InfernoEmbedded) — CPU Fallback Mode ===", env!("CARGO_PKG_VERSION"));
     }
 
     if args.mcp || args.mcp_tcp.is_some() {
@@ -380,7 +382,8 @@ fn main() {
         board.clusters.len()
     );
 
-    let ipc_client = if let Some(ref path_str) = args.kicad_ipc {
+    let ipc_target = args.kicad_ipc.as_ref().or(args.ipc.as_ref());
+    let ipc_client = if let Some(path_str) = ipc_target {
         let custom = if path_str.is_empty() { None } else { Some(path_str.as_str()) };
         if let Some(c) = vulcans_trials::ipc::KiCadIpcClient::connect_or_discover(custom) {
             println!("[KiCad-IPC] Connected to socket: {:?}", c.socket_path());
@@ -403,15 +406,16 @@ fn main() {
 
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Vulcan's Trials — InfernoEmbedded Auto-Placer & Auto-Router (GPLv3)")
+            .with_title(format!("Vulcan's Trials v{} — InfernoEmbedded Auto-Placer & Auto-Router (GPLv3)", env!("CARGO_PKG_VERSION")))
             .with_inner_size([1360.0, 840.0]),
         ..Default::default()
     };
 
     let input_path = args.input.clone();
     let output_path = args.output.clone();
+    let app_title = format!("Vulcan's Trials v{} — InfernoEmbedded", env!("CARGO_PKG_VERSION"));
     if let Err(e) = eframe::run_native(
-        "Vulcan's Trials — InfernoEmbedded",
+        &app_title,
         native_options,
         Box::new(move |_cc| Ok(Box::new(VulcansTrialsApp::new(input_path, output_path, board, vulkan).with_ipc(ipc_client)))),
     ) {

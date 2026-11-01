@@ -41,7 +41,7 @@ fn test_metadata_json_syntax_and_schema_compliance() {
     assert!(!versions.is_empty(), "versions must contain at least one version entry");
 
     let v0 = &versions[0];
-    assert_eq!(v0["version"].as_str(), Some("0.1.0"));
+    assert_eq!(v0["version"].as_str(), Some("1.0.0"));
     assert_eq!(v0["status"].as_str(), Some("stable"));
     assert_eq!(v0["kicad_version"].as_str(), Some("8.0"));
     assert_eq!(v0["kicad_version_max"].as_str(), Some("10.0"));
@@ -91,7 +91,7 @@ fn test_build_pcm_produces_valid_zip_archive_and_repo_index() {
     );
 
     // 1. Verify ZIP archive exists and has non-zero size
-    let zip_path = temp_dir.join("com.infernoembedded.vulcans-trials_v0.1.0_pcm.zip");
+    let zip_path = temp_dir.join("com.infernoembedded.vulcans-trials_v1.0.0_pcm.zip");
     assert!(zip_path.exists(), "PCM zip archive must exist at {}", zip_path.display());
     let zip_size = fs::metadata(&zip_path).unwrap().len();
     assert!(zip_size > 1000, "Zip size should be > 1KB (got {} bytes)", zip_size);
@@ -131,7 +131,7 @@ fn test_build_pcm_produces_valid_zip_archive_and_repo_index() {
     let versions = pkg["versions"].as_array().unwrap();
     assert_eq!(versions.len(), 1);
     let v_entry = &versions[0];
-    assert_eq!(v_entry["version"].as_str(), Some("0.1.0"));
+    assert_eq!(v_entry["version"].as_str(), Some("1.0.0"));
     assert_eq!(v_entry["kicad_version"].as_str(), Some("8.0"));
     assert_eq!(v_entry["kicad_version_max"].as_str(), Some("10.0"));
     assert_eq!(v_entry["download_size"].as_u64(), Some(zip_size));
@@ -189,7 +189,7 @@ fn test_build_pcm_bundled_binary_packaging() {
 
     assert!(output.status.success());
 
-    let zip_path = temp_dir.join("com.infernoembedded.vulcans-trials_v0.1.0_linux_x86_64_pcm.zip");
+    let zip_path = temp_dir.join("com.infernoembedded.vulcans-trials_v1.0.0_linux_x86_64_pcm.zip");
     assert!(zip_path.exists());
 
     let unzip_check = Command::new("python3")

@@ -254,13 +254,20 @@ impl VulcansTrialsApp {
             bundle_track_spacing: 0.25,
             ipc: None,
             kicad_ipc_enabled: false,
-            kicad_ipc_socket_path: String::new(),
+            kicad_ipc_socket_path: KiCadIpcClient::discover_socket_path()
+                .map(|p| format!("ipc://{}", p.display()))
+                .unwrap_or_else(|| "ipc:///tmp/kicad/api.sock".to_string()),
         }
     }
 
     pub fn with_ipc(mut self, ipc: Option<Arc<Mutex<KiCadIpcClient>>>) -> Self {
-        if ipc.is_some() {
+        if let Some(ref client_arc) = ipc {
             self.kicad_ipc_enabled = true;
+            if let Ok(c) = client_arc.lock() {
+                if let Some(path) = c.socket_path() {
+                    self.kicad_ipc_socket_path = format!("ipc://{}", path.display());
+                }
+            }
         }
         self.ipc = ipc;
         self
@@ -1291,7 +1298,7 @@ impl VulcansTrialsApp {
         egui::TopBottomPanel::top("vulcan_top_bar").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new("⚡ Vulcan's Trials").color(Color32::from_rgb(255, 145, 50)));
+                ui.heading(egui::RichText::new(format!("⚡ Vulcan's Trials v{}", env!("CARGO_PKG_VERSION"))).color(Color32::from_rgb(255, 145, 50)));
                 ui.label(egui::RichText::new("by InfernoEmbedded (GPLv3)").weak());
                 ui.separator();
 
@@ -1519,16 +1526,50 @@ impl VulcansTrialsApp {
                 ui.heading("KiCad 10 IPC Live Sync");
                 if ui.checkbox(&mut self.kicad_ipc_enabled, "KiCad IPC Live Sync").changed() {
                     if self.kicad_ipc_enabled && self.ipc.is_none() {
-                        let custom = if self.kicad_ipc_socket_path.is_empty() {
+                        let custom = if self.kicad_ipc_socket_path.trim().is_empty() {
                             None
                         } else {
-                            Some(self.kicad_ipc_socket_path.as_str())
+                            Some(self.kicad_ipc_socket_path.trim())
                         };
                         if let Some(client) = KiCadIpcClient::connect_or_discover(custom) {
+                            if self.kicad_ipc_socket_path.trim().is_empty() {
+                                if let Some(sp) = client.socket_path() {
+                                    self.kicad_ipc_socket_path = format!("ipc://{}", sp.display());
+                                }
+                            }
                             self.ipc = Some(Arc::new(Mutex::new(client)));
                         }
+                    } else if !self.kicad_ipc_enabled {
+                        self.ipc = None;
                     }
                 }
+
+                ui.horizontal(|ui| {
+                    ui.label("Socket:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.kicad_ipc_socket_path)
+                            .hint_text("ipc:///tmp/kicad/api.sock")
+                            .desired_width(160.0),
+                    );
+                    if ui.button("Connect").clicked() {
+                        let custom = if self.kicad_ipc_socket_path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(self.kicad_ipc_socket_path.trim())
+                        };
+                        if let Some(client) = KiCadIpcClient::connect_or_discover(custom) {
+                            if self.kicad_ipc_socket_path.trim().is_empty() {
+                                if let Some(sp) = client.socket_path() {
+                                    self.kicad_ipc_socket_path = format!("ipc://{}", sp.display());
+                                }
+                            }
+                            self.ipc = Some(Arc::new(Mutex::new(client)));
+                            self.kicad_ipc_enabled = true;
+                        } else {
+                            self.ipc = None;
+                        }
+                    }
+                });
 
                 let (status_text, status_col) = match self.ipc.as_ref() {
                     Some(client_lock) => {
@@ -1542,7 +1583,13 @@ impl VulcansTrialsApp {
                             ("Locked", Color32::GRAY)
                         }
                     }
-                    None => ("Offline", Color32::GRAY),
+                    None => {
+                        if self.kicad_ipc_enabled {
+                            ("Connecting / Not Found", Color32::from_rgb(220, 150, 40))
+                        } else {
+                            ("Offline", Color32::GRAY)
+                        }
+                    }
                 };
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Status:").strong());

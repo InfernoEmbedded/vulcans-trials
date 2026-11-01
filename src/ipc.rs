@@ -113,9 +113,23 @@ impl KiCadIpcClient {
         }
     }
 
+    /// Normalizes a socket path string, stripping `ipc://` or `ipc:` URI schemes.
+    pub fn normalize_socket_path(path: &str) -> PathBuf {
+        let trimmed = path.trim();
+        let stripped = if let Some(s) = trimmed.strip_prefix("ipc://") {
+            s
+        } else if let Some(s) = trimmed.strip_prefix("ipc:") {
+            s
+        } else {
+            trimmed
+        };
+        PathBuf::from(stripped)
+    }
+
     /// Connects to a specific Unix domain socket path and performs initial handshake.
+    /// Supports direct filesystem paths as well as `ipc:///path/to/socket` URI syntax.
     pub fn connect<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
-        let p = path.as_ref().to_path_buf();
+        let p = Self::normalize_socket_path(&path.as_ref().to_string_lossy());
         #[cfg(unix)]
         {
             let stream = UnixStream::connect(&p)?;
@@ -142,6 +156,7 @@ impl KiCadIpcClient {
         }
         #[cfg(not(unix))]
         {
+            let _ = p;
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "KiCad IPC domain sockets are supported on Unix platforms",
@@ -152,11 +167,12 @@ impl KiCadIpcClient {
     /// Attempts to connect to a custom path if given, or automatically discovers an active KiCad 10 IPC socket.
     pub fn connect_or_discover(custom_path: Option<&str>) -> Option<Self> {
         if let Some(cp) = custom_path {
-            if !cp.trim().is_empty() {
-                match Self::connect(cp.trim()) {
+            let norm = Self::normalize_socket_path(cp);
+            if !norm.as_os_str().is_empty() {
+                match Self::connect(&norm) {
                     Ok(client) => return Some(client),
                     Err(e) => {
-                        eprintln!("[KiCad-IPC] Failed to connect to specified socket '{}': {}", cp, e);
+                        eprintln!("[KiCad-IPC] Failed to connect to specified socket '{}': {}", norm.display(), e);
                         return None;
                     }
                 }
@@ -181,19 +197,34 @@ impl KiCadIpcClient {
 
     /// Discovers active KiCad 10 IPC Unix socket paths on Linux/macOS.
     /// Checks:
-    /// 1. $KICAD_IPC_PATH or $KICAD_IPC_SOCKET env vars
-    /// 2. $XDG_RUNTIME_DIR/kicad/kicad_ipc_*.sock
-    /// 3. /tmp/kicad_ipc_*.sock
+    /// 1. $KICAD_IPC_PATH or $KICAD_IPC_SOCKET env vars (supports ipc:// prefix)
+    /// 2. Well-known KiCad 9/10 socket paths (/tmp/kicad/api.sock, /tmp/kicad.sock)
+    /// 3. $XDG_RUNTIME_DIR/kicad/
+    /// 4. /tmp/kicad/
+    /// 5. /tmp/
     pub fn discover_socket_path() -> Option<PathBuf> {
         // 1. Environment variable override
         if let Ok(env_path) = env::var("KICAD_IPC_PATH").or_else(|_| env::var("KICAD_IPC_SOCKET")) {
-            let p = PathBuf::from(env_path);
+            let p = Self::normalize_socket_path(&env_path);
             if p.exists() {
                 return Some(p);
             }
         }
 
-        // 2. $XDG_RUNTIME_DIR/kicad/
+        // 2. Direct well-known KiCad 9/10 socket paths
+        let direct_candidates = [
+            "/tmp/kicad/api.sock",
+            "/tmp/kicad.sock",
+            "/tmp/kicad/kicad.sock",
+        ];
+        for candidate in &direct_candidates {
+            let p = Path::new(candidate);
+            if p.exists() {
+                return Some(p.to_path_buf());
+            }
+        }
+
+        // 3. $XDG_RUNTIME_DIR/kicad/
         if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
             let kicad_dir = Path::new(&runtime_dir).join("kicad");
             if let Some(found) = scan_dir_for_socket(&kicad_dir) {
@@ -201,7 +232,12 @@ impl KiCadIpcClient {
             }
         }
 
-        // 3. /tmp/
+        // 4. /tmp/kicad/
+        if let Some(found) = scan_dir_for_socket(Path::new("/tmp/kicad")) {
+            return Some(found);
+        }
+
+        // 5. /tmp/
         if let Some(found) = scan_dir_for_socket(Path::new("/tmp")) {
             return Some(found);
         }
@@ -470,12 +506,15 @@ fn scan_dir_for_socket(dir: &Path) -> Option<PathBuf> {
     if !dir.is_dir() {
         return None;
     }
+    let is_kicad_dir = dir.to_string_lossy().contains("kicad");
     let entries = fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let p = entry.path();
         let fname = p.file_name().and_then(|f| f.to_str()).unwrap_or("");
-        if (fname.starts_with("kicad_ipc") || fname.contains("kicad")) && fname.ends_with(".sock") {
-            return Some(p);
+        if fname.ends_with(".sock") {
+            if is_kicad_dir || fname.starts_with("kicad_ipc") || fname.contains("kicad") || fname == "api.sock" {
+                return Some(p);
+            }
         }
     }
     None
@@ -696,5 +735,49 @@ mod tests {
         let _ = fs::remove_file(&dummy_sock);
 
         assert_eq!(disc, Some(PathBuf::from(dummy_sock)));
+    }
+
+    #[test]
+    fn test_normalize_socket_path() {
+        assert_eq!(
+            KiCadIpcClient::normalize_socket_path("ipc:///tmp/kicad/api.sock"),
+            PathBuf::from("/tmp/kicad/api.sock")
+        );
+        assert_eq!(
+            KiCadIpcClient::normalize_socket_path("ipc:/tmp/kicad/api.sock"),
+            PathBuf::from("/tmp/kicad/api.sock")
+        );
+        assert_eq!(
+            KiCadIpcClient::normalize_socket_path("  ipc:///tmp/kicad.sock  "),
+            PathBuf::from("/tmp/kicad.sock")
+        );
+        assert_eq!(
+            KiCadIpcClient::normalize_socket_path("/tmp/kicad/api.sock"),
+            PathBuf::from("/tmp/kicad/api.sock")
+        );
+    }
+
+    #[test]
+    fn test_connect_with_ipc_uri_scheme() {
+        let sock_path = format!("/tmp/kicad_ipc_uri_test_{}.sock", std::process::id());
+        let _ = fs::remove_file(&sock_path);
+
+        let listener = UnixListener::bind(&sock_path).expect("Failed to bind test unix socket");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("Accept failed");
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            line
+        });
+
+        // Pass path with ipc:// URI prefix
+        let uri = format!("ipc://{}", sock_path);
+        let client = KiCadIpcClient::connect(&uri).expect("Connect with ipc:// failed");
+        assert!(client.is_connected());
+
+        let line = server_thread.join().expect("Server thread join failed");
+        let _ = fs::remove_file(&sock_path);
+        assert!(line.contains("Handshake"));
     }
 }
