@@ -11280,6 +11280,7 @@ mod tests {
             net_id: 1,
             net_name: "NET1".to_string(),
             is_through_hole: false,
+            ..Default::default()
         };
         let fp_circ = make_fp("U1", 10.0, 10.0, false, vec![circ_pad]);
 
@@ -11296,6 +11297,7 @@ mod tests {
             net_id: 2,
             net_name: "NET2".to_string(),
             is_through_hole: false,
+            ..Default::default()
         };
         let fp_rect = make_fp("U2", 30.0, 30.0, false, vec![rect_pad]);
 
@@ -11405,6 +11407,7 @@ mod tests {
             net_id: 1,
             net_name: "NET1".to_string(),
             is_through_hole: false,
+            ..Default::default()
         };
         let fp_target = make_fp("U1", 10.0, 10.0, false, vec![target_pad]);
 
@@ -11421,6 +11424,7 @@ mod tests {
             net_id: 2,
             net_name: "NET2".to_string(),
             is_through_hole: false,
+            ..Default::default()
         };
         let fp_foreign_left = make_fp("R1", 10.24, 10.45, false, vec![foreign_pad_left]);
 
@@ -11436,6 +11440,7 @@ mod tests {
             net_id: 2,
             net_name: "NET2".to_string(),
             is_through_hole: false,
+            ..Default::default()
         };
         let fp_foreign_right = make_fp("R2", 10.24, 9.55, false, vec![foreign_pad_right]);
 
