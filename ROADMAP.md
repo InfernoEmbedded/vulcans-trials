@@ -26,7 +26,7 @@ Below is a comprehensive breakdown of features offered by flagship commercial PC
 | **High-Speed** | Coupled Differential Pair routing (constant gap, coupled turns, via symmetry) | Allegro, Altium, Xpedition | **Phase 2 (v0.2)** |
 | **High-Speed** | Serpentine / Trombone delay & phase length tuning (ps / mm matching) | Allegro, Xpedition, Zuken | **Phase 2 (v0.2)** |
 | **High-Speed** | Impedance-controlled layer-specific track width adjustment | Allegro, Altium | **Phase 2 (v0.2)** |
-| **Topological** | Any-angle / Arc / Teardrop topological rubber-band routing | Eremex TopoR, Xpedition | **Phase 3 (v0.3)** |
+| **Topological** | Any-angle / Arc / Teardrop topological rubber-band routing | Eremex TopoR, Xpedition | **Implemented (v0.3)** |
 | **Topological** | Post-route trace glossing, corner mitering, and via minimization pass | Specctra, Altium | **Phase 3 (v0.3)** |
 | **HDI & BGA** | Dog-bone, via-in-pad, blind/buried & microvia BGA fanout solver | Allegro, Zuken, Xpedition | **Phase 4 (v0.4)** |
 | **HDI & BGA** | Pin & gate swapping optimization (FPGA / MCU / multi-unit op-amps) | Allegro, Xpedition | **Implemented (v0.4)** |
@@ -60,7 +60,7 @@ Below is a comprehensive breakdown of features offered by flagship commercial PC
 - [x] **Post-Route Glossing Pass:** Rubber-band trace straightening, stair-step elimination, and $45^\circ$ / arc corner smoothing.
 - [x] **Via Reduction Pass:** Iterative layer-reassignment pass that removes redundant layer transitions when a single-layer detour is within length budget.
 - [x] **Track Push-and-Shove (Continuous Coordinates):** Off-grid continuous shove engine allowing existing tracks to flex smoothly around newly routed nets.
-- [ ] **TopoR-Style Any-Angle Mode:** Delaunay triangulation + rubber-band topological routing for ultra-compact boards and curved enclosures.
+- [x] **TopoR-Style Any-Angle Mode:** Delaunay triangulation + rubber-band topological routing for ultra-compact boards and curved enclosures.
 
 ### Phase 4: v0.4 — HDI, BGA Fanout & Pin/Gate Swapping
 - [ ] **Automated BGA Escape Solver:** Quadrant dog-bone fanout, channel-routing, and blind/buried microvia stack support for $0.4\text{ mm}$–$0.8\text{ mm}$ pitch BGAs.

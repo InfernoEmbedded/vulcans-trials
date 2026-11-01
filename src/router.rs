@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
-use crate::board::{Board, Footprint, LiveTrialState, NetClass, NetTopology, Pad, Point, TrackSegment, TrialPhase, Via};
+use crate::board::{ArcSegment, Board, Footprint, LiveTrialState, NetClass, NetTopology, Pad, Point, TrackSegment, TrialPhase, Via};
 use crate::vulkan::VulkanEngine;
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -16,12 +16,15 @@ pub const FREE_NET: i32 = 0;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoutingConfig {
     pub crosstalk_penalty: f64,
+    #[serde(default)]
+    pub any_angle_mode: bool,
 }
 
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
             crosstalk_penalty: 4.0,
+            any_angle_mode: false,
         }
     }
 }
@@ -2035,6 +2038,11 @@ impl AutoRouter {
 
     pub fn with_allow_component_nudge(mut self, allow: bool) -> Self {
         self.allow_component_nudge = allow;
+        self
+    }
+
+    pub fn with_any_angle_mode(mut self, enabled: bool) -> Self {
+        self.config.any_angle_mode = enabled;
         self
     }
 
@@ -5280,7 +5288,7 @@ pub fn find_choked_pin_bottlenecks(
     }
 
     pub fn gloss_tracks(&self, board: &mut Board, grid: &RoutingGrid) {
-        gloss_tracks(board, grid);
+        gloss_tracks_with_mode(board, grid, self.config.any_angle_mode);
     }
 
     pub fn prune_dangling_tracks_and_vias(&self, board: &mut Board) {
@@ -7808,6 +7816,20 @@ pub fn enforce_45_grid(chain: &mut TrackChain) {
 }
 
 pub fn gloss_tracks(board: &mut Board, grid: &RoutingGrid) {
+    gloss_tracks_with_mode(board, grid, false);
+}
+
+pub fn gloss_tracks_with_mode(board: &mut Board, grid: &RoutingGrid, any_angle_mode: bool) {
+    if any_angle_mode {
+        gloss_tracks_standard(board, grid);
+        relax_homotopic_rubber_bands(board);
+        apply_any_angle_tangent_arcs(board);
+    } else {
+        gloss_tracks_standard(board, grid);
+    }
+}
+
+pub fn gloss_tracks_standard(board: &mut Board, grid: &RoutingGrid) {
     let mut net_ids: Vec<usize> = board
         .tracks
         .iter()
@@ -7863,6 +7885,448 @@ pub fn gloss_tracks(board: &mut Board, grid: &RoutingGrid) {
                         is_locked: false,
                     });
                 }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ObstacleInfo {
+    pub center: (f64, f64),
+    pub safe_radius: f64,
+}
+
+pub fn point_in_polygon(pt: (f64, f64), poly: &[(f64, f64)]) -> bool {
+    let mut inside = false;
+    let n = poly.len();
+    if n < 3 {
+        return false;
+    }
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        let intersect = ((yi > pt.1) != (yj > pt.1))
+            && (pt.0 < (xj - xi) * (pt.1 - yi) / (yj - yi + 1e-12) + xi);
+        if intersect {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+pub fn collect_obstacles_for_net(board: &Board, layer: usize, net_id: usize, track_width: f64) -> Vec<ObstacleInfo> {
+    let net_clr = board.get_netclass_for_net(net_id).clearance;
+    let half_w = track_width * 0.5;
+    let mut obstacles = Vec::new();
+
+    // 1. Foreign Pads
+    for fp in &board.footprints {
+        let pad_layer = fp.layer;
+        for pad in &fp.pads {
+            if pad.net_id != net_id && (pad.is_through_hole || pad_layer == layer) {
+                let (px, py) = fp.pad_absolute_position(pad);
+                let pad_clr = board.get_netclass_for_net(pad.net_id).clearance;
+                let req_clr = net_clr.max(pad_clr);
+                let pad_r = (pad.width * pad.width + pad.height * pad.height).sqrt() * 0.5;
+                obstacles.push(ObstacleInfo {
+                    center: (px, py),
+                    safe_radius: pad_r + req_clr + half_w,
+                });
+            }
+        }
+    }
+
+    // 2. Foreign Vias
+    for via in &board.vias {
+        if via.net_id != net_id {
+            let via_clr = board.get_netclass_for_net(via.net_id).clearance;
+            let req_clr = net_clr.max(via_clr);
+            let via_r = via.size * 0.5;
+            obstacles.push(ObstacleInfo {
+                center: via.position,
+                safe_radius: via_r + req_clr + half_w,
+            });
+        }
+    }
+
+    obstacles
+}
+
+pub fn relax_homotopic_rubber_bands(board: &mut Board) {
+    let mut net_ids: Vec<usize> = board
+        .tracks
+        .iter()
+        .filter(|t| !t.is_locked)
+        .map(|t| t.net_id)
+        .collect();
+    net_ids.sort_unstable();
+    net_ids.dedup();
+
+    for net_id in net_ids {
+        let net_tracks: Vec<TrackSegment> = board
+            .tracks
+            .iter()
+            .filter(|t| t.net_id == net_id && !t.is_locked)
+            .cloned()
+            .collect();
+        if net_tracks.is_empty() {
+            continue;
+        }
+
+        board.tracks.retain(|t| t.net_id != net_id || t.is_locked);
+
+        let mut chains = extract_track_chains(&net_tracks, board);
+        for chain in &mut chains {
+            relax_chain_homotopic(chain, board);
+        }
+
+        for chain in chains {
+            for k in 0..chain.points.len().saturating_sub(1) {
+                let p1 = chain.points[k];
+                let p2 = chain.points[k + 1];
+                if (p1.0 - p2.0).hypot(p1.1 - p2.1) > 1e-5 {
+                    board.tracks.push(TrackSegment {
+                        start: p1,
+                        end: p2,
+                        width: chain.width,
+                        layer: chain.layer,
+                        net_id: chain.net_id,
+                        is_locked: false,
+                    });
+                }
+            }
+        }
+    }
+}
+
+pub fn relax_chain_homotopic(chain: &mut TrackChain, board: &Board) {
+    if chain.points.len() < 3 {
+        return;
+    }
+
+    let obstacles = collect_obstacles_for_net(board, chain.layer, chain.net_id, chain.width);
+
+    // Iterative rubber-band string pulling passes
+    for _pass in 0..6 {
+        merge_collinear_points(&mut chain.points);
+        if chain.points.len() < 3 {
+            break;
+        }
+
+        // 1. Homotopic Triangle Shortcutting
+        let mut i = 1;
+        while i + 1 < chain.points.len() {
+            let p_prev = chain.points[i - 1];
+            let p_curr = chain.points[i];
+            let p_next = chain.points[i + 1];
+
+            let tri = [p_prev, p_curr, p_next];
+            let homotopy_ok = obstacles.iter().all(|obs| !point_in_polygon(obs.center, &tri));
+            if homotopy_ok && is_segment_clear(board, None, p_prev, p_next, chain.layer, chain.net_id, chain.width) {
+                chain.points.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
+        // 2. Multi-point Chord Shortcutting
+        let mut start_idx = 0;
+        while start_idx < chain.points.len() {
+            let mut best_j = None;
+            for j in ((start_idx + 2)..chain.points.len()).rev() {
+                let p_start = chain.points[start_idx];
+                let p_end = chain.points[j];
+                let poly = &chain.points[start_idx..=j];
+                let homotopy_ok = obstacles.iter().all(|obs| !point_in_polygon(obs.center, poly));
+                if homotopy_ok && is_segment_clear(board, None, p_start, p_end, chain.layer, chain.net_id, chain.width) {
+                    best_j = Some(j);
+                    break;
+                }
+            }
+            if let Some(j) = best_j {
+                chain.points.drain((start_idx + 1)..j);
+            }
+            start_idx += 1;
+        }
+
+        // 3. Obstacle Tangent Apex Contraction
+        for k in 1..chain.points.len().saturating_sub(1) {
+            let p_prev = chain.points[k - 1];
+            let p_curr = chain.points[k];
+            let p_next = chain.points[k + 1];
+
+            let blocking_obs = obstacles
+                .iter()
+                .filter(|obs| dist_point_to_segment(obs.center, p_prev, p_next) < obs.safe_radius)
+                .min_by(|a, b| {
+                    let da = (a.center.0 - p_curr.0).hypot(a.center.1 - p_curr.1);
+                    let db = (b.center.0 - p_curr.0).hypot(b.center.1 - p_curr.1);
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+            if let Some(obs) = blocking_obs {
+                let vx = p_curr.0 - obs.center.0;
+                let vy = p_curr.1 - obs.center.1;
+                let v_len = vx.hypot(vy);
+                if v_len > 1e-4 {
+                    let target_pt = (
+                        obs.center.0 + (vx / v_len) * obs.safe_radius,
+                        obs.center.1 + (vy / v_len) * obs.safe_radius,
+                    );
+                    let tri1 = [p_prev, p_curr, target_pt];
+                    let tri2 = [p_curr, p_next, target_pt];
+                    let h1 = obstacles.iter().all(|o| !point_in_polygon(o.center, &tri1));
+                    let h2 = obstacles.iter().all(|o| !point_in_polygon(o.center, &tri2));
+                    if h1 && h2
+                        && is_segment_clear(board, None, p_prev, target_pt, chain.layer, chain.net_id, chain.width)
+                        && is_segment_clear(board, None, target_pt, p_next, chain.layer, chain.net_id, chain.width)
+                    {
+                        chain.points[k] = target_pt;
+                    }
+                }
+            }
+        }
+
+        // 4. Binary-search Taut Relaxation towards Midpoint
+        for k in 1..chain.points.len().saturating_sub(1) {
+            let p_prev = chain.points[k - 1];
+            let p_curr = chain.points[k];
+            let p_next = chain.points[k + 1];
+            let target = ((p_prev.0 + p_next.0) * 0.5, (p_prev.1 + p_next.1) * 0.5);
+
+            let mut low = 0.0;
+            let mut high = 1.0;
+            let mut best_t = 0.0;
+
+            for _ in 0..8 {
+                let mid = (low + high) * 0.5;
+                let cand = (
+                    p_curr.0 + mid * (target.0 - p_curr.0),
+                    p_curr.1 + mid * (target.1 - p_curr.1),
+                );
+                let tri1 = [p_prev, p_curr, cand];
+                let tri2 = [p_curr, p_next, cand];
+                let h1 = obstacles.iter().all(|o| !point_in_polygon(o.center, &tri1));
+                let h2 = obstacles.iter().all(|o| !point_in_polygon(o.center, &tri2));
+                if h1 && h2
+                    && is_segment_clear(board, None, p_prev, cand, chain.layer, chain.net_id, chain.width)
+                    && is_segment_clear(board, None, cand, p_next, chain.layer, chain.net_id, chain.width)
+                {
+                    best_t = mid;
+                    low = mid;
+                } else {
+                    high = mid;
+                }
+            }
+
+            if best_t > 0.05 {
+                chain.points[k] = (
+                    p_curr.0 + best_t * (target.0 - p_curr.0),
+                    p_curr.1 + best_t * (target.1 - p_curr.1),
+                );
+            }
+        }
+    }
+
+    merge_collinear_points(&mut chain.points);
+}
+
+pub fn is_arc_clear(board: &Board, arc: &ArcSegment) -> bool {
+    let clearance = board.get_netclass_for_net(arc.net_id).clearance;
+    let half_w = arc.width * 0.5;
+
+    // 1. Foreign Pads
+    for fp in &board.footprints {
+        let pad_layer = fp.layer;
+        for pad in &fp.pads {
+            if pad.net_id != arc.net_id && (pad.is_through_hole || pad_layer == arc.layer) {
+                let (px, py) = fp.pad_absolute_position(pad);
+                let pad_clr = board.get_netclass_for_net(pad.net_id).clearance;
+                let req_clr = clearance.max(pad_clr);
+                let required_dist = half_w + req_clr;
+
+                let max_dim = pad.width.max(pad.height);
+                let d_center = arc.distance_to_point((px, py));
+                if d_center < required_dist + max_dim * 0.5 - 1e-4 {
+                    let segs = arc.to_segments(8);
+                    for s in &segs {
+                        if dist_segment_to_pad(s.start, s.end, fp, pad) < required_dist - 1e-4 {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Foreign Vias
+    for via in &board.vias {
+        if via.net_id != arc.net_id {
+            let via_clr = board.get_netclass_for_net(via.net_id).clearance;
+            let req_clr = clearance.max(via_clr);
+            let required_dist = half_w + via.size * 0.5 + req_clr;
+            if arc.distance_to_point(via.position) < required_dist - 1e-4 {
+                return false;
+            }
+        }
+    }
+
+    // 3. Keepouts
+    for ko in &board.keepouts {
+        if ko.layers.contains(&arc.layer) {
+            let segs = arc.to_segments(8);
+            for s in &segs {
+                if !is_segment_clear(board, None, s.start, s.end, arc.layer, arc.net_id, arc.width) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // 4. Foreign Tracks
+    for trk in &board.tracks {
+        if trk.net_id != arc.net_id && trk.layer == arc.layer {
+            let trk_clr = board.get_netclass_for_net(trk.net_id).clearance;
+            let req_clr = clearance.max(trk_clr);
+            let required_dist = half_w + (trk.width * 0.5) + req_clr;
+            let segs = arc.to_segments(8);
+            for s in &segs {
+                if dist_segment_to_segment(s.start, s.end, trk.start, trk.end) < required_dist - 1e-4 {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
+pub fn apply_any_angle_tangent_arcs(board: &mut Board) {
+    let mut net_ids: Vec<usize> = board
+        .tracks
+        .iter()
+        .filter(|t| !t.is_locked)
+        .map(|t| t.net_id)
+        .collect();
+    net_ids.sort_unstable();
+    net_ids.dedup();
+
+    for net_id in net_ids {
+        let net_tracks: Vec<TrackSegment> = board
+            .tracks
+            .iter()
+            .filter(|t| t.net_id == net_id && !t.is_locked)
+            .cloned()
+            .collect();
+        if net_tracks.is_empty() {
+            continue;
+        }
+
+        board.tracks.retain(|t| t.net_id != net_id || t.is_locked);
+
+        let chains = extract_track_chains(&net_tracks, board);
+        for chain in chains {
+            let n = chain.points.len();
+            if n < 3 {
+                for k in 0..n.saturating_sub(1) {
+                    board.tracks.push(TrackSegment {
+                        start: chain.points[k],
+                        end: chain.points[k + 1],
+                        width: chain.width,
+                        layer: chain.layer,
+                        net_id: chain.net_id,
+                        is_locked: false,
+                    });
+                }
+                continue;
+            }
+
+            let mut corner_arcs: Vec<Option<((f64, f64), (f64, f64), ArcSegment)>> = vec![None; n];
+
+            for i in 1..n - 1 {
+                let p_prev = chain.points[i - 1];
+                let p_curr = chain.points[i];
+                let p_next = chain.points[i + 1];
+
+                let v1 = (p_prev.0 - p_curr.0, p_prev.1 - p_curr.1);
+                let v2 = (p_next.0 - p_curr.0, p_next.1 - p_curr.1);
+                let l_a = v1.0.hypot(v1.1);
+                let l_b = v2.0.hypot(v2.1);
+                if l_a < 1e-4 || l_b < 1e-4 {
+                    continue;
+                }
+
+                let u1 = (v1.0 / l_a, v1.1 / l_a);
+                let u2 = (v2.0 / l_b, v2.1 / l_b);
+                let dot = (u1.0 * u2.0 + u1.1 * u2.1).clamp(-1.0, 1.0);
+                let theta = dot.acos();
+                if theta < 0.05 || theta > (std::f64::consts::PI - 0.05) {
+                    continue;
+                }
+
+                let alpha = theta * 0.5;
+                let b_sum = (u1.0 + u2.0, u1.1 + u2.1);
+                let b_len = b_sum.0.hypot(b_sum.1);
+                if b_len < 1e-6 {
+                    continue;
+                }
+                let b = (b_sum.0 / b_len, b_sum.1 / b_len);
+
+                let d_max = (l_a * 0.49).min(l_b * 0.49);
+                let r_max_geom = d_max * alpha.tan();
+                let target_radius: f64 = 1.0;
+                let r_init = target_radius.min(r_max_geom).min(l_a * 0.5).min(l_b * 0.5);
+
+                for scale in [1.0, 0.8, 0.6, 0.4, 0.25] {
+                    let r = r_init * scale;
+                    if r < 0.02 {
+                        continue;
+                    }
+                    let d = r / alpha.tan();
+                    let t1 = (p_curr.0 + d * u1.0, p_curr.1 + d * u1.1);
+                    let t2 = (p_curr.0 + d * u2.0, p_curr.1 + d * u2.1);
+                    let h = r / alpha.sin();
+                    let c = (p_curr.0 + h * b.0, p_curr.1 + h * b.1);
+                    let m_arc = (c.0 - r * b.0, c.1 - r * b.1);
+
+                    if let Some(arc) = ArcSegment::from_3pts(t1, m_arc, t2, chain.width, chain.layer, chain.net_id) {
+                        if is_arc_clear(board, &arc) {
+                            corner_arcs[i] = Some((t1, t2, arc));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            for k in 0..n - 1 {
+                let start_pt = if k > 0 && corner_arcs[k].is_some() {
+                    corner_arcs[k].as_ref().unwrap().1
+                } else {
+                    chain.points[k]
+                };
+
+                let end_pt = if corner_arcs[k + 1].is_some() {
+                    corner_arcs[k + 1].as_ref().unwrap().0
+                } else {
+                    chain.points[k + 1]
+                };
+
+                if (end_pt.0 - start_pt.0).hypot(end_pt.1 - start_pt.1) > 1e-4 {
+                    board.tracks.push(TrackSegment {
+                        start: start_pt,
+                        end: end_pt,
+                        width: chain.width,
+                        layer: chain.layer,
+                        net_id: chain.net_id,
+                        is_locked: false,
+                    });
+                }
+            }
+
+            for opt_arc in corner_arcs.into_iter().flatten() {
+                board.arcs.push(opt_arc.2);
             }
         }
     }
@@ -9393,6 +9857,7 @@ mod tests {
             }],
             tracks: Vec::new(),
             vias: Vec::new(),
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -9932,6 +10397,7 @@ mod tests {
             ],
             tracks: Vec::new(),
             vias: Vec::new(),
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -10031,6 +10497,7 @@ mod tests {
             keepouts: vec![],
             tracks: Vec::new(),
             vias: Vec::new(),
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -10143,6 +10610,7 @@ mod tests {
             keepouts: vec![],
             tracks: Vec::new(),
             vias: Vec::new(),
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -10328,6 +10796,7 @@ mod tests {
                 },
             ],
             vias: Vec::new(),
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -10398,6 +10867,7 @@ mod tests {
             keepouts: Vec::new(),
             tracks,
             vias: Vec::new(),
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -10476,6 +10946,7 @@ mod tests {
                 },
             ],
             vias: Vec::new(),
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -10571,6 +11042,7 @@ mod tests {
                     is_locked: false,
                 },
             ],
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -10646,6 +11118,7 @@ mod tests {
                     is_locked: false,
                 },
             ],
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -10728,6 +11201,7 @@ mod tests {
                     is_locked: false,
                 },
             ],
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -10829,6 +11303,7 @@ mod tests {
                     is_locked: false,
                 },
             ],
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -10929,6 +11404,7 @@ mod tests {
                     is_locked: false,
                 },
             ],
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -10975,6 +11451,7 @@ mod tests {
                 },
             ],
             vias: Vec::new(),
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -11052,6 +11529,7 @@ mod tests {
                 },
             ],
             vias: Vec::new(),
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -11121,6 +11599,7 @@ mod tests {
                 },
             ],
             vias: Vec::new(),
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -11221,6 +11700,7 @@ mod tests {
                     is_locked: false,
                 },
             ],
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -11272,6 +11752,7 @@ mod tests {
                 },
             ],
             vias: Vec::new(),
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -11440,6 +11921,7 @@ mod tests {
             ],
             tracks: Vec::new(),
             vias: Vec::new(),
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -11539,6 +12021,7 @@ mod tests {
             ],
             tracks: Vec::new(),
             vias: Vec::new(),
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -11629,6 +12112,7 @@ mod tests {
             ],
             tracks: Vec::new(),
             vias: Vec::new(),
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -12299,6 +12783,201 @@ mod tests {
 
         let added_second = router.add_return_path_ground_vias(&mut board, &grid);
         assert_eq!(added_second, 0, "Second pass must not add redundant GND vias");
+    }
+
+    #[test]
+    fn test_homotopic_rubber_band_shortening() {
+        let mut board = Board::default();
+        board.nets = vec!["".to_string(), "SIG".to_string(), "GND".to_string()];
+        board.net_name_to_id.insert("SIG".to_string(), 1);
+        board.net_name_to_id.insert("GND".to_string(), 2);
+
+        // Obstacle via for GND (net 2) at (5.0, 5.0), size 1.0 (radius 0.5)
+        board.vias.push(Via {
+            position: (5.0, 5.0),
+            size: 1.0,
+            drill: 0.5,
+            net_id: 2,
+            is_locked: true,
+        });
+
+        // Net 1 (SIG) has a zigzag trace passing around the obstacle on the +y side:
+        // (0.0, 0.0) -> (0.0, 8.0) -> (3.0, 8.0) -> (3.0, 9.0) -> (7.0, 9.0) -> (7.0, 8.0) -> (10.0, 8.0) -> (10.0, 0.0)
+        let pts = [
+            (0.0, 0.0),
+            (0.0, 8.0),
+            (3.0, 8.0),
+            (3.0, 9.0),
+            (7.0, 9.0),
+            (7.0, 8.0),
+            (10.0, 8.0),
+            (10.0, 0.0),
+        ];
+        for k in 0..pts.len() - 1 {
+            board.tracks.push(TrackSegment {
+                start: pts[k],
+                end: pts[k + 1],
+                width: 0.20,
+                layer: 0,
+                net_id: 1,
+                is_locked: false,
+            });
+        }
+
+        let initial_length: f64 = board.tracks.iter().map(|t| t.length()).sum();
+        assert!((initial_length - 28.0).abs() < 1e-4);
+
+        // Relax homotopic rubber bands
+        relax_homotopic_rubber_bands(&mut board);
+
+        let relaxed_length: f64 = board.tracks.iter().map(|t| t.length()).sum();
+
+        // 1. Length must be significantly shortened by taut rubber-band pulling (> 25% reduction)
+        assert!(
+            relaxed_length < initial_length * 0.75,
+            "Relaxed length {:.2} must be < 75% of initial {:.2}",
+            relaxed_length,
+            initial_length
+        );
+
+        // 2. All tracks must maintain required clearance from net 2 via at (5.0, 5.0)
+        let via_pos = (5.0, 5.0);
+        let req_clr = board.get_netclass_for_net(1).clearance.max(board.get_netclass_for_net(2).clearance);
+        let min_centerline_dist = 0.5 + req_clr + 0.10; // via radius (0.5) + clearance (0.2) + half width (0.1)
+        for trk in &board.tracks {
+            let d = dist_point_to_segment(via_pos, trk.start, trk.end);
+            assert!(
+                d >= min_centerline_dist - 1e-4,
+                "Track segment {:?}->{:?} violates clearance: dist={:.4}, req={:.4}",
+                trk.start, trk.end, d, min_centerline_dist
+            );
+        }
+
+        // 3. Homotopy check: trace must remain on the +y side of the obstacle at (5.0, 5.0)
+        for trk in &board.tracks {
+            if (trk.start.0 <= 5.0 && trk.end.0 >= 5.0) || (trk.start.0 >= 5.0 && trk.end.0 <= 5.0) {
+                let t = if (trk.end.0 - trk.start.0).abs() > 1e-6 {
+                    (5.0 - trk.start.0) / (trk.end.0 - trk.start.0)
+                } else {
+                    0.5
+                };
+                let y_at_5 = trk.start.1 + t * (trk.end.1 - trk.start.1);
+                assert!(y_at_5 > 5.0, "Homotopy violated: trace crossed to -y side of obstacle");
+            }
+        }
+    }
+
+    #[test]
+    fn test_tangent_arc_geometry_and_clearance() {
+        let mut board = Board::default();
+        board.nets = vec!["".to_string(), "SIG1".to_string(), "SIG2".to_string(), "GND".to_string()];
+        board.net_name_to_id.insert("SIG1".to_string(), 1);
+        board.net_name_to_id.insert("SIG2".to_string(), 2);
+        board.net_name_to_id.insert("GND".to_string(), 3);
+
+        // 1. 90-degree corner on SIG1
+        board.tracks.push(TrackSegment {
+            start: (0.0, 0.0),
+            end: (10.0, 0.0),
+            width: 0.25,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+        board.tracks.push(TrackSegment {
+            start: (10.0, 0.0),
+            end: (10.0, 10.0),
+            width: 0.25,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+
+        // 2. 45-degree corner on SIG2
+        board.tracks.push(TrackSegment {
+            start: (0.0, 20.0),
+            end: (10.0, 20.0),
+            width: 0.25,
+            layer: 0,
+            net_id: 2,
+            is_locked: false,
+        });
+        board.tracks.push(TrackSegment {
+            start: (10.0, 20.0),
+            end: (15.0, 25.0),
+            width: 0.25,
+            layer: 0,
+            net_id: 2,
+            is_locked: false,
+        });
+
+        apply_any_angle_tangent_arcs(&mut board);
+
+        // Verify that 2 tangent arcs were created (one for 90 deg, one for 45 deg)
+        assert_eq!(board.arcs.len(), 2, "Expected 2 tangent arcs inscribed at corners");
+
+        // Verify 90-degree arc properties (net 1)
+        let arc90 = board.arcs.iter().find(|a| a.net_id == 1).expect("Arc for net 1 not found");
+        let start90 = arc90.start();
+        let end90 = arc90.end();
+        assert!((start90.1 - 0.0).abs() < 1e-3);
+        assert!(start90.0 < 10.0 && start90.0 > 8.0);
+        assert!((end90.0 - 10.0).abs() < 1e-3);
+        assert!(end90.1 > 0.0 && end90.1 < 2.0);
+        assert!((arc90.radius - 1.0).abs() < 1e-3);
+
+        // Verify 45-degree arc properties (net 2)
+        let arc45 = board.arcs.iter().find(|a| a.net_id == 2).expect("Arc for net 2 not found");
+        let start45 = arc45.start();
+        assert!((start45.1 - 20.0).abs() < 1e-3);
+        assert!(start45.0 < 10.0);
+
+        // 3. Test NetClass clearance constraint with a foreign obstacle inside corner
+        let mut drc_board = Board::default();
+        drc_board.nets = vec!["".to_string(), "SIG".to_string(), "GND".to_string()];
+        drc_board.net_name_to_id.insert("SIG".to_string(), 1);
+        drc_board.net_name_to_id.insert("GND".to_string(), 2);
+
+        drc_board.tracks.push(TrackSegment {
+            start: (0.0, 0.0),
+            end: (10.0, 0.0),
+            width: 0.25,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+        drc_board.tracks.push(TrackSegment {
+            start: (10.0, 0.0),
+            end: (10.0, 10.0),
+            width: 0.25,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+
+        // Place foreign via inside the 90-degree corner at (9.4, 0.6)
+        drc_board.vias.push(Via {
+            position: (9.4, 0.6),
+            size: 0.60,
+            drill: 0.30,
+            net_id: 2,
+            is_locked: true,
+        });
+
+        apply_any_angle_tangent_arcs(&mut drc_board);
+
+        // Verify that if an arc is inscribed, its clearance to the foreign via strictly satisfies DRC
+        let via_pos = (9.4, 0.6);
+        let req_clr = drc_board.get_netclass_for_net(1).clearance.max(drc_board.get_netclass_for_net(2).clearance);
+        let required_dist = 0.30 + req_clr + 0.125;
+        for arc in &drc_board.arcs {
+            let d = arc.distance_to_point(via_pos);
+            assert!(
+                d >= required_dist - 1e-4,
+                "Arc {:?} violates netclass clearance to via at {:?}: dist={:.4}, req={:.4}",
+                arc, via_pos, d, required_dist
+            );
+        }
     }
 }
 
