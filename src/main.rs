@@ -7,11 +7,12 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
-use vulcans_trials::board::{Board, Point, Polygon, Segment};
+use vulcans_trials::board::{Board, Point, Polygon, Segment, TrackSegment};
 use vulcans_trials::gui::VulcansTrialsApp;
 use vulcans_trials::placer::{run_auto_placer, PlacementConfig};
 use vulcans_trials::router::{
-    prune_dangling_tracks_and_vias, validate_and_clean_copper, AutoRouter, RoutingGrid,
+    apply_any_angle_tangent_arcs, prune_dangling_tracks_and_vias, validate_and_clean_copper,
+    AutoRouter, RoutingGrid,
 };
 use vulcans_trials::vulkan::VulkanEngine;
 
@@ -58,6 +59,10 @@ struct Args {
     /// Penalty factor for routing non-plane signals across inner power plane layers
     #[arg(long, default_value_t = 8.0)]
     inner_plane_penalty: f64,
+
+    /// Enable TopoR-style any-angle topological routing (homotopic rubber-band & tangent arcs)
+    #[arg(long)]
+    any_angle: bool,
 
     /// Run built-in self-verification suite (Vulkan compute, SAT geometry, router grid)
     #[arg(long)]
@@ -174,6 +179,33 @@ fn run_self_test() -> Result<(), String> {
     }
     println!("[PASS] Automated BGA Escape Solver verified (4x4 0.8mm pitch quadrant dog-bone fanout)");
 
+    // 4. Verify TopoR Any-Angle Tangent Arc Geometry & Homotopic Relaxation
+    let mut arc_board = Board::default();
+    arc_board.tracks.push(TrackSegment {
+        start: (0.0, 0.0),
+        end: (10.0, 0.0),
+        width: 0.25,
+        layer: 0,
+        net_id: 1,
+        is_locked: false,
+    });
+    arc_board.tracks.push(TrackSegment {
+        start: (10.0, 0.0),
+        end: (10.0, 10.0),
+        width: 0.25,
+        layer: 0,
+        net_id: 1,
+        is_locked: false,
+    });
+    apply_any_angle_tangent_arcs(&mut arc_board);
+    if arc_board.arcs.is_empty() {
+        return Err("TopoR any-angle tangent arc self-test failed".to_string());
+    }
+    println!(
+        "[PASS] TopoR any-angle tangent arc geometry verified (r={:.2}mm, center=({:.2},{:.2}))",
+        arc_board.arcs[0].radius, arc_board.arcs[0].center.0, arc_board.arcs[0].center.1
+    );
+
     println!("=== All Self-Tests Passed ===");
     Ok(())
 }
@@ -199,7 +231,9 @@ fn run_headless_trial(args: &Args, board: &mut Board, vulkan: Option<Arc<VulkanE
 
     if do_route {
         let mut grid = RoutingGrid::new(board, args.res, vulkan).with_inner_layer_penalty(args.inner_plane_penalty);
-        let router = AutoRouter::new(args.passes).with_inner_layer_penalty(args.inner_plane_penalty);
+        let router = AutoRouter::new(args.passes)
+            .with_inner_layer_penalty(args.inner_plane_penalty)
+            .with_any_angle_mode(args.any_angle);
         let (routed, total) = router.route_all(board, &mut grid, None, Arc::clone(&stop_flag));
         println!(
             "[Auto-Router] Done in {:.2}s: {}/{} ({:.1}%) connections routed ({} tracks, {} vias)",

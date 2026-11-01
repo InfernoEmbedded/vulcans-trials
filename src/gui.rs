@@ -147,6 +147,7 @@ pub struct VulcansTrialsApp {
     pub allow_layer_flip: bool,
     pub inner_plane_penalty: f64,
     pub allow_component_nudge: bool,
+    pub any_angle_mode: bool,
 
     // Aggressive placement exploration & weights
     pub max_jump_radius_mm: f64,
@@ -218,6 +219,7 @@ impl VulcansTrialsApp {
             allow_layer_flip: false,
             inner_plane_penalty: 8.0,
             allow_component_nudge: false,
+            any_angle_mode: false,
             max_jump_radius_mm: 20.0,
             pair_swap_prob: 0.15,
             centroid_pull_prob: 0.20,
@@ -296,6 +298,7 @@ impl VulcansTrialsApp {
         let allow_flip = self.allow_layer_flip;
         let inner_plane_pen = self.inner_plane_penalty;
         let allow_comp_nudge = self.allow_component_nudge;
+        let any_angle = self.any_angle_mode;
         let max_jump_rad = self.max_jump_radius_mm;
         let pair_swap_p = self.pair_swap_prob;
         let centroid_pull_p = self.centroid_pull_prob;
@@ -346,7 +349,9 @@ impl VulcansTrialsApp {
 
             if do_route && !stop_flag.load(Ordering::Relaxed) {
                 let mut grid = RoutingGrid::new(&working_board, grid_res, vulkan).with_inner_layer_penalty(inner_plane_pen);
-                let mut router = AutoRouter::new(max_passes).with_allow_component_nudge(allow_comp_nudge);
+                let mut router = AutoRouter::new(max_passes)
+                    .with_allow_component_nudge(allow_comp_nudge)
+                    .with_any_angle_mode(any_angle);
                 router.inner_layer_penalty = inner_plane_pen;
                 router.route_all(
                     &mut working_board,
@@ -927,6 +932,40 @@ impl VulcansTrialsApp {
             }
         }
 
+        // 4. Check arcs
+        for arc in &board.arcs {
+            for seg in arc.to_segments(16) {
+                let p1 = self.board_to_screen(board, rect, seg.start.0, seg.start.1).0;
+                let p2 = self.board_to_screen(board, rect, seg.end.0, seg.end.1).0;
+                let v = p2 - p1;
+                let len_sq = v.length_sq();
+                let t = if len_sq < 1e-4 {
+                    0.0
+                } else {
+                    ((pos - p1).dot(v) / len_sq).clamp(0.0, 1.0)
+                };
+                let proj = p1 + v * t;
+                let hit_thresh = ((arc.width as f32) * 0.5 * scale).max(4.0);
+                if pos.distance(proj) <= hit_thresh {
+                    let world_t = t as f64;
+                    let wx = seg.start.0 + (seg.end.0 - seg.start.0) * world_t;
+                    let wy = seg.start.1 + (seg.end.1 - seg.start.1) * world_t;
+                    let net_name = board.nets.get(arc.net_id).cloned().unwrap_or_default();
+                    if !net_name.is_empty() && arc.net_id != 0 {
+                        return Some(HoveredCopperItem {
+                            net_id: arc.net_id,
+                            net_name,
+                            layer: arc.layer,
+                            snap_pos: (wx, wy),
+                            is_pad: false,
+                            is_via: false,
+                            is_track: true,
+                        });
+                    }
+                }
+            }
+        }
+
         None
     }
 
@@ -1451,6 +1490,10 @@ impl VulcansTrialsApp {
                     !is_running,
                     egui::Checkbox::new(&mut self.allow_component_nudge, "Allow Router to Nudge Unlocked Passives"),
                 );
+                ui.add_enabled(
+                    !is_running,
+                    egui::Checkbox::new(&mut self.any_angle_mode, "Any-Angle Mode (TopoR Arcs)"),
+                );
 
                 ui.collapsing("Aggressive Placement & Exploration", |ui| {
                     ui.add_enabled(
@@ -1961,6 +2004,16 @@ impl VulcansTrialsApp {
                                 let p2 = to_screen(tr.end.0, tr.end.1);
                                 let w = ((tr.width as f32) * scale).max(1.5);
                                 draw_track_segment(&painter, p1, p2, w, col);
+                            }
+                        }
+                        for arc in &b.arcs {
+                            if arc.layer == layer_idx {
+                                let w = ((arc.width as f32) * scale).max(1.5);
+                                for seg in arc.to_segments(16) {
+                                    let p1 = to_screen(seg.start.0, seg.start.1);
+                                    let p2 = to_screen(seg.end.0, seg.end.1);
+                                    draw_track_segment(&painter, p1, p2, w, col);
+                                }
                             }
                         }
                     }

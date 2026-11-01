@@ -1480,6 +1480,193 @@ pub struct TrackSegment {
     pub is_locked: bool,
 }
 
+impl TrackSegment {
+    pub fn angle(&self) -> f64 {
+        (self.end.1 - self.start.1).atan2(self.end.0 - self.start.0)
+    }
+
+    pub fn length(&self) -> f64 {
+        (self.end.0 - self.start.0).hypot(self.end.1 - self.start.1)
+    }
+
+    pub fn mid_point(&self) -> (f64, f64) {
+        ((self.start.0 + self.end.0) * 0.5, (self.start.1 + self.end.1) * 0.5)
+    }
+
+    pub fn is_any_angle(&self) -> bool {
+        let deg = self.angle().to_degrees().abs() % 45.0;
+        deg > 0.5 && deg < 44.5
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArcSegment {
+    pub center: (f64, f64),
+    pub radius: f64,
+    pub start_angle_rad: f64,
+    pub end_angle_rad: f64,
+    pub width: f64,
+    pub layer: usize, // 0 = F.Cu, 1 = B.Cu
+    pub net_id: usize,
+    #[serde(default)]
+    pub is_locked: bool,
+}
+
+impl ArcSegment {
+    pub fn new(
+        center: (f64, f64),
+        radius: f64,
+        start_angle_rad: f64,
+        end_angle_rad: f64,
+        width: f64,
+        layer: usize,
+        net_id: usize,
+    ) -> Self {
+        Self {
+            center,
+            radius,
+            start_angle_rad,
+            end_angle_rad,
+            width,
+            layer,
+            net_id,
+            is_locked: false,
+        }
+    }
+
+    pub fn start(&self) -> (f64, f64) {
+        (
+            self.center.0 + self.radius * self.start_angle_rad.cos(),
+            self.center.1 + self.radius * self.start_angle_rad.sin(),
+        )
+    }
+
+    pub fn end(&self) -> (f64, f64) {
+        (
+            self.center.0 + self.radius * self.end_angle_rad.cos(),
+            self.center.1 + self.radius * self.end_angle_rad.sin(),
+        )
+    }
+
+    pub fn mid(&self) -> (f64, f64) {
+        let mid_angle = self.start_angle_rad + (self.end_angle_rad - self.start_angle_rad) * 0.5;
+        (
+            self.center.0 + self.radius * mid_angle.cos(),
+            self.center.1 + self.radius * mid_angle.sin(),
+        )
+    }
+
+    pub fn sweep_angle(&self) -> f64 {
+        self.end_angle_rad - self.start_angle_rad
+    }
+
+    pub fn length(&self) -> f64 {
+        self.radius * self.sweep_angle().abs()
+    }
+
+    pub fn from_3pts(
+        start: (f64, f64),
+        mid: (f64, f64),
+        end: (f64, f64),
+        width: f64,
+        layer: usize,
+        net_id: usize,
+    ) -> Option<Self> {
+        let (x1, y1) = start;
+        let (x2, y2) = mid;
+        let (x3, y3) = end;
+
+        let d = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2));
+        if d.abs() < 1e-9 {
+            return None;
+        }
+
+        let q1 = x1 * x1 + y1 * y1;
+        let q2 = x2 * x2 + y2 * y2;
+        let q3 = x3 * x3 + y3 * y3;
+
+        let cx = (q1 * (y2 - y3) + q2 * (y3 - y1) + q3 * (y1 - y2)) / d;
+        let cy = (q1 * (x3 - x2) + q2 * (x1 - x3) + q3 * (x2 - x1)) / d;
+        let radius = (x1 - cx).hypot(y1 - cy);
+
+        let a1 = (y1 - cy).atan2(x1 - cx);
+        let a2 = (y2 - cy).atan2(x2 - cx);
+        let a3 = (y3 - cy).atan2(x3 - cx);
+
+        use std::f64::consts::TAU;
+        let delta_end = (a3 - a1).rem_euclid(TAU);
+        let delta_mid = (a2 - a1).rem_euclid(TAU);
+
+        let end_angle_rad = if delta_mid < delta_end {
+            a1 + delta_end
+        } else {
+            a1 - (TAU - delta_end)
+        };
+
+        Some(Self {
+            center: (cx, cy),
+            radius,
+            start_angle_rad: a1,
+            end_angle_rad,
+            width,
+            layer,
+            net_id,
+            is_locked: false,
+        })
+    }
+
+    pub fn to_segments(&self, steps: usize) -> Vec<TrackSegment> {
+        let n = steps.max(1);
+        let mut segs = Vec::with_capacity(n);
+        let d_theta = (self.end_angle_rad - self.start_angle_rad) / (n as f64);
+        let mut cur_pt = self.start();
+        for i in 1..=n {
+            let theta = self.start_angle_rad + d_theta * (i as f64);
+            let nxt_pt = (
+                self.center.0 + self.radius * theta.cos(),
+                self.center.1 + self.radius * theta.sin(),
+            );
+            segs.push(TrackSegment {
+                start: cur_pt,
+                end: nxt_pt,
+                width: self.width,
+                layer: self.layer,
+                net_id: self.net_id,
+                is_locked: self.is_locked,
+            });
+            cur_pt = nxt_pt;
+        }
+        segs
+    }
+
+    pub fn distance_to_point(&self, p: (f64, f64)) -> f64 {
+        let dx = p.0 - self.center.0;
+        let dy = p.1 - self.center.1;
+        let d_center = dx.hypot(dy);
+        let p_angle = dy.atan2(dx);
+
+        let sweep = self.end_angle_rad - self.start_angle_rad;
+        use std::f64::consts::TAU;
+        let in_arc = if sweep.abs() < 1e-9 {
+            false
+        } else if sweep > 0.0 {
+            let rel = (p_angle - self.start_angle_rad).rem_euclid(TAU);
+            rel <= sweep + 1e-6
+        } else {
+            let rel = (self.start_angle_rad - p_angle).rem_euclid(TAU);
+            rel <= (-sweep) + 1e-6
+        };
+
+        if in_arc {
+            (d_center - self.radius).abs()
+        } else {
+            let s = self.start();
+            let e = self.end();
+            (p.0 - s.0).hypot(p.1 - s.1).min((p.0 - e.0).hypot(p.1 - e.1))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Via {
     pub position: (f64, f64),
@@ -1556,6 +1743,7 @@ pub struct Board {
     pub keepouts: Vec<KeepoutZone>,
     pub tracks: Vec<TrackSegment>,
     pub vias: Vec<Via>,
+    pub arcs: Vec<ArcSegment>,
     pub clusters: Vec<CompiledCluster>,
     pub schematic_positions: HashMap<String, (f64, f64)>,
     pub outline_polygon: Option<Polygon>,
@@ -1585,6 +1773,7 @@ impl Default for Board {
             keepouts: Vec::new(),
             tracks: Vec::new(),
             vias: Vec::new(),
+            arcs: Vec::new(),
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon: None,
@@ -1614,9 +1803,16 @@ pub fn detect_copper_layers(raw_content: &str) -> Vec<&'static str> {
 }
 
 impl Board {
+    pub fn from_kicad_pcb(content: &str) -> Result<Self, String> {
+        Self::from_content_with_path(content, "", &HashSet::new())
+    }
+
     pub fn load(path: &str, extra_locked: &HashSet<String>) -> Result<Self, String> {
         let content = fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", path, e))?;
+        Self::from_content_with_path(&content, path, extra_locked)
+    }
 
+    pub fn from_content_with_path(content: &str, path: &str, extra_locked: &HashSet<String>) -> Result<Self, String> {
         // 1. Parse top-level nets
         let mut nets = vec!["".to_string()];
         let mut net_name_to_id = HashMap::new();
@@ -1678,6 +1874,7 @@ impl Board {
         let mut footprints = Vec::new();
         let mut tracks = Vec::new();
         let mut vias = Vec::new();
+        let mut arcs = Vec::new();
 
         let active_layers = detect_copper_layers(&content);
 
@@ -1767,6 +1964,15 @@ impl Board {
                         i = end;
                         continue;
                     }
+                } else if word == "arc" {
+                    if let Some(end) = find_closing_paren(bytes, i) {
+                        let block = &content[i..end];
+                        if let Some(arc) = parse_arc(block, &active_layers) {
+                            arcs.push(arc);
+                        }
+                        i = end;
+                        continue;
+                    }
                 } else if word == "via" {
                     if let Some(end) = find_closing_paren(bytes, i) {
                         let block = &content[i..end];
@@ -1838,7 +2044,7 @@ impl Board {
 
         let mut board = Self {
             file_path: path.to_string(),
-            raw_content: content,
+            raw_content: content.to_string(),
             min_x: min_x - 1.5,
             min_y: min_y - 1.5,
             max_x: max_x + 1.5,
@@ -1852,6 +2058,7 @@ impl Board {
             keepouts,
             tracks,
             vias,
+            arcs,
             clusters: Vec::new(),
             schematic_positions: HashMap::new(),
             outline_polygon,
@@ -1859,19 +2066,21 @@ impl Board {
             bundles: Vec::new(),
         };
 
-        // Auto-load project netclasses if sibling .kicad_pro exists
-        let pro_path = Path::new(path).with_extension("kicad_pro");
-        if pro_path.exists() {
-            board.load_project_netclasses(&pro_path);
-            // The project defines its own classes; drop built-in fallbacks left with no nets.
-            let used: HashSet<&String> = board.net_to_class.values().collect();
-            board.netclasses.retain(|name, _| name == "Default" || used.contains(name));
-        }
+        if !path.is_empty() {
+            // Auto-load project netclasses if sibling .kicad_pro exists
+            let pro_path = Path::new(path).with_extension("kicad_pro");
+            if pro_path.exists() {
+                board.load_project_netclasses(&pro_path);
+                // The project defines its own classes; drop built-in fallbacks left with no nets.
+                let used: HashSet<&String> = board.net_to_class.values().collect();
+                board.netclasses.retain(|name, _| name == "Default" || used.contains(name));
+            }
 
-        // Auto-load schematic functional clusters if sibling .kicad_sch exists
-        let sch_path = Path::new(path).with_extension("kicad_sch");
-        if sch_path.exists() {
-            board.load_schematic_clusters(&sch_path);
+            // Auto-load schematic functional clusters if sibling .kicad_sch exists
+            let sch_path = Path::new(path).with_extension("kicad_sch");
+            if sch_path.exists() {
+                board.load_schematic_clusters(&sch_path);
+            }
         }
 
         for fp in &mut board.footprints {
@@ -2009,9 +2218,11 @@ impl Board {
     /// (letters first, then numbers, e.g. C5 before C20).
     pub fn clear_unlocked_objects(&mut self) -> (usize, usize) {
         let tracks_ripped = self.tracks.iter().filter(|t| !t.is_locked).count()
-            + self.vias.iter().filter(|v| !v.is_locked).count();
+            + self.vias.iter().filter(|v| !v.is_locked).count()
+            + self.arcs.iter().filter(|a| !a.is_locked).count();
         self.tracks.retain(|t| t.is_locked);
         self.vias.retain(|v| v.is_locked);
+        self.arcs.retain(|a| a.is_locked);
 
         let mut unlocked = Vec::new();
         let mut locked = Vec::new();
@@ -2398,7 +2609,7 @@ impl Board {
         segments
     }
 
-    pub fn save_pcb(&self, out_path: &Path) -> Result<(), String> {
+    pub fn to_kicad_pcb(&self) -> Result<String, String> {
         let mut replacements: Vec<(usize, usize, String)> = Vec::new();
         for fp in &self.footprints {
             if fp.is_locked && fp.layer == fp.orig_layer {
@@ -2448,7 +2659,7 @@ impl Board {
             }
         }
 
-        // Strip out existing (segment ...) and (via ...) so we don't duplicate or retain old tracks
+        // Strip out existing (segment ...), (via ...), and (arc ...) so we don't duplicate or retain old tracks
         let bytes = self.raw_content.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
@@ -2458,7 +2669,7 @@ impl Board {
                     j += 1;
                 }
                 let word = &self.raw_content[i + 1..j];
-                if word == "segment" || word == "via" {
+                if word == "segment" || word == "via" || word == "arc" {
                     if let Some(end) = find_closing_paren(bytes, i) {
                         let mut start = i;
                         while start > 0 && (bytes[start - 1] == b' ' || bytes[start - 1] == b'\t') {
@@ -2488,7 +2699,7 @@ impl Board {
             }
         }
 
-        if !self.tracks.is_empty() || !self.vias.is_empty() {
+        if !self.tracks.is_empty() || !self.vias.is_empty() || !self.arcs.is_empty() {
             let last_paren = content.rfind(')').ok_or("Invalid .kicad_pcb syntax")?;
             let mut s_expr = String::new();
             for tr in &self.tracks {
@@ -2497,6 +2708,17 @@ impl Board {
                 s_expr.push_str(&format!(
                     "  (segment (start {:.4} {:.4}) (end {:.4} {:.4}) (width {:.4}) (layer \"{}\") (net {}){})\n",
                     tr.start.0, tr.start.1, tr.end.0, tr.end.1, tr.width, layer_name, tr.net_id, locked_str
+                ));
+            }
+            for arc in &self.arcs {
+                let layer_name = self.layer_name(arc.layer);
+                let locked_str = if arc.is_locked { " (locked yes)" } else { "" };
+                let s = arc.start();
+                let m = arc.mid();
+                let e = arc.end();
+                s_expr.push_str(&format!(
+                    "  (arc (start {:.4} {:.4}) (mid {:.4} {:.4}) (end {:.4} {:.4}) (stroke (width {:.4})) (layer \"{}\") (net {}){})\n",
+                    s.0, s.1, m.0, m.1, e.0, e.1, arc.width, layer_name, arc.net_id, locked_str
                 ));
             }
             for v in &self.vias {
@@ -2526,6 +2748,15 @@ impl Board {
             content.insert_str(last_paren, &s_expr);
         }
 
+        Ok(content)
+    }
+
+    pub fn save_kicad_pcb(&self) -> Result<String, String> {
+        self.to_kicad_pcb()
+    }
+
+    pub fn save_pcb(&self, out_path: &Path) -> Result<(), String> {
+        let content = self.to_kicad_pcb()?;
         fs::write(out_path, content).map_err(|e| e.to_string())?;
 
         // Copy sibling project and schematic files if present to keep netclass definitions synced
@@ -2795,6 +3026,23 @@ fn extract_named_usize(block: &str, tag: &str) -> Option<usize> {
     let rest = &block[pos + pattern.len()..];
     let end = rest.find(')')?;
     rest[..end].split_whitespace().next()?.parse::<usize>().ok()
+}
+
+fn parse_arc(block: &str, active_layers: &[&str]) -> Option<ArcSegment> {
+    let start = extract_point(block, "start")?;
+    let mid = extract_point(block, "mid")?;
+    let end = extract_point(block, "end")?;
+    let width = extract_named_f64(block, "width").unwrap_or(0.20);
+    let layer = active_layers
+        .iter()
+        .position(|&l| block.contains(&format!("\"{}\"", l)))
+        .unwrap_or_else(|| if block.contains("\"B.Cu\"") { 1 } else { 0 });
+    let net_id = extract_named_usize(block, "net").unwrap_or(0);
+    let is_locked = block.contains("(locked yes)") || block.contains("(locked)") || block.contains("(status 40000)");
+
+    let mut arc = ArcSegment::from_3pts(start, mid, end, width, layer, net_id)?;
+    arc.is_locked = is_locked;
+    Some(arc)
 }
 
 fn parse_segment(block: &str, active_layers: &[&str]) -> Option<TrackSegment> {
@@ -5450,6 +5698,53 @@ mod tests {
             ..Footprint::default()
         };
         assert!(!r1.is_bga(), "2-pad resistor must not be detected as BGA");
+    }
+
+    #[test]
+    fn test_kicad_arc_sexpr_export_and_parse() {
+        let mut board = Board::default();
+        board.nets = vec!["".to_string(), "GND".to_string(), "SIG_ARC".to_string()];
+        board.net_name_to_id.insert("GND".to_string(), 1);
+        board.net_name_to_id.insert("SIG_ARC".to_string(), 2);
+
+        let arc1 = ArcSegment::new(
+            (100.0, 100.0),
+            5.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+            0.25,
+            0,
+            2,
+        );
+        board.arcs.push(arc1.clone());
+
+        // Export to KiCad PCB S-expression
+        let saved_pcb = board.save_kicad_pcb().expect("save_kicad_pcb failed");
+        assert!(saved_pcb.contains("(arc (start 105.0000 100.0000)"));
+        assert!(saved_pcb.contains("(stroke (width 0.2500))"));
+        assert!(saved_pcb.contains("(layer \"F.Cu\") (net 2)"));
+
+        // Round-trip parse back
+        let loaded_board = Board::from_kicad_pcb(&saved_pcb).expect("from_kicad_pcb failed");
+        assert_eq!(loaded_board.arcs.len(), 1);
+        let parsed = &loaded_board.arcs[0];
+        assert!((parsed.center.0 - arc1.center.0).abs() < 1e-3);
+        assert!((parsed.center.1 - arc1.center.1).abs() < 1e-3);
+        assert!((parsed.radius - arc1.radius).abs() < 1e-3);
+        assert_eq!(parsed.layer, 0);
+        assert_eq!(parsed.net_id, 2);
+        assert!((parsed.width - 0.25).abs() < 1e-4);
+
+        // Also test parsing an arc directly from a KiCad 8/9/10 snippet
+        let snippet = r#"(kicad_pcb
+  (net 0 "") (net 1 "CLK")
+  (arc (start 120.0 50.0) (mid 123.5355 51.4645) (end 125.0 55.0) (stroke (width 0.3000)) (layer "B.Cu") (net 1) (locked yes))
+)"#;
+        let snippet_board = Board::from_kicad_pcb(snippet).expect("snippet parse failed");
+        assert_eq!(snippet_board.arcs.len(), 1);
+        assert!(snippet_board.arcs[0].is_locked);
+        assert_eq!(snippet_board.arcs[0].layer, 1);
+        assert!((snippet_board.arcs[0].width - 0.30).abs() < 1e-4);
     }
 }
 
