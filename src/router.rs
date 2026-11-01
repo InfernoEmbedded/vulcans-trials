@@ -7,10 +7,24 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 pub const KEEPOUT_NET: i32 = -1;
 pub const FREE_NET: i32 = 0;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    pub crosstalk_penalty: f64,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            crosstalk_penalty: 4.0,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GridNode {
@@ -602,6 +616,135 @@ impl RoutingGrid {
         }
 
         neighbors
+    }
+
+    /// Evaluates proximity to existing routed tracks of foreign nets on the same layer.
+    /// Returns true if the candidate step runs parallel to an adjacent foreign track
+    /// at minimum clearance distance (d <= W + 2 * clearance).
+    pub fn is_step_coupled(
+        &self,
+        from: GridNode,
+        to: GridNode,
+        net_id: usize,
+        track_width: f64,
+        req_clearance: f64,
+    ) -> bool {
+        if from.layer != to.layer {
+            return false;
+        }
+        let layer = from.layer;
+        let dx = to.gx as isize - from.gx as isize;
+        let dy = to.gy as isize - from.gy as isize;
+        if dx == 0 && dy == 0 {
+            return false;
+        }
+
+        let perp_dirs = if dx != 0 && dy == 0 {
+            [(0, 1), (0, -1)]
+        } else if dx == 0 && dy != 0 {
+            [(1, 0), (-1, 0)]
+        } else {
+            [(-dy, dx), (dy, -dx)]
+        };
+
+        let max_dist = track_width + 2.0 * req_clearance;
+        let is_diag = dx != 0 && dy != 0;
+        let step_scale = if is_diag { 1.41421356 } else { 1.0 };
+        let max_k = ((max_dist / (self.res * step_scale)).ceil() as isize).max(1);
+
+        for &(pdx, pdy) in &perp_dirs {
+            for k in 1..=max_k {
+                let dist = k as f64 * self.res * step_scale;
+                if dist > max_dist + 1e-4 {
+                    break;
+                }
+                let off_x = pdx * k;
+                let off_y = pdy * k;
+
+                let fx1 = from.gx as isize + off_x;
+                let fy1 = from.gy as isize + off_y;
+                let fx2 = to.gx as isize + off_x;
+                let fy2 = to.gy as isize + off_y;
+
+                if fx1 >= 0 && fx1 < self.width as isize && fy1 >= 0 && fy1 < self.height as isize
+                    && fx2 >= 0 && fx2 < self.width as isize && fy2 >= 0 && fy2 < self.height as isize
+                {
+                    let idx1 = self.idx(fx1 as usize, fy1 as usize, layer);
+                    let idx2 = self.idx(fx2 as usize, fy2 as usize, layer);
+                    let net1 = self.obstacle_net_ids[idx1];
+                    let net2 = self.obstacle_net_ids[idx2];
+
+                    if net1 > 0 && net1 != net_id as i32 && net1 != KEEPOUT_NET {
+                        if net1 == net2 {
+                            return true;
+                        }
+                        for cdy in -1..=1 {
+                            for cdx in -1..=1 {
+                                let cfx = fx2 + cdx;
+                                let cfy = fy2 + cdy;
+                                if cfx >= 0 && cfx < self.width as isize && cfy >= 0 && cfy < self.height as isize {
+                                    let cidx = self.idx(cfx as usize, cfy as usize, layer);
+                                    if self.obstacle_net_ids[cidx] == net1 {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Determines the physically adjacent reference plane layer for a given signal layer.
+    pub fn adjacent_reference_plane(&self, signal_layer: usize) -> Option<usize> {
+        if self.plane_nets.is_empty() {
+            return None;
+        }
+        match signal_layer {
+            0 => {
+                if self.plane_nets.contains_key(&2) {
+                    Some(2)
+                } else {
+                    self.plane_nets.keys().copied().min()
+                }
+            }
+            1 => {
+                if self.plane_nets.contains_key(&3) {
+                    Some(3)
+                } else if self.plane_nets.contains_key(&2) {
+                    Some(2)
+                } else {
+                    self.plane_nets.keys().copied().next()
+                }
+            }
+            l => {
+                self.plane_nets.keys().copied().min_by_key(|&p| (p as isize - l as isize).abs())
+            }
+        }
+    }
+
+    /// Checks if the reference plane at (gx, gy) on ref_layer has a split, cutout, or void.
+    pub fn is_reference_plane_void_at(&self, gx: usize, gy: usize, ref_layer: usize) -> bool {
+        if gx >= self.width || gy >= self.height || ref_layer >= self.num_layers {
+            return true;
+        }
+        let idx = self.idx(gx, gy, ref_layer);
+        let obst = self.obstacle_net_ids[idx];
+
+        // 1. Explicit keepout/cutout zone on plane layer
+        if obst == KEEPOUT_NET {
+            return true;
+        }
+
+        // 2. Foreign net crossing on dedicated plane layer (e.g. split plane boundary into another net)
+        if let Some(&plane_net) = self.plane_nets.get(&ref_layer) {
+            if obst > 0 && obst != plane_net as i32 {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -1861,17 +2004,28 @@ pub struct AutoRouter {
     pub congestion_factor: f32,
     pub inner_layer_penalty: f64,
     pub allow_component_nudge: bool,
+    pub crosstalk_penalty: f64,
+    pub config: RoutingConfig,
 }
 
 impl AutoRouter {
     pub fn new(max_ripup_iterations: usize) -> Self {
+        let config = RoutingConfig::default();
         Self {
             nudge_engine: NudgeEngine::new(),
             max_ripup_iterations,
             congestion_factor: 1.5,
             inner_layer_penalty: 8.0,
             allow_component_nudge: false,
+            crosstalk_penalty: config.crosstalk_penalty,
+            config,
         }
+    }
+
+    pub fn with_crosstalk_penalty(mut self, pen: f64) -> Self {
+        self.crosstalk_penalty = pen;
+        self.config.crosstalk_penalty = pen;
+        self
     }
 
     pub fn with_inner_layer_penalty(mut self, pen: f64) -> Self {
@@ -2317,6 +2471,8 @@ impl AutoRouter {
                                 diff_w,
                                 lc.netclass.via_dia,
                                 u1_center,
+                                lc.netclass.max_coupled_length_mm,
+                                lc.netclass.require_return_path,
                                 &stop_flag,
                             ) {
                                 self.commit_path_to_grid(
@@ -2345,7 +2501,7 @@ impl AutoRouter {
                                 let s_node = GridNode { gx: sgx, gy: sgy, layer: fc.start.2 };
                                 let e_node = GridNode { gx: egx, gy: egy, layer: fc.end.2 };
                                 let fp_opt = self
-                                    .find_path_with_corridor(
+                                    .find_path_with_constraints(
                                         grid,
                                         s_node,
                                         e_node,
@@ -2356,6 +2512,8 @@ impl AutoRouter {
                                         u1_center,
                                         1.0,
                                         0.0,
+                                        fc.netclass.max_coupled_length_mm,
+                                        fc.netclass.require_return_path,
                                         Some(&corridor),
                                         &stop_flag,
                                     )
@@ -2369,6 +2527,8 @@ impl AutoRouter {
                                             diff_w,
                                             fc.netclass.via_dia,
                                             u1_center,
+                                            fc.netclass.max_coupled_length_mm,
+                                            fc.netclass.require_return_path,
                                             &stop_flag,
                                         )
                                     });
@@ -2430,10 +2590,12 @@ impl AutoRouter {
                                 conn.netclass.track_width,
                                 conn.netclass.via_dia,
                                 u1_center,
+                                conn.netclass.max_coupled_length_mm,
+                                conn.netclass.require_return_path,
                                 &stop_flag,
                             )
                         } else {
-                            self.find_path_with_params(
+                            self.find_path_with_constraints(
                                 wave_grid,
                                 start_grid,
                                 end_grid,
@@ -2444,6 +2606,9 @@ impl AutoRouter {
                                 u1_center,
                                 1.0,
                                 0.0,
+                                conn.netclass.max_coupled_length_mm,
+                                conn.netclass.require_return_path,
+                                None,
                                 &stop_flag,
                             )
                         };
@@ -2492,6 +2657,7 @@ impl AutoRouter {
                             track_width,
                             via_dia,
                             u1_center,
+                            connections[conn_idx].netclass.require_return_path,
                         ) {
                         Some(p)
                     } else {
@@ -2507,6 +2673,8 @@ impl AutoRouter {
                             track_width,
                             via_dia,
                             u1_center,
+                            connections[conn_idx].netclass.max_coupled_length_mm,
+                            connections[conn_idx].netclass.require_return_path,
                             &stop_flag,
                         )
                     };
@@ -2808,6 +2976,7 @@ impl AutoRouter {
 
         self.connect_u1_ground_pins(board);
         self.add_ground_stitching_vias(board, grid);
+        self.add_return_path_ground_vias(board, grid);
 
         // Phase 5: Automated DFM Teardrop Generation (pad & via junction strengthening)
         add_teardrops(board);
@@ -2824,6 +2993,7 @@ impl AutoRouter {
         // Comprehensive Pre-Export DRC Verification & Cleaning
         validate_and_clean_copper(board);
         prune_dangling_tracks_and_vias(board);
+        self.validate_crosstalk_and_coupling(board);
 
         if let Some(ref st) = live {
             let remaining_ratsnest: Vec<crate::board::Segment> = connections
@@ -2872,6 +3042,7 @@ impl AutoRouter {
         track_width: f64,
         via_dia: f64,
         u1_center: Option<(f64, f64)>,
+        require_return_path: bool,
     ) -> bool {
         if path.is_empty() {
             return false;
@@ -2892,6 +3063,15 @@ impl AutoRouter {
                 return false;
             }
         }
+        if require_return_path {
+            for node in path {
+                if let Some(ref_layer) = grid.adjacent_reference_plane(node.layer) {
+                    if grid.is_reference_plane_void_at(node.gx, node.gy, ref_layer) {
+                        return false;
+                    }
+                }
+            }
+        }
         true
     }
 
@@ -2905,6 +3085,8 @@ impl AutoRouter {
         track_width: f64,
         via_dia: f64,
         u1_center: Option<(f64, f64)>,
+        max_coupled_length_mm: f64,
+        require_return_path: bool,
         stop_flag: &AtomicBool,
     ) -> Option<Vec<GridNode>> {
         let strategies: &[(bool, f64, f64)] = &[
@@ -2922,7 +3104,7 @@ impl AutoRouter {
             .enumerate()
             .filter_map(|(s_idx, &(reverse, h_weight, dist_bias))| {
                 let (s_node, g_node) = if reverse { (goal, start) } else { (start, goal) };
-                let mut path = self.find_path_with_params(
+                let mut path = self.find_path_with_constraints(
                     grid,
                     s_node,
                     g_node,
@@ -2933,6 +3115,9 @@ impl AutoRouter {
                     u1_center,
                     h_weight,
                     dist_bias,
+                    max_coupled_length_mm,
+                    require_return_path,
+                    None,
                     &found,
                 )?;
                 if stop_flag.load(AtomicOrdering::Relaxed) {
@@ -2948,6 +3133,7 @@ impl AutoRouter {
                         track_width,
                         via_dia,
                         u1_center,
+                        require_return_path,
                     ) {
                         return None;
                     }
@@ -3059,10 +3245,46 @@ impl AutoRouter {
         track_width: f64,
         via_dia: f64,
         u1_center: Option<(f64, f64)>,
+        require_return_path: bool,
+        max_coupled_length_mm: f64,
     ) -> Vec<GridNode> {
         if path.len() < 4 {
             return path;
         }
+
+        let is_valid_candidate = |cand: &[GridNode]| -> bool {
+            if !self.is_path_conflict_free(
+                grid,
+                cand,
+                net_id,
+                req_clearance,
+                track_width,
+                via_dia,
+                u1_center,
+                require_return_path,
+            ) {
+                return false;
+            }
+            if max_coupled_length_mm > 0.0 {
+                let mut run_len = 0.0;
+                for k in 0..cand.len().saturating_sub(1) {
+                    if grid.is_step_coupled(cand[k], cand[k + 1], net_id, track_width, req_clearance) {
+                        let sl = if cand[k].gx != cand[k + 1].gx && cand[k].gy != cand[k + 1].gy {
+                            1.41421356 * grid.res
+                        } else {
+                            1.0 * grid.res
+                        };
+                        run_len += sl;
+                        if run_len > max_coupled_length_mm {
+                            return false;
+                        }
+                    } else {
+                        run_len = 0.0;
+                    }
+                }
+            }
+            true
+        };
 
         // Pass 1: Line-of-sight octilinear shortcutting and staircase collapsing
         // Eliminates staircase zig-zags and rapid direction changes by connecting nodes with
@@ -3103,15 +3325,7 @@ impl AutoRouter {
                     let dy = p_j.gy as isize - p_i.gy as isize;
                     if dx == 0 || dy == 0 || dx.abs() == dy.abs() {
                         let candidate = Self::line_nodes(p_i, p_j);
-                        if self.is_path_conflict_free(
-                            grid,
-                            &candidate,
-                            net_id,
-                            req_clearance,
-                            track_width,
-                            via_dia,
-                            u1_center,
-                        ) {
+                        if is_valid_candidate(&candidate) {
                             let i_prev = i.saturating_sub(1);
                             let j_next = (j + 1).min(path.len() - 1);
                             let bends_before = Self::count_path_bends(&path[i_prev..=j_next]);
@@ -3156,15 +3370,7 @@ impl AutoRouter {
                     let candidates = Self::two_segment_candidates(p_i, p_j);
                     let mut best_candidate: Option<Vec<GridNode>> = None;
                     for cand in candidates {
-                        if self.is_path_conflict_free(
-                            grid,
-                            &cand,
-                            net_id,
-                            req_clearance,
-                            track_width,
-                            via_dia,
-                            u1_center,
-                        ) {
+                        if is_valid_candidate(&cand) {
                             let i_prev = i.saturating_sub(1);
                             let j_next = (j + 1).min(path.len() - 1);
                             let bends_before = Self::count_path_bends(&path[i_prev..=j_next]);
@@ -3227,7 +3433,7 @@ impl AutoRouter {
         dist_bias: f64,
         abort_flag: &AtomicBool,
     ) -> Option<Vec<GridNode>> {
-        self.find_path_with_corridor(
+        self.find_path_with_constraints(
             grid,
             start,
             goal,
@@ -3238,11 +3444,14 @@ impl AutoRouter {
             u1_center,
             h_weight,
             dist_bias,
+            15.0,
+            false,
             None,
             abort_flag,
         )
     }
 
+    #[allow(dead_code)]
     fn find_path_with_corridor(
         &self,
         grid: &RoutingGrid,
@@ -3258,13 +3467,50 @@ impl AutoRouter {
         corridor: Option<&[f32]>,
         abort_flag: &AtomicBool,
     ) -> Option<Vec<GridNode>> {
+        self.find_path_with_constraints(
+            grid,
+            start,
+            goal,
+            net_id,
+            req_clearance,
+            track_width,
+            via_dia,
+            u1_center,
+            h_weight,
+            dist_bias,
+            15.0,
+            false,
+            corridor,
+            abort_flag,
+        )
+    }
+
+    pub fn find_path_with_constraints(
+        &self,
+        grid: &RoutingGrid,
+        start: GridNode,
+        goal: GridNode,
+        net_id: usize,
+        req_clearance: f64,
+        track_width: f64,
+        via_dia: f64,
+        u1_center: Option<(f64, f64)>,
+        h_weight: f64,
+        dist_bias: f64,
+        max_coupled_length_mm: f64,
+        require_return_path: bool,
+        corridor: Option<&[f32]>,
+        abort_flag: &AtomicBool,
+    ) -> Option<Vec<GridNode>> {
         let mut open_set = BinaryHeap::new();
         let mut came_from: HashMap<GridNode, GridNode> = HashMap::new();
         let mut g_score: HashMap<GridNode, f64> = HashMap::new();
+        let mut coupled_length: HashMap<GridNode, f64> = HashMap::new();
 
         let h_scale = if corridor.is_some() { 0.35 } else { 1.0 };
         let h_start = self.heuristic(grid, start, goal) * h_weight * h_scale;
         g_score.insert(start, 0.0);
+        coupled_length.insert(start, 0.0);
         open_set.push(AStarNode {
             node: start,
             cost: 0.0,
@@ -3281,6 +3527,7 @@ impl AutoRouter {
                 if grid.obstacle_net_ids[idx] == net_id as i32 {
                     let alt_start = GridNode { gx: start.gx, gy: start.gy, layer: l };
                     g_score.insert(alt_start, 0.0);
+                    coupled_length.insert(alt_start, 0.0);
                     open_set.push(AStarNode {
                         node: alt_start,
                         cost: 0.0,
@@ -3317,6 +3564,8 @@ impl AutoRouter {
                     track_width,
                     via_dia,
                     u1_center,
+                    require_return_path,
+                    max_coupled_length_mm,
                 ));
             }
 
@@ -3338,6 +3587,7 @@ impl AutoRouter {
             for (neighbor, mut edge_cost) in
                 grid.get_neighbors(u, net_id, req_clearance, track_width, via_dia, u1_center)
             {
+                let mut next_coupled = 0.0;
                 if neighbor.layer == u.layer {
                     if let Some((pdx, pdy)) = prev_dir {
                         let cur_dx = neighbor.gx as isize - u.gx as isize;
@@ -3356,6 +3606,33 @@ impl AutoRouter {
                             }
                         }
                     }
+
+                    // Return-path continuity check for high-speed signals
+                    if require_return_path {
+                        if let Some(ref_layer) = grid.adjacent_reference_plane(neighbor.layer) {
+                            if grid.is_reference_plane_void_at(neighbor.gx, neighbor.gy, ref_layer) {
+                                edge_cost += 35.0 * grid.res + 5.0;
+                            }
+                        }
+                    }
+
+                    // Crosstalk & coupled length limiter
+                    let is_coupled = grid.is_step_coupled(u, neighbor, net_id, track_width, req_clearance);
+                    let step_len = if neighbor.gx != u.gx && neighbor.gy != u.gy {
+                        1.41421356 * grid.res
+                    } else {
+                        1.0 * grid.res
+                    };
+
+                    if is_coupled {
+                        let prev_coupled = coupled_length.get(&u).copied().unwrap_or(0.0);
+                        next_coupled = prev_coupled + step_len;
+                        if next_coupled > max_coupled_length_mm {
+                            let excess = next_coupled - max_coupled_length_mm;
+                            let penalty = self.crosstalk_penalty * step_len * (1.0 + excess * 0.5);
+                            edge_cost += penalty;
+                        }
+                    }
                 } else {
                     // Through-hole via penalty: equivalent to 2.0 mm of trace length
                     edge_cost += 2.0;
@@ -3370,9 +3647,10 @@ impl AutoRouter {
                     edge_cost *= corr[n_idx] as f64;
                 }
                 let tentative_g = current_g + edge_cost;
-                let is_better = g_score.get(&neighbor).is_none_or(|&prev_g| tentative_g < prev_g);
+                let is_better = g_score.get(&neighbor).is_none_or(|&prev_g| tentative_g < prev_g - 1e-6);
                 if is_better {
                     g_score.insert(neighbor, tentative_g);
+                    coupled_length.insert(neighbor, next_coupled);
                     came_from.insert(neighbor, u);
                     let priority = tentative_g + self.heuristic(grid, neighbor, goal) * h_weight * h_scale;
                     open_set.push(AStarNode {
@@ -3898,6 +4176,7 @@ pub fn find_choked_pin_bottlenecks(
                                     connections[rip_idx].netclass.track_width,
                                     other_via_dia,
                                     u1_center,
+                                    connections[rip_idx].netclass.require_return_path,
                                 ) {
                                     valid_slid_path = Some(cand_full);
                                     break 'cand_loop;
@@ -5014,6 +5293,157 @@ pub fn find_choked_pin_bottlenecks(
 
     pub fn validate_and_clean_copper(&self, board: &mut Board) {
         validate_and_clean_copper(board);
+    }
+
+    pub fn add_return_path_ground_vias(&self, board: &mut Board, grid: &RoutingGrid) -> usize {
+        let Some(gnd_net_id) = board.nets.iter().position(|n| n == "GND") else {
+            return 0;
+        };
+
+        let mut gnd_locations: Vec<(f64, f64)> = board
+            .vias
+            .iter()
+            .filter(|v| v.net_id == gnd_net_id)
+            .map(|v| v.position)
+            .collect();
+
+        for fp in &board.footprints {
+            for pad in &fp.pads {
+                if pad.net_id == gnd_net_id && pad.is_through_hole {
+                    gnd_locations.push(fp.pad_absolute_position(pad));
+                }
+            }
+        }
+
+        let signal_vias: Vec<(usize, (f64, f64))> = board
+            .vias
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, v)| {
+                if v.net_id == gnd_net_id {
+                    return None;
+                }
+                let nc = board.get_netclass_for_net(v.net_id);
+                if nc.require_return_path {
+                    Some((idx, v.position))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut added_count = 0;
+        let gnd_c = board.get_netclass_for_net(gnd_net_id).clearance.max(0.15);
+        let via_size = 0.60;
+        let via_drill = 0.30;
+
+        for (_s_idx, s_pos) in signal_vias {
+            let nearest_dist = gnd_locations
+                .iter()
+                .map(|gp| (gp.0 - s_pos.0).hypot(gp.1 - s_pos.1))
+                .fold(f64::INFINITY, f64::min);
+
+            if nearest_dist > 1.5 {
+                if let Some(cand_pos) = Self::find_safe_return_path_via_location(
+                    board,
+                    grid,
+                    gnd_net_id,
+                    s_pos,
+                    gnd_c,
+                    &gnd_locations,
+                ) {
+                    board.vias.push(Via {
+                        position: cand_pos,
+                        size: via_size,
+                        drill: via_drill,
+                        net_id: gnd_net_id,
+                        is_locked: false,
+                    });
+                    gnd_locations.push(cand_pos);
+                    added_count += 1;
+                }
+            }
+        }
+
+        added_count
+    }
+
+    fn find_safe_return_path_via_location(
+        board: &Board,
+        grid: &RoutingGrid,
+        gnd_net_id: usize,
+        s_pos: (f64, f64),
+        gnd_c: f64,
+        existing_vias: &[(f64, f64)],
+    ) -> Option<(f64, f64)> {
+        let via_size = 0.60;
+        let via_r = via_size * 0.5;
+        let r_cells = ((via_r + gnd_c) / grid.res).ceil() as isize;
+
+        let distances = [0.75, 0.90, 1.10, 1.25, 1.40];
+        let mut angles = Vec::with_capacity(16);
+        for i in 0..16 {
+            let theta = (i as f64) * std::f64::consts::PI / 8.0;
+            angles.push((theta.cos(), theta.sin()));
+        }
+
+        for &dist in &distances {
+            for &(cos_t, sin_t) in &angles {
+                let vx = s_pos.0 + dist * cos_t;
+                let vy = s_pos.1 + dist * sin_t;
+
+                if existing_vias.iter().any(|ev| (ev.0 - vx).hypot(ev.1 - vy) < via_size + gnd_c) {
+                    continue;
+                }
+                if board.vias.iter().any(|v| (v.position.0 - vx).hypot(v.position.1 - vy) < (v.size + via_size) * 0.5 + gnd_c) {
+                    continue;
+                }
+
+                if !is_via_location_legal(board, (vx, vy), via_size, gnd_net_id, gnd_c) {
+                    continue;
+                }
+
+                if let Some((gx, gy)) = grid.world_to_grid(vx, vy) {
+                    let mut safe = true;
+                    for cy in -r_cells..=r_cells {
+                        for cx in -r_cells..=r_cells {
+                            if (cx * cx + cy * cy) as f64 * (grid.res * grid.res) <= (via_r + gnd_c).powi(2) {
+                                let nx = gx as isize + cx;
+                                let ny = gy as isize + cy;
+                                if nx < 0 || nx >= grid.width as isize || ny < 0 || ny >= grid.height as isize {
+                                    safe = false;
+                                    break;
+                                }
+                                for l in 0..grid.num_layers {
+                                    let idx_l = grid.idx(nx as usize, ny as usize, l);
+                                    let nl = grid.obstacle_net_ids[idx_l];
+                                    if (nl != FREE_NET && nl != gnd_net_id as i32)
+                                        || (grid.smd_pad_cells[idx_l] && nl != gnd_net_id as i32)
+                                    {
+                                        safe = false;
+                                        break;
+                                    }
+                                }
+                                if !safe {
+                                    break;
+                                }
+                            }
+                        }
+                        if !safe {
+                            break;
+                        }
+                    }
+                    if safe {
+                        return Some((vx, vy));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn validate_crosstalk_and_coupling(&self, board: &Board) -> Vec<CouplingViolation> {
+        validate_crosstalk_and_coupling(board)
     }
 }
 
@@ -8670,6 +9100,143 @@ pub fn validate_and_clean_copper(board: &mut Board) {
     }
 }
 
+/// Represents an SI violation where parallel trace coupling between two nets exceeds the permitted threshold.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CouplingViolation {
+    pub net_a: usize,
+    pub net_b: usize,
+    pub net_a_name: String,
+    pub net_b_name: String,
+    pub coupled_length_mm: f64,
+    pub max_allowed_mm: f64,
+    pub span_start: (f64, f64),
+    pub span_end: (f64, f64),
+}
+
+/// Evaluates post-routing parallel trace coupling between every net pair on each copper layer.
+/// Identifies parallel runs where centerline separation d <= (W_a + W_b)/2 + 2 * max(C_a, C_b) + 0.05 mm,
+/// accumulates coupled length, and emits warnings and violations when exceeding max_coupled_length_mm.
+pub fn validate_crosstalk_and_coupling(board: &Board) -> Vec<CouplingViolation> {
+    let mut violations = Vec::new();
+    let track_count = board.tracks.len();
+    if track_count == 0 {
+        return violations;
+    }
+
+    let mut coupling_map: HashMap<(usize, usize), (f64, f64, f64, f64, f64)> = HashMap::new();
+
+    for i in 0..track_count {
+        let t1 = &board.tracks[i];
+        if t1.net_id == 0 {
+            continue;
+        }
+        let v1_x = t1.end.0 - t1.start.0;
+        let v1_y = t1.end.1 - t1.start.1;
+        let len1 = v1_x.hypot(v1_y);
+        if len1 < 1e-4 {
+            continue;
+        }
+        let u1 = (v1_x / len1, v1_y / len1);
+        let n1 = (-u1.1, u1.0);
+
+        let nc1 = board.get_netclass_for_net(t1.net_id);
+
+        for j in (i + 1)..track_count {
+            let t2 = &board.tracks[j];
+            if t1.net_id == t2.net_id || t1.layer != t2.layer || t2.net_id == 0 {
+                continue;
+            }
+
+            let v2_x = t2.end.0 - t2.start.0;
+            let v2_y = t2.end.1 - t2.start.1;
+            let len2 = v2_x.hypot(v2_y);
+            if len2 < 1e-4 {
+                continue;
+            }
+            let u2 = (v2_x / len2, v2_y / len2);
+            let dot = (u1.0 * u2.0 + u1.1 * u2.1).abs();
+            if dot < 0.99 {
+                continue;
+            }
+
+            let nc2 = board.get_netclass_for_net(t2.net_id);
+            let coupling_thresh = (t1.width + t2.width) * 0.5 + 2.0 * nc1.clearance.max(nc2.clearance) + 0.05;
+
+            let d_start = ((t2.start.0 - t1.start.0) * n1.0 + (t2.start.1 - t1.start.1) * n1.1).abs();
+            let d_end = ((t2.end.0 - t1.start.0) * n1.0 + (t2.end.1 - t1.start.1) * n1.1).abs();
+            let d_perp = (d_start + d_end) * 0.5;
+
+            if d_perp > coupling_thresh {
+                continue;
+            }
+
+            let p_start = (t2.start.0 - t1.start.0) * u1.0 + (t2.start.1 - t1.start.1) * u1.1;
+            let p_end = (t2.end.0 - t1.start.0) * u1.0 + (t2.end.1 - t1.start.1) * u1.1;
+            let t2_min = p_start.min(p_end);
+            let t2_max = p_start.max(p_end);
+
+            let overlap_start = 0.0f64.max(t2_min);
+            let overlap_end = len1.min(t2_max);
+
+            if overlap_end > overlap_start + 1e-4 {
+                let coupled_len = overlap_end - overlap_start;
+                let pair_key = if t1.net_id < t2.net_id {
+                    (t1.net_id, t2.net_id)
+                } else {
+                    (t2.net_id, t1.net_id)
+                };
+
+                let pt_a = (t1.start.0 + overlap_start * u1.0, t1.start.1 + overlap_start * u1.1);
+                let pt_b = (t1.start.0 + overlap_end * u1.0, t1.start.1 + overlap_end * u1.1);
+
+                let entry = coupling_map.entry(pair_key).or_insert((
+                    0.0,
+                    pt_a.0.min(pt_b.0),
+                    pt_a.1.min(pt_b.1),
+                    pt_a.0.max(pt_b.0),
+                    pt_a.1.max(pt_b.1),
+                ));
+                entry.0 += coupled_len;
+                entry.1 = entry.1.min(pt_a.0).min(pt_b.0);
+                entry.2 = entry.2.min(pt_a.1).min(pt_b.1);
+                entry.3 = entry.3.max(pt_a.0).max(pt_b.0);
+                entry.4 = entry.4.max(pt_a.1).max(pt_b.1);
+            }
+        }
+    }
+
+    for (&(net_a, net_b), &(tot_len, min_x, min_y, max_x, max_y)) in &coupling_map {
+        let nc_a = board.get_netclass_for_net(net_a);
+        let nc_b = board.get_netclass_for_net(net_b);
+        let max_allowed = nc_a.max_coupled_length_mm.min(nc_b.max_coupled_length_mm);
+
+        if tot_len > max_allowed + 1e-3 {
+            let net_a_name = board.nets.get(net_a).cloned().unwrap_or_else(|| format!("Net{}", net_a));
+            let net_b_name = board.nets.get(net_b).cloned().unwrap_or_else(|| format!("Net{}", net_b));
+            let span_start = (min_x, min_y);
+            let span_end = (max_x, max_y);
+
+            eprintln!(
+                "[SI WARNING] Crosstalk coupled length between '{}' (net {}) and '{}' (net {}) is {:.2} mm (max allowed: {:.2} mm) spanning ({:.2}, {:.2}) to ({:.2}, {:.2})",
+                net_a_name, net_a, net_b_name, net_b, tot_len, max_allowed, span_start.0, span_start.1, span_end.0, span_end.1
+            );
+
+            violations.push(CouplingViolation {
+                net_a,
+                net_b,
+                net_a_name,
+                net_b_name,
+                coupled_length_mm: tot_len,
+                max_allowed_mm: max_allowed,
+                span_start,
+                span_end,
+            });
+        }
+    }
+
+    violations
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8728,7 +9295,7 @@ mod tests {
                 diff_pair_gap: 0.20,
                 diff_pair_width: 0.20,
                 topology: NetTopology::default(),
-                ..NetClass::default()
+                ..Default::default()
             },
         );
         let mut net_to_class = HashMap::new();
@@ -9033,7 +9600,7 @@ mod tests {
         ];
         assert_eq!(AutoRouter::count_path_bends(&zigzag), 4);
 
-        let smoothed = router.smooth_grid_path(&grid, zigzag, 2, 0.20, 0.20, 0.60, None);
+        let smoothed = router.smooth_grid_path(&grid, zigzag, 2, 0.20, 0.20, 0.60, None, false, 15.0);
         assert_eq!(smoothed.first().unwrap().gx, 10);
         assert_eq!(smoothed.last().unwrap().gx, 15);
         assert_eq!(
@@ -9115,7 +9682,7 @@ mod tests {
                 diff_pair_gap: 0.20,
                 diff_pair_width: 0.20,
                 topology: NetTopology::default(),
-                ..NetClass::default()
+                ..Default::default()
             },
         );
         board.net_to_class.insert("USB_DP".to_string(), "USB_Diff".to_string());
@@ -9216,7 +9783,7 @@ mod tests {
                 diff_pair_gap: 0.20,
                 diff_pair_width: 0.20,
                 topology: NetTopology::default(),
-                ..NetClass::default()
+                ..Default::default()
             },
         );
         board.net_to_class.insert("USB_DP".to_string(), "USB_Diff".to_string());
@@ -9434,7 +10001,7 @@ mod tests {
             diff_pair_gap: 0.20,
             diff_pair_width: 0.20,
             topology: NetTopology::default(),
-            ..NetClass::default()
+            ..Default::default()
         });
         netclasses.insert("Default".to_string(), NetClass::default());
         let mut net_to_class = HashMap::new();
@@ -9544,7 +10111,7 @@ mod tests {
             diff_pair_gap: 0.20,
             diff_pair_width: 0.20,
             topology: NetTopology::default(),
-            ..NetClass::default()
+            ..Default::default()
         });
         let mut net_to_class = HashMap::new();
         net_to_class.insert("".to_string(), "Default".to_string());
@@ -11538,6 +12105,200 @@ mod tests {
         };
         let obs = grid.obstacle_net_ids[grid.idx(gx, gy, 0)];
         assert_eq!(obs, KEEPOUT_NET, "Grid cell at 0.25mm from edge must be marked as keepout");
+    }
+
+    #[test]
+    fn test_crosstalk_parallelism_limiter_diverts_long_coupled_trace() {
+        let mut board = make_router_test_board();
+        let mut sig2_nc = NetClass::default();
+        sig2_nc.max_coupled_length_mm = 3.0;
+        sig2_nc.track_width = 0.20;
+        sig2_nc.clearance = 0.20;
+        board.netclasses.insert("Sig2Class".to_string(), sig2_nc);
+        board.net_to_class.insert("SIG2".to_string(), "Sig2Class".to_string());
+
+        // Place an existing track for SIG1 (net 2)
+        board.tracks.push(TrackSegment {
+            start: (135.0, 100.0),
+            end: (155.0, 100.0),
+            width: 0.20,
+            layer: 0,
+            net_id: 2,
+            is_locked: true,
+        });
+
+        let router = AutoRouter::new(2).with_crosstalk_penalty(5.0);
+        let grid = RoutingGrid::new(&board, 0.25, None);
+
+        // Route SIG2 from (135.0, 100.5) to (155.0, 100.5).
+        let start_node = grid.world_to_grid(135.0, 100.5).map(|(gx, gy)| GridNode { gx, gy, layer: 0 }).unwrap();
+        let goal_node = grid.world_to_grid(155.0, 100.5).map(|(gx, gy)| GridNode { gx, gy, layer: 0 }).unwrap();
+
+        // 1. With crosstalk limiter active (max_coupled = 3.0mm):
+        let stop_flag = AtomicBool::new(false);
+        let path_constrained = router.find_path_with_constraints(
+            &grid,
+            start_node,
+            goal_node,
+            3, // SIG2
+            0.20,
+            0.20,
+            0.60,
+            None,
+            1.0,
+            0.0,
+            3.0,
+            false,
+            None,
+            &stop_flag,
+        );
+        assert!(path_constrained.is_some(), "Path should find a valid route");
+        let path = path_constrained.unwrap();
+
+        let max_y = path.iter().map(|n| {
+            let (_, wy) = grid.grid_to_world(n.gx, n.gy);
+            wy
+        }).fold(0.0f64, f64::max);
+        assert!(max_y > 101.0, "Path should divert away from parallel track to avoid crosstalk penalty, max_y={:.2}", max_y);
+
+        // 2. Also test post-route crosstalk validation
+        let mut drc_board = make_router_test_board();
+        drc_board.netclasses.get_mut("Default").unwrap().max_coupled_length_mm = 5.0;
+        drc_board.tracks.push(TrackSegment {
+            start: (135.0, 100.0),
+            end: (145.0, 100.0),
+            width: 0.20,
+            layer: 0,
+            net_id: 2,
+            is_locked: false,
+        });
+        drc_board.tracks.push(TrackSegment {
+            start: (135.0, 100.4),
+            end: (145.0, 100.4),
+            width: 0.20,
+            layer: 0,
+            net_id: 3,
+            is_locked: false,
+        });
+
+        let violations = validate_crosstalk_and_coupling(&drc_board);
+        assert_eq!(violations.len(), 1, "Should report 1 coupling violation");
+        assert!(violations[0].coupled_length_mm >= 9.9);
+        assert_eq!(violations[0].max_allowed_mm, 5.0);
+    }
+
+    #[test]
+    fn test_return_path_continuity_penalizes_split_plane_crossing() {
+        let mut board = make_router_test_board();
+        board.raw_content = r#"
+            (kicad_pcb
+                (layers
+                    (0 "F.Cu" signal)
+                    (1 "In1.Cu" power)
+                    (2 "In2.Cu" power)
+                    (31 "B.Cu" signal)
+                )
+                (zone (net 1) (net_name "GND") (layers "In1.Cu"))
+            )
+        "#.to_string();
+
+        let mut hs_nc = NetClass::default();
+        hs_nc.require_return_path = true;
+        board.netclasses.insert("HighSpeed".to_string(), hs_nc);
+        board.net_to_class.insert("SIG2".to_string(), "HighSpeed".to_string());
+
+        board.keepouts.push(KeepoutZone {
+            min_x: 144.0,
+            min_y: 95.0,
+            max_x: 146.0,
+            max_y: 105.0,
+            layers: vec![2],
+        });
+
+        let router = AutoRouter::new(4);
+        let grid = RoutingGrid::new(&board, 0.25, None);
+
+        let ref_layer = grid.adjacent_reference_plane(0).expect("Layer 0 must have reference plane");
+        assert_eq!(ref_layer, 2, "In 4-layer stackup, In1.Cu is layer 2");
+
+        let (split_gx, split_gy) = grid.world_to_grid(145.0, 100.0).unwrap();
+        assert!(
+            grid.is_reference_plane_void_at(split_gx, split_gy, ref_layer),
+            "Cell (145.0, 100.0) on reference plane In1.Cu must detect void"
+        );
+
+        let (free_gx, free_gy) = grid.world_to_grid(140.0, 100.0).unwrap();
+        assert!(
+            !grid.is_reference_plane_void_at(free_gx, free_gy, ref_layer),
+            "Cell (140.0, 100.0) on reference plane In1.Cu must have continuous copper"
+        );
+
+        let start_node = GridNode { gx: free_gx, gy: free_gy, layer: 0 };
+        let goal_node = grid.world_to_grid(150.0, 100.0).map(|(gx, gy)| GridNode { gx, gy, layer: 0 }).unwrap();
+
+        let stop_flag = AtomicBool::new(false);
+        let path_with_si = router.find_path_with_constraints(
+            &grid,
+            start_node,
+            goal_node,
+            3, // SIG2
+            0.20,
+            0.20,
+            0.60,
+            None,
+            1.0,
+            0.0,
+            15.0,
+            true, // require_return_path = true
+            None,
+            &stop_flag,
+        );
+        assert!(path_with_si.is_some(), "Should find a route respecting return path");
+        let path = path_with_si.unwrap();
+
+        let crossed_void = path.iter().any(|n| {
+            let (wx, wy) = grid.grid_to_world(n.gx, n.gy);
+            wx >= 144.0 && wx <= 146.0 && wy >= 95.0 && wy <= 105.0
+        });
+        assert!(!crossed_void, "High-speed track with require_return_path=true must detour around split plane void");
+    }
+
+    #[test]
+    fn test_return_path_ground_via_insertion_near_signal_transition() {
+        let mut board = make_router_test_board();
+        let mut nc = NetClass::default();
+        nc.name = "HighSpeed".to_string();
+        nc.require_return_path = true;
+        board.netclasses.insert("HighSpeed".to_string(), nc);
+        board.net_to_class.insert("SIG2".to_string(), "HighSpeed".to_string());
+
+        board.vias.push(Via {
+            position: (138.0, 95.0),
+            size: 0.60,
+            drill: 0.30,
+            net_id: 3,
+            is_locked: false,
+        });
+
+        let router = AutoRouter::new(2);
+        let grid = RoutingGrid::new(&board, 0.25, None);
+
+        let initial_via_count = board.vias.len();
+        let added = router.add_return_path_ground_vias(&mut board, &grid);
+
+        assert_eq!(added, 1, "Should insert exactly 1 ground stitching return-path via");
+        assert_eq!(board.vias.len(), initial_via_count + 1);
+
+        let gnd_via = board.vias.iter().find(|v| v.net_id == 1 && (v.position.0 - 138.0).hypot(v.position.1 - 95.0) <= 1.5);
+        assert!(gnd_via.is_some(), "A GND via must be inserted within 1.5mm of the signal via");
+
+        let gnd_pos = gnd_via.unwrap().position;
+        let dist = (gnd_pos.0 - 138.0).hypot(gnd_pos.1 - 95.0);
+        assert!(dist >= 0.60, "GND via must maintain DRC clearance to signal via: dist={:.2}", dist);
+        assert!(dist <= 1.50, "GND via must be within 1.5mm of signal via: dist={:.2}", dist);
+
+        let added_second = router.add_return_path_ground_vias(&mut board, &grid);
+        assert_eq!(added_second, 0, "Second pass must not add redundant GND vias");
     }
 }
 
