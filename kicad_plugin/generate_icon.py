@@ -82,19 +82,57 @@ def generate_icons(plugin_dir: str = None) -> None:
 
     svg_path = os.path.join(plugin_dir, "icon.svg")
     png_path = os.path.join(plugin_dir, "icon.png")
+    resources_dir = os.path.join(plugin_dir, "resources")
+    os.makedirs(resources_dir, exist_ok=True)
 
     with open(svg_path, "w", encoding="utf-8") as f:
         f.write(ICON_SVG.strip() + "\n")
 
+    res_svg_path = os.path.join(resources_dir, "icon.svg")
+    with open(res_svg_path, "w", encoding="utf-8") as f:
+        f.write(ICON_SVG.strip() + "\n")
+
+    # 26x26 RGBA toolbar button icon
     cairosvg.svg2png(
         bytestring=ICON_SVG.encode("utf-8"),
         write_to=png_path,
         output_width=26,
         output_height=26,
     )
+
+    # 64x64 PCM package manager primary icon
+    res_64_path = os.path.join(resources_dir, "icon.png")
+    cairosvg.svg2png(
+        bytestring=ICON_SVG.encode("utf-8"),
+        write_to=res_64_path,
+        output_width=64,
+        output_height=64,
+    )
+
+    # 64x64 explicit naming
+    cairosvg.svg2png(
+        bytestring=ICON_SVG.encode("utf-8"),
+        write_to=os.path.join(resources_dir, "icon_64x64.png"),
+        output_width=64,
+        output_height=64,
+    )
+
+    # 32x32 compact PCM icon
+    res_32_path = os.path.join(resources_dir, "icon_32x32.png"),
+    cairosvg.svg2png(
+        bytestring=ICON_SVG.encode("utf-8"),
+        write_to=os.path.join(resources_dir, "icon_32x32.png"),
+        output_width=32,
+        output_height=32,
+    )
+
     print(f"Generated {svg_path}")
     print(f"Generated {png_path} (26x26 RGBA)")
+    print(f"Generated {res_svg_path}")
+    print(f"Generated {res_64_path} (64x64 RGBA)")
+    print(f"Generated {os.path.join(resources_dir, 'icon_32x32.png')} (32x32 RGBA)")
 
 
 if __name__ == "__main__":
     generate_icons()
+

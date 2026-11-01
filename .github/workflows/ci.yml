@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials CI Workflow
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bin_path: ./target/release/vulcans-trials
+          - os: macos-latest
+            bin_path: ./target/release/vulcans-trials
+          - os: windows-latest
+            bin_path: ./target/release/vulcans-trials.exe
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libasound2-dev libpulse-dev libudev-dev libcairo2-dev \
+            python3-jsonschema
+
+      - name: Install Python dependencies (macOS & Windows)
+        if: runner.os != 'Linux'
+        run: pip install jsonschema
+
+      - name: Run library unit tests (release mode)
+        run: cargo test --release --lib
+
+      - name: Compile release binary
+        run: cargo build --release
+
+      - name: Execute self-verification test suite
+        run: ${{ matrix.bin_path }} --self-test
+
+      - name: Validate KiCad PCM metadata schema compliance
+        run: python3 kicad_plugin/build_pcm.py --validate-only

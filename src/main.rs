@@ -67,6 +67,10 @@ struct Args {
     /// Run built-in self-verification suite (Vulkan compute, SAT geometry, router grid)
     #[arg(long)]
     self_test: bool,
+
+    /// Optional KiCad IPC streaming socket endpoint or named pipe
+    #[arg(long)]
+    ipc: Option<String>,
 }
 
 fn parse_locked_refs(lock_arg: &str) -> HashSet<String> {
@@ -274,6 +278,10 @@ fn main() {
         return;
     }
 
+    if let Some(ref ep) = args.ipc {
+        println!("KiCad IPC sync endpoint: {}", ep);
+    }
+
     let extra_locked = parse_locked_refs(&args.lock);
 
     let vulkan = VulkanEngine::new();
@@ -365,10 +373,13 @@ mod tests {
             "--lock",
             "U1, J2 , , R5",
             "--self-test",
+            "--ipc",
+            "/tmp/test_ipc.sock",
         ])
         .unwrap();
         assert!(custom.headless);
         assert!(custom.self_test);
+        assert_eq!(custom.ipc, Some("/tmp/test_ipc.sock".to_string()));
         assert_eq!(custom.mode, "place");
         assert_eq!(custom.duration, 2);
         assert_eq!(custom.passes, 4);
@@ -408,7 +419,9 @@ mod tests {
             passes: 1,
             lock: String::new(),
             inner_plane_penalty: 8.0,
+            any_angle: false,
             self_test: false,
+            ipc: None,
         };
         assert!(run_headless_trial(&args, &mut board, None).is_ok());
         assert!(Path::new(out_pcb).exists());
