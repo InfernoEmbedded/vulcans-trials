@@ -1,5 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 26 26" width="26" height="26">
   <defs>
+    <!-- Fire blast gradient -->
     <linearGradient id="fireGrad" x1="0%" y1="100%" x2="0%" y2="0%">
       <stop offset="0%" stop-color="#D50000"/>
       <stop offset="25%" stop-color="#FF3D00"/>
@@ -8,6 +9,7 @@
       <stop offset="100%" stop-color="#FFFDE7"/>
     </linearGradient>
 
+    <!-- Mountain basalt gradient -->
     <linearGradient id="rockGrad" x1="0%" y1="0%" x2="100%" y2="0%">
       <stop offset="0%" stop-color="#2D3238"/>
       <stop offset="35%" stop-color="#3E464F"/>
@@ -15,6 +17,7 @@
       <stop offset="100%" stop-color="#181B1E"/>
     </linearGradient>
 
+    <!-- Crater lava -->
     <radialGradient id="craterGrad" cx="50%" cy="50%" r="50%">
       <stop offset="0%" stop-color="#FFFDE7"/>
       <stop offset="35%" stop-color="#FFD600"/>

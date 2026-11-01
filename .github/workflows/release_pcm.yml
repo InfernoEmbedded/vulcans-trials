@@ -1,0 +1,242 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials KiCad PCM Release Workflow
+
+name: Release KiCad PCM
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-binaries:
+    name: Build Binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_name: vulcans-trials
+            platform: linux
+            arch: x86_64
+            cross: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            binary_name: vulcans-trials
+            platform: linux
+            arch: aarch64
+            cross: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: vulcans-trials.exe
+            platform: windows
+            arch: x86_64
+            cross: false
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary_name: vulcans-trials
+            platform: macos
+            arch: x86_64
+            cross: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary_name: vulcans-trials
+            platform: macos
+            arch: aarch64
+            cross: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install native Linux build dependencies
+        if: matrix.os == 'ubuntu-latest' && !matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libasound2-dev libpulse-dev libudev-dev libcairo2-dev
+
+      - name: Install cross-compilation tools
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build release binary (Native)
+        if: !matrix.cross
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build release binary (Cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Prepare binary artifact staging
+        shell: bash
+        run: |
+          mkdir -p stage/${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} stage/${{ matrix.target }}/
+
+      - name: Upload compiled binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: stage/${{ matrix.target }}/${{ matrix.binary_name }}
+          if-no-files-found: error
+
+  package-and-publish:
+    name: Package KiCad PCM & Publish Release
+    needs: [build-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev
+          pip install jsonschema cairosvg
+
+      - name: Download all compiled binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: staged_binaries
+
+      - name: Extract release version tag
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            VERSION="0.1.0"
+          fi
+          echo "RELEASE_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Building KiCad PCM release v$VERSION"
+
+      - name: Generate crisp icons
+        run: python3 kicad_plugin/generate_icon.py
+
+      - name: Build universal and platform-bundled KiCad PCM packages
+        shell: bash
+        run: |
+          mkdir -p dist/pcm dist/binaries
+
+          # 1. Universal KiCad PCM Package (host-resolved / unbundled binary)
+          python3 kicad_plugin/build_pcm.py \
+            --out-dir dist/pcm \
+            --version "$RELEASE_VERSION"
+
+          # 2. Linux x86_64 bundled package
+          if [ -f "staged_binaries/binary-x86_64-unknown-linux-gnu/vulcans-trials" ]; then
+            chmod +x staged_binaries/binary-x86_64-unknown-linux-gnu/vulcans-trials
+            python3 kicad_plugin/build_pcm.py \
+              --out-dir dist/pcm \
+              --bin staged_binaries/binary-x86_64-unknown-linux-gnu/vulcans-trials \
+              --platform linux \
+              --arch x86_64 \
+              --version "$RELEASE_VERSION"
+            tar -czf dist/binaries/vulcans-trials-v${RELEASE_VERSION}-x86_64-unknown-linux-gnu.tar.gz \
+              -C staged_binaries/binary-x86_64-unknown-linux-gnu vulcans-trials
+          fi
+
+          # 3. Linux aarch64 bundled package
+          if [ -f "staged_binaries/binary-aarch64-unknown-linux-gnu/vulcans-trials" ]; then
+            chmod +x staged_binaries/binary-aarch64-unknown-linux-gnu/vulcans-trials
+            python3 kicad_plugin/build_pcm.py \
+              --out-dir dist/pcm \
+              --bin staged_binaries/binary-aarch64-unknown-linux-gnu/vulcans-trials \
+              --platform linux \
+              --arch aarch64 \
+              --version "$RELEASE_VERSION"
+            tar -czf dist/binaries/vulcans-trials-v${RELEASE_VERSION}-aarch64-unknown-linux-gnu.tar.gz \
+              -C staged_binaries/binary-aarch64-unknown-linux-gnu vulcans-trials
+          fi
+
+          # 4. Windows x86_64 bundled package
+          if [ -f "staged_binaries/binary-x86_64-pc-windows-msvc/vulcans-trials.exe" ]; then
+            python3 kicad_plugin/build_pcm.py \
+              --out-dir dist/pcm \
+              --bin staged_binaries/binary-x86_64-pc-windows-msvc/vulcans-trials.exe \
+              --platform windows \
+              --arch x86_64 \
+              --version "$RELEASE_VERSION"
+            zip -j dist/binaries/vulcans-trials-v${RELEASE_VERSION}-x86_64-pc-windows-msvc.zip \
+              staged_binaries/binary-x86_64-pc-windows-msvc/vulcans-trials.exe
+          fi
+
+          # 5. macOS x86_64 bundled package
+          if [ -f "staged_binaries/binary-x86_64-apple-darwin/vulcans-trials" ]; then
+            chmod +x staged_binaries/binary-x86_64-apple-darwin/vulcans-trials
+            python3 kicad_plugin/build_pcm.py \
+              --out-dir dist/pcm \
+              --bin staged_binaries/binary-x86_64-apple-darwin/vulcans-trials \
+              --platform macos \
+              --arch x86_64 \
+              --version "$RELEASE_VERSION"
+            tar -czf dist/binaries/vulcans-trials-v${RELEASE_VERSION}-x86_64-apple-darwin.tar.gz \
+              -C staged_binaries/binary-x86_64-apple-darwin vulcans-trials
+          fi
+
+          # 6. macOS aarch64 bundled package
+          if [ -f "staged_binaries/binary-aarch64-apple-darwin/vulcans-trials" ]; then
+            chmod +x staged_binaries/binary-aarch64-apple-darwin/vulcans-trials
+            python3 kicad_plugin/build_pcm.py \
+              --out-dir dist/pcm \
+              --bin staged_binaries/binary-aarch64-apple-darwin/vulcans-trials \
+              --platform macos \
+              --arch aarch64 \
+              --version "$RELEASE_VERSION"
+            tar -czf dist/binaries/vulcans-trials-v${RELEASE_VERSION}-aarch64-apple-darwin.tar.gz \
+              -C staged_binaries/binary-aarch64-apple-darwin vulcans-trials
+          fi
+
+          # Generate SHA256 checksums file
+          cd dist
+          sha256sum pcm/*.zip pcm/*.json binaries/* > SHA256SUMS.txt
+          cd ..
+          cat dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            dist/pcm/*.zip
+            dist/pcm/*.json
+            dist/binaries/*
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+      - name: Deploy KiCad PCM Repository Index to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist/pcm
+          keep_files: true
