@@ -227,8 +227,46 @@ impl Drop for CudaEngine {
 }
 
 impl CudaEngine {
+    pub fn all_devices() -> Vec<Arc<Self>> {
+        let api = match CudaDriverApi::load() {
+            Some(a) => a,
+            None => return Vec::new(),
+        };
+        unsafe {
+            if (api.cuInit)(0) != CUDA_SUCCESS {
+                return Vec::new();
+            }
+            let mut count: c_int = 0;
+            if (api.cuDeviceGetCount)(&mut count) != CUDA_SUCCESS || count <= 0 {
+                return Vec::new();
+            }
+            let mut engines = Vec::new();
+            for ord in 0..count {
+                if let Some(engine) = Self::new_with_device(ord) {
+                    engines.push(engine);
+                }
+            }
+            engines.sort_by(|a, b| {
+                let score = |name: &str| {
+                    if name.contains("5090") { 5090 }
+                    else if name.contains("4090") { 4090 }
+                    else if name.contains("4080") { 4080 }
+                    else if name.contains("3090") { 3090 }
+                    else if name.contains("3080") { 3080 }
+                    else if name.contains("4070") { 4070 }
+                    else if name.contains("3070") { 3070 }
+                    else if name.contains("4060") { 4060 }
+                    else if name.contains("3060") { 3060 }
+                    else { 1000 }
+                };
+                score(&b.device_name).cmp(&score(&a.device_name))
+            });
+            engines
+        }
+    }
+
     pub fn new() -> Option<Arc<Self>> {
-        Self::new_with_device(0)
+        Self::all_devices().into_iter().next()
     }
 
     pub fn new_with_device(ordinal: c_int) -> Option<Arc<Self>> {
@@ -1119,5 +1157,25 @@ mod tests {
                 amp_scores[i]
             );
         }
+    }
+
+    #[test]
+    fn test_cuda_all_devices() {
+        let devs = CudaEngine::all_devices();
+        if devs.is_empty() {
+            eprintln!("No CUDA devices available on this host");
+            return;
+        }
+        println!("Detected {} CUDA device(s):", devs.len());
+        for (i, dev) in devs.iter().enumerate() {
+            println!("  [{}] {} ({})", i, dev.device_name, dev.driver_info);
+            // Verify each device can compute distance fields independently
+            let mut obs = vec![0u32; 16 * 16];
+            obs[4 * 16 + 4] = 1;
+            let df = dev.compute_distance_field(&obs, 16, 16, 10).expect("Distance field output");
+            assert_eq!(df[4 * 16 + 4], 0.0);
+            assert!((df[4 * 16 + 8] - 4.0).abs() < 1e-3);
+        }
+        assert!(!devs.is_empty());
     }
 }

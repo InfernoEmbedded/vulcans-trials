@@ -10,10 +10,7 @@ use std::time::Instant;
 use vulcans_trials::board::{Board, Point, Polygon, Segment, TrackSegment};
 use vulcans_trials::gui::VulcansTrialsApp;
 use vulcans_trials::placer::{run_auto_placer, PlacementConfig};
-use vulcans_trials::router::{
-    apply_any_angle_tangent_arcs, prune_dangling_tracks_and_vias, validate_and_clean_copper,
-    AutoRouter, RoutingGrid,
-};
+use vulcans_trials::router::{apply_any_angle_tangent_arcs, AutoRouter, RoutingGrid};
 use vulcans_trials::vulkan::VulkanEngine;
 
 #[derive(Parser, Debug)]
@@ -278,11 +275,6 @@ fn run_headless_trial(
             board.tracks.len(),
             board.vias.len()
         );
-    }
-
-    if do_route {
-        validate_and_clean_copper(board);
-        prune_dangling_tracks_and_vias(board);
     }
 
     let out_path = Path::new(&args.output);

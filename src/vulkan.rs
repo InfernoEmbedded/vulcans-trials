@@ -526,48 +526,80 @@ impl VulkanEngine {
             ..Default::default()
         });
 
-        let mut primary = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await;
+        let mut adapters: Vec<wgpu::Adapter> = instance
+            .enumerate_adapters(wgpu::Backends::VULKAN)
+            .into_iter()
+            .filter(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
+            .collect();
 
-        // Non-testable in isolation on hosts where a working Vulkan ICD is installed:
-        // this branch only executes when `wgpu::Backends::VULKAN` yields no adapter.
-        if primary.is_none() {
+        if adapters.is_empty() {
             let fallback_inst = wgpu::Instance::new(&wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::all(),
                 ..Default::default()
             });
-            primary = fallback_inst
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    compatible_surface: None,
-                    force_fallback_adapter: false,
-                })
-                .await;
+            adapters = fallback_inst
+                .enumerate_adapters(wgpu::Backends::all())
+                .into_iter()
+                .filter(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
+                .collect();
         }
 
-        let primary = primary?;
-        let primary_info = primary.get_info();
+        if adapters.is_empty() {
+            return None;
+        }
+
+        let is_vulkan_forced = force_vulkan
+            || std::env::var("VULCANS_FORCE_VULKAN")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+            || std::env::var("VULCANS_GPU_BACKEND")
+                .map(|v| v.eq_ignore_ascii_case("vulkan"))
+                .unwrap_or(false);
+
+        let cuda_devices = if !is_vulkan_forced {
+            crate::cuda::CudaEngine::all_devices()
+        } else {
+            Vec::new()
+        };
+
         let busy_ns = Arc::new(AtomicU64::new(0));
 
-        let mut extra_devices = Vec::new();
-        let mut seen_names = vec![primary_info.name.clone()];
-        for cand in instance.enumerate_adapters(wgpu::Backends::VULKAN) {
-            let c_info = cand.get_info();
-            if c_info.device_type == wgpu::DeviceType::Cpu || seen_names.contains(&c_info.name) {
-                continue;
+        if !cuda_devices.is_empty() {
+            // Build secondary engines first so they can be bundled into primary.extra_devices
+            let mut extra_devices = Vec::new();
+            for (idx, cuda) in cuda_devices.iter().enumerate().skip(1) {
+                let adapter = adapters.iter()
+                    .find(|a| a.get_info().name == cuda.device_name
+                        || cuda.device_name.contains(&a.get_info().name)
+                        || a.get_info().name.contains(&cuda.device_name))
+                    .cloned()
+                    .unwrap_or_else(|| adapters[idx.min(adapters.len() - 1)].clone());
+
+                if let Some(sec) = Self::from_adapter(adapter, Arc::clone(&busy_ns), Vec::new(), force_vulkan, Some(Arc::clone(cuda))).await {
+                    extra_devices.push(Arc::new(sec));
+                }
             }
-            seen_names.push(c_info.name.clone());
-            if let Some(eng) = Self::from_adapter(cand, Arc::clone(&busy_ns), Vec::new(), force_vulkan).await {
+
+            let primary_cuda = &cuda_devices[0];
+            let primary_adapter = adapters.iter()
+                .find(|a| a.get_info().name == primary_cuda.device_name
+                    || primary_cuda.device_name.contains(&a.get_info().name)
+                    || a.get_info().name.contains(&primary_cuda.device_name))
+                .cloned()
+                .unwrap_or_else(|| adapters[0].clone());
+
+            return Self::from_adapter(primary_adapter, busy_ns, extra_devices, force_vulkan, Some(Arc::clone(primary_cuda))).await;
+        }
+
+        // Pure Vulkan / non-CUDA fallback: bundle secondary adapters into extra_devices
+        let mut extra_devices = Vec::new();
+        for cand in adapters.iter().skip(1) {
+            if let Some(eng) = Self::from_adapter(cand.clone(), Arc::clone(&busy_ns), Vec::new(), force_vulkan, None).await {
                 extra_devices.push(Arc::new(eng));
             }
         }
 
-        Self::from_adapter(primary, busy_ns, extra_devices, force_vulkan).await
+        Self::from_adapter(adapters[0].clone(), busy_ns, extra_devices, force_vulkan, None).await
     }
 
     async fn from_adapter(
@@ -575,6 +607,7 @@ impl VulkanEngine {
         compute_busy_ns: Arc<AtomicU64>,
         extra_devices: Vec<Arc<VulkanEngine>>,
         force_vulkan_arg: bool,
+        cuda_engine_arg: Option<Arc<crate::cuda::CudaEngine>>,
     ) -> Option<Self> {
         let info = adapter.get_info();
         let mut device_name = if extra_devices.is_empty() {
@@ -816,8 +849,8 @@ impl VulkanEngine {
                 .unwrap_or(false);
 
         if !force_vulkan {
-            if let Some(cuda) = crate::cuda::CudaEngine::new() {
-                // Quick startup probe: run 16x16 distance field test to verify CUDA functionality
+            let cand_cuda = cuda_engine_arg.or_else(crate::cuda::CudaEngine::new);
+            if let Some(cuda) = cand_cuda {
                 let test_obs = vec![0u32; 16 * 16];
                 if cuda.compute_distance_field(&test_obs, 16, 16, 4).is_some() {
                     backend_kind = GpuBackendKind::CudaPtx;
@@ -827,6 +860,14 @@ impl VulkanEngine {
                     cuda_engine = Some(cuda);
                 }
             }
+        }
+
+        if !extra_devices.is_empty() {
+            let mut names = vec![device_name.clone()];
+            for d in &extra_devices {
+                names.push(d.device_name.clone());
+            }
+            device_name = format!("{} [{} GPUs Active]", names.join(" + "), 1 + extra_devices.len());
         }
 
         Some(Self {
@@ -1579,6 +1620,26 @@ mod tests {
         let guard = telem.state.lock().unwrap();
         assert!(guard.cpu_load_pct >= 0.0 && guard.cpu_load_pct <= 100.0);
         assert!(guard.gpu_load_pct >= 0.0 && guard.gpu_load_pct <= 100.0);
+    }
+
+    #[test]
+    fn test_vulkan_multi_gpu_all_engines() {
+        let vk = VulkanEngine::new().expect("VulkanEngine must initialize");
+        let engines = vk.all_engines();
+        println!("VulkanEngine primary: {}", vk.device_name);
+        println!("All active GPU engines count: {}", engines.len());
+        for (i, eng) in engines.iter().enumerate() {
+            println!("  Engine [{}]: {} ({:?})", i, eng.device_name, eng.backend_kind);
+            let mut obs = vec![0u32; 16 * 16];
+            obs[4 * 16 + 4] = 1;
+            let df = eng.compute_distance_field(&obs, 16, 16, 10).expect("DF output");
+            assert_eq!(df[4 * 16 + 4], 0.0);
+        }
+        assert!(!engines.is_empty());
+        if crate::cuda::CudaEngine::all_devices().len() > 1 {
+            assert!(engines.len() >= 2, "Expected at least 2 active GPU engines when multiple CUDA devices present");
+            assert!(vk.device_name.contains("2 GPUs Active") || vk.device_name.contains("GPUs Active"));
+        }
     }
 }
 

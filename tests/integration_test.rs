@@ -650,12 +650,19 @@ fn test_p1p2esp_project_board_integration_if_present() {
     assert!(!board.clusters.is_empty());
 
     // Verify p1p2esp.kicad_pro netclasses are loaded and honored
-    let p1_nc = board.get_netclass_for_net(board.net_name_to_id["P1"]);
-    assert_eq!(p1_nc.name, "P1P2_Bus");
-    assert!((p1_nc.track_width - 0.60).abs() < 1e-6 && (p1_nc.clearance - 0.30).abs() < 1e-6 && (p1_nc.via_dia - 0.80).abs() < 1e-6);
-    let pwr_nc = board.get_netclass_for_net(board.net_name_to_id["+3.3V"]);
-    assert_eq!(pwr_nc.name, "Power");
-    assert!((pwr_nc.track_width - 0.60).abs() < 1e-6 && (pwr_nc.clearance - 0.25).abs() < 1e-6);
+    for power_net in ["VBUS", "VRAW", "/BUCK_VIN", "+3.3V", "VCC_5V"] {
+        if let Some(&nid) = board.net_name_to_id.get(power_net) {
+            let nc = board.get_netclass_for_net(nid);
+            assert_eq!(nc.name, "Power", "Net {power_net} must be in Power class");
+            assert!((nc.track_width - 0.60).abs() < 1e-6 && (nc.clearance - 0.25).abs() < 1e-6 && (nc.via_dia - 0.80).abs() < 1e-6);
+        }
+    }
+    for bus_net in ["P1", "P2", "HP", "HN"] {
+        if let Some(&nid) = board.net_name_to_id.get(bus_net) {
+            let nc = board.get_netclass_for_net(nid);
+            assert_eq!(nc.name, "P1P2_Bus", "Net {bus_net} must be in P1P2_Bus class");
+        }
+    }
     let aio_nc = board.get_netclass_for_net(board.net_name_to_id["AIO"]);
     assert_eq!(aio_nc.name, "Analog_Sense");
     assert!((aio_nc.track_width - 0.25).abs() < 1e-6 && (aio_nc.clearance - 0.20).abs() < 1e-6);
@@ -685,7 +692,7 @@ fn test_p1p2esp_project_board_integration_if_present() {
         .unwrap();
     assert_eq!(j1_before, j1_after, "Locked footprint J1 must not move");
 
-    let grid = RoutingGrid::new(&board, 0.10, vk);
+    let mut grid = RoutingGrid::new(&board, 0.10, vk);
     assert!(grid.width > 100 && grid.height > 100);
     assert_eq!(grid.num_layers, 4, "p1p2esp is a 4-layer board (F.Cu, B.Cu, In1.Cu, In2.Cu)");
     assert_eq!(board.copper_layers(), vec!["F.Cu", "B.Cu", "In1.Cu", "In2.Cu"]);
@@ -719,6 +726,90 @@ fn test_p1p2esp_project_board_integration_if_present() {
     };
     let neighbors = grid.get_neighbors(mid, 1, 0.20, 0.20, 0.60, None);
     assert!(!neighbors.is_empty());
+
+    // Verify USB_DP and USB_DM route successfully as a coupled differential pair
+    let mut dp_conn = conns.iter().find(|c| c.net_name == "USB_DP" && c.diff_pair_leader.is_none() && c.start_fp != c.end_fp).unwrap().clone();
+    let mut dm_conn = conns.iter().find(|c| c.net_name == "USB_DM" && c.diff_pair_leader.is_some() && c.start_fp != c.end_fp).unwrap().clone();
+    let escape_stubs = router.generate_escape_stubs(&board);
+
+    for stub in &escape_stubs {
+        if dp_conn.net_id == stub.net_id && dp_conn.start.2 == stub.layer && (dp_conn.start.0 - stub.pad_pos.0).hypot(dp_conn.start.1 - stub.pad_pos.1) < 0.15 {
+            dp_conn.start = (stub.tip_pos.0, stub.tip_pos.1, stub.tip_layer);
+            break;
+        }
+    }
+    for stub in &escape_stubs {
+        if dp_conn.net_id == stub.net_id && dp_conn.end.2 == stub.layer && (dp_conn.end.0 - stub.pad_pos.0).hypot(dp_conn.end.1 - stub.pad_pos.1) < 0.15 {
+            dp_conn.end = (stub.tip_pos.0, stub.tip_pos.1, stub.tip_layer);
+            break;
+        }
+    }
+    for stub in &escape_stubs {
+        if dm_conn.net_id == stub.net_id && dm_conn.start.2 == stub.layer && (dm_conn.start.0 - stub.pad_pos.0).hypot(dm_conn.start.1 - stub.pad_pos.1) < 0.15 {
+            dm_conn.start = (stub.tip_pos.0, stub.tip_pos.1, stub.tip_layer);
+            break;
+        }
+    }
+    for stub in &escape_stubs {
+        if dm_conn.net_id == stub.net_id && dm_conn.end.2 == stub.layer && (dm_conn.end.0 - stub.pad_pos.0).hypot(dm_conn.end.1 - stub.pad_pos.1) < 0.15 {
+            dm_conn.end = (stub.tip_pos.0, stub.tip_pos.1, stub.tip_layer);
+            break;
+        }
+    }
+
+    let (Some((sgx, sgy)), Some((egx, egy))) = (
+        grid.world_to_grid(dp_conn.start.0, dp_conn.start.1),
+        grid.world_to_grid(dp_conn.end.0, dp_conn.end.1),
+    ) else { panic!("Start or end out of grid bounds"); };
+
+    let s_node = GridNode { gx: sgx, gy: sgy, layer: dp_conn.start.2 };
+    let e_node = GridNode { gx: egx, gy: egy, layer: dp_conn.end.2 };
+    let stop_flag = AtomicBool::new(false);
+    let dp_path = router.find_path_with_constraints(
+        &grid,
+        s_node,
+        e_node,
+        dp_conn.net_id,
+        dp_conn.netclass.clearance,
+        dp_conn.netclass.diff_pair_width,
+        dp_conn.netclass.via_dia,
+        None,
+        1.0,
+        0.0,
+        dp_conn.netclass.max_coupled_length_mm,
+        dp_conn.netclass.require_return_path,
+        None,
+        &stop_flag,
+    );
+    assert!(dp_path.is_some(), "USB_DP path must be found");
+    let p = dp_path.unwrap();
+    router.commit_path_to_grid(&mut grid, &p, dp_conn.net_id, dp_conn.netclass.diff_pair_width, dp_conn.netclass.via_dia);
+
+    let corridor = router.build_diff_pair_corridor(&grid, &p, dp_conn.netclass.diff_pair_width, dp_conn.netclass.diff_pair_gap);
+    let (Some((dmg_sx, dmg_sy)), Some((dmg_ex, dmg_ey))) = (
+        grid.world_to_grid(dm_conn.start.0, dm_conn.start.1),
+        grid.world_to_grid(dm_conn.end.0, dm_conn.end.1),
+    ) else { panic!("DM start or end out of grid"); };
+    let dm_s_node = GridNode { gx: dmg_sx, gy: dmg_sy, layer: dm_conn.start.2 };
+    let dm_e_node = GridNode { gx: dmg_ex, gy: dmg_ey, layer: dm_conn.end.2 };
+
+    let dm_path = router.find_path_with_constraints(
+        &grid,
+        dm_s_node,
+        dm_e_node,
+        dm_conn.net_id,
+        dm_conn.netclass.clearance,
+        dm_conn.netclass.diff_pair_width,
+        dm_conn.netclass.via_dia,
+        None,
+        1.0,
+        0.0,
+        dm_conn.netclass.max_coupled_length_mm,
+        dm_conn.netclass.require_return_path,
+        Some(&corridor),
+        &stop_flag,
+    );
+    assert!(dm_path.is_some(), "USB_DM follower path in corridor must be found");
 }
 
 #[test]
@@ -1159,6 +1250,27 @@ fn test_rip_up_connected_traces_on_move_and_shove_e2e() {
     assert_eq!(snap.board.tracks[0].start, r3_pad_pos);
     assert_eq!(snap.board.tracks[0].end, r4_pad_pos);
 }
+
+#[test]
+fn test_p1p2esp_full_routing_completion() {
+    let pcb_path = "/home/deece/src/p1p2esp/p1p2esp.kicad_pcb";
+    if !std::path::Path::new(pcb_path).exists() {
+        return;
+    }
+    let locked: std::collections::HashSet<String> = vulcans_trials::board::DEFAULT_LOCKED_REFS.iter().map(|s| s.to_string()).collect();
+    let mut board = vulcans_trials::board::Board::load(pcb_path, &locked).unwrap();
+    let vulkan = vulcans_trials::vulkan::VulkanEngine::new();
+    let mut grid = vulcans_trials::router::RoutingGrid::new(&board, 0.10, vulkan);
+    let router = vulcans_trials::router::AutoRouter::new(12);
+    let (routed, total) = router.route_all(&mut board, &mut grid, None, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    assert_eq!(routed, total, "Should route all {}/{} connections, got {}/{}", total, total, routed, total);
+
+    // Verify TERM (id 2) has connected tracks to U1
+    let term_nid = *board.net_name_to_id.get("TERM").unwrap();
+    let term_tracks: Vec<_> = board.tracks.iter().filter(|t| t.net_id == term_nid).collect();
+    assert!(term_tracks.len() >= 4, "TERM net must have full route segments connecting U1 to R4, got {}", term_tracks.len());
+}
+
 
 
 

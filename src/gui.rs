@@ -447,10 +447,13 @@ impl VulcansTrialsApp {
             last_saved_prefs: AppPreferences::default(),
         };
 
-        // Load and apply saved preferences on launch
-        let saved_prefs = AppPreferences::load();
-        app.apply_preferences(&saved_prefs);
-        app.last_saved_prefs = app.to_preferences();
+        // Load and apply saved preferences on launch (isolated during unit tests)
+        #[cfg(not(test))]
+        {
+            let saved_prefs = AppPreferences::load();
+            app.apply_preferences(&saved_prefs);
+            app.last_saved_prefs = app.to_preferences();
+        }
 
         // If IPC live sync was saved as enabled and no client connected yet, attempt reconnection
         if app.kicad_ipc_enabled && app.ipc.is_none() {
@@ -3350,6 +3353,7 @@ mod tests {
         board.tracks[0].is_locked = true;
 
         let mut app = VulcansTrialsApp::new(in_path.to_string(), String::new(), board, None);
+        app.show_holding_palette = true;
         assert_eq!(app.live.lock().unwrap().board.footprints.len(), 2);
         assert_eq!(app.live.lock().unwrap().board.tracks.len(), 2);
         assert_eq!(app.live.lock().unwrap().board.vias.len(), 1);
