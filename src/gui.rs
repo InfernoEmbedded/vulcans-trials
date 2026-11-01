@@ -102,7 +102,8 @@ pub fn copper_layers_draw_order<'a>(active_layers: &[&'a str]) -> Vec<&'a str> {
     order
 }
 
-pub use crate::router::{compute_45_dogleg, is_octilinear_segment};
+pub use crate::router::{compute_45_dogleg, generate_bundle_tracks, is_octilinear_segment, route_bundle_along_guide};
+pub use crate::board::BusBundle;
 
 
 #[derive(Clone, Debug)]
@@ -173,6 +174,11 @@ pub struct VulcansTrialsApp {
     pub hovered_footprint: Option<usize>,
     pub active_route: Option<ActiveRoute>,
     pub route_tool_active: bool,
+    pub bundle_sketch_active: bool,
+    pub bundle_guide_points: Vec<(f64, f64)>,
+    pub bundle_selected_nets: Vec<usize>,
+    pub bundle_track_width: f64,
+    pub bundle_track_spacing: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -235,6 +241,11 @@ impl VulcansTrialsApp {
             hovered_footprint: None,
             active_route: None,
             route_tool_active: false,
+            bundle_sketch_active: false,
+            bundle_guide_points: Vec::new(),
+            bundle_selected_nets: Vec::new(),
+            bundle_track_width: 0.25,
+            bundle_track_spacing: 0.25,
         }
     }
 
@@ -1116,6 +1127,101 @@ impl VulcansTrialsApp {
         }
     }
 
+    pub fn get_effective_bundle_nets(&self, board: &Board) -> Vec<usize> {
+        if !self.bundle_selected_nets.is_empty() {
+            return self.bundle_selected_nets.clone();
+        }
+        if let Some(ref sel) = self.selected_net {
+            if let Some(&nid) = board.net_name_to_id.get(sel) {
+                if nid != 0 {
+                    let mut nets = vec![nid];
+                    for &other in board.net_name_to_id.values() {
+                        if other != 0 && other != nid && nets.len() < 4 {
+                            nets.push(other);
+                        }
+                    }
+                    return nets;
+                }
+            }
+        }
+        let mut nets = Vec::new();
+        for &nid in board.net_name_to_id.values() {
+            if nid != 0 && !nets.contains(&nid) {
+                nets.push(nid);
+                if nets.len() >= 4 {
+                    break;
+                }
+            }
+        }
+        if nets.is_empty() {
+            nets = vec![1, 2, 3, 4];
+        }
+        nets.sort();
+        nets
+    }
+
+    pub fn commit_bundle_sketch(&mut self) -> bool {
+        if self.bundle_guide_points.len() < 2 {
+            return false;
+        }
+        let mut g = self.live.lock().unwrap();
+        let nets = self.get_effective_bundle_nets(&g.board);
+        if nets.is_empty() {
+            return false;
+        }
+        let bundle = BusBundle::new(
+            format!("Bundle_{}", g.board.bundles.len() + 1),
+            nets,
+            self.bundle_guide_points.clone(),
+            0,
+            self.bundle_track_width,
+            self.bundle_track_spacing,
+        );
+        let mut grid = RoutingGrid::new(&g.board, if self.grid_res_mm > 0.001 { self.grid_res_mm } else { 0.10 }, self.vulkan.clone());
+        let ok = route_bundle_along_guide(&mut g.board, &mut grid, &bundle);
+        if ok {
+            let total_tracks = g.board.tracks.len();
+            g.refresh_ratsnest();
+            g.push_log(format!(
+                "[BusBundle] Committed bundle '{}' ({} nets, {} guide waypoints). Total tracks: {}",
+                bundle.name, bundle.net_ids.len(), bundle.guide_points.len(), total_tracks
+            ));
+            self.bundle_guide_points.clear();
+            true
+        } else {
+            g.push_log(format!(
+                "[BusBundle] Failed to route bundle '{}': clearance/DRC conflict along guide path",
+                bundle.name
+            ));
+            false
+        }
+    }
+
+    pub fn cancel_bundle_sketch(&mut self) -> bool {
+        if !self.bundle_guide_points.is_empty() {
+            self.bundle_guide_points.clear();
+            let mut g = self.live.lock().unwrap();
+            g.push_log("[BusBundle] Cleared in-progress bundle sketch waypoints");
+            true
+        } else if self.bundle_sketch_active {
+            self.bundle_sketch_active = false;
+            let mut g = self.live.lock().unwrap();
+            g.push_log("[BusBundle] Exited bus bundle sketch mode");
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn handle_bundle_sketch_click(&mut self, rect: Rect, click_pos: Pos2) {
+        let snap = self.live.lock().unwrap();
+        let b = &snap.board;
+        let grid = if self.grid_res_mm > 0.001 { self.grid_res_mm } else { 0.10 };
+        let world_pt = self.screen_to_board(b, rect, click_pos);
+        let snapped_pt = ((world_pt.x / grid).round() * grid, (world_pt.y / grid).round() * grid);
+        self.bundle_guide_points.push(snapped_pt);
+    }
+
     pub fn render_ui(&mut self, ctx: &egui::Context) {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
 
@@ -1242,6 +1348,22 @@ impl VulcansTrialsApp {
                         self.route_tool_active = !self.route_tool_active;
                         if !self.route_tool_active {
                             self.active_route = None;
+                        }
+                    }
+
+                    let bundle_btn = if self.bundle_sketch_active {
+                        egui::Button::new(
+                            egui::RichText::new("🌊 Bus Sketch (B) [ACTIVE]")
+                                .color(Color32::from_rgb(100, 200, 255))
+                                .strong(),
+                        )
+                    } else {
+                        egui::Button::new("🌊 Bus Sketch (B)")
+                    };
+                    if ui.add_enabled(!is_running, bundle_btn).clicked() {
+                        self.bundle_sketch_active = !self.bundle_sketch_active;
+                        if !self.bundle_sketch_active {
+                            self.bundle_guide_points.clear();
                         }
                     }
                 });
@@ -1620,7 +1742,21 @@ impl VulcansTrialsApp {
             // Keyboard shortcuts:
             // KiCad route shortcuts: 'x' (route track), 'v' (place via & switch layer), '/' (toggle dogleg posture), 'Escape' (cancel route / exit route tool)
             // Placement shortcuts: 'm' (pick up/move), 'r' (rotate 90°), 'f' (flip layer), 'Escape' (cancel move)
+            // Bus Bundle shortcut: 'b' (toggle bus sketch), 'Enter' (commit bundle route)
             if !ctx.wants_keyboard_input() && !is_running {
+                // 'B': Bus Bundle Sketch mode toggle
+                if ctx.input(|i| i.key_pressed(egui::Key::B)) {
+                    self.bundle_sketch_active = !self.bundle_sketch_active;
+                    if !self.bundle_sketch_active {
+                        self.bundle_guide_points.clear();
+                    }
+                }
+
+                // 'Enter': Commit bundle sketch
+                if self.bundle_sketch_active && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    self.commit_bundle_sketch();
+                }
+
                 // 'X': Route Track mode / start route
                 if ctx.input(|i| i.key_pressed(egui::Key::X)) {
                     if self.active_route.is_none() {
@@ -1672,16 +1808,18 @@ impl VulcansTrialsApp {
                     }
                 }
 
-                // 'Escape': Cancel active route, exit route tool, or cancel footprint move
+                // 'Escape': Cancel active route, exit route tool, cancel bundle sketch, or cancel footprint move
                 if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    if self.active_route.is_some() || self.route_tool_active {
+                    if self.bundle_sketch_active {
+                        self.cancel_bundle_sketch();
+                    } else if self.active_route.is_some() || self.route_tool_active {
                         self.cancel_route();
                     } else if self.moving_footprint.is_some() {
                         self.cancel_moving_component();
                     }
                 }
 
-                if self.active_route.is_none() && !self.route_tool_active {
+                if self.active_route.is_none() && !self.route_tool_active && !self.bundle_sketch_active {
                     if ctx.input(|i| i.key_pressed(egui::Key::M)) {
                         if self.moving_footprint.is_none() {
                             if let Some(pos) = pointer_pos {
@@ -1700,8 +1838,8 @@ impl VulcansTrialsApp {
                 }
             }
 
-            // If routing is active, show crosshair cursor
-            if self.active_route.is_some() || self.route_tool_active {
+            // If routing or bundle sketching is active, show crosshair cursor
+            if self.active_route.is_some() || self.route_tool_active || self.bundle_sketch_active {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             } else if self.moving_footprint.is_some() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -1718,7 +1856,11 @@ impl VulcansTrialsApp {
             }
 
             if response.clicked() {
-                if self.moving_footprint.is_some() {
+                if self.bundle_sketch_active {
+                    if let Some(click_pos) = response.interact_pointer_pos() {
+                        self.handle_bundle_sketch_click(rect, click_pos);
+                    }
+                } else if self.moving_footprint.is_some() {
                     self.place_moving_component();
                 } else if self.active_route.is_some() {
                     if let Some(click_pos) = response.interact_pointer_pos() {
@@ -1733,7 +1875,20 @@ impl VulcansTrialsApp {
                 }
             }
             if response.secondary_clicked() {
-                if self.active_route.is_some() || self.route_tool_active {
+                if self.bundle_sketch_active {
+                    if self.bundle_guide_points.len() >= 2 {
+                        self.commit_bundle_sketch();
+                    } else if self.bundle_guide_points.len() == 1 {
+                        if let Some(click_pos) = response.interact_pointer_pos() {
+                            self.handle_bundle_sketch_click(rect, click_pos);
+                            self.commit_bundle_sketch();
+                        } else {
+                            self.cancel_bundle_sketch();
+                        }
+                    } else {
+                        self.bundle_sketch_active = false;
+                    }
+                } else if self.active_route.is_some() || self.route_tool_active {
                     self.cancel_route();
                 } else if self.moving_footprint.is_some() {
                     self.cancel_moving_component();
@@ -1742,7 +1897,7 @@ impl VulcansTrialsApp {
                 }
             }
             if response.dragged() {
-                if self.moving_footprint.is_none() && self.active_route.is_none() {
+                if self.moving_footprint.is_none() && self.active_route.is_none() && !self.bundle_sketch_active {
                     self.pan_offset += response.drag_delta();
                 }
             }
@@ -2069,7 +2224,83 @@ impl VulcansTrialsApp {
                 }
             }
 
-            // 11. Draw Color Legend Overlay
+            // 11. Draw Bus Bundle Sketch Live Preview & Spine
+            if self.bundle_sketch_active {
+                let grid = if self.grid_res_mm > 0.001 { self.grid_res_mm } else { 0.10 };
+                let cur_wpt = if let Some(pos) = pointer_pos {
+                    if rect.contains(pos) {
+                        let wpt = self.screen_to_board(b, rect, pos);
+                        Some(((wpt.x / grid).round() * grid, (wpt.y / grid).round() * grid))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let mut tentative_guide = self.bundle_guide_points.clone();
+                if let Some(cpt) = cur_wpt {
+                    if tentative_guide.last().map_or(true, |&last| (last.0 - cpt.0).hypot(last.1 - cpt.1) > 1e-4) {
+                        tentative_guide.push(cpt);
+                    }
+                }
+
+                // Draw committed guide waypoints and spine line
+                for i in 0..self.bundle_guide_points.len() {
+                    let pt = self.bundle_guide_points[i];
+                    let screen_pt = to_screen(pt.0, pt.1);
+                    painter.circle_filled(screen_pt, 4.0, Color32::from_rgb(100, 200, 255));
+                    painter.circle_stroke(screen_pt, 6.0, Stroke::new(1.0_f32, Color32::WHITE));
+                    if i + 1 < self.bundle_guide_points.len() {
+                        let next_pt = self.bundle_guide_points[i + 1];
+                        painter.line_segment(
+                            [screen_pt, to_screen(next_pt.0, next_pt.1)],
+                            Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(100, 200, 255, 180)),
+                        );
+                    }
+                }
+
+                // Draw live tentative ribbon/bundle tracks preview
+                let nets = self.get_effective_bundle_nets(b);
+                if tentative_guide.len() >= 2 && !nets.is_empty() {
+                    let tentative_bundle = BusBundle::new(
+                        "PreviewBundle",
+                        nets.clone(),
+                        tentative_guide.clone(),
+                        0,
+                        self.bundle_track_width,
+                        self.bundle_track_spacing,
+                    );
+                    let preview_tracks = generate_bundle_tracks(b, &tentative_bundle, self.bundle_track_spacing);
+                    let preview_stroke_w = ((self.bundle_track_width as f32) * scale).max(2.0);
+                    for trk in preview_tracks {
+                        let q0 = to_screen(trk.start.0, trk.start.1);
+                        let q1 = to_screen(trk.end.0, trk.end.1);
+                        let col = Color32::from_rgba_unmultiplied(80, 220, 255, 200);
+                        draw_track_segment(&painter, q0, q1, preview_stroke_w, col);
+                    }
+                }
+
+                // Draw cursor waypoint marker and tooltip badge
+                if let Some(cpt) = cur_wpt {
+                    let cur_screen = to_screen(cpt.0, cpt.1);
+                    painter.circle_stroke(cur_screen, 6.0, Stroke::new(1.5_f32, Color32::from_rgb(100, 220, 255)));
+
+                    let label_pos = Pos2::new(cur_screen.x, cur_screen.y - 18.0);
+                    let hint = format!(
+                        "Bus Sketch [{} nets] · [Click] Waypoint ({}) · [Enter/R-Click] Commit · [Esc] Cancel",
+                        nets.len(),
+                        self.bundle_guide_points.len()
+                    );
+                    let galley = painter.layout_no_wrap(hint, egui::FontId::proportional(11.0), Color32::from_rgb(120, 220, 255));
+                    let bg_rect = Rect::from_center_size(label_pos, galley.size() + Vec2::new(8.0, 4.0));
+                    painter.rect_filled(bg_rect, 3.0, Color32::from_rgba_unmultiplied(20, 24, 30, 220));
+                    painter.rect_stroke(bg_rect, 3.0, Stroke::new(1.0_f32, Color32::from_rgb(100, 200, 255)), egui::StrokeKind::Middle);
+                    painter.galley(Pos2::new(bg_rect.left() + 4.0, bg_rect.top() + 2.0), galley, Color32::from_rgb(120, 220, 255));
+                }
+            }
+
+            // 12. Draw Color Legend Overlay
             draw_color_legend(&painter, rect, b);
         });
     }
@@ -3466,6 +3697,79 @@ mod tests {
         let g = app.live.lock().unwrap();
         assert!(g.board.vias.iter().any(|v| v.net_id == expected_net_id));
         assert!(g.board.tracks.iter().any(|t| t.net_id == expected_net_id));
+
+        let _ = fs::remove_file(in_path);
+    }
+
+    #[test]
+    fn test_gui_bundle_sketch_interaction() {
+        let in_path = "test_gui_bundle_sketch.kicad_pcb";
+        let out_path = "test_gui_bundle_sketch_out.ses";
+        let board = make_gui_test_board(in_path);
+        let mut app = VulcansTrialsApp::new(in_path.to_string(), out_path.to_string(), board, None);
+        app.bundle_selected_nets = vec![3, 4];
+
+        assert!(!app.bundle_sketch_active);
+        assert!(app.bundle_guide_points.is_empty());
+
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 800.0));
+
+        // Frame 1: Press 'B' -> toggles bundle sketch active
+        let mut input1 = egui::RawInput::default();
+        input1.screen_rect = Some(rect);
+        input1.events.push(egui::Event::Key {
+            key: egui::Key::B,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input1, |ctx| {
+            app.render_ui(ctx);
+        });
+        assert!(app.bundle_sketch_active, "Key 'B' must activate bundle sketch tool");
+
+        // Add 2 waypoints via canvas clicks in open board routing channel
+        let (wp1_screen, _) = app.board_to_screen(&app.live.lock().unwrap().board, rect, 112.0, 106.0);
+        let (wp2_screen, _) = app.board_to_screen(&app.live.lock().unwrap().board, rect, 125.0, 106.0);
+
+        app.handle_bundle_sketch_click(rect, wp1_screen);
+        app.handle_bundle_sketch_click(rect, wp2_screen);
+        assert_eq!(app.bundle_guide_points.len(), 2);
+
+        // Frame 2: Press 'Enter' -> commits bundle route
+        let mut input2 = egui::RawInput::default();
+        input2.screen_rect = Some(rect);
+        input2.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input2, |ctx| {
+            app.render_ui(ctx);
+        });
+
+        assert!(app.bundle_guide_points.is_empty(), "Committing bundle must clear guide points");
+        let g = app.live.lock().unwrap();
+        assert!(!g.board.bundles.is_empty(), "Board must record committed bundle");
+        assert!(!g.board.tracks.is_empty(), "Board tracks must be created by bundle router");
+
+        drop(g);
+
+        // Test cancel: activate and cancel with Escape
+        app.bundle_sketch_active = true;
+        app.bundle_guide_points.push((110.0, 110.0));
+        assert_eq!(app.bundle_guide_points.len(), 1);
+
+        app.cancel_bundle_sketch();
+        assert!(app.bundle_guide_points.is_empty());
+        assert!(app.bundle_sketch_active);
+
+        app.cancel_bundle_sketch();
+        assert!(!app.bundle_sketch_active);
 
         let _ = fs::remove_file(in_path);
     }

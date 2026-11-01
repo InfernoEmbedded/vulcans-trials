@@ -33,7 +33,7 @@ Below is a comprehensive breakdown of features offered by flagship commercial PC
 | **SI / PI / DFM** | Crosstalk-aware parallel run-length limit & guard-trace insertion | Allegro, HyperLynx | **Implemented (v0.5)** |
 | **SI / PI / DFM** | Return-path continuity & split-plane crossing avoidance | Allegro, Zuken | **Implemented (v0.5)** |
 | **SI / PI / DFM** | Acid-trap removal, solder-mask sliver prevention, and teardrop generation | Altium, Valor NPI | **Implemented (v0.5)** |
-| **Interactive** | Guided River Routing / Bus Bundle sketching ("ActiveRoute" style) | Altium, Xpedition | **Phase 6 (v1.0)** |
+| **Interactive** | Guided River Routing / Bus Bundle sketching ("ActiveRoute" style) | Altium, Xpedition | **Implemented (v1.0)** |
 
 ---
 
@@ -73,6 +73,6 @@ Below is a comprehensive breakdown of features offered by flagship commercial PC
 - [x] **DFM Hardening:** Automatic teardrops on pad/via junctions, solder mask bridge validation against fab rules (JLCPCB / PCBWay presets), and copper-to-edge clearance enforcement.
 
 ### Phase 6: v1.0 — Interactive Guided Routing & KiCad IPC Live Sync
-- [ ] **User-Guided Bundle Sketching:** Draw a rough poly-line path in the GUI or KiCad to guide a bus of nets along a desired channel.
+- [x] **User-Guided Bundle Sketching:** Draw a rough poly-line path in the GUI or KiCad to guide a bus of nets along a desired channel.
 - [ ] **Full KiCad 10 IPC Socket Live Streaming:** Stream placement and trace updates directly into the open KiCad canvas at 60 FPS without file reloads.
 - [ ] **One-Click KiCad PCM Package:** Automated CI/CD builds for Linux, Windows, and macOS published to the official KiCad Plugin and Content Manager repository.

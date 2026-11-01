@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
 use crate::board::{Board, Footprint, LiveTrialState, NetClass, NetTopology, Pad, Point, TrackSegment, TrialPhase, Via};
+pub use crate::board::BusBundle;
 use crate::vulkan::VulkanEngine;
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -9507,6 +9508,340 @@ pub fn validate_crosstalk_and_coupling(board: &Board) -> Vec<CouplingViolation> 
     violations
 }
 
+/// Generates the parallel equidistant track segments for all nets in a BusBundle along its guide polyline.
+/// Handles corner mitering (concentric 45° chamfers) and terminal pad fan-in/fan-out.
+pub fn generate_bundle_tracks(
+    board: &Board,
+    bundle: &BusBundle,
+    spacing: f64,
+) -> Vec<TrackSegment> {
+    if bundle.guide_points.len() < 2 || bundle.net_ids.is_empty() {
+        return Vec::new();
+    }
+
+    // 1. Sanitize raw guide points by removing adjacent duplicate/micro points
+    let mut raw_points: Vec<(f64, f64)> = Vec::new();
+    for &pt in &bundle.guide_points {
+        if let Some(&last) = raw_points.last() {
+            if (pt.0 - last.0).hypot(pt.1 - last.1) < 1e-4 {
+                continue;
+            }
+        }
+        raw_points.push(pt);
+    }
+    if raw_points.len() < 2 {
+        return Vec::new();
+    }
+
+    let m = bundle.net_ids.len();
+    let half_span = (m as f64 - 1.0) * 0.5;
+    let pitch = bundle.track_width + spacing;
+    let o_max = half_span * pitch;
+
+    // 2. Corner beveling on guide polyline:
+    // Any turn sharper than ~45° (cos_theta < 0.707) is beveled with 45° miter chamfers
+    let mut beveled_guide: Vec<(f64, f64)> = Vec::new();
+    beveled_guide.push(raw_points[0]);
+
+    for j in 1..raw_points.len() - 1 {
+        let prev = raw_points[j - 1];
+        let curr = raw_points[j];
+        let next = raw_points[j + 1];
+
+        let v1 = (curr.0 - prev.0, curr.1 - prev.1);
+        let v2 = (next.0 - curr.0, next.1 - curr.1);
+        let l1 = v1.0.hypot(v1.1);
+        let l2 = v2.0.hypot(v2.1);
+
+        if l1 < 1e-4 || l2 < 1e-4 {
+            continue;
+        }
+
+        let u1 = (v1.0 / l1, v1.1 / l1);
+        let u2 = (v2.0 / l2, v2.1 / l2);
+
+        let cos_theta = u1.0 * u2.0 + u1.1 * u2.1;
+
+        if cos_theta > 0.9999 {
+            // Collinear, omit redundant joint
+            continue;
+        }
+
+        // If turn angle is sharp (> ~45°, including 90° corners):
+        if cos_theta < 0.707 {
+            // Setback needed so even the innermost track has a positive-length 45° chamfer
+            let min_sb = o_max * (2.0 - std::f64::consts::SQRT_2) + 1.2 * pitch;
+            let sb = min_sb.min(0.45 * l1).min(0.45 * l2);
+
+            if sb > 0.05 {
+                let p_a = (curr.0 - sb * u1.0, curr.1 - sb * u1.1);
+                let p_b = (curr.0 + sb * u2.0, curr.1 + sb * u2.1);
+                beveled_guide.push(p_a);
+                beveled_guide.push(p_b);
+                continue;
+            }
+        }
+
+        beveled_guide.push(curr);
+    }
+    beveled_guide.push(*raw_points.last().unwrap());
+
+    if beveled_guide.len() < 2 {
+        return Vec::new();
+    }
+
+    // 3. Compute parallel lane tracks for each net in the bundle
+    let num_segs = beveled_guide.len() - 1;
+    let mut seg_unit = Vec::with_capacity(num_segs);
+    let mut seg_norm = Vec::with_capacity(num_segs);
+
+    for k in 0..num_segs {
+        let p0 = beveled_guide[k];
+        let p1 = beveled_guide[k + 1];
+        let dx = p1.0 - p0.0;
+        let dy = p1.1 - p0.1;
+        let len = dx.hypot(dy).max(1e-6);
+        let u = (dx / len, dy / len);
+        let n = (-u.1, u.0);
+        seg_unit.push(u);
+        seg_norm.push(n);
+    }
+
+    let mut all_tracks = Vec::new();
+
+    for (lane_idx, &net_id) in bundle.net_ids.iter().enumerate() {
+        let offset = (lane_idx as f64 - half_span) * pitch;
+
+        // Generate lane vertices along the beveled guide
+        let mut lane_pts: Vec<(f64, f64)> = Vec::with_capacity(beveled_guide.len());
+
+        // First point:
+        let start_v = (
+            beveled_guide[0].0 + offset * seg_norm[0].0,
+            beveled_guide[0].1 + offset * seg_norm[0].1,
+        );
+        lane_pts.push(start_v);
+
+        // Intermediate corners:
+        for k in 1..num_segs {
+            let u_prev = seg_unit[k - 1];
+            let n_prev = seg_norm[k - 1];
+            let u_curr = seg_unit[k];
+            let n_curr = seg_norm[k];
+
+            let a0 = (
+                beveled_guide[k - 1].0 + offset * n_prev.0,
+                beveled_guide[k - 1].1 + offset * n_prev.1,
+            );
+            let b0 = (
+                beveled_guide[k].0 + offset * n_curr.0,
+                beveled_guide[k].1 + offset * n_curr.1,
+            );
+
+            let d = u_prev.0 * u_curr.1 - u_prev.1 * u_curr.0;
+            if d.abs() < 1e-6 {
+                lane_pts.push((
+                    beveled_guide[k].0 + offset * n_curr.0,
+                    beveled_guide[k].1 + offset * n_curr.1,
+                ));
+            } else {
+                let t = ((b0.0 - a0.0) * u_curr.1 - (b0.1 - a0.1) * u_curr.0) / d;
+                let inter = (a0.0 + t * u_prev.0, a0.1 + t * u_prev.1);
+                lane_pts.push(inter);
+            }
+        }
+
+        // Last point:
+        let end_v = (
+            beveled_guide[num_segs].0 + offset * seg_norm[num_segs - 1].0,
+            beveled_guide[num_segs].1 + offset * seg_norm[num_segs - 1].1,
+        );
+        lane_pts.push(end_v);
+
+        // Sanitize lane points: deduplicate
+        let mut clean_lane_pts: Vec<(f64, f64)> = Vec::new();
+        for &pt in &lane_pts {
+            if let Some(&last) = clean_lane_pts.last() {
+                if (pt.0 - last.0).hypot(pt.1 - last.1) < 1e-4 {
+                    continue;
+                }
+            }
+            clean_lane_pts.push(pt);
+        }
+
+        // 4. Terminal fan-in and fan-out connection to pads
+        let mut matching_pads: Vec<(f64, f64)> = Vec::new();
+        for fp in &board.footprints {
+            for pad in &fp.pads {
+                if pad.net_id == net_id && (pad.is_through_hole || fp.layer == bundle.layer) {
+                    let p_pos = fp.pad_absolute_position(pad);
+                    if !matching_pads.iter().any(|m: &(f64, f64)| (m.0 - p_pos.0).hypot(m.1 - p_pos.1) < 1e-4) {
+                        matching_pads.push(p_pos);
+                    }
+                }
+            }
+        }
+
+        let p0_guide = beveled_guide[0];
+        let pk_guide = *beveled_guide.last().unwrap();
+
+        let mut start_pad: Option<(f64, f64)> = None;
+        let mut end_pad: Option<(f64, f64)> = None;
+
+        if matching_pads.len() >= 2 {
+            let mut sorted = matching_pads.clone();
+            sorted.sort_by(|a, b| {
+                let d_a = (a.0 - p0_guide.0).hypot(a.1 - p0_guide.1);
+                let d_b = (b.0 - p0_guide.0).hypot(b.1 - p0_guide.1);
+                d_a.partial_cmp(&d_b).unwrap_or(Ordering::Equal)
+            });
+            start_pad = Some(sorted[0]);
+
+            let mut sorted_end = matching_pads.clone();
+            sorted_end.retain(|p| (p.0 - sorted[0].0).hypot(p.1 - sorted[0].1) > 1e-4);
+            sorted_end.sort_by(|a, b| {
+                let d_a = (a.0 - pk_guide.0).hypot(a.1 - pk_guide.1);
+                let d_b = (b.0 - pk_guide.0).hypot(b.1 - pk_guide.1);
+                d_a.partial_cmp(&d_b).unwrap_or(Ordering::Equal)
+            });
+            if !sorted_end.is_empty() {
+                end_pad = Some(sorted_end[0]);
+            }
+        } else if matching_pads.len() == 1 {
+            let p = matching_pads[0];
+            let d0 = (p.0 - p0_guide.0).hypot(p.1 - p0_guide.1);
+            let dk = (p.0 - pk_guide.0).hypot(p.1 - pk_guide.1);
+            if d0 < dk {
+                start_pad = Some(p);
+            } else {
+                end_pad = Some(p);
+            }
+        }
+
+        let mut full_chain: Vec<(f64, f64)> = Vec::new();
+
+        // Prepend fan-in
+        if let Some(sp) = start_pad {
+            if let Some(&lane_start) = clean_lane_pts.first() {
+                let fanin = compute_45_dogleg(sp, lane_start, false);
+                for pt in fanin {
+                    if full_chain.last().map_or(true, |&last| (last.0 - pt.0).hypot(last.1 - pt.1) > 1e-4) {
+                        full_chain.push(pt);
+                    }
+                }
+            }
+        }
+
+        // Add spine lane points
+        for pt in clean_lane_pts {
+            if full_chain.last().map_or(true, |&last| (last.0 - pt.0).hypot(last.1 - pt.1) > 1e-4) {
+                full_chain.push(pt);
+            }
+        }
+
+        // Append fan-out
+        if let Some(ep) = end_pad {
+            if let Some(&lane_end) = full_chain.last() {
+                let fanout = compute_45_dogleg(lane_end, ep, true);
+                for pt in fanout {
+                    if full_chain.last().map_or(true, |&last| (last.0 - pt.0).hypot(last.1 - pt.1) > 1e-4) {
+                        full_chain.push(pt);
+                    }
+                }
+            }
+        }
+
+        // Convert full chain to TrackSegments
+        for w in 0..full_chain.len().saturating_sub(1) {
+            let p_start = full_chain[w];
+            let p_end = full_chain[w + 1];
+            if (p_start.0 - p_end.0).hypot(p_start.1 - p_end.1) > 1e-4 {
+                all_tracks.push(TrackSegment {
+                    start: p_start,
+                    end: p_end,
+                    width: bundle.track_width,
+                    layer: bundle.layer,
+                    net_id,
+                    is_locked: false,
+                });
+            }
+        }
+    }
+
+    all_tracks
+}
+
+/// Routes an entire bus bundle along a user-sketched guide polyline using equidistant river routing.
+/// Offsets each net symmetrically from the guide spine, applies 45° concentric corner miters,
+/// connects terminal endpoints to component pads, and runs DRC checks with dynamic bottleneck compression.
+pub fn route_bundle_along_guide(
+    board: &mut Board,
+    grid: &mut RoutingGrid,
+    bundle: &BusBundle,
+) -> bool {
+    if bundle.guide_points.len() < 2 {
+        return false;
+    }
+    if bundle.net_ids.is_empty() {
+        return true;
+    }
+
+    // Determine min design clearance for nets in this bundle
+    let min_class_clearance = bundle
+        .net_ids
+        .iter()
+        .map(|&nid| board.get_netclass_for_net(nid).clearance)
+        .fold(0.12_f64, f64::max);
+
+    // Try nominal spacing first, then dynamically compress if localized bottlenecks exist
+    let mut candidate_spacings = vec![bundle.track_spacing];
+    if bundle.track_spacing > min_class_clearance + 0.005 {
+        let steps = 6;
+        for s in 1..=steps {
+            let frac = s as f64 / steps as f64;
+            let comp = bundle.track_spacing - frac * (bundle.track_spacing - min_class_clearance);
+            candidate_spacings.push(comp);
+        }
+    }
+
+    for spacing in candidate_spacings {
+        let tracks = generate_bundle_tracks(board, bundle, spacing);
+        if tracks.is_empty() {
+            continue;
+        }
+
+        // Check DRC legality of all generated segments against foreign obstacles
+        let mut legal = true;
+        for trk in &tracks {
+            let clearance = board.get_netclass_for_net(trk.net_id).clearance.max(0.12);
+            if !is_track_segment_legal(
+                board,
+                trk.start,
+                trk.end,
+                trk.width,
+                trk.layer,
+                trk.net_id,
+                clearance,
+            ) {
+                legal = false;
+                break;
+            }
+        }
+
+        if legal {
+            // Success! Commit tracks to board
+            board.tracks.extend(tracks);
+            if !board.bundles.iter().any(|b| b.name == bundle.name && b.guide_points == bundle.guide_points) {
+                board.bundles.push(bundle.clone());
+            }
+            grid.rasterize_obstacles(board);
+            return true;
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9667,6 +10002,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         }
     }
 
@@ -10206,6 +10542,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -10305,6 +10642,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&route_board, 0.20, None);
@@ -10417,6 +10755,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -10602,6 +10941,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let grid = RoutingGrid::new(&board, 0.20, None);
@@ -10672,6 +11012,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let grid = RoutingGrid::new(&board, 0.20, None);
@@ -10750,6 +11091,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -10845,6 +11187,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -10920,6 +11263,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -11002,6 +11346,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let grid = RoutingGrid::new(&board, 0.20, None);
@@ -11103,6 +11448,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -11203,6 +11549,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -11249,6 +11596,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let nudge = NudgeEngine::new();
@@ -11326,6 +11674,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let nudge = NudgeEngine::new();
@@ -11395,6 +11744,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let orig_tracks = board.tracks.clone();
@@ -11495,6 +11845,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         prune_dangling_tracks_and_vias(&mut board);
@@ -11546,6 +11897,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let via_dia = 0.60;
@@ -11714,6 +12066,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.10, None);
@@ -11813,6 +12166,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.10, None);
@@ -11903,6 +12257,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.10, None);
@@ -12701,6 +13056,165 @@ mod tests {
     }
 
     #[test]
+    fn test_bus_bundle_equidistant_offsets() {
+        let mut board = Board::default();
+        board.nets = vec![
+            "".to_string(),
+            "NET1".to_string(),
+            "NET2".to_string(),
+            "NET3".to_string(),
+            "NET4".to_string(),
+        ];
+        for (i, n) in board.nets.iter().enumerate() {
+            if !n.is_empty() {
+                board.net_name_to_id.insert(n.clone(), i);
+            }
+        }
+        let mut grid = RoutingGrid::new(&board, 0.25, None);
+
+        let bundle = BusBundle::new(
+            "DataBus",
+            vec![1, 2, 3, 4],
+            vec![(10.0, 10.0), (30.0, 10.0), (50.0, 30.0)],
+            0,
+            0.25,
+            0.25,
+        );
+
+        let ok = route_bundle_along_guide(&mut board, &mut grid, &bundle);
+        assert!(ok, "route_bundle_along_guide must succeed for valid 2-segment guide line");
+
+        // Verify tracks created for all 4 nets
+        for &nid in &bundle.net_ids {
+            let count = board.tracks.iter().filter(|t| t.net_id == nid).count();
+            assert!(count >= 2, "Net {} should have at least 2 segments along the polyline", nid);
+        }
+
+        // Along the first straight segment (x from 10 to 30), examine tracks at x = 20.0
+        let mut lane_ys = Vec::new();
+        for &nid in &bundle.net_ids {
+            let trk = board
+                .tracks
+                .iter()
+                .find(|t| t.net_id == nid && t.start.0 <= 20.0 && t.end.0 >= 20.0 && (t.start.1 - t.end.1).abs() < 1e-4)
+                .expect("Each net must have a horizontal segment passing x=20.0");
+            lane_ys.push((nid, trk.start.1));
+        }
+
+        // Verify sorted y-coordinates have exact (W + S) = 0.50mm spacing everywhere
+        lane_ys.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        for i in 0..lane_ys.len() - 1 {
+            let pitch = lane_ys[i + 1].1 - lane_ys[i].1;
+            assert!(
+                (pitch - 0.50).abs() < 1e-4,
+                "Spacing between lane {} and {} must be exactly W + S = 0.50mm, got {:.4}mm",
+                lane_ys[i].0,
+                lane_ys[i + 1].0,
+                pitch
+            );
+        }
+
+        // Verify that along the second diagonal segment (direction (1, 1)), perpendicular distance is exactly 0.50mm
+        let mut diag_lines = Vec::new();
+        for &nid in &bundle.net_ids {
+            let trk = board
+                .tracks
+                .iter()
+                .find(|t| {
+                    t.net_id == nid
+                        && t.start.0 >= 29.0
+                        && ((t.end.0 - t.start.0) - (t.end.1 - t.start.1)).abs() < 1e-4
+                        && (t.end.0 - t.start.0) > 1.0
+                })
+                .expect("Each net must have a 45-degree segment along the second guide segment");
+            let c = trk.start.0 - trk.start.1;
+            diag_lines.push((nid, c));
+        }
+        diag_lines.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        for i in 0..diag_lines.len() - 1 {
+            let perp_dist = (diag_lines[i + 1].1 - diag_lines[i].1) / std::f64::consts::SQRT_2;
+            assert!(
+                (perp_dist - 0.50).abs() < 1e-4,
+                "Diagonal perpendicular spacing must be exactly 0.50mm, got {:.4}mm",
+                perp_dist
+            );
+        }
+    }
+
+    #[test]
+    fn test_bundle_corner_concentric_miters() {
+        let mut board = Board::default();
+        board.nets = vec![
+            "".to_string(),
+            "NET1".to_string(),
+            "NET2".to_string(),
+            "NET3".to_string(),
+            "NET4".to_string(),
+        ];
+        for (i, n) in board.nets.iter().enumerate() {
+            if !n.is_empty() {
+                board.net_name_to_id.insert(n.clone(), i);
+            }
+        }
+        let mut grid = RoutingGrid::new(&board, 0.25, None);
+
+        let w = 0.25;
+        let s = 0.25;
+        let bundle = BusBundle::new(
+            "CornerBus",
+            vec![1, 2, 3, 4],
+            vec![(10.0, 10.0), (40.0, 10.0), (40.0, 40.0)],
+            0,
+            w,
+            s,
+        );
+
+        let ok = route_bundle_along_guide(&mut board, &mut grid, &bundle);
+        assert!(ok, "route_bundle_along_guide must successfully route around 90-degree bend");
+
+        // 1. Verify that 45-degree miter segments were generated around the 90-degree turn
+        for &nid in &bundle.net_ids {
+            let miter_trk = board.tracks.iter().find(|t| {
+                t.net_id == nid
+                    && ((t.end.0 - t.start.0).abs() - (t.end.1 - t.start.1)).abs() < 1e-4
+                    && (t.end.0 - t.start.0).abs() > 0.05
+                    && (t.end.1 - t.start.1).abs() > 0.05
+            });
+            assert!(
+                miter_trk.is_some(),
+                "Net {} must have a 45-degree concentric miter segment at corner",
+                nid
+            );
+        }
+
+        // 2. Verify concentric clearance: no tracks pinch or violate minimum spacing anywhere!
+        let bundle_tracks: Vec<&TrackSegment> = board
+            .tracks
+            .iter()
+            .filter(|t| bundle.net_ids.contains(&t.net_id))
+            .collect();
+
+        for i in 0..bundle_tracks.len() {
+            for j in (i + 1)..bundle_tracks.len() {
+                let t1 = bundle_tracks[i];
+                let t2 = bundle_tracks[j];
+                if t1.net_id != t2.net_id {
+                    let d = dist_segment_to_segment(t1.start, t1.end, t2.start, t2.end);
+                    let copper_clearance = d - (t1.width * 0.5 + t2.width * 0.5);
+                    assert!(
+                        copper_clearance >= s - 1e-4,
+                        "Clearance between Net {} and Net {} pinched to {:.4}mm (minimum required: {:.4}mm)",
+                        t1.net_id,
+                        t2.net_id,
+                        copper_clearance,
+                        s
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_fine_pitch_vippo_fallback() {
         let mut board = Board::default();
         board.min_x = 0.0;
@@ -12777,6 +13291,88 @@ mod tests {
             assert!(
                 is_via_location_legal(&board, via.position, via.size, via.net_id, 0.08),
                 "VIPPO microvia transition must be legal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bundle_fanout_connects_to_pads() {
+        let mut board = Board::default();
+        board.nets = vec![
+            "".to_string(),
+            "D0".to_string(),
+            "D1".to_string(),
+            "D2".to_string(),
+            "D3".to_string(),
+        ];
+        for (i, name) in board.nets.iter().enumerate() {
+            if !name.is_empty() {
+                board.net_name_to_id.insert(name.clone(), i);
+            }
+        }
+
+        let j1_pads = vec![
+            Pad::new("1", 0.0, 0.0, 0.6, 0.6, 1, "D0", false),
+            Pad::new("2", 0.0, 1.0, 0.6, 0.6, 2, "D1", false),
+            Pad::new("3", 0.0, 2.0, 0.6, 0.6, 3, "D2", false),
+            Pad::new("4", 0.0, 3.0, 0.6, 0.6, 4, "D3", false),
+        ];
+        let j1 = make_fp("J1", 5.0, 10.0, true, j1_pads);
+
+        let j2_pads = vec![
+            Pad::new("1", 0.0, 0.0, 0.6, 0.6, 1, "D0", false),
+            Pad::new("2", 0.0, 1.0, 0.6, 0.6, 2, "D1", false),
+            Pad::new("3", 0.0, 2.0, 0.6, 0.6, 3, "D2", false),
+            Pad::new("4", 0.0, 3.0, 0.6, 0.6, 4, "D3", false),
+        ];
+        let j2 = make_fp("J2", 45.0, 10.0, true, j2_pads);
+
+        board.footprints.push(j1);
+        board.footprints.push(j2);
+
+        let mut grid = RoutingGrid::new(&board, 0.25, None);
+
+        let bundle = BusBundle::new(
+            "DataBus",
+            vec![1, 2, 3, 4],
+            vec![(10.0, 11.5), (40.0, 11.5)],
+            0,
+            0.25,
+            0.25,
+        );
+
+        let ok = route_bundle_along_guide(&mut board, &mut grid, &bundle);
+        assert!(ok, "route_bundle_along_guide must successfully connect pads to bundle");
+
+        // Verify each net connects to its respective pad on J1 and J2
+        for (idx, &nid) in bundle.net_ids.iter().enumerate() {
+            let j1_pad_pos = (5.0, 10.0 + idx as f64 * 1.0);
+            let j2_pad_pos = (45.0, 10.0 + idx as f64 * 1.0);
+
+            let connects_j1 = board.tracks.iter().any(|t| {
+                t.net_id == nid
+                    && ((t.start.0 - j1_pad_pos.0).hypot(t.start.1 - j1_pad_pos.1) < 1e-3
+                        || (t.end.0 - j1_pad_pos.0).hypot(t.end.1 - j1_pad_pos.1) < 1e-3)
+            });
+            assert!(
+                connects_j1,
+                "Net {} must connect to J1 pad at ({:.1}, {:.1})",
+                nid,
+                j1_pad_pos.0,
+                j1_pad_pos.1
+            );
+
+            let connects_j2 = board.tracks.iter().any(|t| {
+                t.net_id == nid
+                    && ((t.start.0 - j2_pad_pos.0).hypot(t.start.1 - j2_pad_pos.1) < 1e-3
+                        || (t.end.0 - j2_pad_pos.0).hypot(t.end.1 - j2_pad_pos.1) < 1e-3)
+            });
+            assert!(
+                connects_j2,
+                "Net {} must connect to J2 pad at ({:.1}, {:.1})",
+                nid,
+                j2_pad_pos.0,
+                j2_pad_pos.1
             );
         }
     }

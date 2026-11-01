@@ -1509,6 +1509,36 @@ pub struct CompiledCluster {
     pub weight: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BusBundle {
+    pub name: String,
+    pub net_ids: Vec<usize>,
+    pub guide_points: Vec<(f64, f64)>,
+    pub layer: usize,
+    pub track_width: f64,
+    pub track_spacing: f64,
+}
+
+impl BusBundle {
+    pub fn new(
+        name: impl Into<String>,
+        net_ids: Vec<usize>,
+        guide_points: Vec<(f64, f64)>,
+        layer: usize,
+        track_width: f64,
+        track_spacing: f64,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            net_ids,
+            guide_points,
+            layer,
+            track_width,
+            track_spacing,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Board {
     pub file_path: String,
@@ -1530,6 +1560,7 @@ pub struct Board {
     pub schematic_positions: HashMap<String, (f64, f64)>,
     pub outline_polygon: Option<Polygon>,
     pub pin_swap_history: Vec<PinSwapRecord>,
+    pub bundles: Vec<BusBundle>,
 }
 
 impl Default for Board {
@@ -1558,6 +1589,7 @@ impl Default for Board {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         }
     }
 }
@@ -1824,6 +1856,7 @@ impl Board {
             schematic_positions: HashMap::new(),
             outline_polygon,
             pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
         };
 
         // Auto-load project netclasses if sibling .kicad_pro exists
