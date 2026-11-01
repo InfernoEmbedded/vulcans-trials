@@ -1822,6 +1822,38 @@ impl Board {
                 replacements.push((start, end, new_at));
             }
         }
+
+        // Strip out existing (segment ...) and (via ...) so we don't duplicate or retain old tracks
+        let bytes = self.raw_content.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'(' {
+                let mut j = i + 1;
+                while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b')' {
+                    j += 1;
+                }
+                let word = &self.raw_content[i + 1..j];
+                if word == "segment" || word == "via" {
+                    if let Some(end) = find_closing_paren(bytes, i) {
+                        let mut start = i;
+                        while start > 0 && (bytes[start - 1] == b' ' || bytes[start - 1] == b'\t') {
+                            start -= 1;
+                        }
+                        if start > 0 && bytes[start - 1] == b'\n' {
+                            start -= 1;
+                            if start > 0 && bytes[start - 1] == b'\r' {
+                                start -= 1;
+                            }
+                        }
+                        replacements.push((start, end, String::new()));
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+
         replacements.sort_by(|a, b| b.0.cmp(&a.0));
 
         let mut content = self.raw_content.clone();

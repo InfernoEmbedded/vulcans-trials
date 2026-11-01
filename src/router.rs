@@ -1972,6 +1972,15 @@ impl AutoRouter {
         live: Option<Arc<Mutex<LiveTrialState>>>,
         stop_flag: Arc<AtomicBool>,
     ) -> (usize, usize) {
+        // Clear out any old unlocked tracks/vias before routing so they don't block stubs or grid
+        board.tracks.retain(|t| t.is_locked);
+        board.vias.retain(|v| v.is_locked);
+        grid.obstacle_net_ids.fill(FREE_NET);
+        grid.nudgeable_fp.fill(None);
+        grid.smd_pad_cells.fill(false);
+        grid.rasterize_obstacles(board);
+        grid.update_distance_fields();
+
         if self.allow_component_nudge && self.nudge_components_blocking_escapes(board) {
             grid.obstacle_net_ids.fill(FREE_NET);
             grid.nudgeable_fp.fill(None);
@@ -2504,8 +2513,7 @@ impl AutoRouter {
 
                 // Rip-up and Negotiated Congestion Update (budgeted to avoid wiping all progress)
                 if iteration + 1 < self.max_ripup_iterations {
-                    let max_rip_prio = if iteration == 0 { 2 } else { 10 };
-                    let mut rip_budget = 4;
+                    let mut rip_budget = 6;
                     for conn_idx in 0..total_conns {
                         if rip_budget == 0 {
                             break;
@@ -2523,16 +2531,22 @@ impl AutoRouter {
                                 if rip_idx == conn_idx || routed_paths[rip_idx].is_none() {
                                     continue;
                                 }
-                                if Self::netclass_priority(&connections[rip_idx].netclass.name) > max_rip_prio {
-                                    continue;
-                                }
                                 let p = routed_paths[rip_idx].as_ref().unwrap();
-                                let passes_near = p.iter().any(|node| {
+                                let is_at_pin = p.iter().any(|node| {
+                                    let (wx, wy) = grid.grid_to_world(node.gx, node.gy);
+                                    (wx - b_start.0).hypot(wy - b_start.1) < 1.5
+                                        || (wx - b_end.0).hypot(wy - b_end.1) < 1.5
+                                });
+                                let passes_near = is_at_pin || p.iter().any(|node| {
                                     let (wx, wy) = grid.grid_to_world(node.gx, node.gy);
                                     dist_to_segment(wx, wy, b_start.0, b_start.1, b_end.0, b_end.1) < 1.2
-                                        || (wx - b_start.0).hypot(wy - b_start.1) < 1.8
-                                        || (wx - b_end.0).hypot(wy - b_end.1) < 1.8
                                 });
+
+                                // Always allow ripping up tracks that directly choke a pin endpoint;
+                                // for mid-span proximity, respect priority on pass 0
+                                if !is_at_pin && iteration == 0 && Self::netclass_priority(&connections[rip_idx].netclass.name) > 2 {
+                                    continue;
+                                }
 
                                 if passes_near {
                                     if let Some(p) = routed_paths[rip_idx].take() {
@@ -3533,6 +3547,50 @@ impl AutoRouter {
         false
     }
 
+/// Returns the number of reachable grid cells from (gx, gy, layer) using a local BFS,
+/// along with any foreign obstacle nets bounding the pocket.
+pub fn find_choked_pin_bottlenecks(
+    grid: &RoutingGrid,
+    gx: usize,
+    gy: usize,
+    layer: usize,
+    net_id: usize,
+    max_cells: usize,
+) -> (usize, Vec<usize>) {
+    let mut visited = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    let mut blocking_nets = std::collections::BTreeSet::new();
+
+    queue.push_back((gx, gy));
+    visited.insert((gx, gy));
+
+    while let Some((cx, cy)) = queue.pop_front() {
+        if visited.len() >= max_cells {
+            break;
+        }
+        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)] {
+            let nx = cx as isize + dx;
+            let ny = cy as isize + dy;
+            if nx >= 0 && nx < grid.width as isize && ny >= 0 && ny < grid.height as isize {
+                let ux = nx as usize;
+                let uy = ny as usize;
+                if !visited.contains(&(ux, uy)) {
+                    let idx = grid.idx(ux, uy, layer);
+                    let obs = grid.obstacle_net_ids[idx];
+                    if obs == FREE_NET || obs == net_id as i32 {
+                        visited.insert((ux, uy));
+                        queue.push_back((ux, uy));
+                    } else if obs > 0 {
+                        blocking_nets.insert(obs as usize);
+                    }
+                }
+            }
+        }
+    }
+
+    (visited.len(), blocking_nets.into_iter().collect())
+}
+
     /// When routing is blocked by an unlocked track of another net:
     /// Shoves the blocking track or rips it up so the higher-priority signal can claim the channel.
     pub fn try_nudge_or_ripup_blocking_tracks(
@@ -3552,6 +3610,76 @@ impl AutoRouter {
         let c_end = conn.end;
 
         let total_conns = connections.len();
+
+        // 1. Aggressive Pin-Bottleneck Rip-Up:
+        // If either endpoint pad is choked (<= 25 reachable grid nodes), immediately find the
+        // specific blocking obstacle net(s) walling off the pad and rip them up.
+        let (s_grid, e_grid) = (
+            grid.world_to_grid(c_start.0, c_start.1),
+            grid.world_to_grid(c_end.0, c_end.1),
+        );
+        let mut choked_blocking_nets = Vec::new();
+        if let Some((sgx, sgy)) = s_grid {
+            let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, sgx, sgy, c_start.2, conn.net_id, 30);
+            if reach <= 25 && !nets.is_empty() {
+                choked_blocking_nets.extend(nets);
+            }
+        }
+        if let Some((egx, egy)) = e_grid {
+            let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, egx, egy, c_end.2, conn.net_id, 30);
+            if reach <= 25 && !nets.is_empty() {
+                choked_blocking_nets.extend(nets);
+            }
+        }
+
+        if !choked_blocking_nets.is_empty() {
+            for b_net in choked_blocking_nets {
+                let rip_candidates: Vec<usize> = (0..total_conns)
+                    .filter(|&i| i != conn_idx && connections[i].net_id == b_net && routed_paths[i].is_some())
+                    .collect();
+
+                for rip_idx in rip_candidates {
+                    if let Some(p) = routed_paths[rip_idx].take() {
+                        for node in &p {
+                            let (wx, wy) = grid.grid_to_world(node.gx, node.gy);
+                            if (wx - c_start.0).hypot(wy - c_start.1) < 2.0 || (wx - c_end.0).hypot(wy - c_end.1) < 2.0 {
+                                let idx = grid.idx(node.gx, node.gy, node.layer);
+                                grid.congestion[idx] += self.congestion_factor * 2.0;
+                            }
+                        }
+                        self.rebuild_grid_state(board, grid, connections, routed_paths, escape_stubs);
+
+                        let (Some((sgx, sgy)), Some((egx, egy))) = (
+                            grid.world_to_grid(conn.start.0, conn.start.1),
+                            grid.world_to_grid(conn.end.0, conn.end.1),
+                        ) else {
+                            continue;
+                        };
+                        let s_node = GridNode { gx: sgx, gy: sgy, layer: conn.start.2 };
+                        let e_node = GridNode { gx: egx, gy: egy, layer: conn.end.2 };
+
+                        if let Some(p) = self.find_path_with_params(
+                            grid,
+                            s_node,
+                            e_node,
+                            conn.net_id,
+                            conn.netclass.clearance,
+                            conn.netclass.track_width,
+                            conn.netclass.via_dia,
+                            u1_center,
+                            1.05,
+                            0.0,
+                            stop_flag,
+                        ) {
+                            self.commit_path_to_grid(grid, &p, conn.net_id, conn.netclass.track_width, conn.netclass.via_dia);
+                            routed_paths[conn_idx] = Some(p);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
         let mut blocking_conns = Vec::new();
 
         for rip_idx in 0..total_conns {
@@ -3569,29 +3697,38 @@ impl AutoRouter {
             }
 
             let path = routed_paths[rip_idx].as_ref().unwrap();
+            let mut min_pad_dist = f64::INFINITY;
             let mut min_dist = f64::INFINITY;
             for node in path {
                 let (wx, wy) = grid.grid_to_world(node.gx, node.gy);
                 let d_start = (wx - c_start.0).hypot(wy - c_start.1);
                 let d_end = (wx - c_end.0).hypot(wy - c_end.1);
+                let d_pad = d_start.min(d_end);
+                if d_pad < min_pad_dist {
+                    min_pad_dist = d_pad;
+                }
                 let d_seg = dist_to_segment(wx, wy, c_start.0, c_start.1, c_end.0, c_end.1);
-                let d = d_start.min(d_end).min(d_seg);
+                let d = d_pad.min(d_seg);
                 if d < min_dist {
                     min_dist = d;
                 }
             }
 
             if min_dist < 2.5 {
-                blocking_conns.push((rip_idx, rip_prio, min_dist));
+                let is_near_pad = min_pad_dist < 1.2;
+                blocking_conns.push((rip_idx, rip_prio, min_pad_dist, min_dist, is_near_pad));
             }
         }
 
+        // Prioritize tracks that choke endpoints first, then closest distance, then lower priority
         blocking_conns.sort_by(|a, b| {
-            a.1.cmp(&b.1).then_with(|| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal))
+            b.4.cmp(&a.4)
+                .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal))
+                .then_with(|| a.1.cmp(&b.1))
         });
-        blocking_conns.truncate(2);
+        blocking_conns.truncate(3);
 
-        for (rip_idx, _, _) in blocking_conns {
+        for (rip_idx, _, _, _, _) in blocking_conns {
             let orig_path = routed_paths[rip_idx].clone().unwrap();
             let mut shove_succeeded = false;
 
@@ -4234,7 +4371,7 @@ impl AutoRouter {
                     let (px, py) = fp.pad_absolute_position(pad);
 
                     let stub_w = board.get_netclass_for_net(pad.net_id).track_width.min(0.20).max(0.15);
-                    let eff_clearance = board.get_netclass_for_net(pad.net_id).clearance.max(0.15);
+                    let eff_clearance = board.get_netclass_for_net(pad.net_id).clearance.min(0.15).max(0.12);
                     let stub_margin = (stub_w * 0.5) + eff_clearance;
 
                     // Clearance check against own footprint pads
@@ -4381,9 +4518,9 @@ impl AutoRouter {
                     cand_dirs.sort_by(|a, b| b.dot.partial_cmp(&a.dot).unwrap_or(std::cmp::Ordering::Equal));
 
                     let preferred_lengths: &[f64] = if is_staggered {
-                        &[1.60, 1.80, 1.40, 1.10, 0.85, 0.60, 0.45]
+                        &[1.60, 1.80, 1.40, 1.10, 0.85, 0.65, 0.60, 0.50, 0.45, 0.40]
                     } else {
-                        &[0.85, 0.65, 1.10, 1.40, 0.50, 0.45]
+                        &[0.85, 0.65, 1.10, 1.40, 0.60, 0.50, 0.45, 0.40]
                     };
 
                     let mut found_tip = None;
@@ -6450,6 +6587,21 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid) -> bool {
                     continue;
                 }
 
+                // Check if any SMD pad of this net along chain_pts is on l_hop.
+                // If so, moving the chain to l_orig and deleting the vias would leave that SMD pad disconnected!
+                let smd_hop_conflict = board.footprints.iter().any(|fp| {
+                    fp.pads.iter().any(|p| {
+                        if p.net_id != net_id || p.is_through_hole {
+                            return false;
+                        }
+                        let (px, py) = fp.pad_absolute_position(p);
+                        chain_pts.iter().any(|pt| (px - pt.0).hypot(py - pt.1) < 0.15) && fp.layer != l_orig
+                    })
+                });
+                if smd_hop_conflict {
+                    continue;
+                }
+
                 let track_width = board.tracks[t1_idx].width;
                 let orig_len: f64 = chain_pts
                     .windows(2)
@@ -6666,8 +6818,23 @@ fn consolidate_single_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
                     continue;
                 }
 
-                // Check if curr_pt can exist on l_prim
-                let pad_can_exist_on_l_prim = board.footprints.iter().any(|fp| {
+                // Check if any SMD pad of this net along chain_pts (or at v_pos / curr_pt) belongs to a layer other than l_prim.
+                // If so, moving the chain to l_prim and deleting the via would leave that SMD pad disconnected!
+                let smd_layer_conflict = board.footprints.iter().any(|fp| {
+                    fp.pads.iter().any(|p| {
+                        if p.net_id != net_id || p.is_through_hole {
+                            return false;
+                        }
+                        let (px, py) = fp.pad_absolute_position(p);
+                        chain_pts.iter().any(|pt| (px - pt.0).hypot(py - pt.1) < 0.15) && fp.layer != l_prim
+                    })
+                });
+                if smd_layer_conflict {
+                    continue;
+                }
+
+                // Check if curr_pt connects to a valid anchor on l_prim (either an SMD/TH pad on l_prim, or an existing track on l_prim)
+                let pad_on_l_prim = board.footprints.iter().any(|fp| {
                     fp.pads.iter().any(|p| {
                         if p.net_id != net_id {
                             return false;
@@ -6690,7 +6857,7 @@ fn consolidate_single_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
                         && (quant_point(t.start) == curr_q || quant_point(t.end) == curr_q)
                 });
 
-                if !pad_can_exist_on_l_prim && !connects_to_track_on_l_prim {
+                if !pad_on_l_prim && !connects_to_track_on_l_prim {
                     continue;
                 }
 
