@@ -480,10 +480,18 @@ pub struct NetClass {
     pub diff_pair_width: f64,
     #[serde(default)]
     pub topology: NetTopology,
+    #[serde(default = "default_max_coupled_length_mm")]
+    pub max_coupled_length_mm: f64,
+    #[serde(default)]
+    pub require_return_path: bool,
 }
 
 fn default_diff_pair_dim() -> f64 {
     0.20
+}
+
+fn default_max_coupled_length_mm() -> f64 {
+    15.0
 }
 
 impl Default for NetClass {
@@ -497,11 +505,25 @@ impl Default for NetClass {
             diff_pair_gap: 0.20,
             diff_pair_width: 0.20,
             topology: NetTopology::default(),
+            max_coupled_length_mm: 15.0,
+            require_return_path: false,
         }
     }
 }
 
 impl NetClass {
+    pub fn is_high_speed_name(name: &str) -> bool {
+        let upper = name.to_uppercase();
+        upper.contains("DIFF")
+            || upper.contains("CLK")
+            || upper.contains("CLOCK")
+            || upper.contains("HIGHSPEED")
+            || upper.contains("HIGH_SPEED")
+            || upper.contains("USB")
+            || upper.contains("PCIE")
+            || upper.contains("DDR")
+    }
+
     pub fn resolve_topology(&self, net_name: &str) -> NetTopology {
         if self.topology != NetTopology::EuclideanMst {
             self.topology
@@ -1064,6 +1086,7 @@ impl Board {
             ("USB_Diff", 0.20, 0.20),
             ("Power_5V", 0.35, 0.20),
         ] {
+            let is_hs = NetClass::is_high_speed_name(name);
             netclasses.insert(
                 name.to_string(),
                 NetClass {
@@ -1075,6 +1098,8 @@ impl Board {
                     diff_pair_gap: 0.20,
                     diff_pair_width: width,
                     topology: NetTopology::default(),
+                    max_coupled_length_mm: 15.0,
+                    require_return_path: is_hs,
                 },
             );
         }
@@ -2506,6 +2531,15 @@ pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetCla
                         .and_then(|v| v.as_str())
                         .and_then(NetTopology::parse)
                         .unwrap_or_default();
+                    let is_hs = NetClass::is_high_speed_name(name);
+                    let max_coupled_length_mm = cls
+                        .get("max_coupled_length_mm")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(15.0);
+                    let require_return_path = cls
+                        .get("require_return_path")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(is_hs);
                     netclasses.insert(
                         name.to_string(),
                         NetClass {
@@ -2517,6 +2551,8 @@ pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetCla
                             diff_pair_gap,
                             diff_pair_width,
                             topology,
+                            max_coupled_length_mm,
+                            require_return_path,
                         },
                     );
                 }
@@ -2563,6 +2599,14 @@ pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetCla
                             let via_drill = parse_val("(via_drill", 0.30);
                             let diff_pair_gap = parse_val("(diff_pair_gap", 0.20);
                             let diff_pair_width = parse_val("(diff_pair_width", track_width);
+                            let max_coupled_length_mm = parse_val("(max_coupled_length_mm", 15.0);
+                            let is_hs = NetClass::is_high_speed_name(&name);
+                            let require_return_path = if let Some(pos) = block.find("(require_return_path") {
+                                let rest = &block[pos + "(require_return_path".len()..];
+                                rest.trim_start().starts_with("true") || rest.trim_start().starts_with("1")
+                            } else {
+                                is_hs
+                            };
                             let topology = if let Some(pos) = block.find("(topology") {
                                 let rest = &block[pos + "(topology".len()..];
                                 let token = rest
@@ -2585,6 +2629,8 @@ pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetCla
                                     diff_pair_gap,
                                     diff_pair_width,
                                     topology,
+                                    max_coupled_length_mm,
+                                    require_return_path,
                                 },
                             );
                         }

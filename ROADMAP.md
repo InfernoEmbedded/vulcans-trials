@@ -68,8 +68,8 @@ Below is a comprehensive breakdown of features offered by flagship commercial PC
 - [ ] **Multi-Board & Rigid-Flex Zones:** Layer stackup regions with bend-area trace perpendicularity constraints.
 
 ### Phase 5: v0.5 — Signal Integrity (SI), Power Integrity (PI) & DFM
-- [ ] **Crosstalk & Parallelism Limiter:** Penalize parallel adjacent trace segments exceeding a maximum coupled length threshold ($L_{\text{coupled}}$).
-- [ ] **Reference Plane Return-Path Check:**Penalize high-speed signals crossing splits or cutouts on the adjacent reference plane layer; auto-insert return-path stitching capacitors/vias near signal vias.
+- [x] **Crosstalk & Parallelism Limiter:** Penalize parallel adjacent trace segments exceeding a maximum coupled length threshold ($L_{\text{coupled}}$).
+- [x] **Reference Plane Return-Path Check:** Penalize high-speed signals crossing splits or cutouts on the adjacent reference plane layer; auto-insert return-path stitching capacitors/vias near signal vias.
 - [ ] **DFM Hardening:** Automatic teardrops on pad/via junctions, solder mask bridge validation against fab rules (JLCPCB / PCBWay presets), and copper-to-edge clearance enforcement.
 
 ### Phase 6: v1.0 — Interactive Guided Routing & KiCad IPC Live Sync
