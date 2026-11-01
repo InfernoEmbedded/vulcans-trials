@@ -7,8 +7,11 @@ use crate::placer::{run_auto_placer, PlacementConfig};
 use crate::router::{AutoRouter, RoutingGrid};
 use crate::vulkan::{SystemTelemetry, VulkanEngine};
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::Path;
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -131,6 +134,185 @@ pub struct HoveredCopperItem {
     pub is_track: bool,
 }
 
+/// User-configurable application preferences persisted across sessions in `~/.config/vulcans-trials/preferences.json`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AppPreferences {
+    #[serde(default = "default_place_duration")]
+    pub place_duration_secs: u64,
+    #[serde(default = "default_min_spacing")]
+    pub min_spacing_mm: f64,
+    #[serde(default = "default_grid_res")]
+    pub grid_res_mm: f64,
+    #[serde(default = "default_max_ripup")]
+    pub max_ripup_passes: usize,
+    #[serde(default)]
+    pub allow_layer_flip: bool,
+    #[serde(default = "default_inner_plane_penalty")]
+    pub inner_plane_penalty: f64,
+    #[serde(default)]
+    pub allow_component_nudge: bool,
+    #[serde(default)]
+    pub any_angle_mode: bool,
+
+    // Aggressive placement exploration & weights
+    #[serde(default = "default_max_jump_radius")]
+    pub max_jump_radius_mm: f64,
+    #[serde(default = "default_pair_swap_prob")]
+    pub pair_swap_prob: f64,
+    #[serde(default = "default_centroid_pull_prob")]
+    pub centroid_pull_prob: f64,
+    #[serde(default = "default_temp_scale")]
+    pub temp_scale: f64,
+    #[serde(default = "default_escape_margin_mult")]
+    pub escape_margin_mult: f64,
+    #[serde(default = "default_crossing_weight")]
+    pub crossing_weight: f64,
+
+    // Layer visibility & display toggles
+    #[serde(default = "default_true")]
+    pub show_courtyards: bool,
+    #[serde(default = "default_true")]
+    pub show_ratsnest: bool,
+    #[serde(default = "default_true")]
+    pub show_f_cu: bool,
+    #[serde(default = "default_true")]
+    pub show_b_cu: bool,
+    #[serde(default = "default_true")]
+    pub show_in1_cu: bool,
+    #[serde(default = "default_true")]
+    pub show_in2_cu: bool,
+    #[serde(default = "default_true")]
+    pub show_vias: bool,
+    #[serde(default = "default_true")]
+    pub show_refs: bool,
+    #[serde(default = "default_true")]
+    pub show_holding_palette: bool,
+
+    // KiCad IPC Live Sync
+    #[serde(default)]
+    pub kicad_ipc_enabled: bool,
+    #[serde(default)]
+    pub kicad_ipc_socket_path: String,
+
+    // Bundle river routing
+    #[serde(default = "default_bundle_dim")]
+    pub bundle_track_width: f64,
+    #[serde(default = "default_bundle_dim")]
+    pub bundle_track_spacing: f64,
+
+    // Optional last opened board paths
+    #[serde(default)]
+    pub last_input_path: Option<String>,
+    #[serde(default)]
+    pub last_output_path: Option<String>,
+}
+
+fn default_place_duration() -> u64 { 120 }
+fn default_min_spacing() -> f64 { 0.25 }
+fn default_grid_res() -> f64 { 0.10 }
+fn default_max_ripup() -> usize { 15 }
+fn default_inner_plane_penalty() -> f64 { 8.0 }
+fn default_max_jump_radius() -> f64 { 20.0 }
+fn default_pair_swap_prob() -> f64 { 0.15 }
+fn default_centroid_pull_prob() -> f64 { 0.20 }
+fn default_temp_scale() -> f64 { 1.0 }
+fn default_escape_margin_mult() -> f64 { 1.0 }
+fn default_crossing_weight() -> f64 { 200.0 }
+fn default_true() -> bool { true }
+fn default_bundle_dim() -> f64 { 0.25 }
+
+impl Default for AppPreferences {
+    fn default() -> Self {
+        Self {
+            place_duration_secs: default_place_duration(),
+            min_spacing_mm: default_min_spacing(),
+            grid_res_mm: default_grid_res(),
+            max_ripup_passes: default_max_ripup(),
+            allow_layer_flip: false,
+            inner_plane_penalty: default_inner_plane_penalty(),
+            allow_component_nudge: false,
+            any_angle_mode: false,
+            max_jump_radius_mm: default_max_jump_radius(),
+            pair_swap_prob: default_pair_swap_prob(),
+            centroid_pull_prob: default_centroid_pull_prob(),
+            temp_scale: default_temp_scale(),
+            escape_margin_mult: default_escape_margin_mult(),
+            crossing_weight: default_crossing_weight(),
+            show_courtyards: true,
+            show_ratsnest: true,
+            show_f_cu: true,
+            show_b_cu: true,
+            show_in1_cu: true,
+            show_in2_cu: true,
+            show_vias: true,
+            show_refs: true,
+            show_holding_palette: true,
+            kicad_ipc_enabled: false,
+            kicad_ipc_socket_path: String::new(),
+            bundle_track_width: default_bundle_dim(),
+            bundle_track_spacing: default_bundle_dim(),
+            last_input_path: None,
+            last_output_path: None,
+        }
+    }
+}
+
+impl AppPreferences {
+    /// Returns the default platform-specific configuration path for `preferences.json`.
+    pub fn config_path() -> PathBuf {
+        if let Ok(p) = env::var("VULCANS_TRIALS_CONFIG") {
+            if !p.trim().is_empty() {
+                return PathBuf::from(p.trim());
+            }
+        }
+        if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
+            if !xdg.trim().is_empty() {
+                return PathBuf::from(xdg.trim()).join("vulcans-trials").join("preferences.json");
+            }
+        }
+        if let Ok(home) = env::var("HOME") {
+            if !home.trim().is_empty() {
+                return PathBuf::from(home.trim()).join(".config").join("vulcans-trials").join("preferences.json");
+            }
+        }
+        if let Ok(appdata) = env::var("APPDATA") {
+            if !appdata.trim().is_empty() {
+                return PathBuf::from(appdata.trim()).join("vulcans-trials").join("preferences.json");
+            }
+        }
+        PathBuf::from("preferences.json")
+    }
+
+    /// Loads preferences from the default config path, or returns default preferences if absent/invalid.
+    pub fn load() -> Self {
+        Self::load_from_path(&Self::config_path()).unwrap_or_default()
+    }
+
+    /// Loads preferences from a specific filesystem path.
+    pub fn load_from_path(path: &Path) -> Option<Self> {
+        let content = fs::read_to_string(path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    /// Saves preferences to the default config path.
+    pub fn save(&self) -> std::io::Result<()> {
+        self.save_to_path(&Self::config_path())
+    }
+
+    /// Saves preferences to a specific path, creating parent directories if necessary.
+    pub fn save_to_path(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        let json = serde_json::to_string_pretty(self).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
+        fs::write(path, json)
+    }
+}
+
 pub struct VulcansTrialsApp {
     pub input_path: String,
     pub output_path: String,
@@ -184,6 +366,10 @@ pub struct VulcansTrialsApp {
     pub ipc: Option<Arc<Mutex<KiCadIpcClient>>>,
     pub kicad_ipc_enabled: bool,
     pub kicad_ipc_socket_path: String,
+
+    // Persistence
+    pub preferences_path: Option<PathBuf>,
+    pub last_saved_prefs: AppPreferences,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -208,7 +394,7 @@ impl VulcansTrialsApp {
         }
         let live = Arc::new(Mutex::new(LiveTrialState::new(board)));
 
-        Self {
+        let mut app = Self {
             input_path,
             output_path,
             live,
@@ -257,7 +443,123 @@ impl VulcansTrialsApp {
             kicad_ipc_socket_path: KiCadIpcClient::discover_socket_path()
                 .map(|p| format!("ipc://{}", p.display()))
                 .unwrap_or_else(|| "ipc:///tmp/kicad/api.sock".to_string()),
+            preferences_path: None,
+            last_saved_prefs: AppPreferences::default(),
+        };
+
+        // Load and apply saved preferences on launch
+        let saved_prefs = AppPreferences::load();
+        app.apply_preferences(&saved_prefs);
+        app.last_saved_prefs = app.to_preferences();
+
+        // If IPC live sync was saved as enabled and no client connected yet, attempt reconnection
+        if app.kicad_ipc_enabled && app.ipc.is_none() {
+            let custom = if app.kicad_ipc_socket_path.trim().is_empty() {
+                None
+            } else {
+                Some(app.kicad_ipc_socket_path.trim())
+            };
+            if let Some(client) = KiCadIpcClient::connect_or_discover(custom) {
+                app.ipc = Some(Arc::new(Mutex::new(client)));
+            }
         }
+
+        app
+    }
+
+    /// Sets a custom path for preferences storage (useful for unit testing and isolated profiles).
+    pub fn with_preferences_path(mut self, path: PathBuf) -> Self {
+        if let Some(prefs) = AppPreferences::load_from_path(&path) {
+            self.apply_preferences(&prefs);
+        }
+        self.preferences_path = Some(path);
+        self.last_saved_prefs = self.to_preferences();
+        self
+    }
+
+    /// Applies stored preferences to live application configuration fields.
+    pub fn apply_preferences(&mut self, prefs: &AppPreferences) {
+        self.place_duration_secs = prefs.place_duration_secs;
+        self.min_spacing_mm = prefs.min_spacing_mm;
+        self.grid_res_mm = prefs.grid_res_mm;
+        self.max_ripup_passes = prefs.max_ripup_passes;
+        self.allow_layer_flip = prefs.allow_layer_flip;
+        self.inner_plane_penalty = prefs.inner_plane_penalty;
+        self.allow_component_nudge = prefs.allow_component_nudge;
+        self.any_angle_mode = prefs.any_angle_mode;
+
+        self.max_jump_radius_mm = prefs.max_jump_radius_mm;
+        self.pair_swap_prob = prefs.pair_swap_prob;
+        self.centroid_pull_prob = prefs.centroid_pull_prob;
+        self.temp_scale = prefs.temp_scale;
+        self.escape_margin_mult = prefs.escape_margin_mult;
+        self.crossing_weight = prefs.crossing_weight;
+
+        self.show_courtyards = prefs.show_courtyards;
+        self.show_ratsnest = prefs.show_ratsnest;
+        self.show_f_cu = prefs.show_f_cu;
+        self.show_b_cu = prefs.show_b_cu;
+        self.show_in1_cu = prefs.show_in1_cu;
+        self.show_in2_cu = prefs.show_in2_cu;
+        self.show_vias = prefs.show_vias;
+        self.show_refs = prefs.show_refs;
+        self.show_holding_palette = prefs.show_holding_palette;
+
+        if !prefs.kicad_ipc_socket_path.trim().is_empty() {
+            self.kicad_ipc_socket_path = prefs.kicad_ipc_socket_path.clone();
+        }
+        self.kicad_ipc_enabled = prefs.kicad_ipc_enabled;
+
+        self.bundle_track_width = prefs.bundle_track_width;
+        self.bundle_track_spacing = prefs.bundle_track_spacing;
+    }
+
+    /// Extracts current application configuration as an `AppPreferences` instance.
+    pub fn to_preferences(&self) -> AppPreferences {
+        AppPreferences {
+            place_duration_secs: self.place_duration_secs,
+            min_spacing_mm: self.min_spacing_mm,
+            grid_res_mm: self.grid_res_mm,
+            max_ripup_passes: self.max_ripup_passes,
+            allow_layer_flip: self.allow_layer_flip,
+            inner_plane_penalty: self.inner_plane_penalty,
+            allow_component_nudge: self.allow_component_nudge,
+            any_angle_mode: self.any_angle_mode,
+
+            max_jump_radius_mm: self.max_jump_radius_mm,
+            pair_swap_prob: self.pair_swap_prob,
+            centroid_pull_prob: self.centroid_pull_prob,
+            temp_scale: self.temp_scale,
+            escape_margin_mult: self.escape_margin_mult,
+            crossing_weight: self.crossing_weight,
+
+            show_courtyards: self.show_courtyards,
+            show_ratsnest: self.show_ratsnest,
+            show_f_cu: self.show_f_cu,
+            show_b_cu: self.show_b_cu,
+            show_in1_cu: self.show_in1_cu,
+            show_in2_cu: self.show_in2_cu,
+            show_vias: self.show_vias,
+            show_refs: self.show_refs,
+            show_holding_palette: self.show_holding_palette,
+
+            kicad_ipc_enabled: self.kicad_ipc_enabled,
+            kicad_ipc_socket_path: self.kicad_ipc_socket_path.clone(),
+
+            bundle_track_width: self.bundle_track_width,
+            bundle_track_spacing: self.bundle_track_spacing,
+
+            last_input_path: Some(self.input_path.clone()),
+            last_output_path: Some(self.output_path.clone()),
+        }
+    }
+
+    /// Saves the current preferences to disk if configured or default path.
+    pub fn save_preferences(&mut self) {
+        let prefs = self.to_preferences();
+        let target = self.preferences_path.clone().unwrap_or_else(AppPreferences::config_path);
+        let _ = prefs.save_to_path(&target);
+        self.last_saved_prefs = prefs;
     }
 
     pub fn with_ipc(mut self, ipc: Option<Arc<Mutex<KiCadIpcClient>>>) -> Self {
@@ -270,6 +572,7 @@ impl VulcansTrialsApp {
             }
         }
         self.ipc = ipc;
+        self.last_saved_prefs = self.to_preferences();
         self
     }
 
@@ -1749,6 +2052,20 @@ impl VulcansTrialsApp {
                 });
 
                 ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("💾 Save Preferences").clicked() {
+                        self.save_preferences();
+                    }
+                    let cfg_path = self.preferences_path.clone().unwrap_or_else(AppPreferences::config_path);
+                    ui.label(
+                        egui::RichText::new("Auto-saved")
+                            .small()
+                            .color(Color32::from_rgb(120, 200, 120)),
+                    )
+                    .on_hover_text(format!("Preferences automatically saved to:\n{}", cfg_path.display()));
+                });
+
+                ui.separator();
                 ui.heading("Activity Log");
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -2457,6 +2774,18 @@ impl VulcansTrialsApp {
             // 12. Draw Color Legend Overlay
             draw_color_legend(&painter, rect, b);
         });
+
+        // Persist preferences if any setting was mutated
+        let cur_prefs = self.to_preferences();
+        if cur_prefs != self.last_saved_prefs {
+            self.save_preferences();
+        }
+    }
+}
+
+impl Drop for VulcansTrialsApp {
+    fn drop(&mut self) {
+        self.save_preferences();
     }
 }
 
@@ -3926,6 +4255,104 @@ mod tests {
         assert!(!app.bundle_sketch_active);
 
         let _ = fs::remove_file(in_path);
+    }
+
+    #[test]
+    fn test_preferences_default_values_and_roundtrip() {
+        let temp_pref_path = format!("/tmp/vulcans_trials_pref_test_{}.json", std::process::id());
+        let _ = fs::remove_file(&temp_pref_path);
+
+        let default_prefs = AppPreferences::default();
+        assert_eq!(default_prefs.place_duration_secs, 120);
+        assert_eq!(default_prefs.min_spacing_mm, 0.25);
+        assert_eq!(default_prefs.grid_res_mm, 0.10);
+        assert_eq!(default_prefs.max_ripup_passes, 15);
+        assert!(!default_prefs.allow_layer_flip);
+        assert_eq!(default_prefs.inner_plane_penalty, 8.0);
+        assert!(!default_prefs.allow_component_nudge);
+        assert!(!default_prefs.any_angle_mode);
+        assert!(default_prefs.show_courtyards);
+        assert!(default_prefs.show_ratsnest);
+
+        // Mutate custom values
+        let mut custom = default_prefs.clone();
+        custom.place_duration_secs = 240;
+        custom.min_spacing_mm = 0.40;
+        custom.grid_res_mm = 0.05;
+        custom.max_ripup_passes = 25;
+        custom.allow_layer_flip = true;
+        custom.inner_plane_penalty = 12.0;
+        custom.allow_component_nudge = true;
+        custom.any_angle_mode = true;
+        custom.kicad_ipc_enabled = true;
+        custom.kicad_ipc_socket_path = "ipc:///tmp/custom/kicad.sock".to_string();
+        custom.bundle_track_width = 0.30;
+        custom.bundle_track_spacing = 0.35;
+
+        // Save to path
+        let path = PathBuf::from(&temp_pref_path);
+        custom.save_to_path(&path).expect("Failed to save preferences");
+        assert!(path.exists());
+
+        // Reload from path
+        let loaded = AppPreferences::load_from_path(&path).expect("Failed to load preferences");
+        assert_eq!(loaded, custom);
+
+        let _ = fs::remove_file(&temp_pref_path);
+    }
+
+    #[test]
+    fn test_preferences_applied_to_app_and_auto_saved() {
+        let temp_pref_path = format!("/tmp/vulcans_trials_app_pref_test_{}.json", std::process::id());
+        let _ = fs::remove_file(&temp_pref_path);
+
+        let in_path = format!("/tmp/vulcan_pref_gui_test_{}.kicad_pcb", std::process::id());
+        let content = r#"(kicad_pcb
+          (net 0 "") (net 1 "GND")
+          (gr_rect (start 100.0 100.0) (end 130.0 130.0) (layer "Edge.Cuts"))
+          (footprint "R" (at 110.0 110.0) (property "Reference" "R1")
+            (pad "1" smd rect (at 0 0) (size 0.5 0.5) (net 1 "GND")))
+        )"#;
+        fs::write(&in_path, content).unwrap();
+
+        // 1. Create a custom preferences file
+        let mut initial_prefs = AppPreferences::default();
+        initial_prefs.place_duration_secs = 45;
+        initial_prefs.min_spacing_mm = 0.33;
+        initial_prefs.inner_plane_penalty = 15.0;
+        initial_prefs.allow_layer_flip = true;
+        initial_prefs.any_angle_mode = true;
+        initial_prefs.kicad_ipc_socket_path = "ipc:///tmp/saved_test.sock".to_string();
+        let pref_file = PathBuf::from(&temp_pref_path);
+        initial_prefs.save_to_path(&pref_file).unwrap();
+
+        // 2. Launch VulcansTrialsApp with preferences path
+        let board = Board::load(&in_path, &HashSet::new()).unwrap();
+        let mut app = VulcansTrialsApp::new(in_path.clone(), "/tmp/out.kicad_pcb".to_string(), board, None)
+            .with_preferences_path(pref_file.clone());
+
+        assert_eq!(app.place_duration_secs, 45);
+        assert!((app.min_spacing_mm - 0.33).abs() < 1e-4);
+        assert!((app.inner_plane_penalty - 15.0).abs() < 1e-4);
+        assert!(app.allow_layer_flip);
+        assert!(app.any_angle_mode);
+        assert_eq!(app.kicad_ipc_socket_path, "ipc:///tmp/saved_test.sock");
+
+        // 3. Mutate a setting and run render_ui to trigger auto-save
+        app.place_duration_secs = 99;
+        app.min_spacing_mm = 0.55;
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.render_ui(ctx);
+        });
+
+        // 4. Verify disk file was updated with new values
+        let reloaded = AppPreferences::load_from_path(&pref_file).expect("Must reload from file");
+        assert_eq!(reloaded.place_duration_secs, 99);
+        assert!((reloaded.min_spacing_mm - 0.55).abs() < 1e-4);
+
+        let _ = fs::remove_file(&in_path);
+        let _ = fs::remove_file(&temp_pref_path);
     }
 }
 
