@@ -35,6 +35,19 @@ impl Point {
             y: -self.x * sin_a + self.y * cos_a,
         }
     }
+
+    pub fn distance_to_segment(&self, a: &Point, b: &Point) -> f64 {
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let len_sq = dx * dx + dy * dy;
+        if len_sq < 1e-12 {
+            return self.distance_to(a);
+        }
+        let t = (((self.x - a.x) * dx + (self.y - a.y) * dy) / len_sq).clamp(0.0, 1.0);
+        let proj_x = a.x + t * dx;
+        let proj_y = a.y + t * dy;
+        (self.x - proj_x).hypot(self.y - proj_y)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -160,6 +173,44 @@ impl Polygon {
             j = i;
         }
         inside
+    }
+
+    pub fn distance_to_point(&self, p: &Point) -> f64 {
+        if !self.contains_point(p) {
+            return 0.0;
+        }
+        let n = self.vertices.len();
+        if n < 2 {
+            return 0.0;
+        }
+        let mut min_d = f64::INFINITY;
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let d = p.distance_to_segment(&self.vertices[i], &self.vertices[j]);
+            min_d = min_d.min(d);
+        }
+        min_d
+    }
+
+    pub fn distance_to_segment(&self, s: (f64, f64), e: (f64, f64)) -> f64 {
+        let p_start = Point::new(s.0, s.1);
+        let p_end = Point::new(e.0, e.1);
+        if !self.contains_point(&p_start) || !self.contains_point(&p_end) {
+            return 0.0;
+        }
+        let n = self.vertices.len();
+        if n < 2 {
+            return 0.0;
+        }
+        let seg_len = (e.0 - s.0).hypot(e.1 - s.1);
+        let steps = ((seg_len / 0.05).ceil() as usize).max(2);
+        let mut min_d = f64::INFINITY;
+        for step in 0..=steps {
+            let t = step as f64 / steps as f64;
+            let pt = Point::new(s.0 + t * (e.0 - s.0), s.1 + t * (e.1 - s.1));
+            min_d = min_d.min(self.distance_to_point(&pt));
+        }
+        min_d
     }
 
     pub fn is_convex(&self) -> bool {
@@ -466,6 +517,85 @@ impl NetTopology {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FabPreset {
+    Jlcpcb,
+    PcbWay,
+    Eurocircuits,
+    Custom,
+}
+
+impl FabPreset {
+    pub fn parse(s: &str) -> Option<Self> {
+        let clean = s.trim().to_lowercase().replace(['-', '_', ' ', '.'], "");
+        if clean.contains("jlc") {
+            Some(Self::Jlcpcb)
+        } else if clean.contains("pcbway") {
+            Some(Self::PcbWay)
+        } else if clean.contains("eurocircuit") {
+            Some(Self::Eurocircuits)
+        } else {
+            None
+        }
+    }
+
+    pub fn board_edge_clearance(&self) -> f64 {
+        match self {
+            Self::Jlcpcb => 0.35,
+            Self::PcbWay => 0.30,
+            Self::Eurocircuits => 0.40,
+            Self::Custom => 0.35,
+        }
+    }
+
+    pub fn apply_to_netclass(&self, nc: &mut NetClass) {
+        nc.board_edge_clearance = self.board_edge_clearance();
+        match self {
+            Self::Jlcpcb => {
+                nc.clearance = nc.clearance.max(0.127);
+                nc.track_width = nc.track_width.max(0.127);
+                nc.via_dia = nc.via_dia.max(0.60);
+                nc.via_drill = nc.via_drill.max(0.30);
+            }
+            Self::PcbWay => {
+                nc.clearance = nc.clearance.max(0.15);
+                nc.track_width = nc.track_width.max(0.15);
+                nc.via_dia = nc.via_dia.max(0.60);
+                nc.via_drill = nc.via_drill.max(0.30);
+            }
+            Self::Eurocircuits => {
+                nc.clearance = nc.clearance.max(0.15);
+                nc.track_width = nc.track_width.max(0.15);
+                nc.via_dia = nc.via_dia.max(0.60);
+                nc.via_drill = nc.via_drill.max(0.30);
+            }
+            Self::Custom => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DfmConfig {
+    pub teardrop_enabled: bool,
+    pub teardrop_length_ratio: f64,
+    pub teardrop_width_ratio: f64,
+    pub board_edge_clearance: f64,
+    pub fab_preset: Option<FabPreset>,
+}
+
+impl Default for DfmConfig {
+    fn default() -> Self {
+        Self {
+            teardrop_enabled: true,
+            teardrop_length_ratio: 0.5,
+            teardrop_width_ratio: 0.8,
+            board_edge_clearance: 0.35,
+            fab_preset: Some(FabPreset::Jlcpcb),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NetClass {
@@ -480,10 +610,34 @@ pub struct NetClass {
     pub diff_pair_width: f64,
     #[serde(default)]
     pub topology: NetTopology,
+    #[serde(default = "default_true")]
+    pub teardrop_enabled: bool,
+    #[serde(default = "default_teardrop_length_ratio")]
+    pub teardrop_length_ratio: f64,
+    #[serde(default = "default_teardrop_width_ratio")]
+    pub teardrop_width_ratio: f64,
+    #[serde(default = "default_board_edge_clearance")]
+    pub board_edge_clearance: f64,
 }
 
 fn default_diff_pair_dim() -> f64 {
     0.20
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_teardrop_length_ratio() -> f64 {
+    0.5
+}
+
+fn default_teardrop_width_ratio() -> f64 {
+    0.8
+}
+
+fn default_board_edge_clearance() -> f64 {
+    0.35
 }
 
 impl Default for NetClass {
@@ -497,6 +651,10 @@ impl Default for NetClass {
             diff_pair_gap: 0.20,
             diff_pair_width: 0.20,
             topology: NetTopology::default(),
+            teardrop_enabled: true,
+            teardrop_length_ratio: 0.5,
+            teardrop_width_ratio: 0.8,
+            board_edge_clearance: 0.35,
         }
     }
 }
@@ -1161,7 +1319,11 @@ impl Default for Board {
             holding_palette: Vec::new(),
             nets: vec!["".to_string()],
             net_name_to_id: HashMap::new(),
-            netclasses: HashMap::new(),
+            netclasses: {
+                let mut map = HashMap::new();
+                map.insert("Default".to_string(), NetClass::default());
+                map
+            },
             net_to_class: HashMap::new(),
             keepouts: Vec::new(),
             tracks: Vec::new(),
@@ -1242,6 +1404,7 @@ impl Board {
                     diff_pair_gap: 0.20,
                     diff_pair_width: width,
                     topology: NetTopology::default(),
+                    ..NetClass::default()
                 },
             );
         }
@@ -1556,6 +1719,15 @@ impl Board {
         } else {
             AABB::new(self.min_x + 1.5, self.min_y + 1.5, self.max_x - 1.5, self.max_y - 1.5)
         }
+    }
+
+    /// Minimum clearance from copper to Edge.Cuts outline based on board netclasses (default 0.35 mm).
+    pub fn board_edge_clearance(&self) -> f64 {
+        self.netclasses
+            .values()
+            .map(|nc| nc.board_edge_clearance)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(0.35)
     }
 
     /// Verifies if a point is strictly inside the physical board boundary and outline contour.
@@ -1891,7 +2063,11 @@ impl Board {
                 }
             }
         }
-        self.netclasses.get("Default").unwrap()
+        if let Some(nc) = self.netclasses.get("Default") {
+            return nc;
+        }
+        static DEFAULT_NETCLASS: std::sync::OnceLock<NetClass> = std::sync::OnceLock::new();
+        DEFAULT_NETCLASS.get_or_init(NetClass::default)
     }
 
     pub fn get_net_topology(&self, net_id: usize) -> NetTopology {
@@ -2693,6 +2869,13 @@ pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetCla
     let trimmed = content.trim_start();
     if trimmed.starts_with('{') {
         if let Ok(root) = serde_json::from_str::<serde_json::Value>(content) {
+            let root_preset = root
+                .get("fab_preset")
+                .or_else(|| root.get("preset"))
+                .or_else(|| root.get("fab"))
+                .and_then(|v| v.as_str())
+                .and_then(FabPreset::parse);
+
             let classes_opt = root
                 .get("net_settings")
                 .and_then(|v| v.get("classes"))
@@ -2712,23 +2895,69 @@ pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetCla
                         .and_then(|v| v.as_str())
                         .and_then(NetTopology::parse)
                         .unwrap_or_default();
-                    netclasses.insert(
-                        name.to_string(),
-                        NetClass {
-                            name: name.to_string(),
-                            track_width,
-                            clearance,
-                            via_dia,
-                            via_drill,
-                            diff_pair_gap,
-                            diff_pair_width,
-                            topology,
-                        },
-                    );
+
+                    let cls_preset = cls
+                        .get("fab_preset")
+                        .or_else(|| cls.get("preset"))
+                        .and_then(|v| v.as_str())
+                        .and_then(FabPreset::parse)
+                        .or(root_preset);
+
+                    let teardrop_enabled = cls
+                        .get("teardrop_enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let teardrop_length_ratio = cls
+                        .get("teardrop_length_ratio")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.5);
+                    let teardrop_width_ratio = cls
+                        .get("teardrop_width_ratio")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.8);
+                    let default_edge_clr = cls_preset.map(|p| p.board_edge_clearance()).unwrap_or(0.35);
+                    let board_edge_clearance = cls
+                        .get("board_edge_clearance")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(default_edge_clr);
+
+                    let mut nc = NetClass {
+                        name: name.to_string(),
+                        track_width,
+                        clearance,
+                        via_dia,
+                        via_drill,
+                        diff_pair_gap,
+                        diff_pair_width,
+                        topology,
+                        teardrop_enabled,
+                        teardrop_length_ratio,
+                        teardrop_width_ratio,
+                        board_edge_clearance,
+                    };
+                    if let Some(p) = cls_preset {
+                        p.apply_to_netclass(&mut nc);
+                        if let Some(explicit_bec) = cls.get("board_edge_clearance").and_then(|v| v.as_f64()) {
+                            nc.board_edge_clearance = explicit_bec;
+                        }
+                    }
+                    netclasses.insert(name.to_string(), nc);
                 }
             }
         }
     } else {
+        let global_preset = if let Some(pos) = content.find("(fab_preset") {
+            let rest = &content[pos + "(fab_preset".len()..];
+            let token = rest.trim_start().split(|c: char| c.is_whitespace() || c == ')').next().unwrap_or("").trim_matches('"');
+            FabPreset::parse(token)
+        } else if let Some(pos) = content.find("(preset") {
+            let rest = &content[pos + "(preset".len()..];
+            let token = rest.trim_start().split(|c: char| c.is_whitespace() || c == ')').next().unwrap_or("").trim_matches('"');
+            FabPreset::parse(token)
+        } else {
+            None
+        };
+
         let bytes = content.as_bytes();
         let len = bytes.len();
         let mut i = 0;
@@ -2780,19 +3009,48 @@ pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetCla
                             } else {
                                 NetTopology::default()
                             };
-                            netclasses.insert(
-                                name.clone(),
-                                NetClass {
-                                    name,
-                                    track_width,
-                                    clearance,
-                                    via_dia,
-                                    via_drill,
-                                    diff_pair_gap,
-                                    diff_pair_width,
-                                    topology,
-                                },
-                            );
+
+                            let cls_preset = if let Some(pos) = block.find("(fab_preset") {
+                                let rest = &block[pos + "(fab_preset".len()..];
+                                let token = rest.trim_start().split(|c: char| c.is_whitespace() || c == ')').next().unwrap_or("").trim_matches('"');
+                                FabPreset::parse(token).or(global_preset)
+                            } else {
+                                global_preset
+                            };
+
+                            let default_edge_clr = cls_preset.map(|p| p.board_edge_clearance()).unwrap_or(0.35);
+                            let board_edge_clearance = parse_val("(board_edge_clearance", default_edge_clr);
+                            let teardrop_length_ratio = parse_val("(teardrop_length_ratio", 0.5);
+                            let teardrop_width_ratio = parse_val("(teardrop_width_ratio", 0.8);
+                            let teardrop_enabled = if let Some(pos) = block.find("(teardrop_enabled") {
+                                let rest = &block[pos + "(teardrop_enabled".len()..];
+                                let token = rest.trim_start().split(|c: char| c.is_whitespace() || c == ')').next().unwrap_or("");
+                                token == "true" || token == "1" || token == "yes"
+                            } else {
+                                true
+                            };
+
+                            let mut nc = NetClass {
+                                name: name.clone(),
+                                track_width,
+                                clearance,
+                                via_dia,
+                                via_drill,
+                                diff_pair_gap,
+                                diff_pair_width,
+                                topology,
+                                teardrop_enabled,
+                                teardrop_length_ratio,
+                                teardrop_width_ratio,
+                                board_edge_clearance,
+                            };
+                            if let Some(p) = cls_preset {
+                                p.apply_to_netclass(&mut nc);
+                                if block.contains("(board_edge_clearance") {
+                                    nc.board_edge_clearance = board_edge_clearance;
+                                }
+                            }
+                            netclasses.insert(name, nc);
                         }
                         i = end;
                         continue;
@@ -3863,6 +4121,65 @@ mod tests {
         assert!((eth_cls.track_width - 0.30).abs() < 1e-6);
         assert!((eth_cls.diff_pair_gap - 0.18).abs() < 1e-6);
         assert!((eth_cls.diff_pair_width - 0.30).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dfm_config_and_fab_presets() {
+        // Test FabPreset enum parsing
+        assert_eq!(FabPreset::parse("JLCPCB"), Some(FabPreset::Jlcpcb));
+        assert_eq!(FabPreset::parse("jlc"), Some(FabPreset::Jlcpcb));
+        assert_eq!(FabPreset::parse("pcbway"), Some(FabPreset::PcbWay));
+        assert_eq!(FabPreset::parse("Eurocircuits"), Some(FabPreset::Eurocircuits));
+        assert_eq!(FabPreset::parse("unknown_fab"), None);
+
+        // Test FabPreset clearances
+        assert!((FabPreset::Jlcpcb.board_edge_clearance() - 0.35).abs() < 1e-6);
+        assert!((FabPreset::PcbWay.board_edge_clearance() - 0.30).abs() < 1e-6);
+        assert!((FabPreset::Eurocircuits.board_edge_clearance() - 0.40).abs() < 1e-6);
+
+        // Test NetClass DFM defaults
+        let nc = NetClass::default();
+        assert!(nc.teardrop_enabled);
+        assert!((nc.teardrop_length_ratio - 0.5).abs() < 1e-6);
+        assert!((nc.teardrop_width_ratio - 0.8).abs() < 1e-6);
+        assert!((nc.board_edge_clearance - 0.35).abs() < 1e-6);
+
+        // Test JSON parsing with FabPreset
+        let json_pro = r#"{
+            "fab_preset": "PCBWay",
+            "net_settings": {
+                "classes": [
+                    {
+                        "name": "Power",
+                        "track_width": 0.50,
+                        "clearance": 0.25,
+                        "teardrop_enabled": true,
+                        "teardrop_length_ratio": 0.6,
+                        "teardrop_width_ratio": 0.9
+                    }
+                ]
+            }
+        }"#;
+        let pro_classes = parse_netclasses_from_pro_or_pcb(json_pro);
+        let pwr = pro_classes.get("Power").expect("Power class must parse");
+        assert!(pwr.teardrop_enabled);
+        assert!((pwr.teardrop_length_ratio - 0.6).abs() < 1e-6);
+        assert!((pwr.teardrop_width_ratio - 0.9).abs() < 1e-6);
+        assert!((pwr.board_edge_clearance - 0.30).abs() < 1e-6); // From PCBWay preset
+
+        // Test S-expression parsing with FabPreset
+        let pcb_sexpr = r#"(kicad_pcb
+            (fab_preset "Eurocircuits")
+            (net_class "RF" "RF Class"
+                (clearance 0.20)
+                (trace_width 0.35)
+                (teardrop_enabled false)
+            )
+        )"#;
+        let pcb_classes = parse_netclasses_from_pro_or_pcb(pcb_sexpr);
+        let rf = pcb_classes.get("RF").expect("RF class must parse");
+        assert!(!rf.teardrop_enabled);
+        assert!((rf.board_edge_clearance - 0.40).abs() < 1e-6); // From Eurocircuits preset
     }
 
     #[test]
