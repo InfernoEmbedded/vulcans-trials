@@ -28,7 +28,7 @@ Below is a comprehensive breakdown of features offered by flagship commercial PC
 | **High-Speed** | Impedance-controlled layer-specific track width adjustment | Allegro, Altium | **Phase 2 (v0.2)** |
 | **Topological** | Any-angle / Arc / Teardrop topological rubber-band routing | Eremex TopoR, Xpedition | **Phase 3 (v0.3)** |
 | **Topological** | Post-route trace glossing, corner mitering, and via minimization pass | Specctra, Altium | **Phase 3 (v0.3)** |
-| **HDI & BGA** | Dog-bone, via-in-pad, blind/buried & microvia BGA fanout solver | Allegro, Zuken, Xpedition | **Phase 4 (v0.4)** |
+| **HDI & BGA** | Dog-bone, via-in-pad, blind/buried & microvia BGA fanout solver | Allegro, Zuken, Xpedition | **Implemented (v0.4)** |
 | **HDI & BGA** | Pin & gate swapping optimization (FPGA / MCU / multi-unit op-amps) | Allegro, Xpedition | **Implemented (v0.4)** |
 | **SI / PI / DFM** | Crosstalk-aware parallel run-length limit & guard-trace insertion | Allegro, HyperLynx | **Implemented (v0.5)** |
 | **SI / PI / DFM** | Return-path continuity & split-plane crossing avoidance | Allegro, Zuken | **Implemented (v0.5)** |
@@ -63,7 +63,7 @@ Below is a comprehensive breakdown of features offered by flagship commercial PC
 - [ ] **TopoR-Style Any-Angle Mode:** Delaunay triangulation + rubber-band topological routing for ultra-compact boards and curved enclosures.
 
 ### Phase 4: v0.4 — HDI, BGA Fanout & Pin/Gate Swapping
-- [ ] **Automated BGA Escape Solver:** Quadrant dog-bone fanout, channel-routing, and blind/buried microvia stack support for $0.4\text{ mm}$–$0.8\text{ mm}$ pitch BGAs.
+- [x] **Automated BGA Escape Solver:** Quadrant dog-bone fanout, channel-routing, and blind/buried microvia stack support for $0.4\text{ mm}$–$0.8\text{ mm}$ pitch BGAs.
 - [x] **Pin & Gate Swapping:** Bipartite matching (Hungarian algorithm) on swappable MCU GPIO banks and multi-unit logic/op-amp gates during placement to untangle ratsnest crossings before routing begins.
 - [ ] **Multi-Board & Rigid-Flex Zones:** Layer stackup regions with bend-area trace perpendicularity constraints.
 

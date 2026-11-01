@@ -1225,7 +1225,211 @@ impl Footprint {
         };
         base_spacing + 2.0 * margin
     }
+
+    /// Detects if this footprint is a Ball Grid Array (BGA) package and calculates its
+    /// 2D regular grid geometry, pitch, bounding matrix center, and concentric ring depth per pad.
+    pub fn bga_grid_info(&self) -> Option<BgaGridInfo> {
+        let smd_pads: Vec<(usize, &Pad)> = self
+            .pads
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.is_through_hole)
+            .collect();
+        if smd_pads.len() < 9 {
+            return None;
+        }
+
+        // BGA pads are typically circular, roundrect, oval, or square SMD pads (aspect ratio <= 1.43, size <= 1.2mm)
+        let ball_pads: Vec<(usize, &Pad)> = smd_pads
+            .iter()
+            .filter(|(_, p)| {
+                let ratio = p.width / p.height.max(1e-6);
+                let is_squareish = ratio >= 0.70 && ratio <= 1.43;
+                let is_ball_shape = p.shape == "circle" || p.shape == "roundrect" || p.shape == "oval" || p.shape == "rect";
+                is_squareish && is_ball_shape && p.width >= 0.15 && p.width <= 1.20 && p.height >= 0.15 && p.height <= 1.20
+            })
+            .cloned()
+            .collect();
+
+        if ball_pads.len() < 9 || ball_pads.len() * 4 < smd_pads.len() * 3 {
+            return None;
+        }
+
+        let oy = |p: &Pad| if self.layer != self.orig_layer { -p.offset_y } else { p.offset_y };
+
+        // Collect unique X and unique Y coordinates with 0.08mm tolerance clustering
+        let cluster_coords = |vals: &[f64]| -> Vec<f64> {
+            if vals.is_empty() {
+                return Vec::new();
+            }
+            let mut sorted = vals.to_vec();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mut clusters = Vec::new();
+            let mut cur_sum = sorted[0];
+            let mut cur_cnt = 1;
+            for &v in &sorted[1..] {
+                let mean = cur_sum / (cur_cnt as f64);
+                if (v - mean).abs() <= 0.08 {
+                    cur_sum += v;
+                    cur_cnt += 1;
+                } else {
+                    clusters.push(mean);
+                    cur_sum = v;
+                    cur_cnt = 1;
+                }
+            }
+            clusters.push(cur_sum / (cur_cnt as f64));
+            clusters
+        };
+
+        let all_x: Vec<f64> = ball_pads.iter().map(|(_, p)| p.offset_x).collect();
+        let all_y: Vec<f64> = ball_pads.iter().map(|(_, p)| oy(p)).collect();
+
+        let clusters_x = cluster_coords(&all_x);
+        let clusters_y = cluster_coords(&all_y);
+
+        if clusters_x.len() < 2 || clusters_y.len() < 2 {
+            return None;
+        }
+
+        let diffs_x: Vec<f64> = clusters_x.windows(2).map(|w| w[1] - w[0]).collect();
+        let diffs_y: Vec<f64> = clusters_y.windows(2).map(|w| w[1] - w[0]).collect();
+
+        let min_dx = diffs_x.iter().cloned().fold(f64::INFINITY, f64::min);
+        let min_dy = diffs_y.iter().cloned().fold(f64::INFINITY, f64::min);
+
+        // BGA pitch standard range: 0.35mm <= p <= 1.05mm
+        if min_dx < 0.35 || min_dx > 1.05 || min_dy < 0.35 || min_dy > 1.05 {
+            return None;
+        }
+
+        let pitch_x = (min_dx * 10000.0).round() / 10000.0;
+        let pitch_y = (min_dy * 10000.0).round() / 10000.0;
+
+        // Verify that cluster steps are approximately integer multiples of pitch
+        for &d in &diffs_x {
+            let mult = (d / pitch_x).round();
+            if mult < 1.0 || (d - mult * pitch_x).abs() > 0.12 {
+                return None;
+            }
+        }
+        for &d in &diffs_y {
+            let mult = (d / pitch_y).round();
+            if mult < 1.0 || (d - mult * pitch_y).abs() > 0.12 {
+                return None;
+            }
+        }
+
+        let min_x = clusters_x[0];
+        let max_x = *clusters_x.last().unwrap();
+        let min_y = clusters_y[0];
+        let max_y = *clusters_y.last().unwrap();
+
+        let cols = ((max_x - min_x) / pitch_x).round() as usize + 1;
+        let rows = ((max_y - min_y) / pitch_y).round() as usize + 1;
+
+        // Must be a matrix >= 3x3 with total matrix capacity >= 9
+        if cols < 3 || rows < 3 || (cols * rows) < 9 {
+            return None;
+        }
+
+        let center_x = (((min_x + max_x) * 0.5) * 10000.0).round() / 10000.0;
+        let center_y = (((min_y + max_y) * 0.5) * 10000.0).round() / 10000.0;
+
+        // Index each pad in self.pads into grid columns and rows, and determine ring index
+        let mut pad_rings = vec![0usize; self.pads.len()];
+        let mut pad_grid_indices = vec![None; self.pads.len()];
+        let mut matched_count = 0;
+
+        for (pad_idx, pad) in self.pads.iter().enumerate() {
+            if pad.is_through_hole {
+                continue;
+            }
+            let px = pad.offset_x;
+            let py = oy(pad);
+            let c_f = (px - min_x) / pitch_x;
+            let r_f = (py - min_y) / pitch_y;
+            let c_i = c_f.round() as isize;
+            let r_i = r_f.round() as isize;
+
+            if (c_f - c_i as f64).abs() <= 0.20 && (r_f - r_i as f64).abs() <= 0.20 {
+                if c_i >= 0 && (c_i as usize) < cols && r_i >= 0 && (r_i as usize) < rows {
+                    let col = c_i as usize;
+                    let row = r_i as usize;
+                    let dist_x = col.min(cols - 1 - col);
+                    let dist_y = row.min(rows - 1 - row);
+                    let ring = dist_x.min(dist_y);
+                    pad_rings[pad_idx] = ring;
+                    pad_grid_indices[pad_idx] = Some((col, row));
+                    matched_count += 1;
+                }
+            }
+        }
+
+        if matched_count < 9 || matched_count * 4 < self.pads.len() * 3 {
+            return None;
+        }
+
+        Some(BgaGridInfo {
+            pitch_x,
+            pitch_y,
+            center_x,
+            center_y,
+            cols,
+            rows,
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            pad_rings,
+            pad_grid_indices,
+        })
+    }
+
+    pub fn is_bga(&self) -> bool {
+        self.bga_grid_info().is_some()
+    }
+
+    pub fn bga_pitch(&self) -> Option<(f64, f64)> {
+        self.bga_grid_info().map(|info| (info.pitch_x, info.pitch_y))
+    }
+
+    pub fn bga_matrix_center(&self) -> Option<(f64, f64)> {
+        self.bga_grid_info().map(|info| (info.center_x, info.center_y))
+    }
+
+    pub fn bga_world_center(&self) -> Option<(f64, f64)> {
+        let (cx, cy) = self.bga_matrix_center()?;
+        let p = Point::new(cx, cy).rotate_ccw(self.rotation);
+        Some((self.x + p.x, self.y + p.y))
+    }
+
+    pub fn bga_pad_ring_index(&self, pad_idx: usize) -> usize {
+        if let Some(info) = self.bga_grid_info() {
+            if pad_idx < info.pad_rings.len() {
+                return info.pad_rings[pad_idx];
+            }
+        }
+        0
+    }
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BgaGridInfo {
+    pub pitch_x: f64,
+    pub pitch_y: f64,
+    pub center_x: f64,
+    pub center_y: f64,
+    pub cols: usize,
+    pub rows: usize,
+    pub min_x: f64,
+    pub min_y: f64,
+    pub max_x: f64,
+    pub max_y: f64,
+    pub pad_rings: Vec<usize>,
+    pub pad_grid_indices: Vec<Option<(usize, usize)>>,
+}
+
 
 /// Extracts the outer perimeter boundary line segments of a set of polygons,
 /// discarding internal shared chords (such as triangulation edges).
@@ -5110,6 +5314,109 @@ mod tests {
         let ripped = board.rip_up_connected_traces_to_component(0);
         assert_eq!(ripped, 0);
         assert_eq!(board.tracks.len(), 1);
+    }
+
+    #[test]
+    fn test_bga_detection_and_ring_depth() {
+        let mut fp = Footprint {
+            reference: "U_BGA".to_string(),
+            value: "BGA-16".to_string(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: Vec::new(),
+            width: 5.0,
+            height: 5.0,
+            courtyards: vec![],
+            perimeters: vec![],
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
+        };
+
+        // 4x4 BGA grid with 0.8mm pitch:
+        // Columns: x = -1.2, -0.4, 0.4, 1.2
+        // Rows:    y = -1.2, -0.4, 0.4, 1.2
+        let xs = [-1.2, -0.4, 0.4, 1.2];
+        let ys = [-1.2, -0.4, 0.4, 1.2];
+        let mut pad_num = 1;
+        for &y in &ys {
+            for &x in &xs {
+                fp.pads.push(Pad::new(&pad_num.to_string(), x, y, 0.4, 0.4, pad_num, "SIG", false));
+                pad_num += 1;
+            }
+        }
+
+        assert!(fp.is_bga(), "4x4 regular pad array must be detected as BGA");
+        let (px, py) = fp.bga_pitch().expect("Pitch must be computed");
+        assert!((px - 0.8).abs() < 1e-4, "Pitch X must be 0.8mm: {}", px);
+        assert!((py - 0.8).abs() < 1e-4, "Pitch Y must be 0.8mm: {}", py);
+
+        let (cx, cy) = fp.bga_matrix_center().expect("Center must be computed");
+        assert!(cx.abs() < 1e-4 && cy.abs() < 1e-4, "Center must be (0,0): ({}, {})", cx, cy);
+
+        // Verify concentric ring indexing:
+        // Outer 12 pads: Ring 0
+        // Inner 4 pads: (1,1), (2,1), (1,2), (2,2) -> indices:
+        // Row 0: pads 0,1,2,3 -> all ring 0
+        // Row 1: pad 4 (ring 0), pad 5 (ring 1), pad 6 (ring 1), pad 7 (ring 0)
+        // Row 2: pad 8 (ring 0), pad 9 (ring 1), pad 10 (ring 1), pad 11 (ring 0)
+        // Row 3: pads 12,13,14,15 -> all ring 0
+        for i in 0..16 {
+            let row = i / 4;
+            let col = i % 4;
+            let ring = fp.bga_pad_ring_index(i);
+            if row == 0 || row == 3 || col == 0 || col == 3 {
+                assert_eq!(ring, 0, "Outer pad ({}, {}) must be Ring 0", col, row);
+            } else {
+                assert_eq!(ring, 1, "Inner pad ({}, {}) must be Ring 1", col, row);
+            }
+        }
+
+        // Test 5x5 BGA grid with 0.8mm pitch (Ring 0, 1, 2)
+        let mut fp5 = Footprint {
+            reference: "U_BGA5".to_string(),
+            value: "BGA-25".to_string(),
+            ..Footprint::default()
+        };
+        let xs5 = [-1.6, -0.8, 0.0, 0.8, 1.6];
+        let ys5 = [-1.6, -0.8, 0.0, 0.8, 1.6];
+        pad_num = 1;
+        for &y in &ys5 {
+            for &x in &xs5 {
+                fp5.pads.push(Pad::new(&pad_num.to_string(), x, y, 0.4, 0.4, pad_num, "SIG", false));
+                pad_num += 1;
+            }
+        }
+        assert!(fp5.is_bga(), "5x5 array must be detected as BGA");
+        for i in 0..25 {
+            let row = i / 5;
+            let col = i % 5;
+            let ring = fp5.bga_pad_ring_index(i);
+            if row == 0 || row == 4 || col == 0 || col == 4 {
+                assert_eq!(ring, 0, "5x5 Outer pad ({}, {}) must be Ring 0", col, row);
+            } else if row == 2 && col == 2 {
+                assert_eq!(ring, 2, "5x5 Center pad ({}, {}) must be Ring 2", col, row);
+            } else {
+                assert_eq!(ring, 1, "5x5 Middle pad ({}, {}) must be Ring 1", col, row);
+            }
+        }
+
+        // Test non-BGA footprint (2-pad resistor)
+        let r1 = Footprint {
+            reference: "R1".to_string(),
+            pads: vec![
+                Pad::new("1", -1.0, 0.0, 0.6, 0.6, 1, "NET1", false),
+                Pad::new("2", 1.0, 0.0, 0.6, 0.6, 2, "NET2", false),
+            ],
+            ..Footprint::default()
+        };
+        assert!(!r1.is_bga(), "2-pad resistor must not be detected as BGA");
     }
 }
 

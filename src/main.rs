@@ -127,6 +127,53 @@ fn run_self_test() -> Result<(), String> {
     }
     println!("[PASS] SAT courtyard collision & ratsnest crossing math verified");
 
+    // 3. Verify BGA Package Detection & Quadrant Dog-Bone Fanout
+    let mut bga_fp = vulcans_trials::board::Footprint {
+        reference: "U_BGA".to_string(),
+        value: "BGA-16".to_string(),
+        x: 25.0,
+        y: 25.0,
+        rotation: 0.0,
+        layer: 0,
+        orig_layer: 0,
+        is_locked: false,
+        pads: Vec::new(),
+        width: 5.0,
+        height: 5.0,
+        courtyards: vec![],
+        perimeters: vec![],
+        escape_margin: 0.0,
+        at_span: None,
+        fp_span: None,
+        pin_swap_groups: Vec::new(),
+        gate_swap_groups: Vec::new(),
+    };
+    let xs = [-1.2, -0.4, 0.4, 1.2];
+    let ys = [-1.2, -0.4, 0.4, 1.2];
+    let mut pad_num = 1;
+    for &y in &ys {
+        for &x in &xs {
+            let mut p = vulcans_trials::board::Pad::new(
+                &format!("P{}", pad_num), x, y, 0.40, 0.40, pad_num, &format!("NET{}", pad_num), false,
+            );
+            p.shape = "circle".to_string();
+            bga_fp.pads.push(p);
+            pad_num += 1;
+        }
+    }
+    if !bga_fp.is_bga() {
+        return Err("BGA package detection failed".to_string());
+    }
+    let mut test_board = Board::default();
+    test_board.netclasses.get_mut("Default").unwrap().clearance = 0.12;
+    test_board.footprints.push(bga_fp);
+    let mut test_grid = RoutingGrid::new(&test_board, 0.10, None);
+    vulcans_trials::router::generate_bga_dogbone_escapes(&mut test_board, &mut test_grid);
+    if test_board.vias.len() != 4 {
+        return Err(format!("Expected 4 dog-bone vias, found {}", test_board.vias.len()));
+    }
+    println!("[PASS] Automated BGA Escape Solver verified (4x4 0.8mm pitch quadrant dog-bone fanout)");
+
     println!("=== All Self-Tests Passed ===");
     Ok(())
 }

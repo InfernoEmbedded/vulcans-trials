@@ -2269,6 +2269,8 @@ impl AutoRouter {
         let mut connections = self.extract_connections(board);
         let total_conns = connections.len();
 
+        generate_bga_dogbone_escapes(board, grid);
+
         let escape_stubs = self.generate_escape_stubs(board);
         for stub in &escape_stubs {
             self.commit_stub_to_grid(grid, stub);
@@ -4620,6 +4622,10 @@ pub fn find_choked_pin_bottlenecks(
         prune_dangling_tracks_and_vias(board);
     }
 
+    pub fn generate_bga_dogbone_escapes(&self, board: &mut Board, grid: &mut RoutingGrid) {
+        generate_bga_dogbone_escapes(board, grid);
+    }
+
     pub fn generate_escape_stubs(&self, board: &Board) -> Vec<EscapeStub> {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         enum PadEdge {
@@ -4784,7 +4790,7 @@ pub fn find_choked_pin_bottlenecks(
                 continue;
             }
 
-            if !is_dense_escape_footprint(fp) {
+            if !is_dense_escape_footprint(fp) || fp.is_bga() {
                 continue;
             }
 
@@ -7321,6 +7327,252 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid) -> bool {
     false
 }
 
+/// Automated BGA Escape Solver:
+/// Analyzes regular 2D grid array BGA footprints, assigns pads to 4 quadrants (NE, NW, SE, SW),
+/// and generates deterministic fanouts:
+/// - Ring 0 (outer perimeter): direct surface escape tracks shooting outward without vias
+/// - Ring 1 & inner rings: diagonal 45° dog-bone escape stubs placed at interstitial cell centers
+///   connecting pad to dog-bone via and routing out through interstitial avenue corridors
+/// - Via-in-Pad (VIPPO) fallback: centered microvia (0.30mm dia, 0.15mm drill) for pitch < 0.50mm
+///   or where standard annular ring cannot clear adjacent pads.
+pub fn generate_bga_dogbone_escapes(board: &mut Board, grid: &mut RoutingGrid) {
+    let num_layers = board.copper_layers().len().max(2);
+
+    for fp_idx in 0..board.footprints.len() {
+        let fp = board.footprints[fp_idx].clone();
+        let Some(bga_info) = fp.bga_grid_info() else {
+            continue;
+        };
+
+        let pitch = bga_info.pitch_x.min(bga_info.pitch_y);
+        let (cx, cy) = (bga_info.center_x, bga_info.center_y);
+
+        // Distance from pad center to adjacent 4-pad interstitial cell center:
+        let inter_dist = (bga_info.pitch_x * 0.5).hypot(bga_info.pitch_y * 0.5);
+
+        // Standard dog-bone via parameters
+        let std_via_dia = 0.45;
+        let std_via_drill = 0.20;
+        let std_via_r = std_via_dia * 0.5;
+
+        // Microvia / VIPPO parameters
+        let vippo_via_dia = 0.30;
+        let vippo_via_drill = 0.15;
+
+        // Check if VIPPO fallback is required:
+        // Fallback condition: pitch < 0.50mm, OR standard dog-bone annular ring (0.45mm)
+        // cannot clear adjacent pads with netclass clearance.
+        let default_c = 0.12;
+        let max_pad_r = fp
+            .pads
+            .iter()
+            .filter(|p| !p.is_through_hole)
+            .map(|p| p.width.max(p.height) * 0.5)
+            .fold(0.20f64, f64::max);
+        let vippo_required = pitch < 0.50 || (inter_dist < std_via_r + max_pad_r + default_c);
+
+        let oy = |p: &Pad| if fp.layer != fp.orig_layer { -p.offset_y } else { p.offset_y };
+
+        for (pad_idx, pad) in fp.pads.iter().enumerate() {
+            if pad.is_through_hole {
+                continue;
+            }
+            if pad.net_name.starts_with("unconnected") {
+                continue;
+            }
+
+            let pad_net_id = if pad.net_id > 0 {
+                pad.net_id
+            } else if !pad.net_name.is_empty() {
+                board.net_name_to_id.get(&pad.net_name).copied().unwrap_or(0)
+            } else {
+                0
+            };
+
+            let (px_world, py_world) = fp.pad_absolute_position(pad);
+
+            // Avoid duplicate escapes if already present
+            let already_routed = board.tracks.iter().any(|t| {
+                (t.start.0 - px_world).hypot(t.start.1 - py_world) < 1e-4
+                    || (t.end.0 - px_world).hypot(t.end.1 - py_world) < 1e-4
+            }) || board.vias.iter().any(|v| {
+                (v.position.0 - px_world).hypot(v.position.1 - py_world) < 1e-4
+            });
+            if already_routed {
+                continue;
+            }
+
+            let lx = pad.offset_x;
+            let ly = oy(pad);
+            let dx = lx - cx;
+            let dy = ly - cy;
+
+            // Quadrant signs (+/- p/2 away from center)
+            let sign_x = if dx >= 0.0 { 1.0 } else { -1.0 };
+            let sign_y = if dy >= 0.0 { 1.0 } else { -1.0 };
+
+            let ring = bga_info.pad_rings[pad_idx];
+            let netclass = board.get_netclass_for_net(pad_net_id);
+            let trk_w = (netclass.track_width).min(0.20);
+            let stub_w = (netclass.track_width).min(0.15);
+
+            if ring == 0 {
+                // Ring 0 (outer perimeter): direct surface escape tracks shooting outward away from chip without vias
+                let (col, row) = bga_info.pad_grid_indices[pad_idx].unwrap_or((0, 0));
+                let outward_local = if col == 0 && row == 0 {
+                    (-1.0 / 2.0f64.sqrt(), -1.0 / 2.0f64.sqrt())
+                } else if col == bga_info.cols - 1 && row == 0 {
+                    (1.0 / 2.0f64.sqrt(), -1.0 / 2.0f64.sqrt())
+                } else if col == 0 && row == bga_info.rows - 1 {
+                    (-1.0 / 2.0f64.sqrt(), 1.0 / 2.0f64.sqrt())
+                } else if col == bga_info.cols - 1 && row == bga_info.rows - 1 {
+                    (1.0 / 2.0f64.sqrt(), 1.0 / 2.0f64.sqrt())
+                } else if col == 0 {
+                    (-1.0, 0.0)
+                } else if col == bga_info.cols - 1 {
+                    (1.0, 0.0)
+                } else if row == 0 {
+                    (0.0, -1.0)
+                } else if row == bga_info.rows - 1 {
+                    (0.0, 1.0)
+                } else {
+                    let len = dx.hypot(dy).max(1e-6);
+                    (dx / len, dy / len)
+                };
+
+                let world_dir = Point::new(outward_local.0, outward_local.1).rotate_ccw(fp.rotation);
+                let escape_len = (pitch * 1.5).max(1.0);
+                let tip = (px_world + world_dir.x * escape_len, py_world + world_dir.y * escape_len);
+
+                let trk = TrackSegment {
+                    start: (px_world, py_world),
+                    end: tip,
+                    width: trk_w,
+                    layer: fp.layer,
+                    net_id: pad_net_id,
+                    is_locked: false,
+                };
+                board.tracks.push(trk.clone());
+                grid.commit_track(&trk);
+            } else if vippo_required {
+                // Ring 1 & inner rings with VIPPO fallback:
+                // Centered via-in-pad microvia (0.30mm diameter, 0.15mm drill)
+                let via_pos = (px_world, py_world);
+                let target_layer = if num_layers <= 2 {
+                    1
+                } else if ring == 1 {
+                    1
+                } else {
+                    2 + (ring - 2) % (num_layers - 2)
+                };
+
+                let vippo_via = Via {
+                    position: via_pos,
+                    size: vippo_via_dia,
+                    drill: vippo_via_drill,
+                    net_id: pad_net_id,
+                    is_locked: false,
+                };
+                board.vias.push(vippo_via.clone());
+                grid.commit_via(&vippo_via);
+
+                // Escape track radiating out from microvia on target layer
+                let outward_local = (sign_x / 2.0f64.sqrt(), sign_y / 2.0f64.sqrt());
+                let world_dir = Point::new(outward_local.0, outward_local.1).rotate_ccw(fp.rotation);
+                let escape_len = (pitch * 2.0).max(1.0);
+                let tip = (px_world + world_dir.x * escape_len, py_world + world_dir.y * escape_len);
+
+                let chan_trk = TrackSegment {
+                    start: (px_world, py_world),
+                    end: tip,
+                    width: stub_w,
+                    layer: target_layer,
+                    net_id: pad_net_id,
+                    is_locked: false,
+                };
+                board.tracks.push(chan_trk.clone());
+                grid.commit_track(&chan_trk);
+            } else {
+                // Ring 1 & inner rings: standard 45° dog-bone escape stubs
+                // Dog-bone via placed at diagonal center of adjacent 4-pad interstitial cell (dx = +/- p/2, dy = +/- p/2)
+                let delta_x = sign_x * (bga_info.pitch_x * 0.5);
+                let delta_y = sign_y * (bga_info.pitch_y * 0.5);
+                let via_loc_x = lx + delta_x;
+                let via_loc_y = ly + delta_y;
+
+                let world_via_pt = Point::new(delta_x, delta_y).rotate_ccw(fp.rotation);
+                let world_via = (px_world + world_via_pt.x, py_world + world_via_pt.y);
+
+                // Stub track connecting pad center to dog-bone via
+                let stub_trk = TrackSegment {
+                    start: (px_world, py_world),
+                    end: world_via,
+                    width: stub_w,
+                    layer: fp.layer,
+                    net_id: pad_net_id,
+                    is_locked: false,
+                };
+
+                let target_layer = if num_layers <= 2 {
+                    1
+                } else if ring == 1 {
+                    1
+                } else {
+                    2 + (ring - 2) % (num_layers - 2)
+                };
+
+                let dogbone_via = Via {
+                    position: world_via,
+                    size: std_via_dia,
+                    drill: std_via_drill,
+                    net_id: pad_net_id,
+                    is_locked: false,
+                };
+
+                // Channel escape corridor: radiating out through interstitial avenue
+                let (target_local_x, target_local_y) = if dx.abs() >= dy.abs() {
+                    let end_x = if sign_x > 0.0 {
+                        bga_info.max_x + pitch * 1.5
+                    } else {
+                        bga_info.min_x - pitch * 1.5
+                    };
+                    (end_x, via_loc_y)
+                } else {
+                    let end_y = if sign_y > 0.0 {
+                        bga_info.max_y + pitch * 1.5
+                    } else {
+                        bga_info.min_y - pitch * 1.5
+                    };
+                    (via_loc_x, end_y)
+                };
+
+                let corridor_disp = Point::new(target_local_x - lx, target_local_y - ly).rotate_ccw(fp.rotation);
+                let world_corridor_end = (px_world + corridor_disp.x, py_world + corridor_disp.y);
+
+                let chan_trk = TrackSegment {
+                    start: world_via,
+                    end: world_corridor_end,
+                    width: stub_w,
+                    layer: target_layer,
+                    net_id: pad_net_id,
+                    is_locked: false,
+                };
+
+                board.tracks.push(stub_trk.clone());
+                grid.commit_track(&stub_trk);
+
+                board.vias.push(dogbone_via.clone());
+                grid.commit_via(&dogbone_via);
+
+                board.tracks.push(chan_trk.clone());
+                grid.commit_track(&chan_trk);
+            }
+        }
+    }
+
+    grid.update_distance_fields();
+}
+
 /// Identifies connections with a single via transitioning between layers,
 /// testing whether the alternate layer segment chain can be moved/projected onto
 /// the primary layer without DRC violations, eliminating the solitary via.
@@ -8018,14 +8270,21 @@ pub fn is_via_location_legal_ignoring(
     for fp in &board.footprints {
         for pad in &fp.pads {
             let d = dist_point_to_pad(pos, fp, pad);
+            let (px, py) = fp.pad_absolute_position(pad);
             if pad.net_id != net_id {
-                let pad_c = clearance.max(board.get_netclass_for_net(pad.net_id).clearance).max(0.12);
+                let min_c = if fp.is_bga() && fp.bga_pitch().map_or(false, |p| p.0 < 0.5 || p.1 < 0.5) {
+                    0.05
+                } else {
+                    0.12
+                };
+                let pad_c = clearance.max(board.get_netclass_for_net(pad.net_id).clearance).max(min_c);
                 if d < via_r + pad_c - 1e-4 {
                     return false;
                 }
             } else if !pad.is_through_hole {
-                // Same-net SMD pad: via must NEVER overlap pad copper
-                if d < via_r - 1e-4 {
+                // Same-net SMD pad: via must NEVER overlap pad copper, UNLESS it is a centered VIPPO microvia on a BGA pad
+                let is_vippo = fp.is_bga() && via_dia <= 0.35 && (pos.0 - px).hypot(pos.1 - py) < 1e-3;
+                if !is_vippo && d < via_r - 1e-4 {
                     return false;
                 }
             }
@@ -8033,9 +8292,10 @@ pub fn is_via_location_legal_ignoring(
     }
 
     // 4. Foreign tracks on all copper layers
+    let min_c = if clearance < 0.12 { clearance } else { 0.12 };
     for trk in &board.tracks {
         if trk.net_id != net_id {
-            let trk_c = clearance.max(board.get_netclass_for_net(trk.net_id).clearance).max(0.12);
+            let trk_c = clearance.max(board.get_netclass_for_net(trk.net_id).clearance).max(min_c);
             let d = dist_point_to_segment(pos, trk.start, trk.end);
             if d < via_r + trk.width * 0.5 + trk_c - 1e-4 {
                 return false;
@@ -8050,8 +8310,11 @@ pub fn is_via_location_legal_ignoring(
                 continue;
             }
         }
+        if (pos.0 - v.position.0).hypot(pos.1 - v.position.1) < 1e-4 {
+            continue; // self
+        }
         if v.net_id != net_id {
-            let v_c = clearance.max(board.get_netclass_for_net(v.net_id).clearance).max(0.12);
+            let v_c = clearance.max(board.get_netclass_for_net(v.net_id).clearance).max(min_c);
             let d = (pos.0 - v.position.0).hypot(pos.1 - v.position.1);
             if d < via_r + v.size * 0.5 + v_c - 1e-4 {
                 return false;
@@ -8060,7 +8323,7 @@ pub fn is_via_location_legal_ignoring(
     }
 
     // 6. Hole-to-hole drill clearance against all through-hole pads (including same net)
-    let via_drill = 0.30;
+    let via_drill = if via_dia <= 0.35 { 0.15 } else { 0.30 };
     for fp in &board.footprints {
         for pad in &fp.pads {
             if pad.is_through_hole {
@@ -8085,8 +8348,15 @@ pub fn is_via_location_legal_ignoring(
                 continue;
             }
         }
+        if (pos.0 - v.position.0).hypot(pos.1 - v.position.1) < 1e-4 {
+            continue; // self
+        }
         let d = (pos.0 - v.position.0).hypot(pos.1 - v.position.1);
-        let min_hole_dist = (via_drill * 0.5) + (v.drill * 0.5) + 0.25;
+        let min_hole_dist = if via_dia <= 0.35 && v.drill <= 0.18 {
+            (via_drill * 0.5) + (v.drill * 0.5) + 0.10
+        } else {
+            (via_drill * 0.5) + (v.drill * 0.5) + 0.25
+        };
         if d < min_hole_dist - 1e-4 {
             return false;
         }
@@ -12299,6 +12569,216 @@ mod tests {
 
         let added_second = router.add_return_path_ground_vias(&mut board, &grid);
         assert_eq!(added_second, 0, "Second pass must not add redundant GND vias");
+    }
+
+    #[test]
+    fn test_quadrant_dogbone_fanout_geometry() {
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 50.0;
+        board.max_y = 50.0;
+        board.netclasses.get_mut("Default").unwrap().clearance = 0.12;
+        for i in 0..=20 {
+            board.nets.push(format!("NET{}", i));
+        }
+
+        let mut fp = Footprint {
+            reference: "U_BGA".to_string(),
+            value: "BGA-16".to_string(),
+            x: 25.0,
+            y: 25.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: Vec::new(),
+            width: 5.0,
+            height: 5.0,
+            courtyards: vec![],
+            perimeters: vec![],
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
+        };
+
+        // 4x4 BGA grid with 0.8mm pitch:
+        // Columns: x = -1.2, -0.4, 0.4, 1.2
+        // Rows:    y = -1.2, -0.4, 0.4, 1.2
+        let xs = [-1.2, -0.4, 0.4, 1.2];
+        let ys = [-1.2, -0.4, 0.4, 1.2];
+        let mut pad_num = 1;
+        for &y in &ys {
+            for &x in &xs {
+                let mut p = Pad::new(&format!("P{}", pad_num), x, y, 0.40, 0.40, pad_num, &format!("NET{}", pad_num), false);
+                p.shape = "circle".to_string();
+                fp.pads.push(p);
+                pad_num += 1;
+            }
+        }
+        board.footprints.push(fp);
+
+        let mut grid = RoutingGrid::new(&board, 0.10, None);
+        generate_bga_dogbone_escapes(&mut board, &mut grid);
+
+        // Ring 1 pads: inner 4 pads:
+        // (1,1) -> row 1, col 1: pad 6 (index 5) at local (-0.4, -0.4), NW quadrant
+        // (2,1) -> row 1, col 2: pad 7 (index 6) at local (0.4, -0.4), NE quadrant
+        // (1,2) -> row 2, col 1: pad 10 (index 9) at local (-0.4, 0.4), SW quadrant
+        // (2,2) -> row 2, col 2: pad 11 (index 10) at local (0.4, 0.4), SE quadrant
+        assert_eq!(board.vias.len(), 4, "Expected exactly 4 dog-bone vias for Ring 1 pads of 4x4 BGA");
+
+        let bga_fp = &board.footprints[0];
+        let inner_indices = [5, 6, 9, 10];
+
+        for &pad_idx in &inner_indices {
+            let pad = &bga_fp.pads[pad_idx];
+            let (px, py) = bga_fp.pad_absolute_position(pad);
+
+            // Find matching via for this net
+            let via = board.vias.iter().find(|v| v.net_id == pad.net_id)
+                .expect("Each Ring 1 pad must have a dog-bone via");
+
+            let dx = via.position.0 - px;
+            let dy = via.position.1 - py;
+
+            // Verifies 45° dog-bone via placement in interstitial centers (|dx| == |dy| == p/2)
+            assert!((dx.abs() - 0.4).abs() < 1e-3, "Via dx must be +/- 0.4mm (p/2): dx={}", dx);
+            assert!((dy.abs() - 0.4).abs() < 1e-3, "Via dy must be +/- 0.4mm (p/2): dy={}", dy);
+            assert!((dx.abs() - dy.abs()).abs() < 1e-4, "Dog-bone via must be at 45 degrees (|dx| == |dy|)");
+
+            // Verify quadrant direction:
+            let lx = pad.offset_x;
+            let ly = pad.offset_y;
+            if lx > 0.0 {
+                assert!(dx > 0.0, "Positive local X pad must dog-bone in +X direction");
+            } else {
+                assert!(dx < 0.0, "Negative local X pad must dog-bone in -X direction");
+            }
+            if ly > 0.0 {
+                assert!(dy > 0.0, "Positive local Y pad must dog-bone in +Y direction");
+            } else {
+                assert!(dy < 0.0, "Negative local Y pad must dog-bone in -Y direction");
+            }
+
+            // Verify distance to pad center is sqrt(0.4^2 + 0.4^2) ~ 0.5657 mm
+            let dist_to_pad = dx.hypot(dy);
+            assert!((dist_to_pad - (0.4f64.hypot(0.4))).abs() < 1e-3, "Distance must be interstitial diagonal center");
+
+            // Verify clearance against all foreign pads in the BGA (no shorts!)
+            for foreign_pad in &bga_fp.pads {
+                if foreign_pad.net_id != pad.net_id {
+                    let (fx, fy) = bga_fp.pad_absolute_position(foreign_pad);
+                    let d = (via.position.0 - fx).hypot(via.position.1 - fy);
+                    let min_allowed = (via.size * 0.5) + (foreign_pad.width * 0.5) + 0.12;
+                    assert!(
+                        d >= min_allowed - 1e-4,
+                        "Dog-bone via for net {} at ({:.2}, {:.2}) must not short against foreign pad {} at ({:.2}, {:.2}): d={:.3}, min_allowed={:.3}",
+                        pad.net_id, via.position.0, via.position.1, foreign_pad.net_id, fx, fy, d, min_allowed
+                    );
+                }
+            }
+
+            // Verify is_via_location_legal returns true
+            assert!(
+                is_via_location_legal(&board, via.position, via.size, via.net_id, 0.12),
+                "Dog-bone via location must be strictly legal and clearance-free"
+            );
+        }
+
+        // Verify that Ring 0 pads generated escape tracks
+        for (i, pad) in bga_fp.pads.iter().enumerate() {
+            if bga_fp.bga_pad_ring_index(i) == 0 {
+                let (px, py) = bga_fp.pad_absolute_position(pad);
+                let has_trk = board.tracks.iter().any(|t| {
+                    (t.start.0 - px).hypot(t.start.1 - py) < 1e-4 && t.net_id == pad.net_id
+                });
+                assert!(has_trk, "Ring 0 pad {} must have an escape track", pad.number);
+            }
+        }
+    }
+
+    #[test]
+    fn test_fine_pitch_vippo_fallback() {
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 50.0;
+        board.max_y = 50.0;
+        board.netclasses.get_mut("Default").unwrap().clearance = 0.08;
+        for i in 0..=20 {
+            board.nets.push(format!("NET{}", i));
+        }
+
+        let mut fp = Footprint {
+            reference: "U_BGA_FINE".to_string(),
+            value: "BGA-16-0.4mm".to_string(),
+            x: 25.0,
+            y: 25.0,
+            rotation: 0.0,
+            layer: 0,
+            orig_layer: 0,
+            is_locked: false,
+            pads: Vec::new(),
+            width: 3.0,
+            height: 3.0,
+            courtyards: vec![],
+            perimeters: vec![],
+            escape_margin: 0.0,
+            at_span: None,
+            fp_span: None,
+            pin_swap_groups: Vec::new(),
+            gate_swap_groups: Vec::new(),
+        };
+
+        // 4x4 BGA grid with fine 0.4mm pitch (< 0.50mm):
+        // Columns: x = -0.6, -0.2, 0.2, 0.6
+        // Rows:    y = -0.6, -0.2, 0.2, 0.6
+        let xs = [-0.6, -0.2, 0.2, 0.6];
+        let ys = [-0.6, -0.2, 0.2, 0.6];
+        let mut pad_num = 1;
+        for &y in &ys {
+            for &x in &xs {
+                let mut p = Pad::new(&format!("P{}", pad_num), x, y, 0.22, 0.22, pad_num, &format!("NET{}", pad_num), false);
+                p.shape = "circle".to_string();
+                fp.pads.push(p);
+                pad_num += 1;
+            }
+        }
+        board.footprints.push(fp);
+
+        let mut grid = RoutingGrid::new(&board, 0.05, None);
+        generate_bga_dogbone_escapes(&mut board, &mut grid);
+
+        // For pitch < 0.5mm, VIPPO fallback places centered via-in-pad microvias (0.30mm dia, 0.15mm drill)
+        assert_eq!(board.vias.len(), 4, "Expected exactly 4 VIPPO microvias for Ring 1 pads of fine-pitch BGA");
+
+        let bga_fp = &board.footprints[0];
+        let inner_indices = [5, 6, 9, 10];
+
+        for &pad_idx in &inner_indices {
+            let pad = &bga_fp.pads[pad_idx];
+            let (px, py) = bga_fp.pad_absolute_position(pad);
+
+            let via = board.vias.iter().find(|v| v.net_id == pad.net_id)
+                .expect("Each Ring 1 fine-pitch pad must have a VIPPO microvia");
+
+            // Verify via is centered directly on pad (via-in-pad)
+            let dist_to_pad = (via.position.0 - px).hypot(via.position.1 - py);
+            assert!(dist_to_pad < 1e-4, "VIPPO microvia must be centered directly on pad: dist={}", dist_to_pad);
+
+            // Verify microvia dimensions
+            assert!((via.size - 0.30).abs() < 1e-4, "VIPPO microvia diameter must be 0.30mm: size={}", via.size);
+            assert!((via.drill - 0.15).abs() < 1e-4, "VIPPO microvia drill must be 0.15mm: drill={}", via.drill);
+
+            // Verify legality of via-in-pad microvia transition
+            assert!(
+                is_via_location_legal(&board, via.position, via.size, via.net_id, 0.08),
+                "VIPPO microvia transition must be legal"
+            );
+        }
     }
 }
 
