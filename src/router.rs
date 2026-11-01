@@ -194,16 +194,21 @@ impl RoutingGrid {
         let max_world_y = self.min_y + (self.height as f64) * self.res;
         if let Some(ref poly) = board.outline_polygon {
             let boundary = poly.aabb();
-            let edge_clearance = 0.50;
+            let edge_clearance = board.board_edge_clearance();
             for layer in 0..self.num_layers {
                 for gy in 0..self.height {
                     for gx in 0..self.width {
                         let (wx, wy) = self.grid_to_world(gx, gy);
-                        if wx < boundary.min_x + edge_clearance
-                            || wx > boundary.max_x - edge_clearance
-                            || wy < boundary.min_y + edge_clearance
-                            || wy > boundary.max_y - edge_clearance
-                        {
+                        let is_edge_keepout = if poly.vertices.len() == 4 {
+                            wx < boundary.min_x + edge_clearance
+                                || wx > boundary.max_x - edge_clearance
+                                || wy < boundary.min_y + edge_clearance
+                                || wy > boundary.max_y - edge_clearance
+                        } else {
+                            let p = Point::new(wx, wy);
+                            !poly.contains_point(&p) || poly.distance_to_point(&p) < edge_clearance
+                        };
+                        if is_edge_keepout {
                             let i = self.idx(gx, gy, layer);
                             self.obstacle_net_ids[i] = KEEPOUT_NET;
                         }
@@ -2804,6 +2809,9 @@ impl AutoRouter {
         self.connect_u1_ground_pins(board);
         self.add_ground_stitching_vias(board, grid);
 
+        // Phase 5: Automated DFM Teardrop Generation (pad & via junction strengthening)
+        add_teardrops(board);
+
         for trk in &mut board.tracks {
             let key = (trk.net_id, [trk.start.0.to_bits(), trk.start.1.to_bits(), trk.end.0.to_bits(), trk.end.1.to_bits()]);
             trk.is_locked = orig_locked_tracks.contains(&key);
@@ -5000,6 +5008,10 @@ pub fn find_choked_pin_bottlenecks(
         prune_dangling_tracks_and_vias(board);
     }
 
+    pub fn add_teardrops(&self, board: &mut Board) {
+        add_teardrops(board);
+    }
+
     pub fn validate_and_clean_copper(&self, board: &mut Board) {
         validate_and_clean_copper(board);
     }
@@ -5884,13 +5896,22 @@ pub fn is_segment_clear(
 
     if let Some(ref poly) = board.outline_polygon {
         let boundary = poly.aabb();
-        let edge_clr = 0.50;
+        let edge_clr = board.get_netclass_for_net(net_id).board_edge_clearance;
         if min_x < boundary.min_x + edge_clr
             || max_x > boundary.max_x - edge_clr
             || min_y < boundary.min_y + edge_clr
             || max_y > boundary.max_y - edge_clr
         {
             return false;
+        }
+        if poly.vertices.len() > 4 {
+            let p1_pt = Point::new(p1.0, p1.1);
+            let p2_pt = Point::new(p2.0, p2.1);
+            if !poly.contains_point(&p1_pt) || !poly.contains_point(&p2_pt)
+                || poly.distance_to_segment(p1, p2) < edge_clr + half_w - 1e-4
+            {
+                return false;
+            }
         }
     }
 
@@ -7533,8 +7554,25 @@ pub fn is_via_location_legal_ignoring(
 ) -> bool {
     let via_r = via_dia * 0.5;
 
-    // 1. Board boundary
-    if !board.contains_point_in_boundary(&Point::new(pos.0, pos.1)) {
+    // 1. Board boundary & edge cuts clearance
+    let edge_clr = board.get_netclass_for_net(net_id).board_edge_clearance;
+    let req_edge_dist = via_r + edge_clr;
+    if let Some(ref poly) = board.outline_polygon {
+        let b = poly.aabb();
+        if pos.0 < b.min_x + req_edge_dist
+            || pos.0 > b.max_x - req_edge_dist
+            || pos.1 < b.min_y + req_edge_dist
+            || pos.1 > b.max_y - req_edge_dist
+        {
+            return false;
+        }
+        if poly.vertices.len() > 4 {
+            let pt = Point::new(pos.0, pos.1);
+            if !poly.contains_point(&pt) || poly.distance_to_point(&pt) < req_edge_dist - 1e-4 {
+                return false;
+            }
+        }
+    } else if !board.contains_point_in_boundary(&Point::new(pos.0, pos.1)) {
         return false;
     }
 
@@ -7652,8 +7690,32 @@ pub fn is_track_segment_legal(
 ) -> bool {
     let half_w = width * 0.5;
 
-    // 1. Board boundary
-    if !board.contains_point_in_boundary(&Point::new(start.0, start.1))
+    // 1. Board boundary & edge cuts clearance
+    let edge_clr = board.get_netclass_for_net(net_id).board_edge_clearance;
+    let req_edge_dist = half_w + edge_clr;
+    if let Some(ref poly) = board.outline_polygon {
+        let b = poly.aabb();
+        let s_min_x = start.0.min(end.0);
+        let s_max_x = start.0.max(end.0);
+        let s_min_y = start.1.min(end.1);
+        let s_max_y = start.1.max(end.1);
+        if s_min_x < b.min_x + req_edge_dist
+            || s_max_x > b.max_x - req_edge_dist
+            || s_min_y < b.min_y + req_edge_dist
+            || s_max_y > b.max_y - req_edge_dist
+        {
+            return false;
+        }
+        if poly.vertices.len() > 4 {
+            let p1 = Point::new(start.0, start.1);
+            let p2 = Point::new(end.0, end.1);
+            if !poly.contains_point(&p1) || !poly.contains_point(&p2)
+                || poly.distance_to_segment(start, end) < req_edge_dist - 1e-4
+            {
+                return false;
+            }
+        }
+    } else if !board.contains_point_in_boundary(&Point::new(start.0, start.1))
         || !board.contains_point_in_boundary(&Point::new(end.0, end.1))
     {
         return false;
@@ -8052,6 +8114,289 @@ fn prune_orphan_components(board: &mut Board) {
     board.vias = new_vias;
 }
 
+/// Helper function to check if a candidate teardrop segment violates clearance against
+/// foreign pads, tracks, vias, keepouts, or board edge cuts.
+pub fn is_teardrop_segment_clear(board: &Board, seg: &TrackSegment) -> bool {
+    let half_w = seg.width * 0.5;
+    let net_clr = board.get_netclass_for_net(seg.net_id).clearance.max(0.12);
+
+    // 1. Board edge cuts clearance
+    if let Some(ref poly) = board.outline_polygon {
+        let edge_clr = board.get_netclass_for_net(seg.net_id).board_edge_clearance;
+        let req_edge_dist = half_w + edge_clr;
+        let b = poly.aabb();
+        let s_min_x = seg.start.0.min(seg.end.0);
+        let s_max_x = seg.start.0.max(seg.end.0);
+        let s_min_y = seg.start.1.min(seg.end.1);
+        let s_max_y = seg.start.1.max(seg.end.1);
+        if s_min_x < b.min_x + req_edge_dist
+            || s_max_x > b.max_x - req_edge_dist
+            || s_min_y < b.min_y + req_edge_dist
+            || s_max_y > b.max_y - req_edge_dist
+        {
+            return false;
+        }
+        if poly.vertices.len() > 4 {
+            let p1 = Point::new(seg.start.0, seg.start.1);
+            let p2 = Point::new(seg.end.0, seg.end.1);
+            if !poly.contains_point(&p1) || !poly.contains_point(&p2)
+                || poly.distance_to_segment(seg.start, seg.end) < req_edge_dist - 1e-4
+            {
+                return false;
+            }
+        }
+    } else if !board.contains_point_in_boundary(&Point::new(seg.start.0, seg.start.1))
+        || !board.contains_point_in_boundary(&Point::new(seg.end.0, seg.end.1))
+    {
+        return false;
+    }
+
+    // 2. Keepouts
+    for ko in &board.keepouts {
+        if ko.layers.contains(&seg.layer) {
+            let r = half_w + net_clr;
+            let s_min_x = seg.start.0.min(seg.end.0);
+            let s_max_x = seg.start.0.max(seg.end.0);
+            let s_min_y = seg.start.1.min(seg.end.1);
+            let s_max_y = seg.start.1.max(seg.end.1);
+            if s_max_x >= ko.min_x - r && s_min_x <= ko.max_x + r && s_max_y >= ko.min_y - r && s_min_y <= ko.max_y + r {
+                let corners = [
+                    (ko.min_x, ko.min_y),
+                    (ko.max_x, ko.min_y),
+                    (ko.max_x, ko.max_y),
+                    (ko.min_x, ko.max_y),
+                ];
+                for k in 0..4 {
+                    if dist_segment_to_segment(seg.start, seg.end, corners[k], corners[(k + 1) % 4]) < r - 1e-4 {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Foreign pads
+    for fp in &board.footprints {
+        for pad in &fp.pads {
+            if pad.net_id != seg.net_id && (pad.is_through_hole || fp.layer == seg.layer) {
+                let (_px, _py) = fp.pad_absolute_position(pad);
+                let pad_c = board.get_netclass_for_net(pad.net_id).clearance.max(0.12);
+                let req_c = net_clr.max(pad_c);
+                let min_dist = half_w + req_c;
+                let d = dist_segment_to_pad(seg.start, seg.end, fp, pad);
+                if d < min_dist - 1e-4 {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // 4. Foreign tracks on same layer
+    for trk in &board.tracks {
+        if trk.net_id != seg.net_id && trk.layer == seg.layer {
+            let trk_c = board.get_netclass_for_net(trk.net_id).clearance.max(0.12);
+            let req_c = net_clr.max(trk_c);
+            let min_dist = half_w + trk.width * 0.5 + req_c;
+            let d = dist_segment_to_segment(seg.start, seg.end, trk.start, trk.end);
+            if d < min_dist - 1e-4 {
+                return false;
+            }
+        }
+    }
+
+    // 5. Foreign vias
+    for v in &board.vias {
+        if v.net_id != seg.net_id {
+            let via_c = board.get_netclass_for_net(v.net_id).clearance.max(0.12);
+            let req_c = net_clr.max(via_c);
+            let min_dist = half_w + v.size * 0.5 + req_c;
+            let d = dist_point_to_segment(v.position, seg.start, seg.end);
+            if d < min_dist - 1e-4 {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+/// Automated DFM Teardrop Generator:
+/// For every track segment connected to a footprint pad or through-hole via of the same net,
+/// computes outward tangent flares bridging from the track edge to the perimeter of the pad/via.
+/// Validates that teardrop copper does not violate clearance rules against foreign copper,
+/// and adds clean teardrop flare segments to `board.tracks`.
+pub fn add_teardrops(board: &mut Board) {
+    if board.tracks.is_empty() {
+        return;
+    }
+
+    let initial_tracks = board.tracks.clone();
+    let mut new_teardrops: Vec<TrackSegment> = Vec::new();
+
+    for track in &initial_tracks {
+        let netclass = board.get_netclass_for_net(track.net_id);
+        if !netclass.teardrop_enabled {
+            continue;
+        }
+
+        let length_ratio = netclass.teardrop_length_ratio;
+        let width_ratio = netclass.teardrop_width_ratio;
+        let track_w = track.width;
+
+        // Examine both endpoints of the track segment for pad/via junctions
+        for (t_end, other_end) in [(track.start, track.end), (track.end, track.start)] {
+            let d_vec = (other_end.0 - t_end.0, other_end.1 - t_end.1);
+            let seg_len = d_vec.0.hypot(d_vec.1);
+            if seg_len < 0.05 {
+                continue;
+            }
+            let u = (d_vec.0 / seg_len, d_vec.1 / seg_len);
+            let n = (-u.1, u.0);
+
+            // 1. Check for connected footprint pad of matching net
+            let mut junction: Option<((f64, f64), f64, f64, bool)> = None; // (center, R_u, R_n, is_circle)
+
+            for fp in &board.footprints {
+                if !fp.pads.iter().any(|p| p.net_id == track.net_id && (p.is_through_hole || fp.layer == track.layer)) {
+                    continue;
+                }
+                for pad in &fp.pads {
+                    if pad.net_id != track.net_id || (!pad.is_through_hole && fp.layer != track.layer) {
+                        continue;
+                    }
+                    let (px, py) = fp.pad_absolute_position(pad);
+                    let dist_to_center = (t_end.0 - px).hypot(t_end.1 - py);
+                    let is_connected = dist_to_center <= 0.05
+                        || dist_point_to_pad(t_end, fp, pad) <= 0.05
+                        || (pad.shape == "circle" && dist_to_center <= pad.width.max(pad.height) * 0.5 + 0.05);
+
+                    if is_connected {
+                        if pad.shape == "circle" {
+                            let r = pad.width.max(pad.height) * 0.5;
+                            junction = Some(((px, py), r, r, true));
+                            break;
+                        } else {
+                            let flipped = fp.layer != fp.orig_layer;
+                            let pad_rot = if flipped { -pad.rotation } else { pad.rotation };
+                            let total_rot = ((fp.rotation + pad_rot) % 360.0 + 360.0) % 360.0;
+                            let rad = (-total_rot).to_radians();
+                            let cos_r = rad.cos();
+                            let sin_r = rad.sin();
+                            let u_loc = (u.0 * cos_r - u.1 * sin_r, u.0 * sin_r + u.1 * cos_r);
+                            let n_loc = (n.0 * cos_r - n.1 * sin_r, n.0 * sin_r + n.1 * cos_r);
+                            let hw = pad.width * 0.5;
+                            let hh = pad.height * 0.5;
+                            let tu_x = if u_loc.0.abs() > 1e-6 { hw / u_loc.0.abs() } else { f64::INFINITY };
+                            let tu_y = if u_loc.1.abs() > 1e-6 { hh / u_loc.1.abs() } else { f64::INFINITY };
+                            let r_u = tu_x.min(tu_y);
+                            let tn_x = if n_loc.0.abs() > 1e-6 { hw / n_loc.0.abs() } else { f64::INFINITY };
+                            let tn_y = if n_loc.1.abs() > 1e-6 { hh / n_loc.1.abs() } else { f64::INFINITY };
+                            let r_n = tn_x.min(tn_y);
+                            junction = Some(((px, py), r_u, r_n, false));
+                            break;
+                        }
+                    }
+                }
+                if junction.is_some() {
+                    break;
+                }
+            }
+
+            // 2. Check for connected through-hole via of matching net if no pad matched
+            if junction.is_none() {
+                for via in &board.vias {
+                    if via.net_id == track.net_id {
+                        let dist_to_center = (t_end.0 - via.position.0).hypot(t_end.1 - via.position.1);
+                        let r = via.size * 0.5;
+                        if dist_to_center <= 0.05 || dist_to_center <= r + 0.05 {
+                            junction = Some((via.position, r, r, true));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let Some((center, r_u, r_n, is_circle)) = junction else {
+                continue;
+            };
+
+            let teardrop_len = r_u * length_ratio;
+            let flare_half_w = r_n * width_ratio;
+
+            if flare_half_w <= track_w * 0.5 + 0.01 {
+                continue;
+            }
+
+            // Distance along u from pad/via center to the other end of this segment
+            let dist_to_other = (other_end.0 - center.0) * u.0 + (other_end.1 - center.1) * u.1;
+            if dist_to_other <= r_u + 0.05 {
+                continue;
+            }
+
+            let max_d = (r_u + 0.05).max(dist_to_other * 0.85).min(r_u + teardrop_len);
+            let a = (center.0 + max_d * u.0, center.1 + max_d * u.1);
+
+            let (b_left, b_right) = if is_circle {
+                let h = flare_half_w.min(r_n * 0.98);
+                let x_pad = (r_u * r_u - h * h).max(0.0).sqrt();
+                (
+                    (center.0 + x_pad * u.0 + h * n.0, center.1 + x_pad * u.1 + h * n.1),
+                    (center.0 + x_pad * u.0 - h * n.0, center.1 + x_pad * u.1 - h * n.1),
+                )
+            } else {
+                let h = flare_half_w.min(r_n * 0.95);
+                (
+                    (center.0 + r_u * u.0 + h * n.0, center.1 + r_u * u.1 + h * n.1),
+                    (center.0 + r_u * u.0 - h * n.0, center.1 + r_u * u.1 - h * n.1),
+                )
+            };
+
+            let cand_left = TrackSegment {
+                start: a,
+                end: b_left,
+                width: track_w,
+                layer: track.layer,
+                net_id: track.net_id,
+                is_locked: false,
+            };
+
+            let cand_right = TrackSegment {
+                start: a,
+                end: b_right,
+                width: track_w,
+                layer: track.layer,
+                net_id: track.net_id,
+                is_locked: false,
+            };
+
+            let exists = |cand: &TrackSegment, list: &[TrackSegment]| -> bool {
+                list.iter().any(|t| {
+                    t.net_id == cand.net_id
+                        && t.layer == cand.layer
+                        && (((t.start.0 - cand.start.0).hypot(t.start.1 - cand.start.1) < 1e-3
+                            && (t.end.0 - cand.end.0).hypot(t.end.1 - cand.end.1) < 1e-3)
+                            || ((t.start.0 - cand.end.0).hypot(t.start.1 - cand.end.1) < 1e-3
+                                && (t.end.0 - cand.start.0).hypot(t.end.1 - cand.start.1) < 1e-3))
+                })
+            };
+
+            if !exists(&cand_left, &board.tracks) && !exists(&cand_left, &new_teardrops) {
+                if is_teardrop_segment_clear(board, &cand_left) {
+                    new_teardrops.push(cand_left);
+                }
+            }
+
+            if !exists(&cand_right, &board.tracks) && !exists(&cand_right, &new_teardrops) {
+                if is_teardrop_segment_clear(board, &cand_right) {
+                    new_teardrops.push(cand_right);
+                }
+            }
+        }
+    }
+
+    board.tracks.extend(new_teardrops);
+}
+
 /// Comprehensive pre-export DRC validation: detects and eliminates any residual shorts
 /// or clearance violations between tracks, vias, and pads of different nets.
 pub fn validate_and_clean_copper(board: &mut Board) {
@@ -8105,6 +8450,35 @@ pub fn validate_and_clean_copper(board: &mut Board) {
             }
             let t1 = &board.tracks[i];
             let req_c1 = get_eff_clearance(t1.net_id, t1.start).min(get_eff_clearance(t1.net_id, t1.end));
+
+            // Copper-to-board-edge clearance check
+            if let Some(ref poly) = board.outline_polygon {
+                let edge_clr = board.get_netclass_for_net(t1.net_id).board_edge_clearance;
+                let req_dist = t1.width * 0.5 + edge_clr;
+                let b = poly.aabb();
+                let s_min_x = t1.start.0.min(t1.end.0);
+                let s_max_x = t1.start.0.max(t1.end.0);
+                let s_min_y = t1.start.1.min(t1.end.1);
+                let s_max_y = t1.start.1.max(t1.end.1);
+                if s_min_x < b.min_x + req_dist
+                    || s_max_x > b.max_x - req_dist
+                    || s_min_y < b.min_y + req_dist
+                    || s_max_y > b.max_y - req_dist
+                {
+                    bad_track_indices.insert(i);
+                    continue;
+                }
+                if poly.vertices.len() > 4 {
+                    let p1 = Point::new(t1.start.0, t1.start.1);
+                    let p2 = Point::new(t1.end.0, t1.end.1);
+                    if !poly.contains_point(&p1) || !poly.contains_point(&p2)
+                        || poly.distance_to_segment(t1.start, t1.end) < req_dist - 1e-4
+                    {
+                        bad_track_indices.insert(i);
+                        continue;
+                    }
+                }
+            }
 
             for j in 0..track_count {
                 if i == j {
@@ -8172,6 +8546,28 @@ pub fn validate_and_clean_copper(board: &mut Board) {
             }
             let v1 = &board.vias[i];
             let req_c1 = get_eff_clearance(v1.net_id, v1.position);
+
+            // Copper-to-board-edge clearance check
+            if let Some(ref poly) = board.outline_polygon {
+                let edge_clr = board.get_netclass_for_net(v1.net_id).board_edge_clearance;
+                let req_dist = v1.size * 0.5 + edge_clr;
+                let b = poly.aabb();
+                if v1.position.0 < b.min_x + req_dist
+                    || v1.position.0 > b.max_x - req_dist
+                    || v1.position.1 < b.min_y + req_dist
+                    || v1.position.1 > b.max_y - req_dist
+                {
+                    bad_via_indices.insert(i);
+                    continue;
+                }
+                if poly.vertices.len() > 4 {
+                    let pt = Point::new(v1.position.0, v1.position.1);
+                    if !poly.contains_point(&pt) || poly.distance_to_point(&pt) < req_dist - 1e-4 {
+                        bad_via_indices.insert(i);
+                        continue;
+                    }
+                }
+            }
 
             for fp in &board.footprints {
                 for pad in &fp.pads {
@@ -8330,6 +8726,7 @@ mod tests {
                 diff_pair_gap: 0.20,
                 diff_pair_width: 0.20,
                 topology: NetTopology::default(),
+                ..NetClass::default()
             },
         );
         let mut net_to_class = HashMap::new();
@@ -8715,6 +9112,7 @@ mod tests {
                 diff_pair_gap: 0.20,
                 diff_pair_width: 0.20,
                 topology: NetTopology::default(),
+                ..NetClass::default()
             },
         );
         board.net_to_class.insert("USB_DP".to_string(), "USB_Diff".to_string());
@@ -8815,6 +9213,7 @@ mod tests {
                 diff_pair_gap: 0.20,
                 diff_pair_width: 0.20,
                 topology: NetTopology::default(),
+                ..NetClass::default()
             },
         );
         board.net_to_class.insert("USB_DP".to_string(), "USB_Diff".to_string());
@@ -9031,6 +9430,7 @@ mod tests {
             diff_pair_gap: 0.20,
             diff_pair_width: 0.20,
             topology: NetTopology::default(),
+            ..NetClass::default()
         });
         netclasses.insert("Default".to_string(), NetClass::default());
         let mut net_to_class = HashMap::new();
@@ -9139,6 +9539,7 @@ mod tests {
             diff_pair_gap: 0.20,
             diff_pair_width: 0.20,
             topology: NetTopology::default(),
+            ..NetClass::default()
         });
         let mut net_to_class = HashMap::new();
         net_to_class.insert("".to_string(), "Default".to_string());
@@ -10834,6 +11235,282 @@ mod tests {
                 p2
             );
         }
+    }
+
+    #[test]
+    fn test_teardrop_generation_tangent_to_pad_and_via() {
+        let mut board = Board::default();
+        board.nets = vec!["".to_string(), "NET1".to_string(), "NET2".to_string(), "NET3".to_string()];
+        board.net_name_to_id.insert("NET1".to_string(), 1);
+        board.net_name_to_id.insert("NET2".to_string(), 2);
+        board.net_name_to_id.insert("NET3".to_string(), 3);
+
+        // Circular pad at (10.0, 10.0), net 1, radius 0.40 (dia 0.80)
+        let circ_pad = Pad {
+            number: "1".to_string(),
+            shape: "circle".to_string(),
+            offset_x: 0.0,
+            offset_y: 0.0,
+            width: 0.80,
+            height: 0.80,
+            rotation: 0.0,
+            drill: None,
+            net_id: 1,
+            net_name: "NET1".to_string(),
+            is_through_hole: false,
+        };
+        let fp_circ = make_fp("U1", 10.0, 10.0, false, vec![circ_pad]);
+
+        // Rectangular pad at (30.0, 30.0), net 2, width 0.80, height 1.60
+        let rect_pad = Pad {
+            number: "1".to_string(),
+            shape: "rect".to_string(),
+            offset_x: 0.0,
+            offset_y: 0.0,
+            width: 0.80,
+            height: 1.60,
+            rotation: 0.0,
+            drill: None,
+            net_id: 2,
+            net_name: "NET2".to_string(),
+            is_through_hole: false,
+        };
+        let fp_rect = make_fp("U2", 30.0, 30.0, false, vec![rect_pad]);
+
+        board.footprints = vec![fp_circ, fp_rect];
+
+        // Through-hole via at (50.0, 50.0), net 3, size 0.60
+        board.vias = vec![Via {
+            position: (50.0, 50.0),
+            size: 0.60,
+            drill: 0.30,
+            net_id: 3,
+            is_locked: false,
+        }];
+
+        // Tracks meeting pads and via
+        // Track 1 (net 1): from circular pad center (10.0, 10.0) heading East to (20.0, 10.0)
+        let t1 = TrackSegment {
+            start: (10.0, 10.0),
+            end: (20.0, 10.0),
+            width: 0.20,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        };
+        // Track 2 (net 2): from rectangular pad center (30.0, 30.0) heading North to (30.0, 40.0)
+        let t2 = TrackSegment {
+            start: (30.0, 30.0),
+            end: (30.0, 40.0),
+            width: 0.25,
+            layer: 0,
+            net_id: 2,
+            is_locked: false,
+        };
+        // Track 3 (net 3): from via position (50.0, 50.0) heading East to (60.0, 50.0)
+        let t3 = TrackSegment {
+            start: (50.0, 50.0),
+            end: (60.0, 50.0),
+            width: 0.20,
+            layer: 0,
+            net_id: 3,
+            is_locked: false,
+        };
+
+        board.tracks = vec![t1, t2, t3];
+
+        add_teardrops(&mut board);
+
+        // Expect 2 teardrop flares for each junction: 3 original + 6 flares = 9 tracks
+        assert_eq!(board.tracks.len(), 9, "Each junction must generate 2 smooth flared teardrop tracks");
+
+        // Verify circular pad teardrops
+        let t1_teardrops: Vec<&TrackSegment> = board.tracks[3..]
+            .iter()
+            .filter(|t| t.net_id == 1)
+            .collect();
+        assert_eq!(t1_teardrops.len(), 2);
+        let flare_w1 = (t1_teardrops[0].end.1 - t1_teardrops[1].end.1).abs();
+        assert!(flare_w1 > 0.20, "Circular pad flare width must be wider than track width (0.20)");
+        for td in &t1_teardrops {
+            let dist_to_center = (td.end.0 - 10.0).hypot(td.end.1 - 10.0);
+            assert!((dist_to_center - 0.40).abs() < 1e-2, "Flare end must be on perimeter of circular pad (r=0.40)");
+        }
+
+        // Verify rectangular pad teardrops
+        let t2_teardrops: Vec<&TrackSegment> = board.tracks[3..]
+            .iter()
+            .filter(|t| t.net_id == 2)
+            .collect();
+        assert_eq!(t2_teardrops.len(), 2);
+        let flare_w2 = (t2_teardrops[0].end.0 - t2_teardrops[1].end.0).abs();
+        assert!(flare_w2 > 0.25, "Rectangular pad flare width must be wider than track width (0.25)");
+        for td in &t2_teardrops {
+            assert!((td.end.1 - 30.80).abs() < 1e-2, "Flare end must be on North perimeter of rectangular pad (y=30.80)");
+        }
+
+        // Verify through-hole via teardrops
+        let t3_teardrops: Vec<&TrackSegment> = board.tracks[3..]
+            .iter()
+            .filter(|t| t.net_id == 3)
+            .collect();
+        assert_eq!(t3_teardrops.len(), 2);
+        let flare_w3 = (t3_teardrops[0].end.1 - t3_teardrops[1].end.1).abs();
+        assert!(flare_w3 > 0.20, "Via flare width must be wider than track width (0.20)");
+        for td in &t3_teardrops {
+            let dist_to_via = (td.end.0 - 50.0).hypot(td.end.1 - 50.0);
+            assert!((dist_to_via - 0.30).abs() < 1e-2, "Flare end must be on perimeter of via (r=0.30)");
+        }
+    }
+
+    #[test]
+    fn test_teardrop_suppressed_on_clearance_conflict() {
+        let mut board = Board::default();
+        board.nets = vec!["".to_string(), "NET1".to_string(), "NET2".to_string()];
+        board.net_name_to_id.insert("NET1".to_string(), 1);
+        board.net_name_to_id.insert("NET2".to_string(), 2);
+
+        // Circular pad at (10.0, 10.0), net 1, radius 0.40
+        let target_pad = Pad {
+            number: "1".to_string(),
+            shape: "circle".to_string(),
+            offset_x: 0.0,
+            offset_y: 0.0,
+            width: 0.80,
+            height: 0.80,
+            rotation: 0.0,
+            drill: None,
+            net_id: 1,
+            net_name: "NET1".to_string(),
+            is_through_hole: false,
+        };
+        let fp_target = make_fp("U1", 10.0, 10.0, false, vec![target_pad]);
+
+        // Foreign pads of net 2 immediately flanking the pad-track junction within clearance
+        let foreign_pad_left = Pad {
+            number: "1".to_string(),
+            shape: "circle".to_string(),
+            offset_x: 0.0,
+            offset_y: 0.0,
+            width: 0.40,
+            height: 0.40,
+            rotation: 0.0,
+            drill: None,
+            net_id: 2,
+            net_name: "NET2".to_string(),
+            is_through_hole: false,
+        };
+        let fp_foreign_left = make_fp("R1", 10.24, 10.45, false, vec![foreign_pad_left]);
+
+        let foreign_pad_right = Pad {
+            number: "1".to_string(),
+            shape: "circle".to_string(),
+            offset_x: 0.0,
+            offset_y: 0.0,
+            width: 0.40,
+            height: 0.40,
+            rotation: 0.0,
+            drill: None,
+            net_id: 2,
+            net_name: "NET2".to_string(),
+            is_through_hole: false,
+        };
+        let fp_foreign_right = make_fp("R2", 10.24, 9.55, false, vec![foreign_pad_right]);
+
+        board.footprints = vec![fp_target, fp_foreign_left, fp_foreign_right];
+
+        // Track of net 1
+        board.tracks = vec![TrackSegment {
+            start: (10.0, 10.0),
+            end: (20.0, 10.0),
+            width: 0.20,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        }];
+
+        add_teardrops(&mut board);
+
+        // Teardrops must be suppressed because both flanking flares conflict with foreign pads
+        assert_eq!(board.tracks.len(), 1, "Teardrops must be suppressed when conflicting with adjacent foreign copper");
+    }
+
+    #[test]
+    fn test_copper_to_edge_cuts_clearance_enforced() {
+        let mut board = Board::default();
+        board.outline_polygon = Some(Polygon::from_rect(0.0, 0.0, 50.0, 50.0));
+        board.netclasses.insert("Default".to_string(), NetClass {
+            board_edge_clearance: 0.35,
+            ..NetClass::default()
+        });
+        board.nets = vec!["".to_string(), "NET1".to_string()];
+        board.net_name_to_id.insert("NET1".to_string(), 1);
+
+        // Track 1: distance to x=0 edge is 0.20 - 0.10 = 0.10 mm < 0.35 mm (ILLEGAL)
+        let trk_illegal = TrackSegment {
+            start: (0.20, 10.0),
+            end: (10.0, 10.0),
+            width: 0.20,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        };
+
+        // Track 2: distance to x=0 edge is 1.00 - 0.10 = 0.90 mm >= 0.35 mm (LEGAL)
+        let trk_legal = TrackSegment {
+            start: (1.00, 20.0),
+            end: (10.0, 20.0),
+            width: 0.20,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        };
+
+        // Via 1: distance to x=0 edge is 0.40 - 0.30 = 0.10 mm < 0.35 mm (ILLEGAL)
+        let via_illegal = Via {
+            position: (0.40, 30.0),
+            size: 0.60,
+            drill: 0.30,
+            net_id: 1,
+            is_locked: false,
+        };
+
+        // Via 2: distance to x=0 edge is 1.00 - 0.30 = 0.70 mm >= 0.35 mm (LEGAL)
+        let via_legal = Via {
+            position: (1.00, 35.0),
+            size: 0.60,
+            drill: 0.30,
+            net_id: 1,
+            is_locked: false,
+        };
+
+        // 1. Verify routing geometry checkers reject near-edge copper
+        assert!(!is_track_segment_legal(&board, (0.20, 10.0), (10.0, 10.0), 0.20, 0, 1, 0.20));
+        assert!(is_track_segment_legal(&board, (1.00, 20.0), (10.0, 20.0), 0.20, 0, 1, 0.20));
+        assert!(!is_via_location_legal(&board, (0.40, 30.0), 0.60, 1, 0.20));
+        assert!(is_via_location_legal(&board, (1.00, 35.0), 0.60, 1, 0.20));
+
+        board.tracks = vec![trk_illegal, trk_legal];
+        board.vias = vec![via_illegal, via_legal];
+
+        // 2. Verify validate_and_clean_copper eliminates illegal copper
+        validate_and_clean_copper(&mut board);
+
+        assert_eq!(board.tracks.len(), 1, "Illegal track violating 0.35mm edge clearance must be eliminated");
+        assert_eq!(board.tracks[0].start.0, 1.00);
+
+        assert_eq!(board.vias.len(), 1, "Illegal via violating 0.35mm edge clearance must be eliminated");
+        assert_eq!(board.vias[0].position.0, 1.00);
+
+        // 3. Verify routing grid rasterization expands edge keepout by 0.35 mm
+        let mut grid = RoutingGrid::new(&board, 0.5, None);
+        grid.rasterize_obstacles(&board);
+        // (0.25, 25.0) is 0.25 mm from left boundary (x=0) < 0.35 mm -> must be keepout
+        let Some((gx, gy)) = grid.world_to_grid(0.25, 25.0) else {
+            panic!("(0.25, 25.0) must map into grid");
+        };
+        let obs = grid.obstacle_net_ids[grid.idx(gx, gy, 0)];
+        assert_eq!(obs, KEEPOUT_NET, "Grid cell at 0.25mm from edge must be marked as keepout");
     }
 }
 
