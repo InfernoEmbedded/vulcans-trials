@@ -5094,9 +5094,9 @@ pub fn find_choked_pin_bottlenecks(
         }
     }
 
-    fn add_ground_stitching_vias(&self, board: &mut Board, grid: &RoutingGrid) {
+    pub fn add_ground_stitching_vias(&self, board: &mut Board, grid: &RoutingGrid) -> usize {
         let Some(gnd_net_id) = board.nets.iter().position(|n| n == "GND") else {
-            return;
+            return 0;
         };
 
         let mut added_via_positions: Vec<(f64, f64)> = Vec::new();
@@ -5185,6 +5185,7 @@ pub fn find_choked_pin_bottlenecks(
                 }
             }
         }
+        added_via_positions.len()
     }
 
     fn find_safe_gnd_via_location(
