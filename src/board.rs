@@ -7,9 +7,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_LOCKED_REFS: &[&str] = &[
-    "J1", "J2", "D1", "F1", "F2", "R1", "R2", "C3", "C4",
-    "D4", "D5", "R18", "R19", "SW1", "SW2", "U4",
-    "H1", "H2", "H3", "H4",
+    "J1", "J2", "H1", "H2", "H3", "H4",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -4865,6 +4863,51 @@ mod tests {
         assert_eq!(live.ratsnest.len(), 1);
 
         let _ = fs::remove_file(pcb_path);
+    }
+
+    #[test]
+    fn test_footprint_unlocked_diodes_fuses_and_default_locking() {
+        let content = r#"(kicad_pcb (version 20240108)
+          (net 0 "") (net 1 "GND") (net 2 "P1") (net 3 "P2")
+          (footprint "D" (at 10.0 10.0) (property "Reference" "D1")
+            (pad "1" smd rect (at 0 0) (size 1.0 1.0) (net 2 "P1")))
+          (footprint "F" (at 20.0 10.0) (property "Reference" "F1")
+            (pad "1" smd rect (at 0 0) (size 1.0 1.0) (net 2 "P1")))
+          (footprint "F" (at 20.0 15.0) (property "Reference" "F2")
+            (pad "1" smd rect (at 0 0) (size 1.0 1.0) (net 3 "P2")))
+          (footprint "R" (at 30.0 10.0) (property "Reference" "R1")
+            (pad "1" smd rect (at 0 0) (size 1.0 1.0) (net 2 "P1")))
+          (footprint "C" (at 30.0 15.0) (property "Reference" "C3")
+            (pad "1" smd rect (at 0 0) (size 1.0 1.0) (net 2 "P1")))
+          (footprint "J" (at 5.0 10.0) (property "Reference" "J1")
+            (pad "1" smd rect (at 0 0) (size 1.0 1.0) (net 2 "P1")))
+          (footprint "U" (at 50.0 50.0) (property "Reference" "U1") (locked yes)
+            (pad "1" smd rect (at 0 0) (size 1.0 1.0) (net 2 "P1")))
+          (footprint "U" (at 60.0 50.0) (property "Reference" "U2")
+            (pad "1" smd rect (at 0 0) (size 1.0 1.0) (net 2 "P1")))
+        )"#;
+
+        let mut extra_locked = HashSet::new();
+        extra_locked.insert("U2".to_string());
+
+        let board = Board::from_content_with_path(content, "test.kicad_pcb", &extra_locked).unwrap();
+        let get_fp = |ref_name: &str| board.footprints.iter().find(|fp| fp.reference == ref_name).unwrap();
+
+        // Diodes, fuses, resistors, caps without (locked yes) must NOT be locked
+        assert!(!get_fp("D1").is_locked, "D1 without (locked yes) must be unlocked");
+        assert!(!get_fp("F1").is_locked, "F1 without (locked yes) must be unlocked");
+        assert!(!get_fp("F2").is_locked, "F2 without (locked yes) must be unlocked");
+        assert!(!get_fp("R1").is_locked, "R1 without (locked yes) must be unlocked");
+        assert!(!get_fp("C3").is_locked, "C3 without (locked yes) must be unlocked");
+
+        // Edge connector J1 is in DEFAULT_LOCKED_REFS
+        assert!(get_fp("J1").is_locked, "J1 in DEFAULT_LOCKED_REFS must be locked by default");
+
+        // U1 has explicit (locked yes) in PCB file
+        assert!(get_fp("U1").is_locked, "U1 with (locked yes) must be locked");
+
+        // U2 is in extra_locked
+        assert!(get_fp("U2").is_locked, "U2 in extra_locked must be locked");
     }
 
     #[test]
