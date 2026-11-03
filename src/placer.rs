@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
-use crate::board::{Board, LiveTrialState, Point, Polygon, TrialPhase, AABB};
+use crate::board::{Board, LiveTrialState, Point, Polygon, Segment, TrialPhase, AABB};
 use crate::ipc::KiCadIpcClient;
 use crate::vulkan::{GpuSaParams, VulkanEngine};
 use rand::prelude::*;
@@ -20,6 +20,8 @@ pub struct PlacementConfig {
     pub grid_step_mm: f64,
     pub min_spacing_mm: f64,
     pub crossing_weight: f64,
+    pub corridor_congestion_weight: f64,
+    pub flow_alignment_weight: f64,
     pub wirelength_weight: f64,
     pub overlap_penalty: f64,
     pub boundary_penalty: f64,
@@ -45,6 +47,8 @@ impl Default for PlacementConfig {
             grid_step_mm: 0.635,
             min_spacing_mm: 0.25,
             crossing_weight: 25.0,
+            corridor_congestion_weight: 20.0,
+            flow_alignment_weight: 15.0,
             wirelength_weight: 1.0,
             overlap_penalty: 2500.0,
             boundary_penalty: 50000.0,
@@ -86,6 +90,8 @@ pub struct PlacementState {
     pub cached_pads: Vec<Vec<Point>>,
     pub cost: f64,
     pub crossings: usize,
+    pub corridor_congestion: f64,
+    pub flow_alignment_penalty: f64,
     pub wirelength: f64,
     pub overlaps: usize,
     pub boundary_violations: usize,
@@ -331,6 +337,201 @@ pub fn build_passive_ties(board: &Board) -> Vec<PassiveTie> {
     ties
 }
 
+/// Computes the minimum Euclidean distance between two convex polygons.
+/// Returns 0.0 if the polygons intersect or either is empty.
+pub fn polygon_clearance_gap(p1: &Polygon, p2: &Polygon) -> f64 {
+    if p1.vertices.is_empty() || p2.vertices.is_empty() {
+        return 0.0;
+    }
+    if p1.intersects_convex(p2) {
+        return 0.0;
+    }
+    let mut min_d = f64::INFINITY;
+    let n1 = p1.vertices.len();
+    let n2 = p2.vertices.len();
+    for v in &p1.vertices {
+        for j in 0..n2 {
+            let d = v.distance_to_segment(&p2.vertices[j], &p2.vertices[(j + 1) % n2]);
+            if d < min_d {
+                min_d = d;
+            }
+        }
+    }
+    for v in &p2.vertices {
+        for i in 0..n1 {
+            let d = v.distance_to_segment(&p1.vertices[i], &p1.vertices[(i + 1) % n1]);
+            if d < min_d {
+                min_d = d;
+            }
+        }
+    }
+    if min_d.is_infinite() {
+        0.0
+    } else {
+        min_d
+    }
+}
+
+/// Computes the physical clearance aperture W between two collections of courtyard polygons.
+/// Returns 0.0 if they intersect or either is empty.
+pub fn courtyards_clearance_gap(polys_a: &[Polygon], polys_b: &[Polygon]) -> f64 {
+    if polys_a.is_empty() || polys_b.is_empty() {
+        return 0.0;
+    }
+    let mut min_gap = f64::INFINITY;
+    for pa in polys_a {
+        for pb in polys_b {
+            let d = polygon_clearance_gap(pa, pb);
+            if d < min_gap {
+                min_gap = d;
+                if min_gap <= 1e-6 {
+                    return 0.0;
+                }
+            }
+        }
+    }
+    if min_gap.is_infinite() {
+        0.0
+    } else {
+        min_gap
+    }
+}
+
+/// Computes multi-layer routing corridor capacity:
+/// Capacity = N_layers * max(0, floor((W - C_min) / (W_track + C_min)))
+pub fn compute_corridor_capacity(
+    gap_w: f64,
+    track_width: f64,
+    min_clearance: f64,
+    num_layers: usize,
+) -> usize {
+    if gap_w < min_clearance || (track_width + min_clearance) <= 1e-6 {
+        return 0;
+    }
+    let pitch = track_width + min_clearance;
+    let tracks_per_layer = ((gap_w - min_clearance) / pitch).floor().max(0.0) as usize;
+    num_layers.saturating_mul(tracks_per_layer)
+}
+
+/// Represents a multi-pin bus connection between two components.
+#[derive(Debug, Clone)]
+pub struct ComponentBusLink {
+    pub comp_a: usize,
+    pub comp_b: usize,
+    pub shared_pads: Vec<(usize, usize)>,
+}
+
+/// Discovers shared nets and multi-pin bus links across all components on the board.
+pub fn build_board_topological_connectivity(
+    board: &Board,
+) -> (HashMap<(usize, usize), Vec<usize>>, Vec<ComponentBusLink>) {
+    let mut net_pads: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    for (fp_idx, fp) in board.footprints.iter().enumerate() {
+        for (pad_idx, pad) in fp.pads.iter().enumerate() {
+            if pad.net_id == 0 || pad.net_name.is_empty() || is_ground_net(&pad.net_name) {
+                continue;
+            }
+            net_pads.entry(pad.net_id).or_default().push((fp_idx, pad_idx));
+        }
+    }
+
+    let mut pair_shared_nets: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    let mut pair_shared_pads: HashMap<(usize, usize), Vec<(usize, usize)>> = HashMap::new();
+
+    for (&net_id, pads) in &net_pads {
+        for i in 0..pads.len() {
+            for j in (i + 1)..pads.len() {
+                let (fp_a, pad_a) = pads[i];
+                let (fp_b, pad_b) = pads[j];
+                if fp_a != fp_b {
+                    let key = if fp_a < fp_b { (fp_a, fp_b) } else { (fp_b, fp_a) };
+                    let pad_pair = if fp_a < fp_b { (pad_a, pad_b) } else { (pad_b, pad_a) };
+                    let nets = pair_shared_nets.entry(key).or_default();
+                    if !nets.contains(&net_id) {
+                        nets.push(net_id);
+                    }
+                    pair_shared_pads.entry(key).or_default().push(pad_pair);
+                }
+            }
+        }
+    }
+
+    let mut bus_links = Vec::new();
+    for ((comp_a, comp_b), shared_pads) in pair_shared_pads {
+        if shared_pads.len() >= 2 {
+            bus_links.push(ComponentBusLink {
+                comp_a,
+                comp_b,
+                shared_pads,
+            });
+        }
+    }
+
+    (pair_shared_nets, bus_links)
+}
+
+/// Evaluates topological signal flow and pin ribbon untangling between two connected components.
+/// Penalizes lateral pad order inversions, direct wire segment crossings, and angular skew.
+pub fn compute_flow_alignment_penalty_for_link(
+    pads_a: &[Point],
+    pads_b: &[Point],
+    pos_a: Point,
+    pos_b: Point,
+) -> f64 {
+    let m = pads_a.len().min(pads_b.len());
+    if m < 2 {
+        return 0.0;
+    }
+    let dx = pos_b.x - pos_a.x;
+    let dy = pos_b.y - pos_a.y;
+    let dist = dx.hypot(dy);
+    let (ux, uy) = if dist > 1e-4 {
+        (dx / dist, dy / dist)
+    } else {
+        (1.0, 0.0)
+    };
+    let (vx, vy) = (-uy, ux);
+
+    let mut penalty = 0.0;
+    for j in 0..m {
+        for k in (j + 1)..m {
+            let s_aj = (pads_a[j].x - pos_a.x) * vx + (pads_a[j].y - pos_a.y) * vy;
+            let s_ak = (pads_a[k].x - pos_a.x) * vx + (pads_a[k].y - pos_a.y) * vy;
+            let s_bj = (pads_b[j].x - pos_b.x) * vx + (pads_b[j].y - pos_b.y) * vy;
+            let s_bk = (pads_b[k].x - pos_b.x) * vx + (pads_b[k].y - pos_b.y) * vy;
+
+            let d_sa = s_aj - s_ak;
+            let d_sb = s_bj - s_bk;
+
+            // 1. Lateral order inversion (topological ribbon twisting)
+            if d_sa.abs() > 1e-4 && d_sb.abs() > 1e-4 && d_sa * d_sb < 0.0 {
+                penalty += 1.0;
+            }
+
+            // 2. Direct segment crossing
+            let seg_j = Segment { p1: pads_a[j], p2: pads_b[j], net_id: 1 };
+            let seg_k = Segment { p1: pads_a[k], p2: pads_b[k], net_id: 2 };
+            if seg_j.crosses(&seg_k) {
+                penalty += 1.5;
+            }
+
+            // 3. Angular divergence / parallel skew
+            let wjx = pads_b[j].x - pads_a[j].x;
+            let wjy = pads_b[j].y - pads_a[j].y;
+            let wkx = pads_b[k].x - pads_a[k].x;
+            let wky = pads_b[k].y - pads_a[k].y;
+            let len_j = wjx.hypot(wjy);
+            let len_k = wkx.hypot(wky);
+            if len_j > 1e-4 && len_k > 1e-4 {
+                let dot = (wjx * wkx + wjy * wky) / (len_j * len_k);
+                let angle_skew = (1.0 - dot).clamp(0.0, 2.0);
+                penalty += 0.5 * angle_skew;
+            }
+        }
+    }
+    penalty
+}
+
 impl PlacementState {
     pub fn from_board(board: &Board, config: &PlacementConfig) -> Self {
         let n = board.footprints.len();
@@ -367,6 +568,8 @@ impl PlacementState {
             cached_pads,
             cost: 0.0,
             crossings: 0,
+            corridor_congestion: 0.0,
+            flow_alignment_penalty: 0.0,
             wirelength: 0.0,
             overlaps: 0,
             boundary_violations: 0,
@@ -390,7 +593,11 @@ impl PlacementState {
         }
     }
 
-    fn evaluate(&mut self, board: &Board, config: &PlacementConfig, ties: &[PassiveTie]) {
+    pub fn evaluate(&mut self, board: &Board, config: &PlacementConfig, ties: &[PassiveTie]) {
+        self.evaluate_cost(board, config, ties);
+    }
+
+    pub fn evaluate_cost(&mut self, board: &Board, config: &PlacementConfig, ties: &[PassiveTie]) {
         let segments = board.generate_ratsnest_segments(&self.cached_pads);
         let wirelength: f64 = segments.iter().map(|s| s.length()).sum();
         let mut crossings = 0usize;
@@ -570,12 +777,106 @@ impl PlacementState {
             }
         }
 
+        // Topological Corridor Capacity & Cut Congestion Model
+        let mut corridor_overflow_total = 0.0;
+        let mut flow_alignment_penalty_total = 0.0;
+
+        if config.corridor_congestion_weight > 0.0 || config.flow_alignment_weight > 0.0 {
+            let (shared_nets, bus_links) = build_board_topological_connectivity(board);
+
+            if config.corridor_congestion_weight > 0.0 && n >= 2 {
+                let num_layers = board.copper_layers().len().max(2);
+                let default_nc = board.netclasses.get("Default");
+                let track_width = default_nc.map(|nc| nc.track_width).unwrap_or(0.20).max(0.05);
+                let min_clearance = default_nc.map(|nc| nc.clearance).unwrap_or(0.20).max(0.05);
+
+                for i in 0..n {
+                    for j in (i + 1)..n {
+                        let bi = &self.cached_bounds[i];
+                        let bj = &self.cached_bounds[j];
+                        let dx = (bi.min_x - bj.max_x).max(bj.min_x - bi.max_x).max(0.0);
+                        let dy = (bi.min_y - bj.max_y).max(bj.min_y - bi.max_y).max(0.0);
+                        if dx > 15.0 || dy > 15.0 || (dx * dx + dy * dy) > 225.0 {
+                            continue;
+                        }
+                        if self.layers[i] != self.layers[j]
+                            && board.footprints[i].is_smd_only()
+                            && board.footprints[j].is_smd_only()
+                        {
+                            continue;
+                        }
+
+                        let gap_w = if !self.cached_courtyards[i].is_empty() && !self.cached_courtyards[j].is_empty() {
+                            courtyards_clearance_gap(&self.cached_courtyards[i], &self.cached_courtyards[j])
+                        } else {
+                            dx.hypot(dy)
+                        };
+
+                        let capacity = compute_corridor_capacity(gap_w, track_width, min_clearance, num_layers);
+
+                        let mut demand_nets: Vec<usize> = Vec::new();
+                        if let Some(shared) = shared_nets.get(&(i, j)) {
+                            demand_nets.extend_from_slice(shared);
+                        }
+
+                        let c_i = self.positions[i];
+                        let c_j = self.positions[j];
+                        if c_i.distance_to(&c_j) > 1e-4 {
+                            let cut_seg = Segment { p1: c_i, p2: c_j, net_id: 0 };
+                            for seg in &segments {
+                                if cut_seg.crosses(seg) {
+                                    demand_nets.push(seg.net_id);
+                                }
+                            }
+                        }
+
+                        demand_nets.sort_unstable();
+                        demand_nets.dedup();
+                        let demand = demand_nets.len();
+
+                        if demand > capacity {
+                            let overflow = (demand - capacity) as f64;
+                            corridor_overflow_total += overflow * overflow;
+                        }
+                    }
+                }
+            }
+
+            if config.flow_alignment_weight > 0.0 {
+                for link in &bus_links {
+                    let comp_a = link.comp_a;
+                    let comp_b = link.comp_b;
+                    let pos_a = self.positions[comp_a];
+                    let pos_b = self.positions[comp_b];
+
+                    let mut pads_a = Vec::with_capacity(link.shared_pads.len());
+                    let mut pads_b = Vec::with_capacity(link.shared_pads.len());
+                    for &(pa_idx, pb_idx) in &link.shared_pads {
+                        pads_a.push(self.cached_pads[comp_a][pa_idx]);
+                        pads_b.push(self.cached_pads[comp_b][pb_idx]);
+                    }
+
+                    let link_penalty = compute_flow_alignment_penalty_for_link(
+                        &pads_a,
+                        &pads_b,
+                        pos_a,
+                        pos_b,
+                    );
+                    flow_alignment_penalty_total += link_penalty;
+                }
+            }
+        }
+
         self.wirelength = wirelength;
         self.crossings = crossings;
+        self.corridor_congestion = corridor_overflow_total;
+        self.flow_alignment_penalty = flow_alignment_penalty_total;
         self.overlaps = overlaps;
         self.boundary_violations = boundary_violations;
         self.cost = wirelength * config.wirelength_weight
             + (crossings as f64) * config.crossing_weight
+            + corridor_overflow_total * config.corridor_congestion_weight
+            + flow_alignment_penalty_total * config.flow_alignment_weight
             + overlap_area_cost
             + boundary_cost
             + cluster_cost
@@ -2183,6 +2484,8 @@ pub fn run_auto_placer(
                             let old_layers = current.layers.clone();
                             let old_cost = current.cost;
                             let old_crossings = current.crossings;
+                            let old_cc = current.corridor_congestion;
+                            let old_fa = current.flow_alignment_penalty;
                             let old_wl = current.wirelength;
                             let old_ov = current.overlaps;
                             let old_bv = current.boundary_violations;
@@ -2487,6 +2790,8 @@ pub fn run_auto_placer(
                                 }
                                 current.cost = old_cost;
                                 current.crossings = old_crossings;
+                                current.corridor_congestion = old_cc;
+                                current.flow_alignment_penalty = old_fa;
                                 current.wirelength = old_wl;
                                 current.overlaps = old_ov;
                                 current.boundary_violations = old_bv;
@@ -4310,6 +4615,182 @@ mod tests {
         let oob_success = apply_cluster_group_move(&mut state, &board, &cfg, &clusters[0], 60.0, 0.0, &boundary);
         assert!(!oob_success, "Out of bounds cluster move must be rejected");
         assert!((state.positions[0].x - 60.0).abs() < 1e-6, "Positions must remain unchanged when rejected");
+    }
+
+    #[test]
+    fn test_topological_corridor_capacity_calculation() {
+        // Test polygon clearance gap calculation
+        let p1 = Polygon::from_rect(0.0, 0.0, 2.0, 2.0);
+        let p2 = Polygon::from_rect(4.0, 0.0, 2.0, 2.0);
+        let gap = polygon_clearance_gap(&p1, &p2);
+        assert!((gap - 2.0).abs() < 1e-6);
+
+        let overlapping = Polygon::from_rect(1.0, 0.0, 2.0, 2.0);
+        assert_eq!(polygon_clearance_gap(&p1, &overlapping), 0.0);
+
+        // Test multi-layer corridor capacity calculation
+        // W = 2.0, track_width = 0.2, min_clearance = 0.2 -> pitch = 0.4
+        // (2.0 - 0.2) / 0.4 = 4.5 -> floor = 4 tracks/layer
+        assert_eq!(compute_corridor_capacity(2.0, 0.2, 0.2, 2), 8);
+        assert_eq!(compute_corridor_capacity(2.0, 0.2, 0.2, 4), 16);
+        assert_eq!(compute_corridor_capacity(2.0, 0.2, 0.2, 6), 24);
+
+        // Narrow bottleneck: W = 0.3, clearance = 0.2, track = 0.2 -> (0.3 - 0.2)/0.4 = 0.25 -> 0 tracks
+        assert_eq!(compute_corridor_capacity(0.3, 0.2, 0.2, 2), 0);
+        assert_eq!(compute_corridor_capacity(0.3, 0.2, 0.2, 4), 0);
+
+        // Gap below clearance
+        assert_eq!(compute_corridor_capacity(0.1, 0.2, 0.2, 2), 0);
+        assert_eq!(compute_corridor_capacity(0.0, 0.2, 0.2, 2), 0);
+    }
+
+    #[test]
+    fn test_corridor_congestion_penalizes_bottleneck_overflow() {
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 50.0;
+        board.max_y = 50.0;
+        board.nets = vec![
+            "".to_string(),
+            "SIG1".to_string(),
+            "SIG2".to_string(),
+            "SIG3".to_string(),
+            "SIG4".to_string(),
+        ];
+
+        // Connector J1 at (5, 25) with 4 signal pins
+        let j1 = make_test_fp("J1", 5.0, 25.0, true, vec![
+            Pad::new("1", 0.0, -1.5, 0.5, 0.5, 1, "SIG1", false),
+            Pad::new("2", 0.0, -0.5, 0.5, 0.5, 2, "SIG2", false),
+            Pad::new("3", 0.0, 0.5, 0.5, 0.5, 3, "SIG3", false),
+            Pad::new("4", 0.0, 1.5, 0.5, 0.5, 4, "SIG4", false),
+        ]);
+
+        // Connector J2 at (45, 25) with 4 signal pins
+        let j2 = make_test_fp("J2", 45.0, 25.0, true, vec![
+            Pad::new("1", 0.0, -1.5, 0.5, 0.5, 1, "SIG1", false),
+            Pad::new("2", 0.0, -0.5, 0.5, 0.5, 2, "SIG2", false),
+            Pad::new("3", 0.0, 0.5, 0.5, 0.5, 3, "SIG3", false),
+            Pad::new("4", 0.0, 1.5, 0.5, 0.5, 4, "SIG4", false),
+        ]);
+
+        // Obstacles U1 and U2 in the middle at x = 25 forming a corridor
+        // Wide configuration: U1 at (25, 15), U2 at (25, 35) -> gap between courtyards = 18 mm (large capacity)
+        let mut board_wide = board.clone();
+        let u1_wide = make_test_fp("U1", 25.0, 15.0, false, vec![]);
+        let u2_wide = make_test_fp("U2", 25.0, 35.0, false, vec![]);
+        board_wide.footprints = vec![j1.clone(), j2.clone(), u1_wide, u2_wide];
+
+        let cfg = PlacementConfig {
+            corridor_congestion_weight: 50.0,
+            crossing_weight: 0.0,
+            wirelength_weight: 0.0,
+            ..PlacementConfig::default()
+        };
+
+        let ties = build_passive_ties(&board_wide);
+        let mut st_wide = PlacementState::from_board(&board_wide, &cfg);
+        st_wide.evaluate(&board_wide, &cfg, &ties);
+        assert_eq!(st_wide.corridor_congestion, 0.0, "Wide corridor should have zero congestion overflow");
+
+        // Bottleneck configuration: U1 at (25, 23.8), U2 at (25, 26.2)
+        // Courtyard height = 2.0 (extending -1.0 to +1.0)
+        // U1 courtyard max_y = 24.8, U2 courtyard min_y = 25.2 -> gap W = 0.4 mm
+        // With default pitch = 0.4 mm and clearance = 0.2 mm, capacity is 0 tracks!
+        let mut board_narrow = board;
+        let u1_narrow = make_test_fp("U1", 25.0, 23.8, false, vec![]);
+        let u2_narrow = make_test_fp("U2", 25.0, 26.2, false, vec![]);
+        board_narrow.footprints = vec![j1, j2, u1_narrow, u2_narrow];
+
+        let mut st_narrow = PlacementState::from_board(&board_narrow, &cfg);
+        st_narrow.evaluate(&board_narrow, &cfg, &ties);
+        assert!(st_narrow.corridor_congestion > 0.0, "Narrow bottleneck must incur corridor congestion overflow");
+        assert!(st_narrow.cost > st_wide.cost, "Narrow congested bottleneck cost must exceed wide corridor cost");
+    }
+
+    #[test]
+    fn test_flow_alignment_penalizes_twisted_bus() {
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 40.0;
+        board.max_y = 40.0;
+        board.nets = vec![
+            "".to_string(),
+            "BUS0".to_string(),
+            "BUS1".to_string(),
+            "BUS2".to_string(),
+            "BUS3".to_string(),
+        ];
+
+        // Component U1 with 4 bus pads along Y
+        let u1 = make_test_fp("U1", 10.0, 20.0, false, vec![
+            Pad::new("1", 0.0, -1.5, 0.5, 0.5, 1, "BUS0", false),
+            Pad::new("2", 0.0, -0.5, 0.5, 0.5, 2, "BUS1", false),
+            Pad::new("3", 0.0, 0.5, 0.5, 0.5, 3, "BUS2", false),
+            Pad::new("4", 0.0, 1.5, 0.5, 0.5, 4, "BUS3", false),
+        ]);
+
+        // Aligned U2: Pin 1 faces Pin 1, Pin 2 faces Pin 2, etc.
+        let u2_aligned = make_test_fp("U2", 30.0, 20.0, false, vec![
+            Pad::new("1", 0.0, -1.5, 0.5, 0.5, 1, "BUS0", false),
+            Pad::new("2", 0.0, -0.5, 0.5, 0.5, 2, "BUS1", false),
+            Pad::new("3", 0.0, 0.5, 0.5, 0.5, 3, "BUS2", false),
+            Pad::new("4", 0.0, 1.5, 0.5, 0.5, 4, "BUS3", false),
+        ]);
+
+        // Twisted U2: Pin 1 at top, Pin 4 at bottom (inverted pin order)
+        let mut u2_twisted = u2_aligned.clone();
+        u2_twisted.pads = vec![
+            Pad::new("1", 0.0, 1.5, 0.5, 0.5, 1, "BUS0", false),
+            Pad::new("2", 0.0, 0.5, 0.5, 0.5, 2, "BUS1", false),
+            Pad::new("3", 0.0, -0.5, 0.5, 0.5, 3, "BUS2", false),
+            Pad::new("4", 0.0, -1.5, 0.5, 0.5, 4, "BUS3", false),
+        ];
+
+        let cfg = PlacementConfig {
+            flow_alignment_weight: 25.0,
+            corridor_congestion_weight: 0.0,
+            crossing_weight: 0.0,
+            wirelength_weight: 0.0,
+            ..PlacementConfig::default()
+        };
+
+        let mut board_aligned = board.clone();
+        board_aligned.footprints = vec![u1.clone(), u2_aligned];
+        let ties_aligned = build_passive_ties(&board_aligned);
+        let mut st_aligned = PlacementState::from_board(&board_aligned, &cfg);
+        st_aligned.evaluate(&board_aligned, &cfg, &ties_aligned);
+
+        let mut board_twisted = board;
+        board_twisted.footprints = vec![u1, u2_twisted];
+        let ties_twisted = build_passive_ties(&board_twisted);
+        let mut st_twisted = PlacementState::from_board(&board_twisted, &cfg);
+        st_twisted.evaluate(&board_twisted, &cfg, &ties_twisted);
+
+        assert_eq!(st_aligned.flow_alignment_penalty, 0.0, "Aligned bus ribbon must have zero twist penalty");
+        assert!(st_twisted.flow_alignment_penalty > 0.0, "Twisted bus ribbon must incur flow alignment penalty");
+        assert!(st_aligned.cost < st_twisted.cost, "Aligned configuration cost must be strictly less than twisted configuration");
+    }
+
+    #[test]
+    fn test_topological_placement_annealing_convergence() {
+        let mut board = make_synthetic_board();
+        let cfg = PlacementConfig {
+            duration_secs: 1,
+            corridor_congestion_weight: 20.0,
+            flow_alignment_weight: 15.0,
+            crossing_weight: 10.0,
+            wirelength_weight: 1.0,
+            ..PlacementConfig::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let final_st = run_auto_placer(&mut board, &cfg, None, stop);
+
+        assert_eq!(final_st.overlaps, 0, "Annealing must resolve all component courtyard overlaps");
+        assert_eq!(final_st.boundary_violations, 0, "Annealing must keep all components within board boundary");
+        assert!(final_st.cost.is_finite(), "Placement cost must be finite");
     }
 }
 
