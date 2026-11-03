@@ -5470,18 +5470,26 @@ pub fn find_choked_pin_bottlenecks(
                 .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
                 .map(|(pos, _)| pos);
 
-            let mut snapped_on_tip_layer = false;
-            // Snap adjacent connecting track endpoint to stub.tip_pos for 100% gapless continuity
-            for t in &mut board.tracks {
-                if t.net_id == stub.net_id && t.layer == stub.tip_layer {
-                    let d_start = (t.start.0 - stub.tip_pos.0).hypot(t.start.1 - stub.tip_pos.1);
-                    let d_end = (t.end.0 - stub.tip_pos.0).hypot(t.end.1 - stub.tip_pos.1);
-                    if d_start < 0.15 && d_start <= d_end {
-                        t.start = stub.tip_pos;
-                        snapped_on_tip_layer = true;
-                    } else if d_end < 0.15 {
-                        t.end = stub.tip_pos;
-                        snapped_on_tip_layer = true;
+            let mut snapped_on_tip_layer = board.tracks.iter().any(|t| {
+                t.net_id == stub.net_id
+                    && t.layer == stub.tip_layer
+                    && ((t.start.0 - stub.tip_pos.0).hypot(t.start.1 - stub.tip_pos.1) < 1e-3
+                        || (t.end.0 - stub.tip_pos.0).hypot(t.end.1 - stub.tip_pos.1) < 1e-3)
+            });
+            if !snapped_on_tip_layer {
+                for t in &mut board.tracks {
+                    if t.net_id == stub.net_id && t.layer == stub.tip_layer {
+                        let d_start = (t.start.0 - stub.tip_pos.0).hypot(t.start.1 - stub.tip_pos.1);
+                        let d_end = (t.end.0 - stub.tip_pos.0).hypot(t.end.1 - stub.tip_pos.1);
+                        if d_start < 0.08 && d_start <= d_end && is_octilinear_segment(stub.tip_pos, t.end) {
+                            t.start = stub.tip_pos;
+                            snapped_on_tip_layer = true;
+                            break;
+                        } else if d_end < 0.08 && is_octilinear_segment(t.start, stub.tip_pos) {
+                            t.end = stub.tip_pos;
+                            snapped_on_tip_layer = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -6036,20 +6044,21 @@ pub fn find_choked_pin_bottlenecks(
             return;
         };
         for pad in &u1.pads {
-            let (px, py) = u1.pad_absolute_position(pad);
-            let local_inward = match pad.number.as_str() {
-                "15" | "18" => Some(Point::new(-1.0, 0.0)),
-                "19" | "22" => Some(Point::new(0.0, 1.0)),
-                _ => None,
-            };
-            if let Some(inward_norm) = local_inward {
-                let world_inward = inward_norm.rotate_ccw(u1.rotation);
-                let end = (px + world_inward.x * 0.55, py + world_inward.y * 0.55);
-                if is_track_segment_legal(board, (px, py), end, 0.20, u1.layer, gnd_net_id, 0.15) {
+            if matches!(pad.number.as_str(), "15" | "18" | "19" | "22") {
+                let (px, py) = u1.pad_absolute_position(pad);
+                let dx = u1.x - px;
+                let dy = u1.y - py;
+                let world_inward = if dx.abs() > dy.abs() {
+                    (dx.signum(), 0.0)
+                } else {
+                    (0.0, dy.signum())
+                };
+                let end = (px + world_inward.0 * 0.90, py + world_inward.1 * 0.90);
+                if is_track_segment_legal(board, (px, py), end, 0.15, u1.layer, gnd_net_id, 0.15) {
                     board.tracks.push(TrackSegment {
                         start: (px, py),
                         end,
-                        width: 0.20,
+                        width: 0.15,
                         layer: u1.layer,
                         net_id: gnd_net_id,
                         is_locked: false,
@@ -6113,7 +6122,7 @@ pub fn find_choked_pin_bottlenecks(
                         }
 
                         let track_w = board.get_netclass_for_net(plane_net_id).track_width.min(0.25).max(0.20);
-                        let plane_c = board.get_netclass_for_net(plane_net_id).clearance.max(0.15);
+                        let plane_c = board.get_netclass_for_net(plane_net_id).clearance.max(0.20);
 
                         // Try to connect to an existing nearby plane via first (direct or 2-segment dogleg)
                         let mut connected_to_existing = false;
@@ -6167,7 +6176,7 @@ pub fn find_choked_pin_bottlenecks(
                             if let Some((vx, vy)) =
                                 Self::find_safe_plane_via_location(board, grid, plane_net_id, px, py, fp.layer, pad, &added_via_positions)
                             {
-                                let eff_c = plane_c.min(0.12);
+                                let eff_c = plane_c;
                                 let dogleg = if is_octilinear_segment((px, py), (vx, vy))
                                     && is_track_segment_legal(board, (px, py), (vx, vy), track_w, fp.layer, plane_net_id, eff_c)
                                 {
@@ -6238,7 +6247,7 @@ pub fn find_choked_pin_bottlenecks(
                                     let dogleg = compute_45_dogleg((px, py), tgt, diag_first);
                                     if dogleg.windows(2).all(|w| {
                                         (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) <= 1e-4
-                                            || is_track_segment_legal(board, w[0], w[1], track_w, fp.layer, plane_net_id, plane_c.min(0.12))
+                                            || is_track_segment_legal(board, w[0], w[1], track_w, fp.layer, plane_net_id, plane_c)
                                     }) {
                                         for w in dogleg.windows(2) {
                                             if (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) > 1e-4 {
@@ -6285,7 +6294,7 @@ pub fn find_choked_pin_bottlenecks(
         let pad_dim = pad.width.max(pad.height);
         let min_d = (pad_dim * 0.5) + 0.35;
         let track_w = board.get_netclass_for_net(plane_net_id).track_width.min(0.25).max(0.20);
-        let plane_c = board.get_netclass_for_net(plane_net_id).clearance.max(0.15);
+        let plane_c = board.get_netclass_for_net(plane_net_id).clearance.max(0.20);
 
         let board_mid_x = (board.min_x + board.max_x) * 0.5;
         let zone_max_x = board
@@ -6345,11 +6354,11 @@ pub fn find_choked_pin_bottlenecks(
             if existing_vias.iter().any(|ev| (ev.0 - vx).hypot(ev.1 - vy) < 0.65) {
                 continue;
             }
-            if !is_via_location_legal(board, (vx, vy), 0.60, plane_net_id, plane_c.min(0.12)) {
+            if !is_via_location_legal(board, (vx, vy), 0.60, plane_net_id, plane_c) {
                 continue;
             }
             let direct_ok = is_octilinear_segment((px, py), (vx, vy))
-                && is_track_segment_legal(board, (px, py), (vx, vy), track_w, layer, plane_net_id, plane_c.min(0.12));
+                && is_track_segment_legal(board, (px, py), (vx, vy), track_w, layer, plane_net_id, plane_c);
             let dogleg_ok = if direct_ok {
                 true
             } else {
@@ -6357,7 +6366,7 @@ pub fn find_choked_pin_bottlenecks(
                     let dl = compute_45_dogleg((px, py), (vx, vy), df);
                     dl.windows(2).all(|w| {
                         (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) <= 1e-4
-                            || is_track_segment_legal(board, w[0], w[1], track_w, layer, plane_net_id, plane_c.min(0.12))
+                            || is_track_segment_legal(board, w[0], w[1], track_w, layer, plane_net_id, plane_c)
                     })
                 })
             };
@@ -10209,17 +10218,21 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
                 continue;
             }
 
-            let check_endpoint = |pt: (f64, f64)| -> bool {
+            let check_endpoint = |pt: (f64, f64), other_pt: (f64, f64)| -> bool {
                 // A. Check footprint pads of matching net
                 for fp in &board.footprints {
                     for pad in &fp.pads {
                         if pad.net_id == t.net_id {
                             if pad.is_through_hole || fp.layer == t.layer {
                                 let (px, py) = fp.pad_absolute_position(pad);
-                                if (pt.0 - px).hypot(pt.1 - py) < 0.12
-                                    || dist_point_to_pad(pt, fp, pad) < EPS
-                                {
-                                    return true;
+                                let d_center_pt = (pt.0 - px).hypot(pt.1 - py);
+                                let d_center_other = (other_pt.0 - px).hypot(other_pt.1 - py);
+                                let d_pad_pt = dist_point_to_pad(pt, fp, pad);
+                                if d_center_pt < 0.12 || d_pad_pt < EPS {
+                                    // Only reject if `other_pt` is closer to this same pad's center and the stub is tiny (< 0.05 mm)
+                                    if d_center_other >= 0.05 || d_center_pt + 1e-4 < d_center_other {
+                                        return true;
+                                    }
                                 }
                             }
                         }
@@ -10229,7 +10242,9 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
                 // B. Check vias of matching net
                 for (v_idx, v) in board.vias.iter().enumerate() {
                     if v.net_id == t.net_id && !pruned_vias[v_idx] {
-                        if (pt.0 - v.position.0).hypot(pt.1 - v.position.1) <= v.size * 0.5 + EPS {
+                        let d_pt = (pt.0 - v.position.0).hypot(pt.1 - v.position.1);
+                        let d_other = (other_pt.0 - v.position.0).hypot(other_pt.1 - v.position.1);
+                        if d_pt <= v.size * 0.5 + EPS && d_pt + 1e-4 < d_other {
                             return true;
                         }
                     }
@@ -10240,10 +10255,14 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
                     if i != j && !pruned_tracks[j] {
                         let o = &board.tracks[j];
                         if o.net_id == t.net_id && o.layer == t.layer {
-                            if (pt.0 - o.start.0).hypot(pt.1 - o.start.1) < EPS
-                                || (pt.0 - o.end.0).hypot(pt.1 - o.end.1) < EPS
-                                || dist_point_to_segment(pt, o.start, o.end) < EPS
-                            {
+                            let d_end_pt = (pt.0 - o.start.0).hypot(pt.1 - o.start.1).min((pt.0 - o.end.0).hypot(pt.1 - o.end.1));
+                            let d_end_other = (other_pt.0 - o.start.0).hypot(other_pt.1 - o.start.1).min((other_pt.0 - o.end.0).hypot(other_pt.1 - o.end.1));
+                            if d_end_pt < 1e-3 && d_end_pt + 1e-4 < d_end_other {
+                                return true;
+                            }
+                            let d_pt = dist_point_to_segment(pt, o.start, o.end);
+                            let d_other = dist_point_to_segment(other_pt, o.start, o.end);
+                            if d_pt < EPS && d_pt + 1e-4 < d_other {
                                 return true;
                             }
                         }
@@ -10255,9 +10274,9 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
                     if !pruned_arcs[a_idx] && a.net_id == t.net_id && a.layer == t.layer {
                         let as_pt = a.start();
                         let ae_pt = a.end();
-                        if (pt.0 - as_pt.0).hypot(pt.1 - as_pt.1) < EPS
-                            || (pt.0 - ae_pt.0).hypot(pt.1 - ae_pt.1) < EPS
-                        {
+                        let d_pt = (pt.0 - as_pt.0).hypot(pt.1 - as_pt.1).min((pt.0 - ae_pt.0).hypot(pt.1 - ae_pt.1));
+                        let d_other = (other_pt.0 - as_pt.0).hypot(other_pt.1 - as_pt.1).min((other_pt.0 - ae_pt.0).hypot(other_pt.1 - ae_pt.1));
+                        if d_pt < EPS && d_pt + 1e-4 < d_other {
                             return true;
                         }
                     }
@@ -10266,8 +10285,8 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
                 false
             };
 
-            let start_connected = check_endpoint(t.start);
-            let end_connected = check_endpoint(t.end);
+            let start_connected = check_endpoint(t.start, t.end);
+            let end_connected = check_endpoint(t.end, t.start);
 
             if !start_connected || !end_connected {
                 pruned_tracks[i] = true;
@@ -15413,6 +15432,80 @@ mod tests {
         let (reach, blockers) = AutoRouter::find_choked_pin_bottlenecks(&grid, cx, cy, 0, 2, 400);
         assert!(reach < 100, "Pin enclosed by track ring must be detected as choked (reach={})", reach);
         assert!(blockers.contains(&3), "Blocker net 3 must be identified by find_choked_pin_bottlenecks");
+    }
+
+    #[test]
+    fn test_prune_dangling_micro_stub_and_u1_ground_pin_connection() {
+        let mut board = Board {
+            min_x: 100.0,
+            min_y: 100.0,
+            max_x: 120.0,
+            max_y: 120.0,
+            footprints: vec![
+                Footprint {
+                    reference: "U1".to_string(),
+                    x: 110.0,
+                    y: 110.0,
+                    rotation: 270.0,
+                    pads: vec![
+                        Pad::new("18", 0.75, 2.075, 0.30, 0.75, 1, "GND", false),
+                        Pad::new("19", 2.075, 0.75, 0.75, 0.30, 1, "GND", false),
+                        Pad::new("25", 0.0, 0.0, 2.60, 2.60, 1, "GND", false),
+                        Pad::new("1", -2.075, -0.75, 0.75, 0.30, 2, "SIG", false),
+                    ],
+                    ..Footprint::default()
+                },
+                Footprint {
+                    reference: "U2".to_string(),
+                    x: 105.0,
+                    y: 109.25,
+                    pads: vec![Pad::new("1", 0.0, 0.0, 0.50, 0.50, 2, "SIG", false)],
+                    ..Footprint::default()
+                },
+            ],
+            nets: vec!["".to_string(), "GND".to_string(), "SIG".to_string()],
+            ..Board::default()
+        };
+
+        let u1_p1 = board.footprints[0].pad_absolute_position(&board.footprints[0].pads[3]);
+        let u2_p1 = board.footprints[1].pad_absolute_position(&board.footprints[1].pads[0]);
+        let mid = ((u1_p1.0 + u2_p1.0) * 0.5, u1_p1.1);
+        // Valid main route from U1.1 -> mid -> U2.1, plus a 0.03 mm dangling micro-stub at `mid`
+        board.tracks = vec![
+            TrackSegment {
+                start: u1_p1,
+                end: mid,
+                width: 0.15,
+                layer: 0,
+                net_id: 2,
+                is_locked: false,
+            },
+            TrackSegment {
+                start: mid,
+                end: u2_p1,
+                width: 0.15,
+                layer: 0,
+                net_id: 2,
+                is_locked: false,
+            },
+            TrackSegment {
+                start: mid,
+                end: (mid.0, mid.1 + 0.03),
+                width: 0.15,
+                layer: 0,
+                net_id: 2,
+                is_locked: false,
+            },
+        ];
+
+        let router = AutoRouter::new(1);
+        router.connect_u1_ground_pins(&mut board);
+        prune_dangling_tracks_and_vias(&mut board);
+
+        let sig_tracks: Vec<&TrackSegment> = board.tracks.iter().filter(|t| t.net_id == 2).collect();
+        assert_eq!(sig_tracks.len(), 2, "0.03 mm dangling micro-stub must be pruned while preserving main route");
+        let gnd_tracks: Vec<&TrackSegment> = board.tracks.iter().filter(|t| t.net_id == 1).collect();
+        assert_eq!(gnd_tracks.len(), 2, "Rotated U1 pads 18 and 19 must connect inward into central thermal pad 25 and survive pruning");
     }
 }
 
