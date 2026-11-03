@@ -1266,6 +1266,21 @@ fn test_p1p2esp_full_routing_completion() {
     let (routed, total) = router.route_all(&mut board, &mut grid, None, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
     assert_eq!(routed, total, "Should route all {}/{} connections, got {}/{}", total, total, routed, total);
 
+    // Verify every single extracted connection is 100% electrically connected end-to-end after post-processing
+    let conns = router.extract_connections(&board);
+    for (idx, conn) in conns.iter().enumerate() {
+        assert!(
+            vulcans_trials::router::AutoRouter::is_connection_electrically_connected(&board, conn),
+            "Connection #{} '{}' ({}.pad{} -> {}.pad{}) is not electrically continuous after post-processing",
+            idx,
+            conn.net_name,
+            board.footprints[conn.start_fp].reference,
+            conn.start_pad,
+            board.footprints[conn.end_fp].reference,
+            conn.end_pad
+        );
+    }
+
     // Verify TERM (id 2) has connected tracks to U1
     let term_nid = *board.net_name_to_id.get("TERM").unwrap();
     let term_tracks: Vec<_> = board.tracks.iter().filter(|t| t.net_id == term_nid).collect();
