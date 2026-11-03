@@ -2814,6 +2814,17 @@ impl Board {
             } else {
                 format!("(at {:.4} {:.4} {:.1})", fp.x, fp.y, rot_norm)
             };
+            let orig_rot = fp
+                .at_span
+                .and_then(|(s, e)| {
+                    if s < e && e <= self.raw_content.len() {
+                        parse_at_xy_rot(&self.raw_content[s..e]).map(|(_, _, r)| r)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(fp.rotation);
+            let delta_rot = fp.rotation - orig_rot;
 
             if fp.layer != fp.orig_layer {
                 if let Some((f_start, f_end)) = fp.fp_span {
@@ -2824,6 +2835,11 @@ impl Board {
                                 inner_reps.push((a_start - f_start, a_end - f_start, new_at.clone()));
                             }
                         }
+                        inner_reps.extend(collect_pad_at_replacements(
+                            &self.raw_content[f_start..f_end],
+                            0,
+                            delta_rot,
+                        ));
                         for pad in &fp.pads {
                             if let Some((n_start, n_end)) = pad.net_span {
                                 if n_start >= f_start && n_end <= f_end && n_start < n_end {
@@ -2847,6 +2863,15 @@ impl Board {
 
             if let Some((start, end)) = fp.at_span {
                 replacements.push((start, end, new_at));
+            }
+            if let Some((f_start, f_end)) = fp.fp_span {
+                if f_start < f_end && f_end <= self.raw_content.len() {
+                    replacements.extend(collect_pad_at_replacements(
+                        &self.raw_content[f_start..f_end],
+                        f_start,
+                        delta_rot,
+                    ));
+                }
             }
         }
 
@@ -3559,6 +3584,77 @@ fn parse_at_xy_rot(s: &str) -> Option<(f64, f64, f64)> {
     let y = parts.next()?.parse::<f64>().ok()?;
     let rot = parts.next().and_then(|r| r.parse::<f64>().ok()).unwrap_or(0.0);
     Some((x, y, rot))
+}
+
+fn collect_pad_at_replacements(
+    fp_str: &str,
+    fp_byte_offset: usize,
+    delta_rot: f64,
+) -> Vec<(usize, usize, String)> {
+    let mut reps = Vec::new();
+    let rem = delta_rot.rem_euclid(360.0);
+    if rem < 1e-3 || (360.0 - rem) < 1e-3 {
+        return reps;
+    }
+    let bytes = fp_str.as_bytes();
+    let mut p_idx = 0;
+    while p_idx < bytes.len() {
+        if bytes[p_idx] == b'(' && fp_str[p_idx..].starts_with("(pad ") {
+            if let Some(p_end) = find_closing_paren(bytes, p_idx) {
+                let p_str = &fp_str[p_idx..p_end];
+                let p_bytes = p_str.as_bytes();
+                let mut depth = 0usize;
+                let mut in_quotes = false;
+                for i in 0..p_bytes.len() {
+                    let c = p_bytes[i];
+                    if c == b'"' && (i == 0 || p_bytes[i - 1] != b'\\') {
+                        in_quotes = !in_quotes;
+                    } else if !in_quotes {
+                        if c == b'(' {
+                            depth += 1;
+                            if depth == 2 && p_str[i..].starts_with("(at ") {
+                                if let Some(a_end) = find_closing_paren(p_bytes, i) {
+                                    let inner = p_str[i + 4..a_end - 1].trim();
+                                    let mut parts = inner.split_whitespace();
+                                    if let (Some(x_str), Some(y_str)) = (parts.next(), parts.next()) {
+                                        let old_rot = parts
+                                            .next()
+                                            .and_then(|r| r.parse::<f64>().ok())
+                                            .unwrap_or(0.0);
+                                        let new_rot = (old_rot + delta_rot).rem_euclid(360.0);
+                                        let new_at = if new_rot < 1e-3 || (360.0 - new_rot) < 1e-3 {
+                                            format!("(at {} {})", x_str, y_str)
+                                        } else if (new_rot - new_rot.round()).abs() < 1e-3 {
+                                            format!(
+                                                "(at {} {} {})",
+                                                x_str,
+                                                y_str,
+                                                (new_rot.round() as i64).rem_euclid(360)
+                                            )
+                                        } else {
+                                            format!("(at {} {} {:.1})", x_str, y_str, new_rot)
+                                        };
+                                        reps.push((
+                                            fp_byte_offset + p_idx + i,
+                                            fp_byte_offset + p_idx + a_end,
+                                            new_at,
+                                        ));
+                                    }
+                                    break;
+                                }
+                            }
+                        } else if c == b')' {
+                            depth = depth.saturating_sub(1);
+                        }
+                    }
+                }
+                p_idx = p_end;
+                continue;
+            }
+        }
+        p_idx += 1;
+    }
+    reps
 }
 
 fn extract_property(s: &str, prop_name: &str) -> Option<String> {
@@ -6102,6 +6198,36 @@ mod tests {
         assert_eq!(reloaded.tracks[0].net_id, reloaded.footprints[0].pads[0].net_id);
         assert_eq!(reloaded.vias[0].net_id, reloaded.footprints[0].pads[0].net_id);
     }
+
+    #[test]
+    fn test_rotated_footprint_updates_pad_board_space_rotation_in_kicad_pcb() {
+        let pcb = r#"(kicad_pcb
+  (version 20260206)
+  (generator "pcbnew")
+  (generator_version "10.0")
+  (footprint "Package_DFN_QFN:QFN-24-1EP_4x4mm_P0.5mm"
+    (layer "F.Cu")
+    (at 145.6475 100.3825 180)
+    (property "Reference" "U1")
+    (property "Value" "MAX22088")
+    (pad "1" smd roundrect (at -2.075 -1.25 180) (size 0.85 0.3) (layers "F.Cu" "F.Mask" "F.Paste") (net "BIO"))
+    (pad "7" smd roundrect (at -1.25 2.075 270) (size 0.85 0.3) (layers "F.Cu" "F.Mask" "F.Paste") (net "V_REF"))
+  )
+)"#;
+        let mut board = Board::from_kicad_pcb(pcb).expect("Failed to parse PCB");
+        assert_eq!(board.footprints.len(), 1);
+        assert!((board.footprints[0].pads[0].rotation - 0.0).abs() < 1e-4);
+        assert!((board.footprints[0].pads[1].rotation - 90.0).abs() < 1e-4);
+
+        // Rotate U1 from 180° to 270° (+90°)
+        board.footprints[0].rotation = 270.0;
+        let exported = board.to_kicad_pcb().expect("Failed to export rotated PCB");
+        assert!(exported.contains("(at -2.075 -1.25 270)"), "Pad 1 board-space rotation must advance from 180 to 270");
+        assert!(exported.contains("(at -1.25 2.075)"), "Pad 7 board-space rotation must wrap from 270 + 90 = 0 (omitted)");
+
+        let reloaded = Board::from_kicad_pcb(&exported).expect("Failed to reload rotated PCB");
+        assert!((reloaded.footprints[0].rotation - 270.0).abs() < 1e-4);
+        assert!((reloaded.footprints[0].pads[0].rotation - 0.0).abs() < 1e-4);
+        assert!((reloaded.footprints[0].pads[1].rotation - 90.0).abs() < 1e-4);
+    }
 }
-
-
