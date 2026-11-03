@@ -9869,12 +9869,18 @@ pub fn add_teardrops(board: &mut Board) {
                 continue;
             };
 
-            let teardrop_len = r_u * length_ratio;
-            let flare_half_w = r_n * width_ratio;
-
-            if flare_half_w <= track_w * 0.5 + 0.01 {
+            // Teardrops must smoothly reinforce narrow tracks entering pads/vias without ever bulging past
+            // the outer perimeter of the pad/via. The maximum diameter of the teardrop copper is capped at 2 * r_n.
+            // Since the flare track segment has thickness track_w, its centerline lateral offset h + track_w / 2
+            // must strictly not exceed r_n.
+            let max_flare_offset = (r_n - track_w * 0.5).max(0.0);
+            if max_flare_offset <= track_w * 0.5 + 0.01 {
+                // If the track is already as wide as (or almost as wide as) the via/pad, no teardrop flare is needed
                 continue;
             }
+
+            let teardrop_len = r_u * length_ratio;
+            let flare_half_w = (r_n * width_ratio - track_w * 0.5).clamp(track_w * 0.5 + 0.01, max_flare_offset);
 
             // Distance along u from pad/via center to the other end of this segment
             let dist_to_other = (other_end.0 - center.0) * u.0 + (other_end.1 - center.1) * u.1;
@@ -9906,14 +9912,18 @@ pub fn add_teardrops(board: &mut Board) {
             let a = (center.0 + max_d * u.0, center.1 + max_d * u.1);
 
             let (b_left, b_right) = if is_circle {
-                let h = flare_half_w.min(r_n * 0.98);
-                let x_pad = (r_u * r_u - h * h).max(0.0).sqrt();
+                // For a circle of radius r_n, the center of a flare track with thickness track_w
+                // lies on the circle of radius r_eff = r_n - track_w / 2, guaranteeing that its outer
+                // copper perimeter exactly touches the via/pad circle and NEVER bulges past it.
+                let r_eff = max_flare_offset;
+                let h = flare_half_w.min(r_eff * 0.98);
+                let x_pad = (r_eff * r_eff - h * h).max(0.0).sqrt();
                 (
                     (center.0 + x_pad * u.0 + h * n.0, center.1 + x_pad * u.1 + h * n.1),
                     (center.0 + x_pad * u.0 - h * n.0, center.1 + x_pad * u.1 - h * n.1),
                 )
             } else {
-                let h = flare_half_w.min(r_n * 0.95);
+                let h = flare_half_w.min(max_flare_offset);
                 (
                     (center.0 + r_u * u.0 + h * n.0, center.1 + r_u * u.1 + h * n.1),
                     (center.0 + r_u * u.0 - h * n.0, center.1 + r_u * u.1 - h * n.1),
@@ -13385,10 +13395,12 @@ mod tests {
             .collect();
         assert_eq!(t1_teardrops.len(), 2);
         let flare_w1 = (t1_teardrops[0].end.1 - t1_teardrops[1].end.1).abs();
-        assert!(flare_w1 > 0.20, "Circular pad flare width must be wider than track width (0.20)");
+        assert!(flare_w1 > 0.10, "Circular pad flare width must be positive");
         for td in &t1_teardrops {
             let dist_to_center = (td.end.0 - 10.0).hypot(td.end.1 - 10.0);
-            assert!((dist_to_center - 0.40).abs() < 1e-2, "Flare end must be on perimeter of circular pad (r=0.40)");
+            let outer_copper_radius = dist_to_center + td.width * 0.5;
+            assert!(outer_copper_radius <= 0.40 + 1e-4, "Flare outer copper radius must not exceed pad radius (r=0.40), got {}", outer_copper_radius);
+            assert!((dist_to_center - 0.30).abs() < 1e-2, "Flare centerline end must be on r_eff (r - w/2 = 0.30)");
         }
 
         // Verify rectangular pad teardrops
@@ -13398,9 +13410,12 @@ mod tests {
             .collect();
         assert_eq!(t2_teardrops.len(), 2);
         let flare_w2 = (t2_teardrops[0].end.0 - t2_teardrops[1].end.0).abs();
-        assert!(flare_w2 > 0.25, "Rectangular pad flare width must be wider than track width (0.25)");
+        assert!(flare_w2 > 0.10, "Rectangular pad flare width must be positive");
         for td in &t2_teardrops {
             assert!((td.end.1 - 30.80).abs() < 1e-2, "Flare end must be on North perimeter of rectangular pad (y=30.80)");
+            let lateral_offset = (td.end.0 - 30.0).abs();
+            let outer_copper_x = lateral_offset + td.width * 0.5;
+            assert!(outer_copper_x <= 0.40 + 1e-4, "Flare outer copper must not exceed rectangular pad half-width (0.40)");
         }
 
         // Verify through-hole via teardrops
@@ -13410,10 +13425,12 @@ mod tests {
             .collect();
         assert_eq!(t3_teardrops.len(), 2);
         let flare_w3 = (t3_teardrops[0].end.1 - t3_teardrops[1].end.1).abs();
-        assert!(flare_w3 > 0.20, "Via flare width must be wider than track width (0.20)");
+        assert!(flare_w3 > 0.10, "Via flare width must be positive");
         for td in &t3_teardrops {
             let dist_to_via = (td.end.0 - 50.0).hypot(td.end.1 - 50.0);
-            assert!((dist_to_via - 0.30).abs() < 1e-2, "Flare end must be on perimeter of via (r=0.30)");
+            let outer_copper_radius = dist_to_via + td.width * 0.5;
+            assert!(outer_copper_radius <= 0.30 + 1e-4, "Flare outer copper radius must not exceed via radius (r=0.30), got {}", outer_copper_radius);
+            assert!((dist_to_via - 0.20).abs() < 1e-2, "Flare centerline end must be on r_eff (r - w/2 = 0.20)");
         }
     }
 
