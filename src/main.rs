@@ -61,10 +61,6 @@ struct Args {
     #[arg(long)]
     any_angle: bool,
 
-    /// Suppress generation of DFM teardrops on pad and via junctions
-    #[arg(long)]
-    no_teardrops: bool,
-
     /// Connect to KiCad 10 IPC socket for real-time live canvas streaming (optional socket path)
     #[arg(long, num_args = 0..=1, default_missing_value = "")]
     kicad_ipc: Option<String>,
@@ -268,7 +264,6 @@ fn run_headless_trial(
         let router = AutoRouter::new(args.passes)
             .with_inner_layer_penalty(args.inner_plane_penalty)
             .with_any_angle_mode(args.any_angle)
-            .with_teardrops(!args.no_teardrops)
             .with_ipc(ipc.clone());
         let (routed, total) = router.route_all(board, &mut grid, None, Arc::clone(&stop_flag));
         println!(
@@ -516,7 +511,6 @@ mod tests {
             lock: String::new(),
             inner_plane_penalty: 8.0,
             any_angle: false,
-            no_teardrops: false,
             kicad_ipc: None,
             self_test: false,
             ipc: None,

@@ -70,7 +70,7 @@ Below is a comprehensive breakdown of features offered by flagship commercial PC
 ### Phase 5: v0.5 — Signal Integrity (SI), Power Integrity (PI) & DFM
 - [x] **Crosstalk & Parallelism Limiter:** Penalize parallel adjacent trace segments exceeding a maximum coupled length threshold ($L_{\text{coupled}}$).
 - [x] **Reference Plane Return-Path Check:** Penalize high-speed signals crossing splits or cutouts on the adjacent reference plane layer; auto-insert return-path stitching capacitors/vias near signal vias.
-- [x] **DFM Hardening:** Automatic teardrops on pad/via junctions, solder mask bridge validation against fab rules (JLCPCB / PCBWay presets), and copper-to-edge clearance enforcement.
+- [x] **DFM Hardening:** KiCad native teardrop delegation, solder mask bridge validation against fab rules (JLCPCB / PCBWay presets), and copper-to-edge clearance enforcement.
 
 ### Phase 6: v1.0 — Interactive Guided Routing & KiCad IPC Live Sync
 - [x] **User-Guided Bundle Sketching:** Draw a rough poly-line path in the GUI or KiCad to guide a bus of nets along a desired channel.
