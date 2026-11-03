@@ -20,6 +20,12 @@ pub struct RoutingConfig {
     pub crosstalk_penalty: f64,
     #[serde(default)]
     pub any_angle_mode: bool,
+    #[serde(default = "default_true")]
+    pub teardrops: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for RoutingConfig {
@@ -27,6 +33,7 @@ impl Default for RoutingConfig {
         Self {
             crosstalk_penalty: 4.0,
             any_angle_mode: false,
+            teardrops: true,
         }
     }
 }
@@ -2147,6 +2154,11 @@ impl AutoRouter {
         self
     }
 
+    pub fn with_teardrops(mut self, enabled: bool) -> Self {
+        self.config.teardrops = enabled;
+        self
+    }
+
     /// Returns true if `a` and `b` form a differential pair (e.g. `USB_DP`/`USB_DM`, `USB_D+`/`USB_D-`).
     pub fn are_diff_pair_mates(a: &str, b: &str) -> bool {
         if a == b {
@@ -2215,11 +2227,7 @@ impl AutoRouter {
         let mut net_pads: HashMap<usize, Vec<PadInfo>> = HashMap::new();
         for (fp_idx, fp) in board.footprints.iter().enumerate() {
             for (pad_idx, pad) in fp.pads.iter().enumerate() {
-                if pad.net_id == 0 {
-                    continue;
-                }
-                let netname = &board.nets[pad.net_id];
-                if netname == "GND" {
+                if pad.net_id == 0 || board.is_plane_net(pad.net_id) {
                     continue;
                 }
                 let (px, py) = fp.pad_absolute_position(pad);
@@ -3199,11 +3207,8 @@ impl AutoRouter {
         }
 
         self.connect_u1_ground_pins(board);
-        self.add_ground_stitching_vias(board, grid);
+        self.add_plane_stitching_vias(board, grid);
         self.add_return_path_ground_vias(board, grid);
-
-        // Phase 5: Automated DFM Teardrop Generation (pad & via junction strengthening)
-        add_teardrops(board);
 
         for trk in &mut board.tracks {
             let key = (trk.net_id, [trk.start.0.to_bits(), trk.start.1.to_bits(), trk.end.0.to_bits(), trk.end.1.to_bits()]);
@@ -3218,6 +3223,11 @@ impl AutoRouter {
         validate_and_clean_copper(board);
         prune_dangling_tracks_and_vias(board);
         self.validate_crosstalk_and_coupling(board);
+
+        // Phase 5: Automated DFM Teardrop Generation (pad & via junction strengthening)
+        if self.config.teardrops {
+            add_teardrops(board);
+        }
 
         if let Some(ref st) = live {
             let remaining_ratsnest: Vec<crate::board::Segment> = connections
@@ -4801,14 +4811,19 @@ pub fn find_choked_pin_bottlenecks(
                             Some(final_via_pt)
                         } else {
                             let mut cand_pt = None;
-                            for &(dx, dy) in &[(0.05, 0.0), (-0.05, 0.0), (0.0, 0.05), (0.0, -0.05), (0.05, 0.05), (-0.05, -0.05)] {
-                                let cand = (final_via_pt.0 + dx, final_via_pt.1 + dy);
-                                if is_via_location_legal(board, cand, via_dia, conn.net_id, conn.netclass.clearance.min(0.15)) {
-                                    cand_pt = Some(cand);
+                            for r in [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40] {
+                                for &(dx, dy) in &[(r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r), (r, r), (r, -r), (-r, r), (-r, -r)] {
+                                    let cand = (final_via_pt.0 + dx, final_via_pt.1 + dy);
+                                    if is_via_location_legal(board, cand, via_dia, conn.net_id, conn.netclass.clearance.min(0.15)) {
+                                        cand_pt = Some(cand);
+                                        break;
+                                    }
+                                }
+                                if cand_pt.is_some() {
                                     break;
                                 }
                             }
-                            cand_pt.or(Some(final_via_pt))
+                            cand_pt
                         };
 
                         if let Some(vp) = final_pt {
@@ -5374,92 +5389,105 @@ pub fn find_choked_pin_bottlenecks(
         }
     }
 
-    pub fn add_ground_stitching_vias(&self, board: &mut Board, grid: &RoutingGrid) -> usize {
-        let Some(gnd_net_id) = board.nets.iter().position(|n| n == "GND") else {
+    pub fn add_plane_stitching_vias(&self, board: &mut Board, grid: &RoutingGrid) -> usize {
+        let mut plane_net_ids: Vec<usize> = Vec::new();
+        if let Some(gnd_id) = board.nets.iter().position(|n| n == "GND" || n.starts_with("GND")) {
+            plane_net_ids.push(gnd_id);
+        }
+        for &nid in board.inner_plane_nets().values() {
+            if !plane_net_ids.contains(&nid) {
+                plane_net_ids.push(nid);
+            }
+        }
+        if plane_net_ids.is_empty() {
             return 0;
-        };
+        }
 
         let mut added_via_positions: Vec<(f64, f64)> = Vec::new();
 
-        for fp in board.footprints.clone() {
-            if fp.reference == "U1" {
-                continue;
-            }
-            for pad in &fp.pads {
-                if pad.net_id == gnd_net_id && !pad.is_through_hole {
-                    let (px, py) = fp.pad_absolute_position(pad);
+        for &plane_net_id in &plane_net_ids {
+            let is_gnd = board.nets.get(plane_net_id).map_or(false, |n| n == "GND" || n.starts_with("GND"));
 
-                    // Check if pad already has a connected track on its layer
-                    let has_connected_track = board.tracks.iter().any(|t| {
-                        t.net_id == gnd_net_id
-                            && t.layer == fp.layer
-                            && ((t.start.0 - px).hypot(t.start.1 - py) < 0.05
-                                || (t.end.0 - px).hypot(t.end.1 - py) < 0.05)
-                    });
-                    if has_connected_track {
-                        continue;
-                    }
+            for fp in board.footprints.clone() {
+                if is_gnd && fp.reference == "U1" {
+                    continue;
+                }
+                for pad in &fp.pads {
+                    if pad.net_id == plane_net_id && !pad.is_through_hole {
+                        let (px, py) = fp.pad_absolute_position(pad);
 
-                    // Check if pad touches a PTH pin of GND
-                    let touches_pth = board.footprints.iter().any(|ofp| {
-                        ofp.pads.iter().any(|opad| {
-                            if opad.is_through_hole && opad.net_id == gnd_net_id {
-                                let (ox, oy) = ofp.pad_absolute_position(opad);
-                                (ox - px).hypot(oy - py) < 0.05
-                            } else {
-                                false
-                            }
-                        })
-                    });
-                    if touches_pth {
-                        continue;
-                    }
+                        // Check if pad already has a connected track on its layer
+                        let has_connected_track = board.tracks.iter().any(|t| {
+                            t.net_id == plane_net_id
+                                && t.layer == fp.layer
+                                && ((t.start.0 - px).hypot(t.start.1 - py) < 0.05
+                                    || (t.end.0 - px).hypot(t.end.1 - py) < 0.05)
+                        });
+                        if has_connected_track {
+                            continue;
+                        }
 
-                    let track_w = board.get_netclass_for_net(gnd_net_id).track_width.min(0.25).max(0.20);
-                    let gnd_c = board.get_netclass_for_net(gnd_net_id).clearance.max(0.15);
+                        // Check if pad touches a PTH pin of this plane net
+                        let touches_pth = board.footprints.iter().any(|ofp| {
+                            ofp.pads.iter().any(|opad| {
+                                if opad.is_through_hole && opad.net_id == plane_net_id {
+                                    let (ox, oy) = ofp.pad_absolute_position(opad);
+                                    (ox - px).hypot(oy - py) < 0.05
+                                } else {
+                                    false
+                                }
+                            })
+                        });
+                        if touches_pth {
+                            continue;
+                        }
 
-                    // Try to connect to an existing nearby GND via first
-                    let mut connected_to_existing = false;
-                    for v in &board.vias {
-                        if v.net_id == gnd_net_id
-                            && (v.position.0 - px).hypot(v.position.1 - py) < 1.5
-                            && is_octilinear_segment((px, py), v.position)
-                        {
-                            if is_track_segment_legal(board, (px, py), v.position, track_w, fp.layer, gnd_net_id, gnd_c) {
-                                board.tracks.push(TrackSegment {
-                                    start: (px, py),
-                                    end: v.position,
-                                    width: track_w,
-                                    layer: fp.layer,
-                                    net_id: gnd_net_id,
-                                    is_locked: false,
-                                });
-                                connected_to_existing = true;
-                                break;
+                        let track_w = board.get_netclass_for_net(plane_net_id).track_width.min(0.25).max(0.20);
+                        let plane_c = board.get_netclass_for_net(plane_net_id).clearance.max(0.15);
+
+                        // Try to connect to an existing nearby plane via first
+                        let mut connected_to_existing = false;
+                        for v in &board.vias {
+                            if v.net_id == plane_net_id
+                                && (v.position.0 - px).hypot(v.position.1 - py) < 1.5
+                                && is_octilinear_segment((px, py), v.position)
+                            {
+                                if is_track_segment_legal(board, (px, py), v.position, track_w, fp.layer, plane_net_id, plane_c) {
+                                    board.tracks.push(TrackSegment {
+                                        start: (px, py),
+                                        end: v.position,
+                                        width: track_w,
+                                        layer: fp.layer,
+                                        net_id: plane_net_id,
+                                        is_locked: false,
+                                    });
+                                    connected_to_existing = true;
+                                    break;
+                                }
                             }
                         }
-                    }
 
-                    if !connected_to_existing {
-                        if let Some((vx, vy)) =
-                            Self::find_safe_gnd_via_location(board, grid, gnd_net_id, px, py, fp.layer, pad, &added_via_positions)
-                        {
-                            board.tracks.push(TrackSegment {
-                                start: (px, py),
-                                end: (vx, vy),
-                                width: track_w,
-                                layer: fp.layer,
-                                net_id: gnd_net_id,
-                                is_locked: false,
-                            });
-                            board.vias.push(Via {
-                                position: (vx, vy),
-                                size: 0.60,
-                                drill: 0.30,
-                                net_id: gnd_net_id,
-                                is_locked: false,
-                            });
-                            added_via_positions.push((vx, vy));
+                        if !connected_to_existing {
+                            if let Some((vx, vy)) =
+                                Self::find_safe_plane_via_location(board, grid, plane_net_id, px, py, fp.layer, pad, &added_via_positions)
+                            {
+                                board.tracks.push(TrackSegment {
+                                    start: (px, py),
+                                    end: (vx, vy),
+                                    width: track_w,
+                                    layer: fp.layer,
+                                    net_id: plane_net_id,
+                                    is_locked: false,
+                                });
+                                board.vias.push(Via {
+                                    position: (vx, vy),
+                                    size: 0.60,
+                                    drill: 0.30,
+                                    net_id: plane_net_id,
+                                    is_locked: false,
+                                });
+                                added_via_positions.push((vx, vy));
+                            }
                         }
                     }
                 }
@@ -5468,10 +5496,14 @@ pub fn find_choked_pin_bottlenecks(
         added_via_positions.len()
     }
 
-    fn find_safe_gnd_via_location(
+    pub fn add_ground_stitching_vias(&self, board: &mut Board, grid: &RoutingGrid) -> usize {
+        self.add_plane_stitching_vias(board, grid)
+    }
+
+    fn find_safe_plane_via_location(
         board: &Board,
         grid: &RoutingGrid,
-        gnd_net_id: usize,
+        plane_net_id: usize,
         px: f64,
         py: f64,
         layer: usize,
@@ -5480,8 +5512,8 @@ pub fn find_choked_pin_bottlenecks(
     ) -> Option<(f64, f64)> {
         let pad_dim = pad.width.max(pad.height);
         let min_d = (pad_dim * 0.5) + 0.35;
-        let track_w = board.get_netclass_for_net(gnd_net_id).track_width.min(0.25).max(0.20);
-        let gnd_c = board.get_netclass_for_net(gnd_net_id).clearance.max(0.15);
+        let track_w = board.get_netclass_for_net(plane_net_id).track_width.min(0.25).max(0.20);
+        let plane_c = board.get_netclass_for_net(plane_net_id).clearance.max(0.15);
 
         let mut offsets = Vec::new();
         for &dist in &[min_d, min_d + 0.25, min_d + 0.50, min_d + 0.75, min_d + 1.0, min_d + 1.25] {
@@ -5505,10 +5537,10 @@ pub fn find_choked_pin_bottlenecks(
             if existing_vias.iter().any(|ev| (ev.0 - vx).hypot(ev.1 - vy) < 0.65) {
                 continue;
             }
-            if !is_via_location_legal(board, (vx, vy), 0.60, gnd_net_id, gnd_c) {
+            if !is_via_location_legal(board, (vx, vy), 0.60, plane_net_id, plane_c) {
                 continue;
             }
-            if !is_track_segment_legal(board, (px, py), (vx, vy), track_w, layer, gnd_net_id, gnd_c) {
+            if !is_track_segment_legal(board, (px, py), (vx, vy), track_w, layer, plane_net_id, plane_c) {
                 continue;
             }
             if let Some((gx, gy)) = grid.world_to_grid(vx, vy) {
@@ -5525,8 +5557,8 @@ pub fn find_choked_pin_bottlenecks(
                             for l in 0..grid.num_layers {
                                 let idx_l = grid.idx(nx as usize, ny as usize, l);
                                 let nl = grid.obstacle_net_ids[idx_l];
-                                if (nl != FREE_NET && nl != gnd_net_id as i32)
-                                    || (grid.smd_pad_cells[idx_l] && nl != gnd_net_id as i32)
+                                if (nl != FREE_NET && nl != plane_net_id as i32)
+                                    || (grid.smd_pad_cells[idx_l] && nl != plane_net_id as i32)
                                 {
                                     safe = false;
                                     break;
@@ -9368,8 +9400,61 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
                 }
             }
 
+            let has_outward_reach = |layer: usize| -> bool {
+                let incident_to_v: Vec<usize> = board.tracks.iter().enumerate()
+                    .filter(|&(idx, t)| {
+                        t.net_id == v.net_id && !pruned_tracks[idx] && t.layer == layer && {
+                            let d_s = (t.start.0 - v.position.0).hypot(t.start.1 - v.position.1);
+                            let d_e = (t.end.0 - v.position.0).hypot(t.end.1 - v.position.1);
+                            d_s <= v.size * 0.5 + EPS || d_e <= v.size * 0.5 + EPS
+                        }
+                    })
+                    .map(|(idx, _)| idx)
+                    .collect();
+
+                for &t_idx in &incident_to_v {
+                    let t = &board.tracks[t_idx];
+                    let d_s = (t.start.0 - v.position.0).hypot(t.start.1 - v.position.1);
+                    let other_pt = if d_s <= v.size * 0.5 + EPS { t.end } else { t.start };
+
+                    let reaches_pad = board.footprints.iter().any(|fp| {
+                        fp.pads.iter().any(|p| {
+                            p.net_id == v.net_id && (p.is_through_hole || fp.layer == layer) && {
+                                let (px, py) = fp.pad_absolute_position(p);
+                                (other_pt.0 - px).hypot(other_pt.1 - py) < 0.12 || dist_point_to_pad(other_pt, fp, p) < EPS
+                            }
+                        })
+                    });
+                    if reaches_pad {
+                        return true;
+                    }
+
+                    let reaches_other_via = board.vias.iter().enumerate().any(|(vi, ov)| {
+                        vi != v_idx && ov.net_id == v.net_id && !pruned_vias[vi]
+                            && (other_pt.0 - ov.position.0).hypot(other_pt.1 - ov.position.1) <= ov.size * 0.5 + EPS
+                    });
+                    if reaches_other_via {
+                        return true;
+                    }
+
+                    let reaches_external_track = board.tracks.iter().enumerate().any(|(j, ot)| {
+                        ot.net_id == v.net_id && ot.layer == layer && !pruned_tracks[j] && !incident_to_v.contains(&j) && {
+                            (other_pt.0 - ot.start.0).hypot(other_pt.1 - ot.start.1) < EPS
+                                || (other_pt.0 - ot.end.0).hypot(other_pt.1 - ot.end.1) < EPS
+                                || dist_point_to_segment(other_pt, ot.start, ot.end) < EPS
+                        }
+                    });
+                    if reaches_external_track {
+                        return true;
+                    }
+                }
+                false
+            };
+
+            let valid_connected_layers = connected_layers.iter().filter(|&&l| has_outward_reach(l)).count();
+
             if !touches_pad && !has_plane {
-                if connected_tracks <= 1 || connected_layers.len() < 2 {
+                if connected_tracks <= 1 || valid_connected_layers < 2 {
                     pruned_vias[v_idx] = true;
                     changed = true;
                 }
@@ -9794,6 +9879,26 @@ pub fn add_teardrops(board: &mut Board) {
             // Distance along u from pad/via center to the other end of this segment
             let dist_to_other = (other_end.0 - center.0) * u.0 + (other_end.1 - center.1) * u.1;
             if dist_to_other <= r_u + 0.05 {
+                continue;
+            }
+
+            // Check if other_end also touches a pad or via of the same net
+            let other_touches_terminal = board.footprints.iter().any(|fp| {
+                fp.pads.iter().any(|p| {
+                    if p.net_id == track.net_id && (p.is_through_hole || fp.layer == track.layer) {
+                        let (px, py) = fp.pad_absolute_position(p);
+                        (other_end.0 - px).hypot(other_end.1 - py) <= p.width.max(p.height) * 0.5 + 0.10
+                            || dist_point_to_pad(other_end, fp, p) <= 0.10
+                    } else {
+                        false
+                    }
+                })
+            }) || board.vias.iter().any(|v| {
+                v.net_id == track.net_id && (other_end.0 - v.position.0).hypot(other_end.1 - v.position.1) <= v.size * 0.5 + 0.10
+            });
+
+            // Suppress teardrops on short segments (< 1.0mm) or pad-to-via / via-to-via stubs (< 2.0mm) to prevent dog-bone shapes
+            if seg_len < 1.0 || (other_touches_terminal && seg_len < 2.0) || dist_to_other < r_u + teardrop_len + 0.35 {
                 continue;
             }
 

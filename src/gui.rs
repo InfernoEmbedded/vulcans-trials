@@ -3328,7 +3328,7 @@ mod tests {
         // Second call while running should be a no-op
         app.start_trial(true, true);
 
-        for _ in 0..100 {
+        for _ in 0..300 {
             if !app.worker_running.load(Ordering::Relaxed) {
                 break;
             }

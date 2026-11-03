@@ -2181,6 +2181,13 @@ impl Board {
         map
     }
 
+    pub fn is_plane_net(&self, net_id: usize) -> bool {
+        let net_name = self.nets.get(net_id).map(|s| s.as_str()).unwrap_or("");
+        net_name == "GND"
+            || net_name.starts_with("GND")
+            || self.inner_plane_nets().values().any(|&pn| pn == net_id)
+    }
+
     pub fn boundary_aabb(&self) -> AABB {
         if let Some(ref poly) = self.outline_polygon {
             poly.aabb()

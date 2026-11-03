@@ -713,7 +713,8 @@ fn test_p1p2esp_project_board_integration_if_present() {
 
     let router = AutoRouter::new(2);
     let conns = router.extract_connections(&board);
-    assert_eq!(conns.len(), 77);
+    // 66 signal connections (11 +3.3V power connections are handled via direct plane via drops to In2.Cu)
+    assert_eq!(conns.len(), 66);
     assert!(
         conns.iter().any(|c| c.diff_pair_leader.is_some() && (c.net_name == "USB_DP" || c.net_name == "USB_DM")),
         "USB_DP/USB_DM between J2 and U4 must be paired as a coupled differential bus"
