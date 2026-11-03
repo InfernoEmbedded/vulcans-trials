@@ -257,6 +257,15 @@ impl Default for AppPreferences {
     }
 }
 
+fn is_running_under_cargo_test() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    env::current_exe()
+        .ok()
+        .is_some_and(|p| p.parent().is_some_and(|d| d.ends_with("deps")))
+}
+
 impl AppPreferences {
     /// Returns the default platform-specific configuration path for `preferences.json`.
     pub fn config_path() -> PathBuf {
@@ -285,7 +294,20 @@ impl AppPreferences {
 
     /// Loads preferences from the default config path, or returns default preferences if absent/invalid.
     pub fn load() -> Self {
-        Self::load_from_path(&Self::config_path()).unwrap_or_default()
+        let mut prefs = Self::load_from_path(&Self::config_path()).unwrap_or_default();
+        let test_polluted = prefs
+            .last_input_path
+            .as_deref()
+            .is_some_and(|p| p.starts_with("/tmp/vulcan"));
+        if test_polluted || (prefs.max_ripup_passes <= 1 && prefs.grid_res_mm >= 0.25) {
+            prefs.grid_res_mm = default_grid_res();
+            prefs.max_ripup_passes = default_max_ripup();
+            if test_polluted {
+                prefs.last_input_path = None;
+                prefs.last_output_path = None;
+            }
+        }
+        prefs
     }
 
     /// Loads preferences from a specific filesystem path.
@@ -447,9 +469,8 @@ impl VulcansTrialsApp {
             last_saved_prefs: AppPreferences::default(),
         };
 
-        // Load and apply saved preferences on launch (isolated during unit tests)
-        #[cfg(not(test))]
-        {
+        // Load and apply saved preferences on launch (isolated during unit and integration tests)
+        if !is_running_under_cargo_test() {
             let saved_prefs = AppPreferences::load();
             app.apply_preferences(&saved_prefs);
             app.last_saved_prefs = app.to_preferences();
@@ -562,12 +583,9 @@ impl VulcansTrialsApp {
         let prefs = self.to_preferences();
         if let Some(ref target) = self.preferences_path {
             let _ = prefs.save_to_path(target);
-        } else {
-            #[cfg(not(test))]
-            {
-                let target = AppPreferences::config_path();
-                let _ = prefs.save_to_path(&target);
-            }
+        } else if !is_running_under_cargo_test() {
+            let target = AppPreferences::config_path();
+            let _ = prefs.save_to_path(&target);
         }
         self.last_saved_prefs = prefs;
     }

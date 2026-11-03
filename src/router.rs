@@ -3067,6 +3067,40 @@ impl AutoRouter {
                     best_routed_count = done;
                     best_routed_paths = routed_paths.clone();
                 }
+                if let Some(ref st) = live {
+                    self.reconstruct_tracks_and_vias(board, grid, &connections, &routed_paths, &escape_stubs);
+                    let remaining_ratsnest: Vec<crate::board::Segment> = connections
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, _)| routed_paths[i].is_none())
+                        .map(|(_, c)| {
+                            let p1 = board.footprints[c.start_fp].pad_absolute_position(&board.footprints[c.start_fp].pads[c.start_pad]);
+                            let p2 = board.footprints[c.end_fp].pad_absolute_position(&board.footprints[c.end_fp].pads[c.end_pad]);
+                            crate::board::Segment {
+                                p1: Point::new(p1.0, p1.1),
+                                p2: Point::new(p2.0, p2.1),
+                                net_id: c.net_id,
+                            }
+                        })
+                        .collect();
+                    if let Ok(mut g) = st.lock() {
+                        g.board.tracks = board.tracks.clone();
+                        g.board.vias = board.vias.clone();
+                        g.board.footprints = board.footprints.clone();
+                        g.ratsnest = remaining_ratsnest;
+                        g.routed_conns = done;
+                        g.routing_pass = iteration + 1;
+                        g.progress = 0.5 + 0.5 * (done as f32 / total_conns.max(1) as f32);
+                        g.status_text = format!(
+                            "Pass {}/{}: Routed {}/{} ({:.1}%)",
+                            iteration + 1,
+                            self.max_ripup_iterations,
+                            done,
+                            total_conns,
+                            (done as f64 / total_conns.max(1) as f64) * 100.0
+                        );
+                    }
+                }
                 println!(
                     "  [Router] Pass {}/{}: Routed {}/{} connections ({:.1}%) [{:.1}s elapsed]",
                     iteration + 1,
@@ -3085,6 +3119,7 @@ impl AutoRouter {
                 // Rip-up and Negotiated Congestion Update (budgeted to avoid wiping all progress)
                 if iteration + 1 < self.max_ripup_iterations {
                     let mut rip_budget = 8;
+                    let corridor_tol = (0.85 + 0.35 * (iteration as f64)).min(2.5);
                     for conn_idx in 0..total_conns {
                         if rip_budget == 0 {
                             break;
@@ -3096,14 +3131,14 @@ impl AutoRouter {
 
                             let mut choked_nets = Vec::new();
                             if let Some((sgx, sgy)) = grid.world_to_grid(b_start.0, b_start.1) {
-                                let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, sgx, sgy, b_start.2, blocked_conn.net_id, 60);
-                                if reach <= 45 {
+                                let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, sgx, sgy, b_start.2, blocked_conn.net_id, 400);
+                                if reach < 300 {
                                     choked_nets.extend(nets);
                                 }
                             }
                             if let Some((egx, egy)) = grid.world_to_grid(b_end.0, b_end.1) {
-                                let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, egx, egy, b_end.2, blocked_conn.net_id, 60);
-                                if reach <= 45 {
+                                let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, egx, egy, b_end.2, blocked_conn.net_id, 400);
+                                if reach < 300 {
                                     choked_nets.extend(nets);
                                 }
                             }
@@ -3120,13 +3155,13 @@ impl AutoRouter {
                                 let is_choked = choked_nets.contains(&connections[rip_idx].net_id);
                                 let is_at_pin = is_choked || p.iter().any(|node| {
                                     let (wx, wy) = grid.grid_to_world(node.gx, node.gy);
-                                    (wx - b_start.0).hypot(wy - b_start.1) < 1.0
-                                        || (wx - b_end.0).hypot(wy - b_end.1) < 1.0
+                                    (wx - b_start.0).hypot(wy - b_start.1) < 1.2
+                                        || (wx - b_end.0).hypot(wy - b_end.1) < 1.2
                                 });
                                 let passes_near = is_at_pin
                                     || p.iter().any(|node| {
                                         let (wx, wy) = grid.grid_to_world(node.gx, node.gy);
-                                        dist_to_segment(wx, wy, b_start.0, b_start.1, b_end.0, b_end.1) < 0.75
+                                        dist_to_segment(wx, wy, b_start.0, b_start.1, b_end.0, b_end.1) < corridor_tol
                                     });
 
                                 let is_diff = connections[rip_idx].diff_pair_leader.is_some()
@@ -3150,7 +3185,7 @@ impl AutoRouter {
                                             let d_e = (wx - b_end.0).hypot(wy - b_end.1);
                                             let d_seg = dist_to_segment(wx, wy, b_start.0, b_start.1, b_end.0, b_end.1);
                                             let idx = grid.idx(node.gx, node.gy, node.layer);
-                                            if d_s < 1.5 || d_e < 1.5 || d_seg < 1.2 {
+                                            if is_choked || d_s < 1.8 || d_e < 1.8 || d_seg < corridor_tol {
                                                 grid.congestion[idx] += self.congestion_factor * 3.5;
                                             } else {
                                                 grid.congestion[idx] += self.congestion_factor * 1.5;
@@ -4400,11 +4435,35 @@ pub fn find_choked_pin_bottlenecks(
                 if !visited.contains(&(ux, uy)) {
                     let idx = grid.idx(ux, uy, layer);
                     let obs = grid.obstacle_net_ids[idx];
-                    if obs == FREE_NET || obs == net_id as i32 {
+                    if obs != FREE_NET && obs != net_id as i32 {
+                        if obs > 0 && !grid.smd_pad_cells[idx] {
+                            blocking_nets.insert(obs as usize);
+                        }
+                        continue;
+                    }
+                    // Also check 1-cell clearance halo around (ux, uy) so the BFS does not
+                    // leak through sub-clearance 0.10mm cracks between foreign tracks and pads
+                    let mut halo_blocked = false;
+                    for hdx in -1isize..=1 {
+                        for hdy in -1isize..=1 {
+                            if hdx == 0 && hdy == 0 {
+                                continue;
+                            }
+                            let hx = ux as isize + hdx;
+                            let hy = uy as isize + hdy;
+                            if hx >= 0 && hx < grid.width as isize && hy >= 0 && hy < grid.height as isize {
+                                let h_idx = grid.idx(hx as usize, hy as usize, layer);
+                                let h_obs = grid.obstacle_net_ids[h_idx];
+                                if h_obs > 0 && h_obs != net_id as i32 && !grid.smd_pad_cells[h_idx] {
+                                    blocking_nets.insert(h_obs as usize);
+                                    halo_blocked = true;
+                                }
+                            }
+                        }
+                    }
+                    if !halo_blocked {
                         visited.insert((ux, uy));
                         queue.push_back((ux, uy));
-                    } else if obs > 0 {
-                        blocking_nets.insert(obs as usize);
                     }
                 }
             }
@@ -4436,7 +4495,7 @@ pub fn find_choked_pin_bottlenecks(
 
         // 1. Identify Candidate Blocking Connections:
         // Include:
-        // (a) Choked pin bottlenecks (<= 25 reachable nodes)
+        // (a) Choked pin bottlenecks (< 300 reachable nodes)
         // (b) Tracks / vias in the corridor within 2.5 mm
         let (s_grid, e_grid) = (
             grid.world_to_grid(c_start.0, c_start.1),
@@ -4444,14 +4503,14 @@ pub fn find_choked_pin_bottlenecks(
         );
         let mut choked_blocking_nets = Vec::new();
         if let Some((sgx, sgy)) = s_grid {
-            let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, sgx, sgy, c_start.2, conn.net_id, 60);
-            if reach <= 45 && !nets.is_empty() {
+            let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, sgx, sgy, c_start.2, conn.net_id, 400);
+            if reach < 300 && !nets.is_empty() {
                 choked_blocking_nets.extend(nets);
             }
         }
         if let Some((egx, egy)) = e_grid {
-            let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, egx, egy, c_end.2, conn.net_id, 60);
-            if reach <= 45 && !nets.is_empty() {
+            let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, egx, egy, c_end.2, conn.net_id, 400);
+            if reach < 300 && !nets.is_empty() {
                 choked_blocking_nets.extend(nets);
             }
         }
@@ -5083,55 +5142,57 @@ pub fn find_choked_pin_bottlenecks(
                                 connections.iter().position(|c| c.diff_pair_leader == Some(conn_idx))
                             };
                             if let Some(m_idx) = mate_conn_idx {
-                                if let Some(ref m_path) = paths[m_idx] {
-                                    let mut nearest_trans = None;
-                                    let mut min_d = f64::INFINITY;
-                                    for (mi, mn) in m_path.iter().enumerate() {
-                                        if mi + 1 < m_path.len() && m_path[mi + 1].layer != mn.layer {
-                                            let mw = grid.grid_to_world(mn.gx, mn.gy);
-                                            let d = (mw.0 - pt.0).hypot(mw.1 - pt.1);
-                                            if d < min_d && d < 2.0 {
-                                                min_d = d;
-                                                nearest_trans = Some(mw);
+                                if m_idx < paths.len() && m_idx < connections.len() {
+                                    if let Some(ref m_path) = paths[m_idx] {
+                                        let mut nearest_trans = None;
+                                        let mut min_d = f64::INFINITY;
+                                        for (mi, mn) in m_path.iter().enumerate() {
+                                            if mi + 1 < m_path.len() && m_path[mi + 1].layer != mn.layer {
+                                                let mw = grid.grid_to_world(mn.gx, mn.gy);
+                                                let d = (mw.0 - pt.0).hypot(mw.1 - pt.1);
+                                                if d < min_d && d < 2.0 {
+                                                    min_d = d;
+                                                    nearest_trans = Some(mw);
+                                                }
                                             }
                                         }
-                                    }
-                                    if let Some(m_pt) = nearest_trans {
-                                        let min_spacing = (via_dia + conn.netclass.clearance).max(0.80);
-                                        let mid = ((pt.0 + m_pt.0) * 0.5, (pt.1 + m_pt.1) * 0.5);
-                                        let mut norm = (pt.0 - m_pt.0, pt.1 - m_pt.1);
-                                        let norm_len = norm.0.hypot(norm.1);
-                                        if norm_len > 1e-4 {
-                                            norm = (norm.0 / norm_len, norm.1 / norm_len);
-                                            let cand_via = (mid.0 + norm.0 * min_spacing * 0.5, mid.1 + norm.1 * min_spacing * 0.5);
-                                            let cand_mate = (mid.0 - norm.0 * min_spacing * 0.5, mid.1 - norm.1 * min_spacing * 0.5);
-                                            let mate_conn = &connections[m_idx];
-                                            if is_via_location_legal(board, cand_via, via_dia, conn.net_id, conn.netclass.clearance)
-                                                && is_via_location_legal(board, cand_mate, via_dia, mate_conn.net_id, mate_conn.netclass.clearance)
-                                            {
-                                                final_via_pt = cand_via;
-                                                for mv in &mut board.vias {
-                                                    if (mv.position.0 - m_pt.0).hypot(mv.position.1 - m_pt.1) < 0.40 {
-                                                        mv.position = cand_mate;
-                                                    }
-                                                }
-                                                for t in &mut board.tracks {
-                                                    if t.net_id == mate_conn.net_id {
-                                                        if (t.start.0 - m_pt.0).hypot(t.start.1 - m_pt.1) < 0.05 {
-                                                            t.start = cand_mate;
-                                                        }
-                                                        if (t.end.0 - m_pt.0).hypot(t.end.1 - m_pt.1) < 0.05 {
-                                                            t.end = cand_mate;
+                                        if let Some(m_pt) = nearest_trans {
+                                            let min_spacing = (via_dia + conn.netclass.clearance).max(0.80);
+                                            let mid = ((pt.0 + m_pt.0) * 0.5, (pt.1 + m_pt.1) * 0.5);
+                                            let mut norm = (pt.0 - m_pt.0, pt.1 - m_pt.1);
+                                            let norm_len = norm.0.hypot(norm.1);
+                                            if norm_len > 1e-4 {
+                                                norm = (norm.0 / norm_len, norm.1 / norm_len);
+                                                let cand_via = (mid.0 + norm.0 * min_spacing * 0.5, mid.1 + norm.1 * min_spacing * 0.5);
+                                                let cand_mate = (mid.0 - norm.0 * min_spacing * 0.5, mid.1 - norm.1 * min_spacing * 0.5);
+                                                let mate_conn = &connections[m_idx];
+                                                if is_via_location_legal(board, cand_via, via_dia, conn.net_id, conn.netclass.clearance)
+                                                    && is_via_location_legal(board, cand_mate, via_dia, mate_conn.net_id, mate_conn.netclass.clearance)
+                                                {
+                                                    final_via_pt = cand_via;
+                                                    for mv in &mut board.vias {
+                                                        if (mv.position.0 - m_pt.0).hypot(mv.position.1 - m_pt.1) < 0.40 {
+                                                            mv.position = cand_mate;
                                                         }
                                                     }
-                                                }
-                                                if let Some(last_trk) = board.tracks.last_mut() {
-                                                    if last_trk.net_id == conn.net_id && (last_trk.end.0 - pt.0).hypot(last_trk.end.1 - pt.1) < 0.05 {
-                                                        last_trk.end = cand_via;
+                                                    for t in &mut board.tracks {
+                                                        if t.net_id == mate_conn.net_id {
+                                                            if (t.start.0 - m_pt.0).hypot(t.start.1 - m_pt.1) < 0.05 {
+                                                                t.start = cand_mate;
+                                                            }
+                                                            if (t.end.0 - m_pt.0).hypot(t.end.1 - m_pt.1) < 0.05 {
+                                                                t.end = cand_mate;
+                                                            }
+                                                        }
                                                     }
+                                                    if let Some(last_trk) = board.tracks.last_mut() {
+                                                        if last_trk.net_id == conn.net_id && (last_trk.end.0 - pt.0).hypot(last_trk.end.1 - pt.1) < 0.05 {
+                                                            last_trk.end = cand_via;
+                                                        }
+                                                    }
+                                                } else {
+                                                    final_via_pt = pt;
                                                 }
-                                            } else {
-                                                final_via_pt = pt;
                                             }
                                         }
                                     }
@@ -15291,4 +15352,67 @@ mod tests {
             "Connection must remain electrically continuous after merging duplicate same-net vias"
         );
     }
+
+    #[test]
+    fn test_single_connection_reconstruct_with_diff_pair_leader_and_choked_pocket_ripup() {
+        let mut board = Board {
+            min_x: 100.0,
+            min_y: 100.0,
+            max_x: 120.0,
+            max_y: 120.0,
+            footprints: vec![
+                Footprint {
+                    reference: "U1".to_string(),
+                    x: 105.0,
+                    y: 105.0,
+                    pads: vec![Pad::new("1", 0.0, 0.0, 0.5, 0.5, 2, "USB_DM", false)],
+                    ..Footprint::default()
+                },
+                Footprint {
+                    reference: "U2".to_string(),
+                    x: 112.0,
+                    y: 105.0,
+                    pads: vec![Pad::new("1", 0.0, 0.0, 0.5, 0.5, 2, "USB_DM", false)],
+                    ..Footprint::default()
+                },
+            ],
+            nets: vec!["".to_string(), "GND".to_string(), "USB_DM".to_string(), "BLOCKER".to_string()],
+            ..Board::default()
+        };
+        let router = AutoRouter::new(2);
+        let mut grid = RoutingGrid::new(&board, 0.10, None);
+
+        // 1. Verify single-connection reconstruct_tracks_and_vias does not panic when diff_pair_leader is out of slice bounds
+        let mut single_conn = router.extract_connections(&board);
+        assert_eq!(single_conn.len(), 1);
+        single_conn[0].diff_pair_leader = Some(5); // Out-of-bounds index relative to single_paths (len 1)
+        let (sgx, sgy) = grid.world_to_grid(105.0, 105.0).unwrap();
+        let (egx, egy) = grid.world_to_grid(112.0, 105.0).unwrap();
+        let path = vec![
+            GridNode { gx: sgx, gy: sgy, layer: 0 },
+            GridNode { gx: (sgx + egx) / 2, gy: sgy, layer: 0 },
+            GridNode { gx: (sgx + egx) / 2, gy: sgy, layer: 1 },
+            GridNode { gx: egx, gy: egy, layer: 1 },
+        ];
+        router.reconstruct_tracks_and_vias(&mut board, &grid, &single_conn, &[Some(path)], &[]);
+        assert!(!board.tracks.is_empty(), "Single-connection reconstruct with layer change must emit tracks without panicking");
+
+        // 2. Verify find_choked_pin_bottlenecks detects a surrounding track ring even if 1-cell cracks exist
+        let (cx, cy) = (sgx, sgy);
+        for d in -4isize..=4 {
+            // Place foreign net 3 on a ring at radius 4 with a 1-cell diagonal gap that a 1-cell halo catches
+            let top = grid.idx((cx as isize + d) as usize, (cy as isize - 4) as usize, 0);
+            let bot = grid.idx((cx as isize + d) as usize, (cy as isize + 4) as usize, 0);
+            let lft = grid.idx((cx as isize - 4) as usize, (cy as isize + d) as usize, 0);
+            let rgt = grid.idx((cx as isize + 4) as usize, (cy as isize + d) as usize, 0);
+            grid.obstacle_net_ids[top] = 3;
+            grid.obstacle_net_ids[bot] = 3;
+            grid.obstacle_net_ids[lft] = 3;
+            grid.obstacle_net_ids[rgt] = 3;
+        }
+        let (reach, blockers) = AutoRouter::find_choked_pin_bottlenecks(&grid, cx, cy, 0, 2, 400);
+        assert!(reach < 100, "Pin enclosed by track ring must be detected as choked (reach={})", reach);
+        assert!(blockers.contains(&3), "Blocker net 3 must be identified by find_choked_pin_bottlenecks");
+    }
 }
+
