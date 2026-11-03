@@ -560,8 +560,15 @@ impl VulcansTrialsApp {
     /// Saves the current preferences to disk if configured or default path.
     pub fn save_preferences(&mut self) {
         let prefs = self.to_preferences();
-        let target = self.preferences_path.clone().unwrap_or_else(AppPreferences::config_path);
-        let _ = prefs.save_to_path(&target);
+        if let Some(ref target) = self.preferences_path {
+            let _ = prefs.save_to_path(target);
+        } else {
+            #[cfg(not(test))]
+            {
+                let target = AppPreferences::config_path();
+                let _ = prefs.save_to_path(&target);
+            }
+        }
         self.last_saved_prefs = prefs;
     }
 
