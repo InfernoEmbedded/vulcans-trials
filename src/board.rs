@@ -2286,6 +2286,7 @@ impl Board {
         const EPS: f64 = 0.05;
 
         let mut tracks_to_remove = HashSet::new();
+        let mut arcs_to_remove = HashSet::new();
         let mut vias_to_remove = HashSet::new();
 
         for &net_id in &active_nets {
@@ -2310,6 +2311,14 @@ impl Board {
                 .map(|(i, _)| i)
                 .collect();
 
+            let arc_indices: Vec<usize> = self
+                .arcs
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.net_id == net_id && !a.is_locked)
+                .map(|(i, _)| i)
+                .collect();
+
             let via_indices: Vec<usize> = self
                 .vias
                 .iter()
@@ -2318,7 +2327,7 @@ impl Board {
                 .map(|(i, _)| i)
                 .collect();
 
-            if trk_indices.is_empty() && via_indices.is_empty() {
+            if trk_indices.is_empty() && arc_indices.is_empty() && via_indices.is_empty() {
                 continue;
             }
 
@@ -2351,6 +2360,22 @@ impl Board {
                 false
             };
 
+            let arc_touches_my_pads = |a: &ArcSegment| -> bool {
+                let s = a.start();
+                let e = a.end();
+                for pad in &my_pads {
+                    if !pad.is_through_hole && target_fp.layer != a.layer {
+                        continue;
+                    }
+                    if crate::router::dist_point_to_pad(s, &target_fp, pad) < EPS
+                        || crate::router::dist_point_to_pad(e, &target_fp, pad) < EPS
+                    {
+                        return true;
+                    }
+                }
+                false
+            };
+
             let via_touches_my_pads = |v: &Via| -> bool {
                 for pad in &my_pads {
                     let (px, py) = target_fp.pad_absolute_position(pad);
@@ -2367,6 +2392,7 @@ impl Board {
             #[derive(Copy, Clone, PartialEq, Eq, Hash)]
             enum Item {
                 Track(usize),
+                Arc(usize),
                 Via(usize),
             }
 
@@ -2377,6 +2403,12 @@ impl Board {
                 if track_touches_my_pads(&self.tracks[ti]) {
                     visited.insert(Item::Track(ti));
                     queue.push_back(Item::Track(ti));
+                }
+            }
+            for &ai in &arc_indices {
+                if arc_touches_my_pads(&self.arcs[ai]) {
+                    visited.insert(Item::Arc(ai));
+                    queue.push_back(Item::Arc(ai));
                 }
             }
             for &vi in &via_indices {
@@ -2426,6 +2458,31 @@ impl Board {
                             }
                         }
 
+                        for &ai in &arc_indices {
+                            if visited.contains(&Item::Arc(ai)) {
+                                continue;
+                            }
+                            let a = &self.arcs[ai];
+                            if a.layer != t.layer {
+                                continue;
+                            }
+                            let as_pt = a.start();
+                            let ae_pt = a.end();
+                            let contact = if crate::router::dist_point_to_segment(as_pt, t.start, t.end) < EPS {
+                                Some(as_pt)
+                            } else if crate::router::dist_point_to_segment(ae_pt, t.start, t.end) < EPS {
+                                Some(ae_pt)
+                            } else {
+                                None
+                            };
+                            if let Some(cpt) = contact {
+                                if !touches_any_other_pad(cpt, Some(t.layer)) {
+                                    visited.insert(Item::Arc(ai));
+                                    queue.push_back(Item::Arc(ai));
+                                }
+                            }
+                        }
+
                         for &vi in &via_indices {
                             if visited.contains(&Item::Via(vi)) {
                                 continue;
@@ -2433,6 +2490,78 @@ impl Board {
                             let v = &self.vias[vi];
                             let d = crate::router::dist_point_to_segment(v.position, t.start, t.end);
                             if d <= v.size * 0.5 + EPS {
+                                if !touches_any_other_pad(v.position, None) {
+                                    visited.insert(Item::Via(vi));
+                                    queue.push_back(Item::Via(vi));
+                                }
+                            }
+                        }
+                    }
+                    Item::Arc(a_idx) => {
+                        let a = &self.arcs[a_idx];
+                        let as_pt = a.start();
+                        let ae_pt = a.end();
+
+                        for &ti in &trk_indices {
+                            if visited.contains(&Item::Track(ti)) {
+                                continue;
+                            }
+                            let t = &self.tracks[ti];
+                            if t.layer != a.layer {
+                                continue;
+                            }
+                            let contact = if crate::router::dist_point_to_segment(as_pt, t.start, t.end) < EPS {
+                                Some(as_pt)
+                            } else if crate::router::dist_point_to_segment(ae_pt, t.start, t.end) < EPS {
+                                Some(ae_pt)
+                            } else {
+                                None
+                            };
+                            if let Some(cpt) = contact {
+                                if !touches_any_other_pad(cpt, Some(a.layer)) {
+                                    visited.insert(Item::Track(ti));
+                                    queue.push_back(Item::Track(ti));
+                                }
+                            }
+                        }
+
+                        for &other_a_idx in &arc_indices {
+                            if other_a_idx == a_idx || visited.contains(&Item::Arc(other_a_idx)) {
+                                continue;
+                            }
+                            let oa = &self.arcs[other_a_idx];
+                            if oa.layer != a.layer {
+                                continue;
+                            }
+                            let oas = oa.start();
+                            let oae = oa.end();
+                            let contact = if (as_pt.0 - oas.0).hypot(as_pt.1 - oas.1) < EPS
+                                || (as_pt.0 - oae.0).hypot(as_pt.1 - oae.1) < EPS
+                            {
+                                Some(as_pt)
+                            } else if (ae_pt.0 - oas.0).hypot(ae_pt.1 - oas.1) < EPS
+                                || (ae_pt.0 - oae.0).hypot(ae_pt.1 - oae.1) < EPS
+                            {
+                                Some(ae_pt)
+                            } else {
+                                None
+                            };
+                            if let Some(cpt) = contact {
+                                if !touches_any_other_pad(cpt, Some(a.layer)) {
+                                    visited.insert(Item::Arc(other_a_idx));
+                                    queue.push_back(Item::Arc(other_a_idx));
+                                }
+                            }
+                        }
+
+                        for &vi in &via_indices {
+                            if visited.contains(&Item::Via(vi)) {
+                                continue;
+                            }
+                            let v = &self.vias[vi];
+                            if (v.position.0 - as_pt.0).hypot(v.position.1 - as_pt.1) <= v.size * 0.5 + EPS
+                                || (v.position.0 - ae_pt.0).hypot(v.position.1 - ae_pt.1) <= v.size * 0.5 + EPS
+                            {
                                 if !touches_any_other_pad(v.position, None) {
                                     visited.insert(Item::Via(vi));
                                     queue.push_back(Item::Via(vi));
@@ -2453,6 +2582,23 @@ impl Board {
                                 if !touches_any_other_pad(v.position, None) {
                                     visited.insert(Item::Track(ti));
                                     queue.push_back(Item::Track(ti));
+                                }
+                            }
+                        }
+
+                        for &ai in &arc_indices {
+                            if visited.contains(&Item::Arc(ai)) {
+                                continue;
+                            }
+                            let a = &self.arcs[ai];
+                            let as_pt = a.start();
+                            let ae_pt = a.end();
+                            if (v.position.0 - as_pt.0).hypot(v.position.1 - as_pt.1) <= v.size * 0.5 + EPS
+                                || (v.position.0 - ae_pt.0).hypot(v.position.1 - ae_pt.1) <= v.size * 0.5 + EPS
+                            {
+                                if !touches_any_other_pad(v.position, None) {
+                                    visited.insert(Item::Arc(ai));
+                                    queue.push_back(Item::Arc(ai));
                                 }
                             }
                         }
@@ -2479,6 +2625,9 @@ impl Board {
                     Item::Track(ti) => {
                         tracks_to_remove.insert(ti);
                     }
+                    Item::Arc(ai) => {
+                        arcs_to_remove.insert(ai);
+                    }
                     Item::Via(vi) => {
                         vias_to_remove.insert(vi);
                     }
@@ -2487,8 +2636,9 @@ impl Board {
         }
 
         let ripped_tracks_count = tracks_to_remove.len();
+        let ripped_arcs_count = arcs_to_remove.len();
         let ripped_vias_count = vias_to_remove.len();
-        let total_ripped = ripped_tracks_count + ripped_vias_count;
+        let total_ripped = ripped_tracks_count + ripped_arcs_count + ripped_vias_count;
 
         if total_ripped > 0 {
             let mut new_tracks = Vec::with_capacity(self.tracks.len() - ripped_tracks_count);
@@ -2498,6 +2648,14 @@ impl Board {
                 }
             }
             self.tracks = new_tracks;
+
+            let mut new_arcs = Vec::with_capacity(self.arcs.len() - ripped_arcs_count);
+            for (idx, arc) in self.arcs.drain(..).enumerate() {
+                if !arcs_to_remove.contains(&idx) {
+                    new_arcs.push(arc);
+                }
+            }
+            self.arcs = new_arcs;
 
             let mut new_vias = Vec::with_capacity(self.vias.len() - ripped_vias_count);
             for (idx, v) in self.vias.drain(..).enumerate() {
@@ -2722,7 +2880,7 @@ impl Board {
                 let m = arc.mid();
                 let e = arc.end();
                 s_expr.push_str(&format!(
-                    "  (arc (start {:.4} {:.4}) (mid {:.4} {:.4}) (end {:.4} {:.4}) (stroke (width {:.4})) (layer \"{}\") (net {}){})\n",
+                    "  (arc (start {:.4} {:.4}) (mid {:.4} {:.4}) (end {:.4} {:.4}) (width {:.4}) (layer \"{}\") (net {}){})\n",
                     s.0, s.1, m.0, m.1, e.0, e.1, arc.width, layer_name, arc.net_id, locked_str
                 ));
             }
@@ -5771,7 +5929,7 @@ mod tests {
         // Export to KiCad PCB S-expression
         let saved_pcb = board.save_kicad_pcb().expect("save_kicad_pcb failed");
         assert!(saved_pcb.contains("(arc (start 105.0000 100.0000)"));
-        assert!(saved_pcb.contains("(stroke (width 0.2500))"));
+        assert!(saved_pcb.contains("(width 0.2500)"));
         assert!(saved_pcb.contains("(layer \"F.Cu\") (net 2)"));
 
         // Round-trip parse back

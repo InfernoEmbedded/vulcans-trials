@@ -3167,7 +3167,7 @@ impl AutoRouter {
         }
 
         // Phase 3: Post-Route Glossing Pass (rubber-band straightening, stair-step elimination, 45-deg mitering)
-        self.gloss_tracks(board, grid);
+        gloss_tracks_standard(board, grid);
         prune_dangling_tracks_and_vias(board);
 
         // Phase 2: Coupled Diff Pair Precision Alignment and Intra-Pair Phase Matching
@@ -3210,6 +3210,13 @@ impl AutoRouter {
         // Comprehensive Pre-Export DRC Verification & Cleaning
         validate_and_clean_copper(board);
         prune_dangling_tracks_and_vias(board);
+
+        if self.config.any_angle_mode {
+            relax_homotopic_rubber_bands(board);
+            apply_any_angle_tangent_arcs(board);
+            prune_dangling_tracks_and_vias(board);
+        }
+
         self.validate_crosstalk_and_coupling(board);
 
         if let Some(ref st) = live {
@@ -4543,6 +4550,7 @@ pub fn find_choked_pin_bottlenecks(
         let locked_vias: Vec<Via> = board.vias.iter().filter(|v| v.is_locked).cloned().collect();
         board.tracks = locked_tracks;
         board.vias = locked_vias;
+        board.arcs.retain(|a| a.is_locked);
 
         for (conn_idx, path_opt) in paths.iter().enumerate() {
             let Some(path) = path_opt else {
@@ -6457,17 +6465,32 @@ pub fn extract_track_chains(tracks: &[TrackSegment], board: &Board) -> Vec<Track
             if let Some(&pt) = pt_coords.get(&q) {
                 let near_pad = board.footprints.iter().any(|fp| {
                     fp.pads.iter().any(|p| {
-                        p.net_id == net_id && (fp.pad_absolute_position(p).0 - pt.0).hypot(fp.pad_absolute_position(p).1 - pt.1) < 0.05
+                        p.net_id == net_id
+                            && (p.is_through_hole || fp.layer == layer)
+                            && ((fp.pad_absolute_position(p).0 - pt.0).hypot(fp.pad_absolute_position(p).1 - pt.1) < 0.12
+                                || dist_point_to_pad(pt, fp, p) < 0.05)
                     })
                 });
                 let near_via = board.vias.iter().any(|v| {
-                    v.net_id == net_id && (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05
+                    v.net_id == net_id && (v.position.0 - pt.0).hypot(v.position.1 - pt.1) <= v.size * 0.5 + 0.05
                 });
                 let near_other_track = tracks.iter().any(|t| {
                     t.net_id == net_id
                         && (t.layer != layer || (t.width - width).abs() > 1e-4)
                         && ((t.start.0 - pt.0).hypot(t.start.1 - pt.1) < 1e-3
                             || (t.end.0 - pt.0).hypot(t.end.1 - pt.1) < 1e-3)
+                }) || board.tracks.iter().any(|t| {
+                    t.is_locked
+                        && t.net_id == net_id
+                        && t.layer == layer
+                        && ((t.start.0 - pt.0).hypot(t.start.1 - pt.1) < 0.05
+                            || (t.end.0 - pt.0).hypot(t.end.1 - pt.1) < 0.05
+                            || dist_point_to_segment(pt, t.start, t.end) < 0.05)
+                }) || board.arcs.iter().any(|a| {
+                    a.net_id == net_id
+                        && a.layer == layer
+                        && ((a.start().0 - pt.0).hypot(a.start().1 - pt.1) < 0.05
+                            || (a.end().0 - pt.0).hypot(a.end().1 - pt.1) < 0.05)
                 });
                 near_pad || near_via || near_other_track
             } else {
@@ -8788,8 +8811,9 @@ pub fn apply_any_angle_tangent_arcs(board: &mut Board) {
         }
 
         board.tracks.retain(|t| t.net_id != net_id || t.is_locked);
+        board.arcs.retain(|a| a.net_id != net_id || a.is_locked);
 
-        let chains = extract_track_chains(&net_tracks, board);
+        let mut chains = extract_track_chains(&net_tracks, board);
         for chain in chains {
             let n = chain.points.len();
             if n < 3 {
@@ -9281,8 +9305,10 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
         pass += 1;
 
         let num_tracks = board.tracks.len();
+        let num_arcs = board.arcs.len();
         let num_vias = board.vias.len();
         let mut pruned_tracks = vec![false; num_tracks];
+        let mut pruned_arcs = vec![false; num_arcs];
         let mut pruned_vias = vec![false; num_vias];
 
         // 1. Identify track dead-ends
@@ -9333,6 +9359,19 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
                     }
                 }
 
+                // D. Check arcs of matching net on same layer
+                for (a_idx, a) in board.arcs.iter().enumerate() {
+                    if !pruned_arcs[a_idx] && a.net_id == t.net_id && a.layer == t.layer {
+                        let as_pt = a.start();
+                        let ae_pt = a.end();
+                        if (pt.0 - as_pt.0).hypot(pt.1 - as_pt.1) < EPS
+                            || (pt.0 - ae_pt.0).hypot(pt.1 - ae_pt.1) < EPS
+                        {
+                            return true;
+                        }
+                    }
+                }
+
                 false
             };
 
@@ -9341,6 +9380,75 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
 
             if !start_connected || !end_connected {
                 pruned_tracks[i] = true;
+                changed = true;
+            }
+        }
+
+        // 1b. Identify arc dead-ends
+        for i in 0..num_arcs {
+            let a = &board.arcs[i];
+            if a.is_locked {
+                continue;
+            }
+
+            let check_arc_endpoint = |pt: (f64, f64)| -> bool {
+                for fp in &board.footprints {
+                    for pad in &fp.pads {
+                        if pad.net_id == a.net_id {
+                            if pad.is_through_hole || fp.layer == a.layer {
+                                let (px, py) = fp.pad_absolute_position(pad);
+                                if (pt.0 - px).hypot(pt.1 - py) < 0.12
+                                    || dist_point_to_pad(pt, fp, pad) < EPS
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for (v_idx, v) in board.vias.iter().enumerate() {
+                    if v.net_id == a.net_id && !pruned_vias[v_idx] {
+                        if (pt.0 - v.position.0).hypot(pt.1 - v.position.1) <= v.size * 0.5 + EPS {
+                            return true;
+                        }
+                    }
+                }
+
+                for j in 0..num_tracks {
+                    if !pruned_tracks[j] {
+                        let o = &board.tracks[j];
+                        if o.net_id == a.net_id && o.layer == a.layer {
+                            if (pt.0 - o.start.0).hypot(pt.1 - o.start.1) < EPS
+                                || (pt.0 - o.end.0).hypot(pt.1 - o.end.1) < EPS
+                                || dist_point_to_segment(pt, o.start, o.end) < EPS
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+
+                for j in 0..num_arcs {
+                    if i != j && !pruned_arcs[j] {
+                        let oa = &board.arcs[j];
+                        if oa.net_id == a.net_id && oa.layer == a.layer {
+                            let oas = oa.start();
+                            let oae = oa.end();
+                            if (pt.0 - oas.0).hypot(pt.1 - oas.1) < EPS
+                                || (pt.0 - oae.0).hypot(pt.1 - oae.1) < EPS
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+
+                false
+            };
+
+            if !check_arc_endpoint(a.start()) || !check_arc_endpoint(a.end()) {
+                pruned_arcs[i] = true;
                 changed = true;
             }
         }
@@ -9379,6 +9487,19 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
                 }
             }
 
+            for (a_idx, a) in board.arcs.iter().enumerate() {
+                if a.net_id == v.net_id && !pruned_arcs[a_idx] {
+                    let as_pt = a.start();
+                    let ae_pt = a.end();
+                    let d_start = (as_pt.0 - v.position.0).hypot(as_pt.1 - v.position.1);
+                    let d_end = (ae_pt.0 - v.position.0).hypot(ae_pt.1 - v.position.1);
+                    if d_start <= v.size * 0.5 + EPS || d_end <= v.size * 0.5 + EPS {
+                        connected_tracks += 1;
+                        connected_layers.insert(a.layer);
+                    }
+                }
+            }
+
             let has_outward_reach = |layer: usize| -> bool {
                 let incident_to_v: Vec<usize> = board.tracks.iter().enumerate()
                     .filter(|&(idx, t)| {
@@ -9391,11 +9512,20 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
                     .map(|(idx, _)| idx)
                     .collect();
 
-                for &t_idx in &incident_to_v {
-                    let t = &board.tracks[t_idx];
-                    let d_s = (t.start.0 - v.position.0).hypot(t.start.1 - v.position.1);
-                    let other_pt = if d_s <= v.size * 0.5 + EPS { t.end } else { t.start };
+                let incident_arcs_to_v: Vec<usize> = board.arcs.iter().enumerate()
+                    .filter(|&(idx, a)| {
+                        a.net_id == v.net_id && !pruned_arcs[idx] && a.layer == layer && {
+                            let as_pt = a.start();
+                            let ae_pt = a.end();
+                            let d_s = (as_pt.0 - v.position.0).hypot(as_pt.1 - v.position.1);
+                            let d_e = (ae_pt.0 - v.position.0).hypot(ae_pt.1 - v.position.1);
+                            d_s <= v.size * 0.5 + EPS || d_e <= v.size * 0.5 + EPS
+                        }
+                    })
+                    .map(|(idx, _)| idx)
+                    .collect();
 
+                let check_other_pt_reach = |other_pt: (f64, f64)| -> bool {
                     let reaches_pad = board.footprints.iter().any(|fp| {
                         fp.pads.iter().any(|p| {
                             p.net_id == v.net_id && (p.is_through_hole || fp.layer == layer) && {
@@ -9426,7 +9556,38 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
                     if reaches_external_track {
                         return true;
                     }
+
+                    let reaches_external_arc = board.arcs.iter().enumerate().any(|(j, oa)| {
+                        oa.net_id == v.net_id && oa.layer == layer && !pruned_arcs[j] && !incident_arcs_to_v.contains(&j) && {
+                            let oas = oa.start();
+                            let oae = oa.end();
+                            (other_pt.0 - oas.0).hypot(other_pt.1 - oas.1) < EPS
+                                || (other_pt.0 - oae.0).hypot(other_pt.1 - oae.1) < EPS
+                        }
+                    });
+                    reaches_external_arc
+                };
+
+                for &t_idx in &incident_to_v {
+                    let t = &board.tracks[t_idx];
+                    let d_s = (t.start.0 - v.position.0).hypot(t.start.1 - v.position.1);
+                    let other_pt = if d_s <= v.size * 0.5 + EPS { t.end } else { t.start };
+                    if check_other_pt_reach(other_pt) {
+                        return true;
+                    }
                 }
+
+                for &a_idx in &incident_arcs_to_v {
+                    let a = &board.arcs[a_idx];
+                    let as_pt = a.start();
+                    let ae_pt = a.end();
+                    let d_s = (as_pt.0 - v.position.0).hypot(as_pt.1 - v.position.1);
+                    let other_pt = if d_s <= v.size * 0.5 + EPS { ae_pt } else { as_pt };
+                    if check_other_pt_reach(other_pt) {
+                        return true;
+                    }
+                }
+
                 false
             };
 
@@ -9449,6 +9610,14 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
             }
             board.tracks = new_tracks;
 
+            let mut new_arcs = Vec::with_capacity(num_arcs);
+            for (idx, arc) in board.arcs.drain(..).enumerate() {
+                if !pruned_arcs[idx] {
+                    new_arcs.push(arc);
+                }
+            }
+            board.arcs = new_arcs;
+
             let mut new_vias = Vec::with_capacity(num_vias);
             for (idx, v) in board.vias.drain(..).enumerate() {
                 if !pruned_vias[idx] {
@@ -9465,7 +9634,7 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
 
 /// Prunes disconnected islands of copper that do not connect to any pad or plane.
 fn prune_orphan_components(board: &mut Board) {
-    if board.tracks.is_empty() {
+    if board.tracks.is_empty() && board.arcs.is_empty() {
         return;
     }
     let plane_nets = board.inner_plane_nets();
@@ -9476,13 +9645,19 @@ fn prune_orphan_components(board: &mut Board) {
             || plane_nets.values().any(|&pn| pn == nid)
     };
 
-    const EPS: f64 = 0.005;
+    const EPS: f64 = 0.05;
 
-    let mut net_ids: Vec<usize> = board.tracks.iter().map(|t| t.net_id).collect();
+    let mut net_ids: Vec<usize> = board
+        .tracks
+        .iter()
+        .map(|t| t.net_id)
+        .chain(board.arcs.iter().map(|a| a.net_id))
+        .collect();
     net_ids.sort_unstable();
     net_ids.dedup();
 
     let mut keep_track = vec![true; board.tracks.len()];
+    let mut keep_arc = vec![true; board.arcs.len()];
     let mut keep_via = vec![true; board.vias.len()];
 
     for net_id in net_ids {
@@ -9493,6 +9668,13 @@ fn prune_orphan_components(board: &mut Board) {
             .filter(|(_, t)| t.net_id == net_id)
             .map(|(i, _)| i)
             .collect();
+        let arc_indices: Vec<usize> = board
+            .arcs
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.net_id == net_id)
+            .map(|(i, _)| i)
+            .collect();
         let via_indices: Vec<usize> = board
             .vias
             .iter()
@@ -9501,7 +9683,7 @@ fn prune_orphan_components(board: &mut Board) {
             .map(|(i, _)| i)
             .collect();
 
-        if track_indices.is_empty() {
+        if track_indices.is_empty() && arc_indices.is_empty() {
             continue;
         }
 
@@ -9522,8 +9704,10 @@ fn prune_orphan_components(board: &mut Board) {
         let has_plane = is_plane_net(net_id);
 
         let n_t = track_indices.len();
+        let n_a = arc_indices.len();
         let n_v = via_indices.len();
-        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n_t + n_v];
+        let total_nodes = n_t + n_a + n_v;
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); total_nodes];
 
         for i in 0..n_t {
             let ti = &board.tracks[track_indices[i]];
@@ -9544,13 +9728,64 @@ fn prune_orphan_components(board: &mut Board) {
                     }
                 }
             }
+            for ai in 0..n_a {
+                let a = &board.arcs[arc_indices[ai]];
+                if ti.layer == a.layer {
+                    let as_pt = a.start();
+                    let ae_pt = a.end();
+                    let node_a = n_t + ai;
+                    let connected = (ti.start.0 - as_pt.0).hypot(ti.start.1 - as_pt.1) < EPS
+                        || (ti.start.0 - ae_pt.0).hypot(ti.start.1 - ae_pt.1) < EPS
+                        || (ti.end.0 - as_pt.0).hypot(ti.end.1 - as_pt.1) < EPS
+                        || (ti.end.0 - ae_pt.0).hypot(ti.end.1 - ae_pt.1) < EPS
+                        || dist_point_to_segment(as_pt, ti.start, ti.end) < EPS
+                        || dist_point_to_segment(ae_pt, ti.start, ti.end) < EPS;
+                    if connected {
+                        adj[i].push(node_a);
+                        adj[node_a].push(i);
+                    }
+                }
+            }
+        }
+
+        for ai in 0..n_a {
+            let a = &board.arcs[arc_indices[ai]];
+            let as_pt = a.start();
+            let ae_pt = a.end();
+            let node_a = n_t + ai;
+            for aj in (ai + 1)..n_a {
+                let oa = &board.arcs[arc_indices[aj]];
+                if a.layer == oa.layer {
+                    let oas = oa.start();
+                    let oae = oa.end();
+                    let node_oa = n_t + aj;
+                    let connected = (as_pt.0 - oas.0).hypot(as_pt.1 - oas.1) < EPS
+                        || (as_pt.0 - oae.0).hypot(as_pt.1 - oae.1) < EPS
+                        || (ae_pt.0 - oas.0).hypot(ae_pt.1 - oas.1) < EPS
+                        || (ae_pt.0 - oae.0).hypot(ae_pt.1 - oae.1) < EPS;
+                    if connected {
+                        adj[node_a].push(node_oa);
+                        adj[node_oa].push(node_a);
+                    }
+                }
+            }
+            for vi in 0..n_v {
+                let v = &board.vias[via_indices[vi]];
+                let node_v = n_t + n_a + vi;
+                let d_s = (as_pt.0 - v.position.0).hypot(as_pt.1 - v.position.1);
+                let d_e = (ae_pt.0 - v.position.0).hypot(ae_pt.1 - v.position.1);
+                if d_s <= v.size * 0.5 + EPS || d_e <= v.size * 0.5 + EPS {
+                    adj[node_a].push(node_v);
+                    adj[node_v].push(node_a);
+                }
+            }
         }
 
         for i in 0..n_t {
             let ti = &board.tracks[track_indices[i]];
             for vi in 0..n_v {
                 let v = &board.vias[via_indices[vi]];
-                let node_v = n_t + vi;
+                let node_v = n_t + n_a + vi;
                 let d_s = (ti.start.0 - v.position.0).hypot(ti.start.1 - v.position.1);
                 let d_e = (ti.end.0 - v.position.0).hypot(ti.end.1 - v.position.1);
                 if d_s <= v.size * 0.5 + EPS || d_e <= v.size * 0.5 + EPS {
@@ -9560,7 +9795,7 @@ fn prune_orphan_components(board: &mut Board) {
             }
         }
 
-        let mut is_anchor = vec![false; n_t + n_v];
+        let mut is_anchor = vec![false; total_nodes];
         for i in 0..n_t {
             let ti = &board.tracks[track_indices[i]];
             if ti.is_locked {
@@ -9569,8 +9804,8 @@ fn prune_orphan_components(board: &mut Board) {
             }
             for &(px, py, pad_layer, is_th) in &pad_positions {
                 if is_th || pad_layer == ti.layer {
-                    if (ti.start.0 - px).hypot(ti.start.1 - py) < 0.10
-                        || (ti.end.0 - px).hypot(ti.end.1 - py) < 0.10
+                    if (ti.start.0 - px).hypot(ti.start.1 - py) < 0.12
+                        || (ti.end.0 - px).hypot(ti.end.1 - py) < 0.12
                         || dist_point_to_segment((px, py), ti.start, ti.end) < 0.05
                     {
                         is_anchor[i] = true;
@@ -9580,9 +9815,30 @@ fn prune_orphan_components(board: &mut Board) {
             }
         }
 
+        for ai in 0..n_a {
+            let a = &board.arcs[arc_indices[ai]];
+            let node_a = n_t + ai;
+            if a.is_locked {
+                is_anchor[node_a] = true;
+                continue;
+            }
+            let as_pt = a.start();
+            let ae_pt = a.end();
+            for &(px, py, pad_layer, is_th) in &pad_positions {
+                if is_th || pad_layer == a.layer {
+                    if (as_pt.0 - px).hypot(as_pt.1 - py) < 0.12
+                        || (ae_pt.0 - px).hypot(ae_pt.1 - py) < 0.12
+                    {
+                        is_anchor[node_a] = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         for vi in 0..n_v {
             let v = &board.vias[via_indices[vi]];
-            let node_v = n_t + vi;
+            let node_v = n_t + n_a + vi;
             if v.is_locked || has_plane {
                 is_anchor[node_v] = true;
                 continue;
@@ -9595,9 +9851,9 @@ fn prune_orphan_components(board: &mut Board) {
             }
         }
 
-        let mut visited = vec![false; n_t + n_v];
+        let mut visited = vec![false; total_nodes];
         let mut queue = VecDeque::new();
-        for node in 0..(n_t + n_v) {
+        for node in 0..total_nodes {
             if is_anchor[node] {
                 visited[node] = true;
                 queue.push_back(node);
@@ -9618,8 +9874,13 @@ fn prune_orphan_components(board: &mut Board) {
                 keep_track[track_indices[i]] = false;
             }
         }
+        for ai in 0..n_a {
+            if !visited[n_t + ai] && !board.arcs[arc_indices[ai]].is_locked {
+                keep_arc[arc_indices[ai]] = false;
+            }
+        }
         for vi in 0..n_v {
-            if !visited[n_t + vi] && !board.vias[via_indices[vi]].is_locked {
+            if !visited[n_t + n_a + vi] && !board.vias[via_indices[vi]].is_locked {
                 keep_via[via_indices[vi]] = false;
             }
         }
@@ -9632,6 +9893,14 @@ fn prune_orphan_components(board: &mut Board) {
         }
     }
     board.tracks = new_tracks;
+
+    let mut new_arcs = Vec::with_capacity(board.arcs.len());
+    for (i, a) in board.arcs.drain(..).enumerate() {
+        if keep_arc[i] {
+            new_arcs.push(a);
+        }
+    }
+    board.arcs = new_arcs;
 
     let mut new_vias = Vec::with_capacity(board.vias.len());
     for (i, v) in board.vias.drain(..).enumerate() {
@@ -13958,6 +14227,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_any_angle_tangent_arcs_preserved_by_pruning() {
+        let mut board = Board::default();
+        board.nets = vec!["".to_string(), "SIG".to_string()];
+        board.net_name_to_id.insert("SIG".to_string(), 1);
+
+        let mut fp1 = Footprint {
+            reference: "R1".to_string(),
+            x: 0.0,
+            y: 0.0,
+            ..Footprint::default()
+        };
+        fp1.pads.push(Pad::new("1", 0.0, 0.0, 0.6, 0.6, 1, "SIG", false));
+        let mut fp2 = Footprint {
+            reference: "R2".to_string(),
+            x: 10.0,
+            y: 10.0,
+            layer: 1,
+            ..Footprint::default()
+        };
+        fp2.pads.push(Pad::new("1", 0.0, 0.0, 0.6, 0.6, 1, "SIG", false));
+        board.footprints.push(fp1);
+        board.footprints.push(fp2);
+
+        // Route from R1 (0,0, L0) -> (5,0, L0) -> (5,5, L0) [via to L1] -> (10,5, L1) -> R2 (10,10, L1)
+        board.tracks.push(TrackSegment { start: (0.0, 0.0), end: (5.0, 0.0), width: 0.25, layer: 0, net_id: 1, is_locked: false });
+        board.tracks.push(TrackSegment { start: (5.0, 0.0), end: (5.0, 5.0), width: 0.25, layer: 0, net_id: 1, is_locked: false });
+        board.vias.push(Via { position: (5.0, 5.0), size: 0.60, drill: 0.30, net_id: 1, is_locked: false });
+        board.tracks.push(TrackSegment { start: (5.0, 5.0), end: (10.0, 5.0), width: 0.25, layer: 1, net_id: 1, is_locked: false });
+        board.tracks.push(TrackSegment { start: (10.0, 5.0), end: (10.0, 10.0), width: 0.25, layer: 1, net_id: 1, is_locked: false });
+
+        apply_any_angle_tangent_arcs(&mut board);
+        assert_eq!(board.arcs.len(), 2, "Expected 2 corner tangent arcs");
+
+        // Also add a genuinely dangling arc that is not connected on one end
+        board.arcs.push(crate::board::ArcSegment::new((30.0, 30.0), 2.0, 0.0, 1.0, 0.25, 0, 1));
+
+        prune_dangling_tracks_and_vias(&mut board);
+
+        assert_eq!(board.tracks.len(), 4, "All 4 trimmed straight segments must survive pruning");
+        assert_eq!(board.arcs.len(), 2, "Both connected corner arcs must survive while dangling arc is pruned");
+        assert_eq!(board.vias.len(), 1, "Layer transition via must survive pruning");
     }
 }
 
