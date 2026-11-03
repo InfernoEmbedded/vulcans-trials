@@ -1818,6 +1818,9 @@ impl Board {
 
         for line in content.lines() {
             let trimmed = line.trim();
+            if trimmed.starts_with("(footprint") || trimmed.starts_with("(module") {
+                break;
+            }
             if trimmed.starts_with("(net ") && trimmed.ends_with(')') {
                 let inner = &trimmed[5..trimmed.len() - 1];
                 let mut parts = inner.splitn(2, ' ');
@@ -1956,7 +1959,7 @@ impl Board {
                 } else if word == "segment" {
                     if let Some(end) = find_closing_paren(bytes, i) {
                         let block = &content[i..end];
-                        if let Some(tr) = parse_segment(block, &active_layers) {
+                        if let Some(tr) = parse_segment(block, &active_layers, &mut nets, &mut net_name_to_id) {
                             tracks.push(tr);
                         }
                         i = end;
@@ -1965,7 +1968,7 @@ impl Board {
                 } else if word == "arc" {
                     if let Some(end) = find_closing_paren(bytes, i) {
                         let block = &content[i..end];
-                        if let Some(arc) = parse_arc(block, &active_layers) {
+                        if let Some(arc) = parse_arc(block, &active_layers, &mut nets, &mut net_name_to_id) {
                             arcs.push(arc);
                         }
                         i = end;
@@ -1974,7 +1977,7 @@ impl Board {
                 } else if word == "via" {
                     if let Some(end) = find_closing_paren(bytes, i) {
                         let block = &content[i..end];
-                        if let Some(v) = parse_via(block) {
+                        if let Some(v) = parse_via(block, &mut nets, &mut net_name_to_id) {
                             vias.push(v);
                         }
                         i = end;
@@ -2773,6 +2776,33 @@ impl Board {
     }
 
     pub fn to_kicad_pcb(&self) -> Result<String, String> {
+        let is_kicad10_named_nets = self.raw_content.contains("(version 2026")
+            || self.raw_content.contains("(generator_version \"10.")
+            || self.footprints.iter().any(|fp| {
+                fp.pads.iter().any(|p| {
+                    p.net_span.is_some_and(|(s, e)| {
+                        e <= self.raw_content.len() && self.raw_content[s..e].starts_with("(net \"")
+                    })
+                })
+            });
+
+        let format_pad_net = |pad: &Pad| -> String {
+            if is_kicad10_named_nets {
+                format!("(net \"{}\")", pad.net_name)
+            } else {
+                format!("(net {} \"{}\")", pad.net_id, pad.net_name)
+            }
+        };
+
+        let format_copper_net = |net_id: usize| -> String {
+            if is_kicad10_named_nets {
+                let name = self.nets.get(net_id).map(|s| s.as_str()).unwrap_or("");
+                format!("(net \"{}\")", name)
+            } else {
+                format!("(net {})", net_id)
+            }
+        };
+
         let mut replacements: Vec<(usize, usize, String)> = Vec::new();
         for fp in &self.footprints {
             if fp.is_locked && fp.layer == fp.orig_layer {
@@ -2788,10 +2818,24 @@ impl Board {
             if fp.layer != fp.orig_layer {
                 if let Some((f_start, f_end)) = fp.fp_span {
                     if f_start < f_end && f_end <= self.raw_content.len() {
-                        let mut fp_block = self.raw_content[f_start..f_end].to_string();
+                        let mut inner_reps: Vec<(usize, usize, String)> = Vec::new();
                         if let Some((a_start, a_end)) = fp.at_span {
                             if a_start >= f_start && a_end <= f_end {
-                                fp_block.replace_range((a_start - f_start)..(a_end - f_start), &new_at);
+                                inner_reps.push((a_start - f_start, a_end - f_start, new_at.clone()));
+                            }
+                        }
+                        for pad in &fp.pads {
+                            if let Some((n_start, n_end)) = pad.net_span {
+                                if n_start >= f_start && n_end <= f_end && n_start < n_end {
+                                    inner_reps.push((n_start - f_start, n_end - f_start, format_pad_net(pad)));
+                                }
+                            }
+                        }
+                        inner_reps.sort_by(|a, b| b.0.cmp(&a.0));
+                        let mut fp_block = self.raw_content[f_start..f_end].to_string();
+                        for (rs, re, rep_s) in inner_reps {
+                            if rs < re && re <= fp_block.len() {
+                                fp_block.replace_range(rs..re, &rep_s);
                             }
                         }
                         fp_block = swap_footprint_layers(&fp_block);
@@ -2811,7 +2855,7 @@ impl Board {
             if fp.layer == fp.orig_layer {
                 for pad in &fp.pads {
                     if let Some((n_start, n_end)) = pad.net_span {
-                        let expected_net_str = format!("(net {} \"{}\")", pad.net_id, pad.net_name);
+                        let expected_net_str = format_pad_net(pad);
                         if n_start < n_end && n_end <= self.raw_content.len() {
                             if &self.raw_content[n_start..n_end] != expected_net_str {
                                 replacements.push((n_start, n_end, expected_net_str));
@@ -2868,27 +2912,30 @@ impl Board {
             for tr in &self.tracks {
                 let layer_name = self.layer_name(tr.layer);
                 let locked_str = if tr.is_locked { " (locked yes)" } else { "" };
+                let net_expr = format_copper_net(tr.net_id);
                 s_expr.push_str(&format!(
-                    "  (segment (start {:.4} {:.4}) (end {:.4} {:.4}) (width {:.4}) (layer \"{}\") (net {}){})\n",
-                    tr.start.0, tr.start.1, tr.end.0, tr.end.1, tr.width, layer_name, tr.net_id, locked_str
+                    "  (segment (start {:.4} {:.4}) (end {:.4} {:.4}) (width {:.4}) (layer \"{}\") {}{})\n",
+                    tr.start.0, tr.start.1, tr.end.0, tr.end.1, tr.width, layer_name, net_expr, locked_str
                 ));
             }
             for arc in &self.arcs {
                 let layer_name = self.layer_name(arc.layer);
                 let locked_str = if arc.is_locked { " (locked yes)" } else { "" };
+                let net_expr = format_copper_net(arc.net_id);
                 let s = arc.start();
                 let m = arc.mid();
                 let e = arc.end();
                 s_expr.push_str(&format!(
-                    "  (arc (start {:.4} {:.4}) (mid {:.4} {:.4}) (end {:.4} {:.4}) (width {:.4}) (layer \"{}\") (net {}){})\n",
-                    s.0, s.1, m.0, m.1, e.0, e.1, arc.width, layer_name, arc.net_id, locked_str
+                    "  (arc (start {:.4} {:.4}) (mid {:.4} {:.4}) (end {:.4} {:.4}) (width {:.4}) (layer \"{}\") {}{})\n",
+                    s.0, s.1, m.0, m.1, e.0, e.1, arc.width, layer_name, net_expr, locked_str
                 ));
             }
             for v in &self.vias {
                 let locked_str = if v.is_locked { " (locked yes)" } else { "" };
+                let net_expr = format_copper_net(v.net_id);
                 s_expr.push_str(&format!(
-                    "  (via (at {:.4} {:.4}) (size {:.4}) (drill {:.4}) (layers \"F.Cu\" \"B.Cu\") (net {}){})\n",
-                    v.position.0, v.position.1, v.size, v.drill, v.net_id, locked_str
+                    "  (via (at {:.4} {:.4}) (size {:.4}) (drill {:.4}) (layers \"F.Cu\" \"B.Cu\") {}{})\n",
+                    v.position.0, v.position.1, v.size, v.drill, net_expr, locked_str
                 ));
             }
             if !content.contains("(net_class ") {
@@ -3191,7 +3238,40 @@ fn extract_named_usize(block: &str, tag: &str) -> Option<usize> {
     rest[..end].split_whitespace().next()?.parse::<usize>().ok()
 }
 
-fn parse_arc(block: &str, active_layers: &[&str]) -> Option<ArcSegment> {
+fn extract_net_id_or_name(
+    block: &str,
+    nets: &mut Vec<String>,
+    net_name_to_id: &mut HashMap<String, usize>,
+) -> usize {
+    if let Some(id) = extract_named_usize(block, "net") {
+        return id;
+    }
+    if let Some(pos) = block.find("(net ") {
+        let after = &block[pos + 5..];
+        if let Some(q1) = after.find('"') {
+            if let Some(q2) = after[q1 + 1..].find('"') {
+                let name = after[q1 + 1..q1 + 1 + q2].to_string();
+                if !name.is_empty() {
+                    if let Some(&id) = net_name_to_id.get(&name) {
+                        return id;
+                    }
+                    let new_id = nets.len();
+                    nets.push(name.clone());
+                    net_name_to_id.insert(name, new_id);
+                    return new_id;
+                }
+            }
+        }
+    }
+    0
+}
+
+fn parse_arc(
+    block: &str,
+    active_layers: &[&str],
+    nets: &mut Vec<String>,
+    net_name_to_id: &mut HashMap<String, usize>,
+) -> Option<ArcSegment> {
     let start = extract_point(block, "start")?;
     let mid = extract_point(block, "mid")?;
     let end = extract_point(block, "end")?;
@@ -3200,7 +3280,7 @@ fn parse_arc(block: &str, active_layers: &[&str]) -> Option<ArcSegment> {
         .iter()
         .position(|&l| block.contains(&format!("\"{}\"", l)))
         .unwrap_or_else(|| if block.contains("\"B.Cu\"") { 1 } else { 0 });
-    let net_id = extract_named_usize(block, "net").unwrap_or(0);
+    let net_id = extract_net_id_or_name(block, nets, net_name_to_id);
     let is_locked = block.contains("(locked yes)") || block.contains("(locked)") || block.contains("(status 40000)");
 
     let mut arc = ArcSegment::from_3pts(start, mid, end, width, layer, net_id)?;
@@ -3208,7 +3288,12 @@ fn parse_arc(block: &str, active_layers: &[&str]) -> Option<ArcSegment> {
     Some(arc)
 }
 
-fn parse_segment(block: &str, active_layers: &[&str]) -> Option<TrackSegment> {
+fn parse_segment(
+    block: &str,
+    active_layers: &[&str],
+    nets: &mut Vec<String>,
+    net_name_to_id: &mut HashMap<String, usize>,
+) -> Option<TrackSegment> {
     let (sx, sy) = extract_point(block, "start")?;
     let (ex, ey) = extract_point(block, "end")?;
     let width = extract_named_f64(block, "width").unwrap_or(0.20);
@@ -3216,7 +3301,7 @@ fn parse_segment(block: &str, active_layers: &[&str]) -> Option<TrackSegment> {
         .iter()
         .position(|&l| block.contains(&format!("\"{}\"", l)))
         .unwrap_or_else(|| if block.contains("\"B.Cu\"") { 1 } else { 0 });
-    let net_id = extract_named_usize(block, "net").unwrap_or(0);
+    let net_id = extract_net_id_or_name(block, nets, net_name_to_id);
     let is_locked = block.contains("(locked yes)") || block.contains("(locked)") || block.contains("(status 40000)");
     Some(TrackSegment {
         start: (sx, sy),
@@ -3228,11 +3313,15 @@ fn parse_segment(block: &str, active_layers: &[&str]) -> Option<TrackSegment> {
     })
 }
 
-fn parse_via(block: &str) -> Option<Via> {
+fn parse_via(
+    block: &str,
+    nets: &mut Vec<String>,
+    net_name_to_id: &mut HashMap<String, usize>,
+) -> Option<Via> {
     let (vx, vy) = extract_point(block, "at")?;
     let size = extract_named_f64(block, "size").unwrap_or(0.60);
     let drill = extract_named_f64(block, "drill").unwrap_or(0.30);
-    let net_id = extract_named_usize(block, "net").unwrap_or(0);
+    let net_id = extract_net_id_or_name(block, nets, net_name_to_id);
     let is_locked = block.contains("(locked yes)") || block.contains("(locked)") || block.contains("(status 40000)");
     Some(Via {
         position: (vx, vy),
@@ -5954,5 +6043,65 @@ mod tests {
         assert_eq!(snippet_board.arcs[0].layer, 1);
         assert!((snippet_board.arcs[0].width - 0.30).abs() < 1e-4);
     }
+
+    #[test]
+    fn test_kicad10_named_net_roundtrip_and_pad_swap_export() {
+        let kicad10_pcb = r#"(kicad_pcb
+  (version 20260206)
+  (generator "pcbnew")
+  (generator_version "10.0")
+  (footprint "Resistor_SMD:R_0603_1608Metric"
+    (layer "F.Cu")
+    (at 10.0 20.0)
+    (property "Reference" "R1")
+    (property "Value" "10k")
+    (pad "1" smd rect (at -0.8 0) (size 0.8 0.9) (layers "F.Cu" "F.Mask") (net "+3.3V"))
+    (pad "2" smd rect (at 0.8 0) (size 0.8 0.9) (layers "F.Cu" "F.Mask") (net "Net-(D4-A)"))
+  )
+)"#;
+        let mut board = Board::from_kicad_pcb(kicad10_pcb).expect("Failed to parse KiCad 10 PCB");
+        assert_eq!(board.footprints.len(), 1);
+        assert_eq!(board.footprints[0].pads[0].net_name, "+3.3V");
+        assert_eq!(board.footprints[0].pads[1].net_name, "Net-(D4-A)");
+
+        // Swap the pads as pin swapping would
+        let p0_id = board.footprints[0].pads[0].net_id;
+        let p0_name = board.footprints[0].pads[0].net_name.clone();
+        let p1_id = board.footprints[0].pads[1].net_id;
+        let p1_name = board.footprints[0].pads[1].net_name.clone();
+        board.footprints[0].pads[0].net_id = p1_id;
+        board.footprints[0].pads[0].net_name = p1_name;
+        board.footprints[0].pads[1].net_id = p0_id;
+        board.footprints[0].pads[1].net_name = p0_name;
+
+        board.tracks.push(TrackSegment {
+            start: (9.2, 20.0),
+            end: (15.0, 20.0),
+            width: 0.2,
+            layer: 0,
+            net_id: p1_id,
+            is_locked: false,
+        });
+        board.vias.push(Via {
+            position: (15.0, 20.0),
+            size: 0.6,
+            drill: 0.3,
+            net_id: p1_id,
+            is_locked: false,
+        });
+
+        let exported = board.to_kicad_pcb().expect("Failed to export KiCad 10 PCB");
+        assert!(exported.contains("(net \"Net-(D4-A)\")"), "KiCad 10 export must preserve named net syntax without numeric ID prefix");
+        assert!(!exported.contains("(net 2 \"Net-(D4-A)\")"), "KiCad 10 export must not inject numeric ID on pads");
+        assert!(exported.contains("(segment (start 9.2000 20.0000) (end 15.0000 20.0000) (width 0.2000) (layer \"F.Cu\") (net \"Net-(D4-A)\"))"));
+        assert!(exported.contains("(via (at 15.0000 20.0000) (size 0.6000) (drill 0.3000) (layers \"F.Cu\" \"B.Cu\") (net \"Net-(D4-A)\"))"));
+
+        let reloaded = Board::from_kicad_pcb(&exported).expect("Failed to reload exported KiCad 10 PCB");
+        assert_eq!(reloaded.tracks.len(), 1);
+        assert_eq!(reloaded.vias.len(), 1);
+        assert_eq!(reloaded.tracks[0].net_id, reloaded.footprints[0].pads[0].net_id);
+        assert_eq!(reloaded.vias[0].net_id, reloaded.footprints[0].pads[0].net_id);
+    }
 }
+
 
