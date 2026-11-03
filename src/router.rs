@@ -560,8 +560,10 @@ impl RoutingGrid {
                                 } else {
                                     req_clearance
                                 };
-                                let eff_c = if req_clearance <= 0.15 || self.smd_pad_cells[c_idx] {
-                                    req_clearance.min(raw_obst_c).max(0.12)
+                                let eff_c = if self.smd_pad_cells[c_idx] {
+                                    (req_clearance.min(raw_obst_c) - 0.015).max(0.135)
+                                } else if req_clearance <= 0.15 {
+                                    req_clearance.min(raw_obst_c).max(0.15)
                                 } else {
                                     req_clearance.max(raw_obst_c)
                                 };
@@ -640,7 +642,8 @@ impl RoutingGrid {
                                 } else {
                                     req_clearance.max(obst_c)
                                 };
-                                let eff_c = (via_dia / 2.0) + obst_half_w + eff_c_val + 0.025;
+                                let obst_r = if self.smd_pad_cells[c_idx] { self.res * 0.5 } else { obst_half_w };
+                                let eff_c = (via_dia / 2.0) + obst_r + eff_c_val + 0.025;
                                 if d_sq < eff_c.powi(2) + 1e-6 {
                                     via_clearance_violation = true;
                                     break 'via_check;
@@ -660,7 +663,7 @@ impl RoutingGrid {
                                     } else {
                                         req_clearance.max(obst_c)
                                     };
-                                    (via_dia / 2.0) + obst_half_w + eff_c_val + 0.025
+                                    (via_dia / 2.0) + self.res * 0.5 + eff_c_val + 0.025
                                 };
                                 if d_sq < eff_c.powi(2) - 1e-6 {
                                     via_clearance_violation = true;
@@ -2154,7 +2157,7 @@ impl AutoRouter {
         }
         let ua = a.to_ascii_uppercase();
         let ub = b.to_ascii_uppercase();
-        for (suf_p, suf_n) in [("DP", "DM"), ("D+", "D-"), ("_P", "_N"), ("+", "-"), ("P", "N")] {
+        for (suf_p, suf_n) in [("DP", "DM"), ("D+", "D-"), ("_P", "_N"), ("+", "-")] {
             if let (Some(pa), Some(pb)) = (ua.strip_suffix(suf_p), ub.strip_suffix(suf_n)) {
                 if !pa.is_empty() && pa == pb {
                     return true;
@@ -2471,9 +2474,7 @@ impl AutoRouter {
                         || (conn.end.0 - s.tip_pos.0).hypot(conn.end.1 - s.tip_pos.1) < 0.05
                 });
             if touches_fine_pitch {
-                if !conn.netclass.name.starts_with("Power_15V") {
-                    conn.netclass.track_width = conn.netclass.track_width.min(0.15);
-                }
+                conn.netclass.track_width = conn.netclass.track_width.min(0.15);
                 conn.netclass.diff_pair_width = conn.netclass.diff_pair_width.min(0.20);
                 conn.netclass.diff_pair_gap = conn.netclass.diff_pair_gap.min(0.15);
                 conn.netclass.clearance = conn.netclass.clearance.min(0.15);
@@ -2485,7 +2486,7 @@ impl AutoRouter {
             }
             if is_passive_terminal {
                 if !conn.netclass.name.starts_with("Power_15V") {
-                    conn.netclass.track_width = conn.netclass.track_width.min(0.20);
+                    conn.netclass.track_width = conn.netclass.track_width.min(0.15);
                 }
                 conn.netclass.clearance = conn.netclass.clearance.min(0.15);
                 conn.netclass.via_dia = conn.netclass.via_dia.min(0.60);
@@ -3006,7 +3007,7 @@ impl AutoRouter {
 
                 // Rip-up and Negotiated Congestion Update (budgeted to avoid wiping all progress)
                 if iteration + 1 < self.max_ripup_iterations {
-                    let mut rip_budget = 12;
+                    let mut rip_budget = 8;
                     for conn_idx in 0..total_conns {
                         if rip_budget == 0 {
                             break;
@@ -3015,6 +3016,20 @@ impl AutoRouter {
                             let blocked_conn = &connections[conn_idx];
                             let b_start = blocked_conn.start;
                             let b_end = blocked_conn.end;
+
+                            let mut choked_nets = Vec::new();
+                            if let Some((sgx, sgy)) = grid.world_to_grid(b_start.0, b_start.1) {
+                                let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, sgx, sgy, b_start.2, blocked_conn.net_id, 60);
+                                if reach <= 45 {
+                                    choked_nets.extend(nets);
+                                }
+                            }
+                            if let Some((egx, egy)) = grid.world_to_grid(b_end.0, b_end.1) {
+                                let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, egx, egy, b_end.2, blocked_conn.net_id, 60);
+                                if reach <= 45 {
+                                    choked_nets.extend(nets);
+                                }
+                            }
 
                             let mut ripped = false;
                             for rip_idx in 0..total_conns {
@@ -3025,17 +3040,17 @@ impl AutoRouter {
                                     continue;
                                 }
                                 let p = routed_paths[rip_idx].as_ref().unwrap();
-                                let is_at_pin = p.iter().any(|node| {
+                                let is_choked = choked_nets.contains(&connections[rip_idx].net_id);
+                                let is_at_pin = is_choked || p.iter().any(|node| {
                                     let (wx, wy) = grid.grid_to_world(node.gx, node.gy);
                                     (wx - b_start.0).hypot(wy - b_start.1) < 1.0
                                         || (wx - b_end.0).hypot(wy - b_end.1) < 1.0
                                 });
-                                let airwire_len = (b_start.0 - b_end.0).hypot(b_start.1 - b_end.1);
                                 let passes_near = is_at_pin
-                                    || (airwire_len < 3.0 && p.iter().any(|node| {
+                                    || p.iter().any(|node| {
                                         let (wx, wy) = grid.grid_to_world(node.gx, node.gy);
-                                        dist_to_segment(wx, wy, b_start.0, b_start.1, b_end.0, b_end.1) < 0.6
-                                    }));
+                                        dist_to_segment(wx, wy, b_start.0, b_start.1, b_end.0, b_end.1) < 0.75
+                                    });
 
                                 let is_diff = connections[rip_idx].diff_pair_leader.is_some()
                                     || connections.iter().any(|c| c.diff_pair_leader == Some(rip_idx))
@@ -3053,8 +3068,16 @@ impl AutoRouter {
                                 if passes_near {
                                     if let Some(p) = routed_paths[rip_idx].take() {
                                         for node in &p {
+                                            let (wx, wy) = grid.grid_to_world(node.gx, node.gy);
+                                            let d_s = (wx - b_start.0).hypot(wy - b_start.1);
+                                            let d_e = (wx - b_end.0).hypot(wy - b_end.1);
+                                            let d_seg = dist_to_segment(wx, wy, b_start.0, b_start.1, b_end.0, b_end.1);
                                             let idx = grid.idx(node.gx, node.gy, node.layer);
-                                            grid.congestion[idx] += self.congestion_factor * 4.0;
+                                            if d_s < 1.5 || d_e < 1.5 || d_seg < 1.2 {
+                                                grid.congestion[idx] += self.congestion_factor * 3.5;
+                                            } else {
+                                                grid.congestion[idx] += self.congestion_factor * 1.5;
+                                            }
                                         }
                                         ripped = true;
                                         rip_budget -= 1;
@@ -4259,14 +4282,14 @@ pub fn find_choked_pin_bottlenecks(
         );
         let mut choked_blocking_nets = Vec::new();
         if let Some((sgx, sgy)) = s_grid {
-            let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, sgx, sgy, c_start.2, conn.net_id, 30);
-            if reach <= 25 && !nets.is_empty() {
+            let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, sgx, sgy, c_start.2, conn.net_id, 60);
+            if reach <= 45 && !nets.is_empty() {
                 choked_blocking_nets.extend(nets);
             }
         }
         if let Some((egx, egy)) = e_grid {
-            let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, egx, egy, c_end.2, conn.net_id, 30);
-            if reach <= 25 && !nets.is_empty() {
+            let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, egx, egy, c_end.2, conn.net_id, 60);
+            if reach <= 45 && !nets.is_empty() {
                 choked_blocking_nets.extend(nets);
             }
         }
@@ -4307,7 +4330,7 @@ pub fn find_choked_pin_bottlenecks(
                 }
             }
 
-            if is_choked_net || min_dist < 2.5 {
+            if is_choked_net || min_dist < 1.5 {
                 let is_near_pad = is_choked_net || min_pad_dist < 1.2;
                 candidate_conns.push((rip_idx, rip_prio, min_pad_dist, min_dist, is_near_pad));
             }
@@ -4319,9 +4342,9 @@ pub fn find_choked_pin_bottlenecks(
                 .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal))
                 .then_with(|| a.1.cmp(&b.1))
         });
-        candidate_conns.truncate(4);
+        candidate_conns.truncate(5);
 
-        for (rip_idx, _, _, _, _) in candidate_conns {
+        for &(rip_idx, _, _, _, _) in &candidate_conns {
             let orig_path = routed_paths[rip_idx].clone().unwrap();
 
             // ========================================================
@@ -4532,6 +4555,96 @@ pub fn find_choked_pin_bottlenecks(
 
             // If routing conn_idx failed even with rip_idx lifted, restore rip_idx and continue to next candidate
             routed_paths[rip_idx] = Some(orig_path);
+            self.rebuild_grid_state(board, grid, connections, routed_paths, escape_stubs);
+        }
+
+        // ========================================================
+        // STAGE 3: Multi-Track Corridor Shove
+        // If lifting 1 blocking track at a time was insufficient (e.g. 2-3 parallel tracks block a narrow gap),
+        // lift the top 3 closest blocking candidates simultaneously, route conn_idx, and immediately re-route
+        // the lifted candidates around conn_idx.
+        // ========================================================
+        if candidate_conns.len() >= 2 {
+            let group_size = candidate_conns.len().min(2);
+            let mut saved_group: Vec<(usize, Vec<GridNode>)> = Vec::with_capacity(group_size);
+            for i in 0..group_size {
+                let r_idx = candidate_conns[i].0;
+                if let Some(p) = routed_paths[r_idx].take() {
+                    saved_group.push((r_idx, p));
+                }
+            }
+            self.rebuild_grid_state(board, grid, connections, routed_paths, escape_stubs);
+
+            if let (Some((sgx, sgy)), Some((egx, egy))) = (
+                grid.world_to_grid(conn.start.0, conn.start.1),
+                grid.world_to_grid(conn.end.0, conn.end.1),
+            ) {
+                let s_node = GridNode { gx: sgx, gy: sgy, layer: conn.start.2 };
+                let e_node = GridNode { gx: egx, gy: egy, layer: conn.end.2 };
+
+                if let Some(p_conn) = self.find_path_parallel(
+                    grid,
+                    s_node,
+                    e_node,
+                    conn.net_id,
+                    conn.netclass.clearance,
+                    conn.netclass.track_width,
+                    conn.netclass.via_dia,
+                    u1_center,
+                    conn.netclass.max_coupled_length_mm,
+                    conn.netclass.require_return_path,
+                    stop_flag,
+                ) {
+                    self.commit_path_to_grid(grid, &p_conn, conn.net_id, conn.netclass.track_width, conn.netclass.via_dia);
+                    routed_paths[conn_idx] = Some(p_conn);
+
+                    for (r_idx, orig_p) in saved_group {
+                        let rip_conn = &connections[r_idx];
+                        let mut rerouted = false;
+                        if let (Some((rsgx, rsgy)), Some((regx, regy))) = (
+                            grid.world_to_grid(rip_conn.start.0, rip_conn.start.1),
+                            grid.world_to_grid(rip_conn.end.0, rip_conn.end.1),
+                        ) {
+                            let r_s = GridNode { gx: rsgx, gy: rsgy, layer: rip_conn.start.2 };
+                            let r_e = GridNode { gx: regx, gy: regy, layer: rip_conn.end.2 };
+                            if let Some(p_shoved) = self.find_path_parallel(
+                                grid,
+                                r_s,
+                                r_e,
+                                rip_conn.net_id,
+                                rip_conn.netclass.clearance,
+                                rip_conn.netclass.track_width,
+                                rip_conn.netclass.via_dia,
+                                u1_center,
+                                rip_conn.netclass.max_coupled_length_mm,
+                                rip_conn.netclass.require_return_path,
+                                stop_flag,
+                            ) {
+                                self.commit_path_to_grid(grid, &p_shoved, rip_conn.net_id, rip_conn.netclass.track_width, rip_conn.netclass.via_dia);
+                                routed_paths[r_idx] = Some(p_shoved);
+                                rerouted = true;
+                            }
+                        }
+                        if !rerouted {
+                            for node in &orig_p {
+                                let (wx, wy) = grid.grid_to_world(node.gx, node.gy);
+                                if (wx - c_start.0).hypot(wy - c_start.1) < 2.5
+                                    || (wx - c_end.0).hypot(wy - c_end.1) < 2.5
+                                    || dist_to_segment(wx, wy, c_start.0, c_start.1, c_end.0, c_end.1) < 2.0
+                                {
+                                    let idx = grid.idx(node.gx, node.gy, node.layer);
+                                    grid.congestion[idx] += self.congestion_factor * 2.5;
+                                }
+                            }
+                        }
+                    }
+                    return true;
+                }
+            }
+
+            for (r_idx, orig_p) in saved_group {
+                routed_paths[r_idx] = Some(orig_p);
+            }
             self.rebuild_grid_state(board, grid, connections, routed_paths, escape_stubs);
         }
 
@@ -4802,7 +4915,7 @@ pub fn find_choked_pin_bottlenecks(
                             Some(final_via_pt)
                         } else {
                             let mut cand_pt = None;
-                            for r in [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40] {
+                            for r in [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.60] {
                                 for &(dx, dy) in &[(r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r), (r, r), (r, -r), (-r, r), (-r, -r)] {
                                     let cand = (final_via_pt.0 + dx, final_via_pt.1 + dy);
                                     if is_via_location_legal(board, cand, via_dia, conn.net_id, conn.netclass.clearance.min(0.15)) {
@@ -8813,7 +8926,7 @@ pub fn apply_any_angle_tangent_arcs(board: &mut Board) {
         board.tracks.retain(|t| t.net_id != net_id || t.is_locked);
         board.arcs.retain(|a| a.net_id != net_id || a.is_locked);
 
-        let mut chains = extract_track_chains(&net_tracks, board);
+        let chains = extract_track_chains(&net_tracks, board);
         for chain in chains {
             let n = chain.points.len();
             if n < 3 {
@@ -9936,8 +10049,16 @@ pub fn validate_and_clean_copper(board: &mut Board) {
 
             // Copper-to-board-edge clearance check
             if let Some(ref poly) = board.outline_polygon {
+                let touches_own_pad = board.footprints.iter().any(|fp| {
+                    fp.pads.iter().any(|p| {
+                        p.net_id == t1.net_id
+                            && (p.is_through_hole || fp.layer == t1.layer)
+                            && (dist_point_to_pad(t1.start, fp, p) < 0.05
+                                || dist_point_to_pad(t1.end, fp, p) < 0.05)
+                    })
+                });
                 let edge_clr = board.get_netclass_for_net(t1.net_id).board_edge_clearance;
-                let req_dist = t1.width * 0.5 + edge_clr;
+                let req_dist = if touches_own_pad { 0.0 } else { t1.width * 0.5 + edge_clr };
                 let b = poly.aabb();
                 let s_min_x = t1.start.0.min(t1.end.0);
                 let s_max_x = t1.start.0.max(t1.end.0);
@@ -9955,7 +10076,7 @@ pub fn validate_and_clean_copper(board: &mut Board) {
                     let p1 = Point::new(t1.start.0, t1.start.1);
                     let p2 = Point::new(t1.end.0, t1.end.1);
                     if !poly.contains_point(&p1) || !poly.contains_point(&p2)
-                        || poly.distance_to_segment(t1.start, t1.end) < req_dist - 1e-4
+                        || (!touches_own_pad && poly.distance_to_segment(t1.start, t1.end) < req_dist - 1e-4)
                     {
                         bad_track_indices.insert(i);
                         continue;
@@ -14272,6 +14393,70 @@ mod tests {
         assert_eq!(board.arcs.len(), 2, "Both connected corner arcs must survive while dangling arc is pruned");
         assert_eq!(board.vias.len(), 1, "Layer transition via must survive pruning");
     }
+
+    #[test]
+    fn test_multi_track_corridor_shove_and_non_diff_pair_suffixes() {
+        // Non-differential nets like Net-(U1-HPA) / Net-(U1-HNA) must not be falsely matched
+        assert!(!AutoRouter::are_diff_pair_mates("Net-(U1-HPA)", "Net-(U1-HNA)"));
+        assert!(!AutoRouter::are_diff_pair_mates("CAP_P1", "CAP_N1"));
+        assert!(AutoRouter::are_diff_pair_mates("USB_DP", "USB_DM"));
+        assert!(AutoRouter::are_diff_pair_mates("LVDS_P", "LVDS_N"));
+
+        // Construct a board where 2 parallel tracks block a narrow corridor for a 3rd net
+        let nets = vec![
+            "".to_string(),
+            "GND".to_string(),
+            "BLK1".to_string(),
+            "BLK2".to_string(),
+            "TARGET".to_string(),
+        ];
+        let mut net_name_to_id = HashMap::new();
+        for (i, n) in nets.iter().enumerate() {
+            net_name_to_id.insert(n.clone(), i);
+        }
+        let mut netclasses = HashMap::new();
+        netclasses.insert("Default".to_string(), NetClass::default());
+        let mut net_to_class = HashMap::new();
+        for n in &nets {
+            net_to_class.insert(n.clone(), "Default".to_string());
+        }
+
+        let b1_s = make_fp("B1S", 102.0, 109.6, true, vec![Pad::new("1", 0.0, 0.0, 0.4, 0.4, 2, "BLK1", false)]);
+        let b1_e = make_fp("B1E", 118.0, 109.6, true, vec![Pad::new("1", 0.0, 0.0, 0.4, 0.4, 2, "BLK1", false)]);
+        let b2_s = make_fp("B2S", 102.0, 110.4, true, vec![Pad::new("1", 0.0, 0.0, 0.4, 0.4, 3, "BLK2", false)]);
+        let b2_e = make_fp("B2E", 118.0, 110.4, true, vec![Pad::new("1", 0.0, 0.0, 0.4, 0.4, 3, "BLK2", false)]);
+        let tgt_s = make_fp("TS", 110.0, 106.0, true, vec![Pad::new("1", 0.0, 0.0, 0.4, 0.4, 4, "TARGET", false)]);
+        let tgt_e = make_fp("TE", 110.0, 114.0, true, vec![Pad::new("1", 0.0, 0.0, 0.4, 0.4, 4, "TARGET", false)]);
+
+        let mut board = Board {
+            file_path: String::new(),
+            raw_content: "()".to_string(),
+            min_x: 100.0,
+            min_y: 100.0,
+            max_x: 120.0,
+            max_y: 120.0,
+            footprints: vec![b1_s, b1_e, b2_s, b2_e, tgt_s, tgt_e],
+            holding_palette: Vec::new(),
+            nets,
+            net_name_to_id,
+            netclasses,
+            net_to_class,
+            keepouts: Vec::new(),
+            tracks: Vec::new(),
+            vias: Vec::new(),
+            arcs: Vec::new(),
+            clusters: Vec::new(),
+            schematic_positions: HashMap::new(),
+            outline_polygon: None,
+            pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
+        };
+
+        let mut grid = RoutingGrid::new(&board, 0.20, None);
+        let router = AutoRouter::new(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (routed, total) = router.route_all(&mut board, &mut grid, None, stop);
+        assert_eq!(total, 3);
+        assert_eq!(routed, 3, "All 3 connections must route cleanly");
+    }
 }
-
-
