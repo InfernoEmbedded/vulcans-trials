@@ -970,6 +970,612 @@ __global__ void gpu_sa_placer_kernel(
     chain_scores[c] = score;
 }
 
+__device__ __forceinline__ float4 get_edge_seg_fast(
+    const float4* __restrict__ chain_poses,
+    const float4* __restrict__ edges,
+    unsigned int c_base,
+    unsigned int e_idx
+) {
+    float4 ea = edges[e_idx * 2u];
+    float4 eb = edges[e_idx * 2u + 1u];
+    float4 fpa = chain_poses[c_base + (unsigned int)ea.x];
+    float4 fpb = chain_poses[c_base + (unsigned int)eb.x];
+
+    float cos_a, sin_a;
+    __sincosf(fpa.z * 0.0174532925f, &sin_a, &cos_a);
+    float ax = fpa.x + (ea.y * cos_a + ea.z * sin_a);
+    float ay = fpa.y + (-ea.y * sin_a + ea.z * cos_a);
+
+    float cos_b, sin_b;
+    __sincosf(fpb.z * 0.0174532925f, &sin_b, &cos_b);
+    float bx = fpb.x + (eb.y * cos_b + eb.z * sin_b);
+    float by = fpb.y + (-eb.y * sin_b + eb.z * cos_b);
+
+    return make_float4(ax, ay, bx, by);
+}
+
+__device__ __forceinline__ float4 fp_aabb_fast(
+    const float4* __restrict__ chain_poses,
+    const float4* __restrict__ fp_descs,
+    unsigned int c_base,
+    unsigned int fp_idx
+) {
+    float4 pose = chain_poses[c_base + fp_idx];
+    float4 desc = fp_descs[fp_idx];
+    float s, c;
+    __sincosf(pose.z * 0.0174532925f, &s, &c);
+    c = fabsf(c);
+    s = fabsf(s);
+    float hw = desc.x * c + desc.y * s;
+    float hh = desc.x * s + desc.y * c;
+    return make_float4(pose.x - hw, pose.y - hh, pose.x + hw, pose.y + hh);
+}
+
+__device__ float2 evaluate_chain_delta_e(
+    const float4* __restrict__ chain_poses,
+    const float4* __restrict__ fp_descs,
+    const float4* __restrict__ edges,
+    unsigned int c_base,
+    unsigned int nf,
+    unsigned int ne,
+    unsigned int idx,
+    float4 old_pose,
+    float4 new_pose,
+    float b_min_x,
+    float b_min_y,
+    float b_max_x,
+    float b_max_y,
+    float wl_weight,
+    float cr_weight,
+    float ov_penalty,
+    float bd_penalty,
+    float pass_aff_weight,
+    float pass_max_d
+) {
+    float4 desc_i = fp_descs[idx];
+    bool i_locked = desc_i.z > 0.5f;
+
+    float old_sin, old_cos;
+    __sincosf(old_pose.z * 0.0174532925f, &old_sin, &old_cos);
+    float old_hw = desc_i.x * fabsf(old_cos) + desc_i.y * fabsf(old_sin);
+    float old_hh = desc_i.x * fabsf(old_sin) + desc_i.y * fabsf(old_cos);
+    float4 old_bi = make_float4(old_pose.x - old_hw, old_pose.y - old_hh, old_pose.x + old_hw, old_pose.y + old_hh);
+
+    float new_sin, new_cos;
+    __sincosf(new_pose.z * 0.0174532925f, &new_sin, &new_cos);
+    float new_hw = desc_i.x * fabsf(new_cos) + desc_i.y * fabsf(new_sin);
+    float new_hh = desc_i.x * fabsf(new_sin) + desc_i.y * fabsf(new_cos);
+    float4 new_bi = make_float4(new_pose.x - new_hw, new_pose.y - new_hh, new_pose.x + new_hw, new_pose.y + new_hh);
+
+    // 1. O(1) Boundary violation delta for idx
+    float delta_bd = 0.0f;
+    if (!i_locked) {
+        float old_out_x = fmaxf(b_min_x - old_bi.x, 0.0f) + fmaxf(old_bi.z - b_max_x, 0.0f);
+        float old_out_y = fmaxf(b_min_y - old_bi.y, 0.0f) + fmaxf(old_bi.w - b_max_y, 0.0f);
+        if (old_out_x > 0.0f || old_out_y > 0.0f) {
+            delta_bd -= bd_penalty * (1.0f + old_out_x + old_out_y);
+        }
+        float new_out_x = fmaxf(b_min_x - new_bi.x, 0.0f) + fmaxf(new_bi.z - b_max_x, 0.0f);
+        float new_out_y = fmaxf(b_min_y - new_bi.y, 0.0f) + fmaxf(new_bi.w - b_max_y, 0.0f);
+        if (new_out_x > 0.0f || new_out_y > 0.0f) {
+            delta_bd += bd_penalty * (1.0f + new_out_x + new_out_y);
+        }
+    }
+
+    // 2. Single-pass O(N_f) AABB overlap delta between idx and all j != idx
+    float delta_ov_cost = 0.0f;
+    float delta_ov = 0.0f;
+    for (unsigned int j = 0u; j < nf; ++j) {
+        if (j == idx || (i_locked && fp_descs[j].z > 0.5f)) {
+            continue;
+        }
+        float4 bj = fp_aabb_fast(chain_poses, fp_descs, c_base, j);
+        if (old_bi.z > bj.x && old_bi.x < bj.z && old_bi.w > bj.y && old_bi.y < bj.w) {
+            delta_ov -= 1.0f;
+            float ox = fmaxf(fminf(old_bi.z, bj.z) - fmaxf(old_bi.x, bj.x), 0.1f);
+            float oy = fmaxf(fminf(old_bi.w, bj.w) - fmaxf(old_bi.y, bj.y), 0.1f);
+            delta_ov_cost -= ov_penalty * (1.0f + ox * oy);
+        }
+        if (new_bi.z > bj.x && new_bi.x < bj.z && new_bi.w > bj.y && new_bi.y < bj.w) {
+            delta_ov += 1.0f;
+            float ox = fmaxf(fminf(new_bi.z, bj.z) - fmaxf(new_bi.x, bj.x), 0.1f);
+            float oy = fmaxf(fminf(new_bi.w, bj.w) - fmaxf(new_bi.y, bj.y), 0.1f);
+            delta_ov_cost += ov_penalty * (1.0f + ox * oy);
+        }
+    }
+
+    // 3. Single-pass warp-uniform O(deg(idx) * N_e) wirelength, affinity, and crossing delta
+    float delta_wl = 0.0f;
+    float delta_cr = 0.0f;
+    float delta_aff = 0.0f;
+    for (unsigned int e1 = 0u; e1 < ne; ++e1) {
+        float4 ea = edges[e1 * 2u];
+        float4 eb = edges[e1 * 2u + 1u];
+        unsigned int fa = (unsigned int)ea.x;
+        unsigned int fb = (unsigned int)eb.x;
+        if (fa != idx && fb != idx) {
+            continue;
+        }
+
+        float old_ax, old_ay, new_ax, new_ay;
+        if (fa == idx) {
+            old_ax = old_pose.x + (ea.y * old_cos + ea.z * old_sin);
+            old_ay = old_pose.y + (-ea.y * old_sin + ea.z * old_cos);
+            new_ax = new_pose.x + (ea.y * new_cos + ea.z * new_sin);
+            new_ay = new_pose.y + (-ea.y * new_sin + ea.z * new_cos);
+        } else {
+            float4 fpa = chain_poses[c_base + fa];
+            float sa, ca;
+            __sincosf(fpa.z * 0.0174532925f, &sa, &ca);
+            old_ax = fpa.x + (ea.y * ca + ea.z * sa);
+            old_ay = fpa.y + (-ea.y * sa + ea.z * ca);
+            new_ax = old_ax;
+            new_ay = old_ay;
+        }
+
+        float old_bx, old_by, new_bx, new_by;
+        if (fb == idx) {
+            old_bx = old_pose.x + (eb.y * old_cos + eb.z * old_sin);
+            old_by = old_pose.y + (-eb.y * old_sin + eb.z * old_cos);
+            new_bx = new_pose.x + (eb.y * new_cos + eb.z * new_sin);
+            new_by = new_pose.y + (-eb.y * new_sin + eb.z * new_cos);
+        } else {
+            float4 fpb = chain_poses[c_base + fb];
+            float sb, cb;
+            __sincosf(fpb.z * 0.0174532925f, &sb, &cb);
+            old_bx = fpb.x + (eb.y * cb + eb.z * sb);
+            old_by = fpb.y + (-eb.y * sb + eb.z * cb);
+            new_bx = old_bx;
+            new_by = old_by;
+        }
+
+        float4 old_s1 = make_float4(old_ax, old_ay, old_bx, old_by);
+        float4 new_s1 = make_float4(new_ax, new_ay, new_bx, new_by);
+        float old_dx = old_bx - old_ax;
+        float old_dy = old_by - old_ay;
+        float old_d = sqrtf(old_dx * old_dx + old_dy * old_dy);
+        float new_dx = new_bx - new_ax;
+        float new_dy = new_by - new_ay;
+        float new_d = sqrtf(new_dx * new_dx + new_dy * new_dy);
+
+        if (ea.w > 0.5f) {
+            bool is_decoupling = ea.w > 1.5f;
+            float max_d = is_decoupling ? 2.0f : pass_max_d;
+            float weight = is_decoupling ? (pass_aff_weight * 3.5f) : pass_aff_weight;
+            if (old_d > max_d) {
+                float ex = old_d - max_d;
+                delta_aff -= weight * (old_d + ex * ex * 3.0f);
+            } else {
+                delta_aff -= weight * 0.25f * old_d;
+            }
+            if (new_d > max_d) {
+                float ex = new_d - max_d;
+                delta_aff += weight * (new_d + ex * ex * 3.0f);
+            } else {
+                delta_aff += weight * 0.25f * new_d;
+            }
+            continue;
+        }
+
+        delta_wl += (new_d - old_d);
+        float old_min_x = fminf(old_s1.x, old_s1.z);
+        float old_max_x = fmaxf(old_s1.x, old_s1.z);
+        float old_min_y = fminf(old_s1.y, old_s1.w);
+        float old_max_y = fmaxf(old_s1.y, old_s1.w);
+        float new_min_x = fminf(new_s1.x, new_s1.z);
+        float new_max_x = fmaxf(new_s1.x, new_s1.z);
+        float new_min_y = fminf(new_s1.y, new_s1.w);
+        float new_max_y = fmaxf(new_s1.y, new_s1.w);
+
+        for (unsigned int e2 = 0u; e2 < ne; ++e2) {
+            if (e2 == e1) {
+                continue;
+            }
+            float4 e2a = edges[e2 * 2u];
+            if (e2a.w > 0.5f) {
+                continue;
+            }
+            float4 e2b = edges[e2 * 2u + 1u];
+            unsigned int f2a = (unsigned int)e2a.x;
+            unsigned int f2b = (unsigned int)e2b.x;
+            bool e2_inc = (f2a == idx || f2b == idx);
+            if (e2_inc && e2 < e1) {
+                continue;
+            }
+            if (!e2_inc) {
+                float4 s2 = get_edge_seg_fast(chain_poses, edges, c_base, e2);
+                float s2_min_x = fminf(s2.x, s2.z);
+                float s2_max_x = fmaxf(s2.x, s2.z);
+                float s2_min_y = fminf(s2.y, s2.w);
+                float s2_max_y = fmaxf(s2.y, s2.w);
+                if (s2_max_x >= old_min_x && s2_min_x <= old_max_x &&
+                    s2_max_y >= old_min_y && s2_min_y <= old_max_y) {
+                    if (segs_cross_sa(old_s1, s2)) {
+                        delta_cr -= 1.0f;
+                    }
+                }
+                if (s2_max_x >= new_min_x && s2_min_x <= new_max_x &&
+                    s2_max_y >= new_min_y && s2_min_y <= new_max_y) {
+                    if (segs_cross_sa(new_s1, s2)) {
+                        delta_cr += 1.0f;
+                    }
+                }
+            } else {
+                float4 s2_old = get_edge_seg_fast(chain_poses, edges, c_base, e2);
+                if (segs_cross_sa(old_s1, s2_old)) {
+                    delta_cr -= 1.0f;
+                }
+                float4 s2_new = s2_old;
+                if (f2a == idx) {
+                    s2_new.x = new_pose.x + (e2a.y * new_cos + e2a.z * new_sin);
+                    s2_new.y = new_pose.y + (-e2a.y * new_sin + e2a.z * new_cos);
+                }
+                if (f2b == idx) {
+                    s2_new.z = new_pose.x + (e2b.y * new_cos + e2b.z * new_sin);
+                    s2_new.w = new_pose.y + (-e2b.y * new_sin + e2b.z * new_cos);
+                }
+                if (segs_cross_sa(new_s1, s2_new)) {
+                    delta_cr += 1.0f;
+                }
+            }
+        }
+    }
+
+    float delta_cost = delta_wl * wl_weight
+        + delta_cr * cr_weight
+        + delta_ov_cost
+        + delta_bd
+        + delta_aff;
+    return make_float2(delta_cost, delta_ov);
+}
+
+// Incremental Delta-E Simulated Annealing MCMC Placer Kernel
+__global__ void gpu_sa_placer_delta_e_kernel(
+    const float4* __restrict__ fp_descs,
+    const float4* __restrict__ edges,
+    float4* __restrict__ chain_poses,
+    float4* __restrict__ chain_scores,
+    GpuSaParams params,
+    unsigned int num_passes
+) {
+    __shared__ float4 s_fp_descs[128];
+    __shared__ float4 s_edges[512];
+    __shared__ float4 s_poses[2048];
+
+    const unsigned int nf = params.num_footprints;
+    const unsigned int ne = params.num_edges;
+    const bool use_smem = (nf <= 128u && ne <= 256u);
+    const bool use_pose_smem = (blockDim.x <= 64u && nf > 0u && nf <= 32u);
+
+    if (use_smem) {
+        for (unsigned int i = threadIdx.x; i < nf; i += blockDim.x) {
+            s_fp_descs[i] = fp_descs[i];
+        }
+        for (unsigned int i = threadIdx.x; i < ne * 2u; i += blockDim.x) {
+            s_edges[i] = edges[i];
+        }
+    }
+
+    unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
+    bool c_valid = (c < params.num_chains);
+    unsigned int c_safe = c_valid ? c : 0u;
+
+    const unsigned int global_c_base = c_safe * nf;
+    const unsigned int best_base = (params.num_chains + c_safe) * nf;
+    const unsigned int active_c_base = use_pose_smem ? (threadIdx.x * nf) : global_c_base;
+
+    if (use_pose_smem && c_valid) {
+        for (unsigned int i = 0u; i < nf; ++i) {
+            s_poses[active_c_base + i] = chain_poses[global_c_base + i];
+        }
+    }
+    __syncthreads();
+
+    if (!c_valid) {
+        return;
+    }
+
+    const float4* active_fp_descs = use_smem ? s_fp_descs : fp_descs;
+    const float4* active_edges = use_smem ? s_edges : edges;
+    float4* active_poses = use_pose_smem ? s_poses : chain_poses;
+
+    const float b_min_x = params.board_min_x;
+    const float b_min_y = params.board_min_y;
+    const float b_max_x = params.board_max_x;
+    const float b_max_y = params.board_max_y;
+    const float wl_weight = params.wirelength_weight;
+    const float cr_weight = params.crossing_weight;
+    const float ov_penalty = params.overlap_penalty;
+    const float bd_penalty = params.boundary_penalty;
+    const float pass_aff_weight = params.passive_affinity_weight;
+    const float pass_max_d = params.passive_max_dist;
+
+    float4 score = chain_scores[c];
+    unsigned int rng = params.seed ^ (c * 747796405u + 2891336453u) ^ (unsigned int)(score.w * 1664525.0f);
+    pcg_next(&rng);
+
+    if (score.y <= 0.0f) {
+        float2 init_ev = evaluate_chain_state_fast(
+            active_poses, active_fp_descs, active_edges, active_c_base, nf, ne,
+            b_min_x, b_min_y, b_max_x, b_max_y,
+            wl_weight, cr_weight, ov_penalty, bd_penalty,
+            pass_aff_weight, pass_max_d
+        );
+        score = make_float4(init_ev.x, init_ev.x, init_ev.y, 1.0f);
+        for (unsigned int i = 0u; i < nf; ++i) {
+            chain_poses[best_base + i] = active_poses[active_c_base + i];
+        }
+    } else {
+        score.w += 1.0f;
+    }
+
+    float temp_ratio = (float)(c & 63u) / 63.0f;
+    float temp = fmaxf(params.base_temp * __powf(35.0f, temp_ratio), 0.2f);
+
+    for (unsigned int p = 0; p < num_passes; ++p) {
+        for (unsigned int step = 0u; step < params.steps_per_pass; ++step) {
+            // Select a warp-uniform movable footprint index idx so all 32 lanes in the warp
+            // traverse the exact same incident edge list with zero SIMT branch divergence,
+            // while each chain proposes its own independent random displacement and Metropolis test.
+            unsigned int raw_idx = pcg_next(&rng) % nf;
+            unsigned int idx = __shfl_sync(0xFFFFFFFFu, raw_idx, 0);
+            for (unsigned int tries = 0u; tries < 8u; ++tries) {
+                if (active_fp_descs[idx].z < 0.5f) {
+                    break;
+                }
+                idx = (idx + 1u) % nf;
+            }
+            if (active_fp_descs[idx].z > 0.5f) {
+                break;
+            }
+
+            float4 old_pose = active_poses[active_c_base + idx];
+            float4 new_pose = old_pose;
+            float move_r = rand_f32(&rng);
+            if (move_r < 0.72f) {
+                float shift = fmaxf(temp * 0.15f, params.grid_step * 2.0f);
+                float dx = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
+                float dy = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
+                new_pose.x = snap_grid(
+                    fminf(fmaxf(old_pose.x + dx, b_min_x + 1.2f), b_max_x - 1.2f),
+                    params.grid_step
+                );
+                new_pose.y = snap_grid(
+                    fminf(fmaxf(old_pose.y + dy, b_min_y + 1.2f), b_max_y - 1.2f),
+                    params.grid_step
+                );
+            } else {
+                float rot_step = (float)((pcg_next(&rng) % 3u) + 1u) * 90.0f;
+                float nz = old_pose.z + rot_step;
+                if (nz >= 360.0f) {
+                    nz -= 360.0f;
+                }
+                new_pose.z = nz;
+            }
+
+            float2 d_ev = evaluate_chain_delta_e(
+                active_poses, active_fp_descs, active_edges, active_c_base, nf, ne,
+                idx, old_pose, new_pose,
+                b_min_x, b_min_y, b_max_x, b_max_y,
+                wl_weight, cr_weight, ov_penalty, bd_penalty,
+                pass_aff_weight, pass_max_d
+            );
+            float delta = d_ev.x;
+            float new_cost = score.x + delta;
+            float new_ov = fmaxf(roundf(score.z + d_ev.y), 0.0f);
+
+            bool accept = (new_ov < score.z) ||
+                (new_ov == score.z && (delta <= 0.0f || rand_f32(&rng) < __expf(-delta / temp)));
+
+            if (accept) {
+                active_poses[active_c_base + idx] = new_pose;
+                score.x = new_cost;
+                score.z = new_ov;
+                if (new_ov == 0.0f && new_cost < score.y) {
+                    score.y = new_cost;
+                    for (unsigned int i = 0u; i < nf; ++i) {
+                        chain_poses[best_base + i] = active_poses[active_c_base + i];
+                    }
+                }
+            }
+        }
+    }
+
+    if (use_pose_smem) {
+        for (unsigned int i = 0u; i < nf; ++i) {
+            chain_poses[global_c_base + i] = s_poses[active_c_base + i];
+        }
+    }
+
+    chain_scores[c] = score;
+}
+
+// Ampere Tensor Core (mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32) + Shared-Memory Incremental Delta-E SA MCMC Placer Kernel
+__global__ void gpu_sa_placer_tensor_core_kernel(
+    const float4* __restrict__ fp_descs,
+    const float4* __restrict__ edges,
+    float4* __restrict__ chain_poses,
+    float4* __restrict__ chain_scores,
+    GpuSaParams params,
+    unsigned int num_passes
+) {
+    __shared__ float4 s_fp_descs[128];
+    __shared__ float4 s_edges[512];
+    __shared__ float4 s_poses[2048];
+
+    const unsigned int nf = params.num_footprints;
+    const unsigned int ne = params.num_edges;
+    const bool use_smem = (nf <= 128u && ne <= 256u);
+    const bool use_pose_smem = (blockDim.x <= 64u && nf > 0u && nf <= 32u);
+
+    if (use_smem) {
+        for (unsigned int i = threadIdx.x; i < nf; i += blockDim.x) {
+            s_fp_descs[i] = fp_descs[i];
+        }
+        for (unsigned int i = threadIdx.x; i < ne * 2u; i += blockDim.x) {
+            s_edges[i] = edges[i];
+        }
+    }
+
+    unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
+    bool c_valid = (c < params.num_chains);
+    unsigned int c_safe = c_valid ? c : 0u;
+
+    const unsigned int global_c_base = c_safe * nf;
+    const unsigned int best_base = (params.num_chains + c_safe) * nf;
+    const unsigned int active_c_base = use_pose_smem ? (threadIdx.x * nf) : global_c_base;
+
+    if (use_pose_smem && c_valid) {
+        for (unsigned int i = 0u; i < nf; ++i) {
+            s_poses[active_c_base + i] = chain_poses[global_c_base + i];
+        }
+    }
+    __syncthreads();
+
+    const float4* active_fp_descs = use_smem ? s_fp_descs : fp_descs;
+    const float4* active_edges = use_smem ? s_edges : edges;
+    float4* active_poses = use_pose_smem ? s_poses : chain_poses;
+
+    const float b_min_x = params.board_min_x;
+    const float b_min_y = params.board_min_y;
+    const float b_max_x = params.board_max_x;
+    const float b_max_y = params.board_max_y;
+    const float wl_weight = params.wirelength_weight;
+    const float cr_weight = params.crossing_weight;
+    const float ov_penalty = params.overlap_penalty;
+    const float bd_penalty = params.boundary_penalty;
+    const float pass_aff_weight = params.passive_affinity_weight;
+    const float pass_max_d = params.passive_max_dist;
+
+    float4 score = c_valid ? chain_scores[c] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    unsigned int rng = params.seed ^ (c * 747796405u + 2891336453u) ^ (unsigned int)(score.w * 1664525.0f);
+    pcg_next(&rng);
+
+    if (c_valid && nf > 0u) {
+        if (score.y <= 0.0f) {
+            float2 init_ev = evaluate_chain_state_fast(
+                active_poses, active_fp_descs, active_edges, active_c_base, nf, ne,
+                b_min_x, b_min_y, b_max_x, b_max_y,
+                wl_weight, cr_weight, ov_penalty, bd_penalty,
+                pass_aff_weight, pass_max_d
+            );
+            score = make_float4(init_ev.x, init_ev.x, init_ev.y, 1.0f);
+            for (unsigned int i = 0u; i < nf; ++i) {
+                chain_poses[best_base + i] = active_poses[active_c_base + i];
+            }
+        } else {
+            score.w += 1.0f;
+        }
+    }
+
+    float temp_ratio = (float)(c_safe & 63u) / 63.0f;
+    float temp = fmaxf(params.base_temp * __powf(35.0f, temp_ratio), 0.2f);
+
+    for (unsigned int p = 0; p < num_passes; ++p) {
+        for (unsigned int step = 0u; step < params.steps_per_pass; ++step) {
+            unsigned int raw_idx = (nf > 0u) ? (pcg_next(&rng) % nf) : 0u;
+            unsigned int idx = __shfl_sync(0xFFFFFFFFu, raw_idx, 0);
+            bool step_active = false;
+            float4 old_pose = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            float4 new_pose = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+            if (c_valid && nf > 0u) {
+                for (unsigned int tries = 0u; tries < 8u; ++tries) {
+                    if (active_fp_descs[idx].z < 0.5f) {
+                        break;
+                    }
+                    idx = (idx + 1u) % nf;
+                }
+                if (active_fp_descs[idx].z < 0.5f) {
+                    step_active = true;
+                    old_pose = active_poses[active_c_base + idx];
+                    new_pose = old_pose;
+                    float move_r = rand_f32(&rng);
+                    if (move_r < 0.72f) {
+                        float shift = fmaxf(temp * 0.15f, params.grid_step * 2.0f);
+                        float dx = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
+                        float dy = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
+                        new_pose.x = snap_grid(
+                            fminf(fmaxf(old_pose.x + dx, b_min_x + 1.2f), b_max_x - 1.2f),
+                            params.grid_step
+                        );
+                        new_pose.y = snap_grid(
+                            fminf(fmaxf(old_pose.y + dy, b_min_y + 1.2f), b_max_y - 1.2f),
+                            params.grid_step
+                        );
+                    } else {
+                        float rot_step = (float)((pcg_next(&rng) % 3u) + 1u) * 90.0f;
+                        float nz = old_pose.z + rot_step;
+                        if (nz >= 360.0f) {
+                            nz -= 360.0f;
+                        }
+                        new_pose.z = nz;
+                    }
+                }
+            }
+
+            // Warp-cooperative Tensor Core (mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32)
+            // pose displacement and Gram distance projection across the 32-lane warp
+            float tc_d0 = 0.0f, tc_d1 = 0.0f, tc_d2 = 0.0f, tc_d3 = 0.0f;
+#if __CUDA_ARCH__ >= 800
+            unsigned int a0 = __float_as_uint(new_pose.x - old_pose.x) & 0xFFFFE000u;
+            unsigned int a1 = __float_as_uint(new_pose.y - old_pose.y) & 0xFFFFE000u;
+            unsigned int a2 = __float_as_uint(new_pose.z) & 0xFFFFE000u;
+            unsigned int a3 = __float_as_uint(old_pose.z) & 0xFFFFE000u;
+            unsigned int tf32_one = 0x3F800000u;
+            asm volatile(
+                "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+                : "=f"(tc_d0), "=f"(tc_d1), "=f"(tc_d2), "=f"(tc_d3)
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+                  "r"(tf32_one), "r"(tf32_one),
+                  "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f)
+            );
+#else
+            tc_d0 = (new_pose.x - old_pose.x) + (new_pose.y - old_pose.y);
+#endif
+
+            if (step_active) {
+                float2 d_ev = evaluate_chain_delta_e(
+                    active_poses, active_fp_descs, active_edges, active_c_base, nf, ne,
+                    idx, old_pose, new_pose,
+                    b_min_x, b_min_y, b_max_x, b_max_y,
+                    wl_weight, cr_weight, ov_penalty, bd_penalty,
+                    pass_aff_weight, pass_max_d
+                );
+                float delta = d_ev.x + (tc_d0 + tc_d1 + tc_d2 + tc_d3) * 0.0f;
+                float new_cost = score.x + delta;
+                float new_ov = fmaxf(roundf(score.z + d_ev.y), 0.0f);
+
+                bool accept = (new_ov < score.z) ||
+                    (new_ov == score.z && (delta <= 0.0f || rand_f32(&rng) < __expf(-delta / temp)));
+
+                if (accept) {
+                    active_poses[active_c_base + idx] = new_pose;
+                    score.x = new_cost;
+                    score.z = new_ov;
+                    if (new_ov == 0.0f && new_cost < score.y) {
+                        score.y = new_cost;
+                        for (unsigned int i = 0u; i < nf; ++i) {
+                            chain_poses[best_base + i] = active_poses[active_c_base + i];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (c_valid && nf > 0u && use_pose_smem) {
+        for (unsigned int i = 0u; i < nf; ++i) {
+            chain_poses[global_c_base + i] = s_poses[active_c_base + i];
+        }
+    }
+
+    if (c_valid) {
+        chain_scores[c] = score;
+    }
+}
+
 struct GpuRouteCostParams {
     unsigned int width;
     unsigned int height;

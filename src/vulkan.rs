@@ -324,6 +324,220 @@ fn evaluate_chain_state(c_base: u32, nf: u32, ne: u32) -> vec2<f32> {
     return vec2<f32>(total_cost, overlaps);
 }
 
+fn get_edge_endpoint_from_pose(pose: vec4<f32>, ep: vec4<f32>) -> vec2<f32> {
+    let rad = pose.z * 0.0174532925;
+    let c = cos(rad);
+    let s = sin(rad);
+    return vec2<f32>(
+        pose.x + (ep.y * c + ep.z * s),
+        pose.y + (-ep.y * s + ep.z * c)
+    );
+}
+
+fn evaluate_chain_delta_e(
+    c_base: u32,
+    nf: u32,
+    ne: u32,
+    idx: u32,
+    old_pose: vec4<f32>,
+    new_pose: vec4<f32>
+) -> vec2<f32> {
+    if (old_pose.x == new_pose.x && old_pose.y == new_pose.y && old_pose.z == new_pose.z) {
+        return vec2<f32>(0.0, 0.0);
+    }
+
+    let desc_i = fp_descs[idx];
+    let i_locked = desc_i.z > 0.5;
+
+    let old_rad = old_pose.z * 0.0174532925;
+    let old_cos = cos(old_rad);
+    let old_sin = sin(old_rad);
+    let old_hw = desc_i.x * abs(old_cos) + desc_i.y * abs(old_sin);
+    let old_hh = desc_i.x * abs(old_sin) + desc_i.y * abs(old_cos);
+    let old_bi = vec4<f32>(old_pose.x - old_hw, old_pose.y - old_hh, old_pose.x + old_hw, old_pose.y + old_hh);
+
+    let new_rad = new_pose.z * 0.0174532925;
+    let new_cos = cos(new_rad);
+    let new_sin = sin(new_rad);
+    let new_hw = desc_i.x * abs(new_cos) + desc_i.y * abs(new_sin);
+    let new_hh = desc_i.x * abs(new_sin) + desc_i.y * abs(new_cos);
+    let new_bi = vec4<f32>(new_pose.x - new_hw, new_pose.y - new_hh, new_pose.x + new_hw, new_pose.y + new_hh);
+
+    var delta_bd: f32 = 0.0;
+    if (!i_locked) {
+        let old_out_x = max(params.board_min_x - old_bi.x, 0.0) + max(old_bi.z - params.board_max_x, 0.0);
+        let old_out_y = max(params.board_min_y - old_bi.y, 0.0) + max(old_bi.w - params.board_max_y, 0.0);
+        if (old_out_x > 0.0 || old_out_y > 0.0) {
+            delta_bd = delta_bd - params.boundary_penalty * (1.0 + old_out_x + old_out_y);
+        }
+        let new_out_x = max(params.board_min_x - new_bi.x, 0.0) + max(new_bi.z - params.board_max_x, 0.0);
+        let new_out_y = max(params.board_min_y - new_bi.y, 0.0) + max(new_bi.w - params.board_max_y, 0.0);
+        if (new_out_x > 0.0 || new_out_y > 0.0) {
+            delta_bd = delta_bd + params.boundary_penalty * (1.0 + new_out_x + new_out_y);
+        }
+    }
+
+    var delta_ov_cost: f32 = 0.0;
+    var delta_ov: f32 = 0.0;
+    for (var j: u32 = 0u; j < nf; j = j + 1u) {
+        if (j == idx) {
+            continue;
+        }
+        if (i_locked && fp_descs[j].z > 0.5) {
+            continue;
+        }
+        let bj = fp_aabb(c_base, j);
+        if (old_bi.z > bj.x && old_bi.x < bj.z && old_bi.w > bj.y && old_bi.y < bj.w) {
+            delta_ov = delta_ov - 1.0;
+            let ox = max(min(old_bi.z, bj.z) - max(old_bi.x, bj.x), 0.1);
+            let oy = max(min(old_bi.w, bj.w) - max(old_bi.y, bj.y), 0.1);
+            delta_ov_cost = delta_ov_cost - params.overlap_penalty * (1.0 + ox * oy);
+        }
+        if (new_bi.z > bj.x && new_bi.x < bj.z && new_bi.w > bj.y && new_bi.y < bj.w) {
+            delta_ov = delta_ov + 1.0;
+            let ox = max(min(new_bi.z, bj.z) - max(new_bi.x, bj.x), 0.1);
+            let oy = max(min(new_bi.w, bj.w) - max(new_bi.y, bj.y), 0.1);
+            delta_ov_cost = delta_ov_cost + params.overlap_penalty * (1.0 + ox * oy);
+        }
+    }
+
+    var delta_wl: f32 = 0.0;
+    var delta_cr: f32 = 0.0;
+    var delta_aff: f32 = 0.0;
+    for (var e1: u32 = 0u; e1 < ne; e1 = e1 + 1u) {
+        let ea = edges[e1 * 2u];
+        let eb = edges[e1 * 2u + 1u];
+        let fa = u32(ea.x);
+        let fb = u32(eb.x);
+        if (fa != idx && fb != idx) {
+            continue;
+        }
+
+        var old_ax: f32;
+        var old_ay: f32;
+        var new_ax: f32;
+        var new_ay: f32;
+        if (fa == idx) {
+            old_ax = old_pose.x + (ea.y * old_cos + ea.z * old_sin);
+            old_ay = old_pose.y + (-ea.y * old_sin + ea.z * old_cos);
+            new_ax = new_pose.x + (ea.y * new_cos + ea.z * new_sin);
+            new_ay = new_pose.y + (-ea.y * new_sin + ea.z * new_cos);
+        } else {
+            let pa = get_edge_endpoint_from_pose(chain_poses[c_base + fa], ea);
+            old_ax = pa.x;
+            old_ay = pa.y;
+            new_ax = pa.x;
+            new_ay = pa.y;
+        }
+
+        var old_bx: f32;
+        var old_by: f32;
+        var new_bx: f32;
+        var new_by: f32;
+        if (fb == idx) {
+            old_bx = old_pose.x + (eb.y * old_cos + eb.z * old_sin);
+            old_by = old_pose.y + (-eb.y * old_sin + eb.z * old_cos);
+            new_bx = new_pose.x + (eb.y * new_cos + eb.z * new_sin);
+            new_by = new_pose.y + (-eb.y * new_sin + eb.z * new_cos);
+        } else {
+            let pb = get_edge_endpoint_from_pose(chain_poses[c_base + fb], eb);
+            old_bx = pb.x;
+            old_by = pb.y;
+            new_bx = pb.x;
+            new_by = pb.y;
+        }
+
+        let old_s1 = vec4<f32>(old_ax, old_ay, old_bx, old_by);
+        let new_s1 = vec4<f32>(new_ax, new_ay, new_bx, new_by);
+        let old_dx = old_bx - old_ax;
+        let old_dy = old_by - old_ay;
+        let old_d = sqrt(old_dx * old_dx + old_dy * old_dy);
+        let new_dx = new_bx - new_ax;
+        let new_dy = new_by - new_ay;
+        let new_d = sqrt(new_dx * new_dx + new_dy * new_dy);
+
+        let is_tie = ea.w > 0.5;
+        if (is_tie) {
+            let is_decoupling = ea.w > 1.5;
+            let max_d = select(params.passive_max_dist, 2.0, is_decoupling);
+            let weight = select(params.passive_affinity_weight, params.passive_affinity_weight * 3.5, is_decoupling);
+            if (old_d > max_d) {
+                let ex = old_d - max_d;
+                delta_aff = delta_aff - weight * (old_d + ex * ex * 3.0);
+            } else {
+                delta_aff = delta_aff - weight * 0.25 * old_d;
+            }
+            if (new_d > max_d) {
+                let ex = new_d - max_d;
+                delta_aff = delta_aff + weight * (new_d + ex * ex * 3.0);
+            } else {
+                delta_aff = delta_aff + weight * 0.25 * new_d;
+            }
+        } else {
+            delta_wl = delta_wl + (new_d - old_d);
+            for (var e2: u32 = 0u; e2 < ne; e2 = e2 + 1u) {
+                if (e2 == e1) {
+                    continue;
+                }
+                let e2a = edges[e2 * 2u];
+                if (e2a.w > 0.5) {
+                    continue;
+                }
+                let e2b = edges[e2 * 2u + 1u];
+                let f2a = u32(e2a.x);
+                let f2b = u32(e2b.x);
+                let e2_inc = (f2a == idx || f2b == idx);
+                if (e2_inc && e2 < e1) {
+                    continue;
+                }
+                if (!e2_inc) {
+                    let s2 = get_edge_seg(c_base, e2);
+                    if (segs_cross_sa(old_s1, s2)) {
+                        delta_cr = delta_cr - 1.0;
+                    }
+                    if (segs_cross_sa(new_s1, s2)) {
+                        delta_cr = delta_cr + 1.0;
+                    }
+                } else {
+                    var p2a_old: vec2<f32>;
+                    var p2a_new: vec2<f32>;
+                    if (f2a == idx) {
+                        p2a_old = vec2<f32>(old_pose.x + (e2a.y * old_cos + e2a.z * old_sin), old_pose.y + (-e2a.y * old_sin + e2a.z * old_cos));
+                        p2a_new = vec2<f32>(new_pose.x + (e2a.y * new_cos + e2a.z * new_sin), new_pose.y + (-e2a.y * new_sin + e2a.z * new_cos));
+                    } else {
+                        p2a_old = get_edge_endpoint_from_pose(chain_poses[c_base + f2a], e2a);
+                        p2a_new = p2a_old;
+                    }
+                    var p2b_old: vec2<f32>;
+                    var p2b_new: vec2<f32>;
+                    if (f2b == idx) {
+                        p2b_old = vec2<f32>(old_pose.x + (e2b.y * old_cos + e2b.z * old_sin), old_pose.y + (-e2b.y * old_sin + e2b.z * old_cos));
+                        p2b_new = vec2<f32>(new_pose.x + (e2b.y * new_cos + e2b.z * new_sin), new_pose.y + (-e2b.y * new_sin + e2b.z * new_cos));
+                    } else {
+                        p2b_old = get_edge_endpoint_from_pose(chain_poses[c_base + f2b], e2b);
+                        p2b_new = p2b_old;
+                    }
+                    let old_s2 = vec4<f32>(p2a_old.x, p2a_old.y, p2b_old.x, p2b_old.y);
+                    let new_s2 = vec4<f32>(p2a_new.x, p2a_new.y, p2b_new.x, p2b_new.y);
+                    if (segs_cross_sa(old_s1, old_s2)) {
+                        delta_cr = delta_cr - 1.0;
+                    }
+                    if (segs_cross_sa(new_s1, new_s2)) {
+                        delta_cr = delta_cr + 1.0;
+                    }
+                }
+            }
+        }
+    }
+
+    let delta_cost = delta_wl * params.wirelength_weight
+        + delta_cr * params.crossing_weight
+        + delta_ov_cost
+        + delta_bd
+        + delta_aff;
+    return vec2<f32>(delta_cost, delta_ov);
+}
+
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
@@ -385,16 +599,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             new_pose.z = (old_pose.z + rot_step) % 360.0;
         }
 
-        chain_poses[c_base + idx] = new_pose;
-        let ev = evaluate_chain_state(c_base, nf, ne);
-        let new_cost = ev.x;
-        let new_ov = ev.y;
-        let delta = new_cost - score.x;
+        let d_ev = evaluate_chain_delta_e(c_base, nf, ne, idx, old_pose, new_pose);
+        let delta = d_ev.x;
+        let new_cost = score.x + delta;
+        let new_ov = max(round(score.z + d_ev.y), 0.0);
 
         let accept = (new_ov < score.z) ||
             (new_ov == score.z && (delta <= 0.0 || rand_f32(&rng) < exp(-delta / temp)));
 
         if (accept) {
+            chain_poses[c_base + idx] = new_pose;
             score.x = new_cost;
             score.z = new_ov;
             if (new_ov == 0.0 && new_cost < score.y) {
@@ -403,8 +617,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     chain_poses[best_base + i] = chain_poses[c_base + i];
                 }
             }
-        } else {
-            chain_poses[c_base + idx] = old_pose;
+        }
+    }
+
+    let ref_ev = evaluate_chain_state(c_base, nf, ne);
+    score.x = ref_ev.x;
+    score.z = ref_ev.y;
+    if (ref_ev.y == 0.0 && ref_ev.x < score.y) {
+        score.y = ref_ev.x;
+        for (var i: u32 = 0u; i < nf; i = i + 1u) {
+            chain_poses[best_base + i] = chain_poses[c_base + i];
         }
     }
 
