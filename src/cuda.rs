@@ -2470,9 +2470,9 @@ impl CudaEngine {
             return Some(Vec::new());
         }
 
-        if nc >= 128 {
-            let devs = Self::all_devices();
-            if devs.len() > 1 {
+        let devs = Self::all_devices();
+        if devs.len() > 1 {
+            if nc >= 32 {
                 let num_devs = devs.len();
                 let chunk_size = (nc + num_devs - 1) / num_devs;
                 let mut chunks_out: Vec<Option<Vec<u32>>> = (0..num_devs).map(|_| None).collect();
@@ -2508,6 +2508,16 @@ impl CudaEngine {
                 }
                 if combined.len() == nc {
                     return Some(combined);
+                }
+            } else {
+                static DRC_DEVICE_RR: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let rr_idx =
+                    DRC_DEVICE_RR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % devs.len();
+                if let Some(res) =
+                    devs[rr_idx].evaluate_drc_candidates_single(pads, tracks, vias, candidates)
+                {
+                    return Some(res);
                 }
             }
         }

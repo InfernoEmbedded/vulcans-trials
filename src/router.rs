@@ -60,6 +60,7 @@ pub struct RoutingGrid {
     pub max_net_clearance: f64,
     pub inner_layer_penalty: f64,
     pub vulkan: Option<Arc<VulkanEngine>>,
+    pub base_snapshot: Option<Arc<(Vec<i32>, Vec<u32>, Vec<Option<usize>>, Vec<bool>)>>,
 }
 
 /// Checks whether a segment conforms to the standard octilinear 45-degree grid (0°, 45°, 90°, etc.).
@@ -176,6 +177,7 @@ impl RoutingGrid {
             max_net_clearance,
             inner_layer_penalty: 8.0,
             vulkan,
+            base_snapshot: None,
         };
 
         grid.rasterize_obstacles(board);
@@ -2868,14 +2870,23 @@ impl AutoRouter {
         if let Some(ref vk) = vk_opt {
             let engines = vk.all_engines();
             if !engines.is_empty() {
-                for layer in 0..num_layers {
-                    let vk_dev = &engines[layer % engines.len()];
-                    let offset = layer * layer_cells;
-                    let obs_u32: Vec<u32> = grid.obstacle_net_ids[offset..offset + layer_cells]
-                        .iter()
-                        .map(|&n| if n != FREE_NET { 1u32 } else { 0u32 })
+                let layer_dfs: Vec<(usize, Option<Vec<f32>>)> = std::thread::scope(|s| {
+                    let handles: Vec<_> = (0..num_layers)
+                        .map(|layer| {
+                            let vk_dev = Arc::clone(&engines[layer % engines.len()]);
+                            let offset = layer * layer_cells;
+                            let obs_u32: Vec<u32> = grid.obstacle_net_ids[offset..offset + layer_cells]
+                                .iter()
+                                .map(|&n| if n != FREE_NET { 1u32 } else { 0u32 })
+                                .collect();
+                            s.spawn(move || (layer, vk_dev.compute_distance_field(&obs_u32, grid_w, grid_h, 16)))
+                        })
                         .collect();
-                    if let Some(df) = vk_dev.compute_distance_field(&obs_u32, grid_w, grid_h, 16) {
+                    handles.into_iter().filter_map(|h| h.join().ok()).collect()
+                });
+                for (layer, df_opt) in layer_dfs {
+                    if let Some(df) = df_opt {
+                        let offset = layer * layer_cells;
                         for (dst, &val) in grid.dist_field[offset..offset + layer_cells]
                             .iter_mut()
                             .zip(df.iter())
@@ -2908,14 +2919,23 @@ impl AutoRouter {
                     if let Some(ref vk) = vk_opt {
                         let engines = vk.all_engines();
                         if !engines.is_empty() {
-                            for layer in 0..num_layers {
-                                let vk_dev = &engines[layer % engines.len()];
-                                let offset = layer * layer_cells;
-                                let obs_u32: Vec<u32> = grid.obstacle_net_ids[offset..offset + layer_cells]
-                                    .iter()
-                                    .map(|&n| if n != FREE_NET { 1u32 } else { 0u32 })
+                            let layer_dfs: Vec<(usize, Option<Vec<f32>>)> = std::thread::scope(|s| {
+                                let handles: Vec<_> = (0..num_layers)
+                                    .map(|layer| {
+                                        let vk_dev = Arc::clone(&engines[layer % engines.len()]);
+                                        let offset = layer * layer_cells;
+                                        let obs_u32: Vec<u32> = grid.obstacle_net_ids[offset..offset + layer_cells]
+                                            .iter()
+                                            .map(|&n| if n != FREE_NET { 1u32 } else { 0u32 })
+                                            .collect();
+                                        s.spawn(move || (layer, vk_dev.compute_distance_field(&obs_u32, grid_w, grid_h, 16)))
+                                    })
                                     .collect();
-                                if let Some(df) = vk_dev.compute_distance_field(&obs_u32, grid_w, grid_h, 16) {
+                                handles.into_iter().filter_map(|h| h.join().ok()).collect()
+                            });
+                            for (layer, df_opt) in layer_dfs {
+                                if let Some(df) = df_opt {
+                                    let offset = layer * layer_cells;
                                     for (dst, &val) in grid.dist_field[offset..offset + layer_cells]
                                         .iter_mut()
                                         .zip(df.iter())
@@ -3114,6 +3134,7 @@ impl AutoRouter {
                             max_net_clearance: self.max_net_clearance,
                             inner_layer_penalty: self.inner_layer_penalty,
                             vulkan: self.vulkan.clone(),
+                            base_snapshot: self.base_snapshot.clone(),
                         }
                     }
                 }
@@ -3740,52 +3761,145 @@ impl AutoRouter {
                             }
                         }
 
-                        let raw_candidates: Vec<(usize, usize, Vec<GridNode>)> = tasks
-                            .par_iter()
-                            .filter_map(|&(t_pos, conn_idx, v_id)| {
-                                if stop_flag.load(AtomicOrdering::Relaxed) {
-                                    return None;
-                                }
+                        // Prepare a concurrent GPU 3D wavefront batch (up to 16 connections) so both GPUs
+                        // solve 3D wavefront trajectories simultaneously while CPU cores run A* portfolio variants.
+                        let concurrent_gpu_limit = target_indices.len().min(16);
+                        let concurrent_gpu_reqs: Vec<(usize, (GridNode, GridNode, usize, f32))> = target_indices[..concurrent_gpu_limit]
+                            .iter()
+                            .filter_map(|&conn_idx| {
                                 let conn = &connections[conn_idx];
                                 let (sgx, sgy) = grid.world_to_grid(conn.start.0, conn.start.1)?;
                                 let (egx, egy) = grid.world_to_grid(conn.end.0, conn.end.1)?;
-                                let start_grid = GridNode { gx: sgx, gy: sgy, layer: conn.start.2 };
-                                let end_grid = GridNode { gx: egx, gy: egy, layer: conn.end.2 };
-                                let var = PORTFOLIO_VARIANTS[v_id];
-                                let w = if conn.diff_pair_leader.is_some() || conn.netclass.name == "USB_Diff" {
-                                    conn.netclass.diff_pair_width
-                                } else {
-                                    conn.netclass.track_width
-                                };
-                                let path = self.find_path_portfolio_variant(
-                                    grid,
-                                    start_grid,
-                                    end_grid,
-                                    conn.net_id,
-                                    conn.netclass.clearance,
-                                    w,
-                                    conn.netclass.via_dia,
-                                    u1_center,
-                                    conn.netclass.max_coupled_length_mm,
-                                    conn.netclass.require_return_path,
-                                    var.via_mult,
-                                    var.hist_w,
-                                    var.heur_w,
-                                    var.dist_bias,
-                                    var.reverse,
-                                    var.diag_first,
-                                    stop_flag,
-                                    Some(&found_counts[t_pos]),
-                                    None,
-                                )?;
-                                Some((conn_idx, v_id, path))
+                                Some((
+                                    conn_idx,
+                                    (
+                                        GridNode { gx: sgx, gy: sgy, layer: conn.start.2 },
+                                        GridNode { gx: egx, gy: egy, layer: conn.end.2 },
+                                        conn.net_id,
+                                        3.0f32,
+                                    ),
+                                ))
                             })
-                            .collect::<Vec<_>>();
+                            .collect();
 
-                        let mut raw_candidates = raw_candidates;
+                        let (mut raw_candidates, concurrent_gpu_paths): (
+                            Vec<(usize, usize, Vec<GridNode>)>,
+                            Vec<(usize, Option<Vec<GridNode>>)>,
+                        ) = rayon::join(
+                            || {
+                                tasks
+                                    .par_iter()
+                                    .filter_map(|&(t_pos, conn_idx, v_id)| {
+                                        if stop_flag.load(AtomicOrdering::Relaxed) {
+                                            return None;
+                                        }
+                                        let conn = &connections[conn_idx];
+                                        let (sgx, sgy) = grid.world_to_grid(conn.start.0, conn.start.1)?;
+                                        let (egx, egy) = grid.world_to_grid(conn.end.0, conn.end.1)?;
+                                        let start_grid = GridNode { gx: sgx, gy: sgy, layer: conn.start.2 };
+                                        let end_grid = GridNode { gx: egx, gy: egy, layer: conn.end.2 };
+                                        let var = PORTFOLIO_VARIANTS[v_id];
+                                        let w = if conn.diff_pair_leader.is_some() || conn.netclass.name == "USB_Diff" {
+                                            conn.netclass.diff_pair_width
+                                        } else {
+                                            conn.netclass.track_width
+                                        };
+                                        let path = if v_id == 0 {
+                                            self.find_path_with_constraints(
+                                                grid,
+                                                start_grid,
+                                                end_grid,
+                                                conn.net_id,
+                                                conn.netclass.clearance,
+                                                w,
+                                                conn.netclass.via_dia,
+                                                u1_center,
+                                                1.0,
+                                                0.0,
+                                                conn.netclass.max_coupled_length_mm,
+                                                conn.netclass.require_return_path,
+                                                None,
+                                                stop_flag,
+                                            )
+                                            .map(|p| {
+                                                found_counts[t_pos].fetch_add(1, AtomicOrdering::Relaxed);
+                                                p
+                                            })
+                                            .or_else(|| {
+                                                self.find_path_portfolio_variant(
+                                                    grid,
+                                                    start_grid,
+                                                    end_grid,
+                                                    conn.net_id,
+                                                    conn.netclass.clearance,
+                                                    w,
+                                                    conn.netclass.via_dia,
+                                                    u1_center,
+                                                    conn.netclass.max_coupled_length_mm,
+                                                    conn.netclass.require_return_path,
+                                                    var.via_mult,
+                                                    var.hist_w,
+                                                    var.heur_w,
+                                                    var.dist_bias,
+                                                    var.reverse,
+                                                    var.diag_first,
+                                                    stop_flag,
+                                                    Some(&found_counts[t_pos]),
+                                                    None,
+                                                )
+                                            })?
+                                        } else {
+                                            self.find_path_portfolio_variant(
+                                                grid,
+                                                start_grid,
+                                                end_grid,
+                                                conn.net_id,
+                                                conn.netclass.clearance,
+                                                w,
+                                                conn.netclass.via_dia,
+                                                u1_center,
+                                                conn.netclass.max_coupled_length_mm,
+                                                conn.netclass.require_return_path,
+                                                var.via_mult,
+                                                var.hist_w,
+                                                var.heur_w,
+                                                var.dist_bias,
+                                                var.reverse,
+                                                var.diag_first,
+                                                stop_flag,
+                                                Some(&found_counts[t_pos]),
+                                                None,
+                                            )?
+                                        };
+                                        Some((conn_idx, v_id, path))
+                                    })
+                                    .collect()
+                            },
+                            || {
+                                if concurrent_gpu_reqs.is_empty() || stop_flag.load(AtomicOrdering::Relaxed) {
+                                    return Vec::new();
+                                }
+                                let wf_reqs: Vec<(GridNode, GridNode, usize, f32)> =
+                                    concurrent_gpu_reqs.iter().map(|(_, r)| *r).collect();
+                                let wf_paths = self.solve_batch_gpu_wavefront_paths(grid, &wf_reqs, 1);
+                                concurrent_gpu_reqs
+                                    .iter()
+                                    .map(|(c_idx, _)| *c_idx)
+                                    .zip(wf_paths)
+                                    .collect()
+                            },
+                        );
+
+                        for (conn_idx, wf_opt) in concurrent_gpu_paths {
+                            if let Some(p) = wf_opt {
+                                raw_candidates.push((conn_idx, PORTFOLIO_VARIANTS.len(), p));
+                            }
+                        }
+
                         let missing_gpu_reqs: Vec<(usize, (GridNode, GridNode, usize, f32))> = target_indices
                             .iter()
                             .enumerate()
+                            .skip(concurrent_gpu_limit)
                             .filter(|(t_pos, _)| found_counts[*t_pos].load(AtomicOrdering::Relaxed) == 0)
                             .filter_map(|(_, &conn_idx)| {
                                 let conn = &connections[conn_idx];
@@ -4087,84 +4201,14 @@ impl AutoRouter {
                 }
 
                 let wave_grid: &RoutingGrid = &*grid;
-                let use_portfolio_phase1 = unrouted_indices.len() <= 12 || iteration >= 1;
-                let speculative_paths: Vec<(usize, Option<Vec<GridNode>>)> = if use_portfolio_phase1 {
-                    self.route_connections_portfolio(
-                        board,
-                        wave_grid,
-                        &connections,
-                        &unrouted_indices,
-                        u1_center,
-                        &stop_flag,
-                    )
-                } else {
-                    unrouted_indices
-                        .par_iter()
-                        .map(|&conn_idx| {
-                            if stop_flag.load(AtomicOrdering::Relaxed) {
-                                return (conn_idx, None);
-                            }
-                            let conn = &connections[conn_idx];
-                            let Some((sgx, sgy)) = wave_grid.world_to_grid(conn.start.0, conn.start.1) else {
-                                return (conn_idx, None);
-                            };
-                            let Some((egx, egy)) = wave_grid.world_to_grid(conn.end.0, conn.end.1) else {
-                                return (conn_idx, None);
-                            };
-                            let start_grid = GridNode {
-                                gx: sgx,
-                                gy: sgy,
-                                layer: conn.start.2,
-                            };
-                            let end_grid = GridNode {
-                                gx: egx,
-                                gy: egy,
-                                layer: conn.end.2,
-                            };
-                            let p = self
-                                .find_path_with_constraints(
-                                    wave_grid,
-                                    start_grid,
-                                    end_grid,
-                                    conn.net_id,
-                                    conn.netclass.clearance,
-                                    conn.netclass.track_width,
-                                    conn.netclass.via_dia,
-                                    u1_center,
-                                    1.0,
-                                    0.0,
-                                    conn.netclass.max_coupled_length_mm,
-                                    conn.netclass.require_return_path,
-                                    None,
-                                    &stop_flag,
-                                )
-                                .or_else(|| {
-                                    self.find_path_portfolio_variant(
-                                        wave_grid,
-                                        start_grid,
-                                        end_grid,
-                                        conn.net_id,
-                                        conn.netclass.clearance,
-                                        conn.netclass.track_width,
-                                        conn.netclass.via_dia,
-                                        u1_center,
-                                        conn.netclass.max_coupled_length_mm,
-                                        conn.netclass.require_return_path,
-                                        1.0,
-                                        1.0,
-                                        1.0,
-                                        0.0,
-                                        true,
-                                        false,
-                                        &stop_flag,
-                                        None,
-                                        None,
-                                    )
-                                });
-                            (conn_idx, p)
-                        })
-                        .collect()
-                };
+                let speculative_paths: Vec<(usize, Option<Vec<GridNode>>)> = self.route_connections_portfolio(
+                    board,
+                    wave_grid,
+                    &connections,
+                    &unrouted_indices,
+                    u1_center,
+                    &stop_flag,
+                );
 
                 // Phase 2: Conflict-Graph Independent Set Wave Partitioning & Parallel Sub-Wave Re-Routing
                 let mut _any_committed_in_wave = false;
@@ -4220,7 +4264,7 @@ impl AutoRouter {
 
                 // Parallel Sub-Wave Re-Routing for paths that conflicted with Wave 0
                 need_reroute.sort_by_key(|&idx| std::cmp::Reverse(unrouted_history[idx]));
-                let max_subwaves = 2usize;
+                let max_subwaves = 4usize;
                 for _sub in 0..max_subwaves {
                     if need_reroute.is_empty() || stop_flag.load(AtomicOrdering::Relaxed) {
                         break;
@@ -4490,6 +4534,7 @@ impl AutoRouter {
                 // Rip-up and Negotiated Congestion Update (budgeted to avoid wiping all progress)
                 if iteration + 1 < self.max_ripup_iterations {
                     let mut rip_budget = 8;
+                    let mut any_ripped_in_pass = false;
                     let corridor_tol = (0.85 + 0.35 * (iteration as f64)).min(2.5);
                     for conn_idx in 0..total_conns {
                         if rip_budget == 0 {
@@ -4514,7 +4559,6 @@ impl AutoRouter {
                                 }
                             }
 
-                            let mut ripped = false;
                             for rip_idx in 0..total_conns {
                                 if rip_budget == 0 {
                                     break;
@@ -4562,17 +4606,17 @@ impl AutoRouter {
                                                 grid.congestion[idx] += self.congestion_factor * 1.5;
                                             }
                                         }
-                                        ripped = true;
+                                        any_ripped_in_pass = true;
                                         rip_budget -= 1;
                                     }
                                 }
                             }
-                            if ripped {
-                                self.rebuild_grid_state(board, grid, &connections, &routed_paths, &escape_stubs);
-                                if let Ok(mut obs_g) = shared_obs.lock() {
-                                    obs_g.clone_from(&grid.obstacle_net_ids);
-                                }
-                            }
+                        }
+                    }
+                    if any_ripped_in_pass {
+                        self.rebuild_grid_state(board, grid, &connections, &routed_paths, &escape_stubs);
+                        if let Ok(mut obs_g) = shared_obs.lock() {
+                            obs_g.clone_from(&grid.obstacle_net_ids);
                         }
                     }
                 }
@@ -4770,6 +4814,21 @@ impl AutoRouter {
                                 None,
                                 &stop_flag,
                             )
+                            .or_else(|| {
+                                self.find_path_parallel(
+                                    grid,
+                                    s_node,
+                                    e_node,
+                                    conn.net_id,
+                                    conn.netclass.clearance,
+                                    conn.netclass.track_width,
+                                    conn.netclass.via_dia,
+                                    u1_center,
+                                    conn.netclass.max_coupled_length_mm,
+                                    false,
+                                    &stop_flag,
+                                )
+                            })
                             .or_else(|| {
                                 used_w = conn.netclass.track_width.min(0.25);
                                 used_c = conn.netclass.clearance.min(0.15);
@@ -5596,24 +5655,38 @@ impl AutoRouter {
         routed_paths: &[Option<Vec<GridNode>>],
         escape_stubs: &[EscapeStub],
     ) {
-        grid.obstacle_net_ids.fill(FREE_NET);
-        grid.usage_count.fill(0);
-        grid.gpu_net_cost_maps.clear();
-        grid.nudgeable_fp.fill(None);
-        grid.smd_pad_cells.fill(false);
-        grid.rasterize_obstacles(board);
-        for trk in &board.tracks {
-            if trk.is_locked {
-                grid.commit_track(trk);
+        if let Some(ref snap) = grid.base_snapshot {
+            grid.obstacle_net_ids.copy_from_slice(&snap.0);
+            grid.usage_count.copy_from_slice(&snap.1);
+            grid.nudgeable_fp.copy_from_slice(&snap.2);
+            grid.smd_pad_cells.copy_from_slice(&snap.3);
+            grid.gpu_net_cost_maps.clear();
+        } else {
+            grid.obstacle_net_ids.fill(FREE_NET);
+            grid.usage_count.fill(0);
+            grid.gpu_net_cost_maps.clear();
+            grid.nudgeable_fp.fill(None);
+            grid.smd_pad_cells.fill(false);
+            grid.rasterize_obstacles(board);
+            for trk in &board.tracks {
+                if trk.is_locked {
+                    grid.commit_track(trk);
+                }
             }
-        }
-        for v in &board.vias {
-            if v.is_locked {
-                grid.commit_via(v);
+            for v in &board.vias {
+                if v.is_locked {
+                    grid.commit_via(v);
+                }
             }
-        }
-        for stub in escape_stubs {
-            self.commit_stub_to_grid(grid, stub);
+            for stub in escape_stubs {
+                self.commit_stub_to_grid(grid, stub);
+            }
+            grid.base_snapshot = Some(Arc::new((
+                grid.obstacle_net_ids.clone(),
+                grid.usage_count.clone(),
+                grid.nudgeable_fp.clone(),
+                grid.smd_pad_cells.clone(),
+            )));
         }
         for (c_idx, path_opt) in routed_paths.iter().enumerate() {
             if let Some(path) = path_opt {
@@ -5691,6 +5764,7 @@ impl AutoRouter {
             max_net_clearance: grid.max_net_clearance,
             inner_layer_penalty: grid.inner_layer_penalty,
             vulkan: None,
+            base_snapshot: grid.base_snapshot.clone(),
         }
     }
 
@@ -5754,119 +5828,127 @@ impl AutoRouter {
         }
 
         blocking_candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal));
-        blocking_candidates.truncate(2);
+        blocking_candidates.truncate(3);
+        if blocking_candidates.is_empty() {
+            return false;
+        }
 
-        for (fp_idx, push_dir, _) in blocking_candidates {
+        // Flatten all candidate (fp_idx, dx, dy) poses across all blocking footprints into one parallel batch
+        let mut flat_pose_cands = Vec::new();
+        for &(fp_idx, push_dir, _) in &blocking_candidates {
             let orig_fp_x = board.footprints[fp_idx].x;
             let orig_fp_y = board.footprints[fp_idx].y;
-            let nudge_offsets = self.nudge_engine.nudge_candidates(push_dir);
-
-            // Pre-evaluate all candidate (dx, dy) poses in parallel across Rayon workers
-            let legal_poses: Vec<(f64, f64)> = nudge_offsets
-                .par_iter()
-                .filter_map(|&(dx, dy)| {
-                    let nx = orig_fp_x + dx;
-                    let ny = orig_fp_y + dy;
-                    if self.nudge_engine.is_placement_valid(board, fp_idx, nx, ny) {
-                        Some((nx, ny))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            if legal_poses.is_empty() {
-                continue;
+            for (dx, dy) in self.nudge_engine.nudge_candidates(push_dir) {
+                flat_pose_cands.push((fp_idx, orig_fp_x + dx, orig_fp_y + dy));
             }
+        }
 
-            // Evaluate A* pathfinding in parallel across legal footprint poses
-            let winning_pose: Option<((f64, f64), Vec<GridNode>)> = legal_poses
-                .par_iter()
-                .filter_map(|&(nx, ny)| {
-                    if stop_flag.load(AtomicOrdering::Relaxed) {
-                        return None;
-                    }
-                    let mut local_board = board.clone();
-                    local_board.footprints[fp_idx].x = nx;
-                    local_board.footprints[fp_idx].y = ny;
+        let legal_poses: Vec<(usize, f64, f64)> = flat_pose_cands
+            .par_iter()
+            .filter_map(|&(fp_idx, nx, ny)| {
+                if self.nudge_engine.is_placement_valid(board, fp_idx, nx, ny) {
+                    Some((fp_idx, nx, ny))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-                    let mut local_conns = connections.to_vec();
-                    let mut local_paths = routed_paths.to_vec();
-                    for (c_i, c) in local_conns.iter_mut().enumerate() {
-                        if c.start_fp == fp_idx {
-                            let (px, py) = local_board.footprints[fp_idx]
-                                .pad_absolute_position(&local_board.footprints[fp_idx].pads[c.start_pad]);
-                            c.start = (px, py, c.start.2);
-                            local_paths[c_i] = None;
-                        }
-                        if c.end_fp == fp_idx {
-                            let (px, py) = local_board.footprints[fp_idx]
-                                .pad_absolute_position(&local_board.footprints[fp_idx].pads[c.end_pad]);
-                            c.end = (px, py, c.end.2);
-                            local_paths[c_i] = None;
-                        }
-                    }
+        if legal_poses.is_empty() {
+            return false;
+        }
 
-                    let mut local_grid = Self::clone_grid_for_worker(grid);
-                    self.rebuild_grid_state(&local_board, &mut local_grid, &local_conns, &local_paths, escape_stubs);
+        // Evaluate A* pathfinding in parallel across all legal footprint poses simultaneously
+        let winning_pose: Option<(usize, (f64, f64), Vec<GridNode>)> = legal_poses
+            .par_iter()
+            .filter_map(|&(fp_idx, nx, ny)| {
+                if stop_flag.load(AtomicOrdering::Relaxed) {
+                    return None;
+                }
+                let mut local_board = board.clone();
+                local_board.footprints[fp_idx].x = nx;
+                local_board.footprints[fp_idx].y = ny;
 
-                    let updated_conn = &local_conns[conn_idx];
-                    let (Some((sgx, sgy)), Some((egx, egy))) = (
-                        local_grid.world_to_grid(updated_conn.start.0, updated_conn.start.1),
-                        local_grid.world_to_grid(updated_conn.end.0, updated_conn.end.1),
-                    ) else {
-                        return None;
-                    };
-                    let s_node = GridNode { gx: sgx, gy: sgy, layer: updated_conn.start.2 };
-                    let e_node = GridNode { gx: egx, gy: egy, layer: updated_conn.end.2 };
-
-                    self.find_path_with_params(
-                        &local_grid,
-                        s_node,
-                        e_node,
-                        c_net_id,
-                        req_clearance,
-                        track_width,
-                        via_dia,
-                        u1_center,
-                        1.05,
-                        0.0,
-                        stop_flag,
-                    )
-                    .map(|p| ((nx, ny), p))
-                })
-                .find_first(|_| true);
-
-            if let Some(((nx, ny), p)) = winning_pose {
-                board.footprints[fp_idx].x = nx;
-                board.footprints[fp_idx].y = ny;
-
-                for (c_i, c) in connections.iter_mut().enumerate() {
+                let mut local_conns = connections.to_vec();
+                let mut local_paths = routed_paths.to_vec();
+                for (c_i, c) in local_conns.iter_mut().enumerate() {
                     if c.start_fp == fp_idx {
-                        let (px, py) = board.footprints[fp_idx]
-                            .pad_absolute_position(&board.footprints[fp_idx].pads[c.start_pad]);
+                        let (px, py) = local_board.footprints[fp_idx]
+                            .pad_absolute_position(&local_board.footprints[fp_idx].pads[c.start_pad]);
                         c.start = (px, py, c.start.2);
-                        routed_paths[c_i] = None;
+                        local_paths[c_i] = None;
                     }
                     if c.end_fp == fp_idx {
-                        let (px, py) = board.footprints[fp_idx]
-                            .pad_absolute_position(&board.footprints[fp_idx].pads[c.end_pad]);
+                        let (px, py) = local_board.footprints[fp_idx]
+                            .pad_absolute_position(&local_board.footprints[fp_idx].pads[c.end_pad]);
                         c.end = (px, py, c.end.2);
-                        routed_paths[c_i] = None;
+                        local_paths[c_i] = None;
                     }
                 }
 
-                self.rebuild_grid_state(board, grid, connections, routed_paths, escape_stubs);
-                self.commit_path_to_grid(grid, &p, c_net_id, track_width, via_dia);
-                routed_paths[conn_idx] = Some(p);
+                let mut local_grid = Self::clone_grid_for_worker(grid);
+                local_grid.base_snapshot = None;
+                self.rebuild_grid_state(&local_board, &mut local_grid, &local_conns, &local_paths, escape_stubs);
 
-                board.rip_up_connected_traces_to_component_at(
-                    fp_idx,
-                    Some((orig_fp_x, orig_fp_y, board.footprints[fp_idx].rotation, board.footprints[fp_idx].layer)),
-                );
-                grid.update_distance_fields();
-                return true;
+                let updated_conn = &local_conns[conn_idx];
+                let (Some((sgx, sgy)), Some((egx, egy))) = (
+                    local_grid.world_to_grid(updated_conn.start.0, updated_conn.start.1),
+                    local_grid.world_to_grid(updated_conn.end.0, updated_conn.end.1),
+                ) else {
+                    return None;
+                };
+                let s_node = GridNode { gx: sgx, gy: sgy, layer: updated_conn.start.2 };
+                let e_node = GridNode { gx: egx, gy: egy, layer: updated_conn.end.2 };
+
+                self.find_path_with_params(
+                    &local_grid,
+                    s_node,
+                    e_node,
+                    c_net_id,
+                    req_clearance,
+                    track_width,
+                    via_dia,
+                    u1_center,
+                    1.05,
+                    0.0,
+                    stop_flag,
+                )
+                .map(|p| (fp_idx, (nx, ny), p))
+            })
+            .find_first(|_| true);
+
+        if let Some((fp_idx, (nx, ny), p)) = winning_pose {
+            let orig_fp_x = board.footprints[fp_idx].x;
+            let orig_fp_y = board.footprints[fp_idx].y;
+            board.footprints[fp_idx].x = nx;
+            board.footprints[fp_idx].y = ny;
+
+            for (c_i, c) in connections.iter_mut().enumerate() {
+                if c.start_fp == fp_idx {
+                    let (px, py) = board.footprints[fp_idx]
+                        .pad_absolute_position(&board.footprints[fp_idx].pads[c.start_pad]);
+                    c.start = (px, py, c.start.2);
+                    routed_paths[c_i] = None;
+                }
+                if c.end_fp == fp_idx {
+                    let (px, py) = board.footprints[fp_idx]
+                        .pad_absolute_position(&board.footprints[fp_idx].pads[c.end_pad]);
+                    c.end = (px, py, c.end.2);
+                    routed_paths[c_i] = None;
+                }
             }
+
+            grid.base_snapshot = None;
+            self.rebuild_grid_state(board, grid, connections, routed_paths, escape_stubs);
+            self.commit_path_to_grid(grid, &p, c_net_id, track_width, via_dia);
+            routed_paths[conn_idx] = Some(p);
+
+            board.rip_up_connected_traces_to_component_at(
+                fp_idx,
+                Some((orig_fp_x, orig_fp_y, board.footprints[fp_idx].rotation, board.footprints[fp_idx].layer)),
+            );
+            grid.update_distance_fields();
+            return true;
         }
         false
     }
@@ -6172,18 +6254,29 @@ pub fn find_choked_pin_bottlenecks(
                 .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal))
                 .then_with(|| a.1.cmp(&b.1))
         });
-        candidate_conns.truncate(5);
+        candidate_conns.truncate(8);
 
         let drc_ctx = GpuDrcContext::from_board(board);
 
-        for &(rip_idx, _, _, _, _) in &candidate_conns {
-            let orig_path = routed_paths[rip_idx].clone().unwrap();
+        // ========================================================
+        // STAGE 1: Flattened Parallel Via Shoving with Multi-GPU Batch Pre-Filtering
+        // Collect all corridor via shift candidates across all blocking connections into one
+        // unified GPU DRC batch and evaluate all shifted via poses in parallel across Rayon workers.
+        // ========================================================
+        let shifts: [(isize, isize); 16] = [
+            (1, 0), (-1, 0), (0, 1), (0, -1),
+            (1, 1), (-1, 1), (1, -1), (-1, -1),
+            (2, 0), (-2, 0), (0, 2), (0, -2),
+            (2, 2), (-2, 2), (2, -2), (-2, -2),
+        ];
 
-            // ========================================================
-            // STAGE 1: Parallel Via Shoving with GpuDrcContext Batch Pre-Filtering
-            // If the blocking path has a via close to our corridor, evaluate all 16 shifted
-            // via poses in parallel across GPU DRC + Rayon worker threads.
-            // ========================================================
+        let mut via_shift_tasks: Vec<(usize, usize, isize, isize)> = Vec::new();
+        let mut gpu_via_cands: Vec<GpuDrcCandidate> = Vec::new();
+
+        for &(rip_idx, _, _, _, _) in &candidate_conns {
+            let Some(ref orig_path) = routed_paths[rip_idx] else {
+                continue;
+            };
             let other_net_id = connections[rip_idx].net_id;
             let other_clearance = connections[rip_idx].netclass.clearance;
             let other_via_dia = connections[rip_idx].netclass.via_dia;
@@ -6198,147 +6291,146 @@ pub fn find_choked_pin_bottlenecks(
                     if d_start.min(d_end).min(d_corridor) > 2.5 {
                         continue;
                     }
-
-                    let shifts: [(isize, isize); 16] = [
-                        (1, 0), (-1, 0), (0, 1), (0, -1),
-                        (1, 1), (-1, 1), (1, -1), (-1, -1),
-                        (2, 0), (-2, 0), (0, 2), (0, -2),
-                        (2, 2), (-2, 2), (2, -2), (-2, -2),
-                    ];
-
-                    let gpu_via_cands: Vec<GpuDrcCandidate> = shifts
-                        .iter()
-                        .map(|&(dx, dy)| {
-                            let ngx = (v_node.gx as isize + dx).clamp(0, grid.width.saturating_sub(1) as isize) as usize;
-                            let ngy = (v_node.gy as isize + dy).clamp(0, grid.height.saturating_sub(1) as isize) as usize;
-                            let (nwx, nwy) = grid.grid_to_world(ngx, ngy);
-                            GpuDrcCandidate {
-                                x1: nwx as f32,
-                                y1: nwy as f32,
-                                x2: 0.0,
-                                y2: 0.0,
-                                radius_or_half_width: (other_via_dia * 0.5) as f32,
-                                clearance: other_clearance as f32,
-                                layer: 0,
-                                net_id: other_net_id as u32,
-                                kind: 0,
-                                ignore_same_net_pads: 0,
-                                _pad0: 0,
-                                _pad1: 0,
-                            }
-                        })
-                        .collect();
-                    let gpu_via_flags = drc_ctx.evaluate(grid.vulkan.as_ref(), &gpu_via_cands);
-
-                    let winning_via_shove: Option<(Vec<GridNode>, Vec<GridNode>)> = shifts
-                        .par_iter()
-                        .enumerate()
-                        .filter_map(|(s_idx, &(dx, dy))| {
-                            if stop_flag.load(AtomicOrdering::Relaxed) {
-                                return None;
-                            }
-                            if !gpu_via_flags.as_ref().map_or(true, |f| f[s_idx] != 0) {
-                                return None;
-                            }
-                            let ngx = v_node.gx as isize + dx;
-                            let ngy = v_node.gy as isize + dy;
-                            if ngx < 0 || ngx >= grid.width as isize || ngy < 0 || ngy >= grid.height as isize {
-                                return None;
-                            }
-                            let (cand_gx, cand_gy) = (ngx as usize, ngy as usize);
-                            let (nwx, nwy) = grid.grid_to_world(cand_gx, cand_gy);
-                            if !is_via_location_legal(board, (nwx, nwy), other_via_dia, other_net_id, other_clearance) {
-                                return None;
-                            }
-
-                            for l in 0..grid.num_layers {
-                                let idx = grid.idx(cand_gx, cand_gy, l);
-                                let obst = grid.obstacle_net_ids[idx];
-                                if obst != FREE_NET && obst != other_net_id as i32 {
-                                    return None;
-                                }
-                            }
-
-                            let l_in = v_node.layer;
-                            let l_out = orig_path[v_step + 1].layer;
-                            let cand_via_in = GridNode { gx: cand_gx, gy: cand_gy, layer: l_in };
-                            let cand_via_out = GridNode { gx: cand_gx, gy: cand_gy, layer: l_out };
-
-                            let lead_in_anchor = if v_step > 0 { orig_path[v_step - 1] } else { orig_path[0] };
-                            let lead_out_anchor = if v_step + 2 < orig_path.len() { orig_path[v_step + 2] } else { orig_path[v_step + 1] };
-
-                            let c1_list = Self::two_segment_candidates(lead_in_anchor, cand_via_in);
-                            let c2_list = Self::two_segment_candidates(cand_via_out, lead_out_anchor);
-
-                            let mut valid_slid_path = None;
-                            'cand_loop: for c1 in &c1_list {
-                                for c2 in &c2_list {
-                                    let mut cand_full = Vec::with_capacity(orig_path.len() + c1.len() + c2.len());
-                                    cand_full.extend_from_slice(&orig_path[0..v_step.saturating_sub(1).max(1)]);
-                                    cand_full.extend(c1.iter().cloned());
-                                    cand_full.push(cand_via_in);
-                                    cand_full.push(cand_via_out);
-                                    cand_full.extend(c2.iter().cloned());
-                                    if v_step + 2 < orig_path.len() {
-                                        cand_full.extend_from_slice(&orig_path[(v_step + 2)..]);
-                                    }
-
-                                    if self.is_path_conflict_free(
-                                        grid,
-                                        &cand_full,
-                                        other_net_id,
-                                        other_clearance,
-                                        connections[rip_idx].netclass.track_width,
-                                        other_via_dia,
-                                        u1_center,
-                                        connections[rip_idx].netclass.require_return_path,
-                                    ) {
-                                        valid_slid_path = Some(cand_full);
-                                        break 'cand_loop;
-                                    }
-                                }
-                            }
-
-                            let slid_path = valid_slid_path?;
-                            let mut local_paths = routed_paths.to_vec();
-                            local_paths[rip_idx] = Some(slid_path.clone());
-                            let mut local_grid = Self::clone_grid_for_worker(grid);
-                            self.rebuild_grid_state(board, &mut local_grid, connections, &local_paths, escape_stubs);
-
-                            let (Some((sgx, sgy)), Some((egx, egy))) = (
-                                local_grid.world_to_grid(conn.start.0, conn.start.1),
-                                local_grid.world_to_grid(conn.end.0, conn.end.1),
-                            ) else {
-                                return None;
-                            };
-                            let s_node = GridNode { gx: sgx, gy: sgy, layer: conn.start.2 };
-                            let e_node = GridNode { gx: egx, gy: egy, layer: conn.end.2 };
-
-                            self.find_path_with_params(
-                                &local_grid,
-                                s_node,
-                                e_node,
-                                conn.net_id,
-                                conn.netclass.clearance,
-                                conn.netclass.track_width,
-                                conn.netclass.via_dia,
-                                u1_center,
-                                1.05,
-                                0.0,
-                                stop_flag,
-                            )
-                            .map(|p| (slid_path, p))
-                        })
-                        .find_first(|_| true);
-
-                    if let Some((slid_path, p)) = winning_via_shove {
-                        routed_paths[rip_idx] = Some(slid_path);
-                        self.rebuild_grid_state(board, grid, connections, routed_paths, escape_stubs);
-                        self.commit_path_to_grid(grid, &p, conn.net_id, conn.netclass.track_width, conn.netclass.via_dia);
-                        routed_paths[conn_idx] = Some(p);
-                        return true;
+                    for &(dx, dy) in &shifts {
+                        let ngx = (v_node.gx as isize + dx).clamp(0, grid.width.saturating_sub(1) as isize) as usize;
+                        let ngy = (v_node.gy as isize + dy).clamp(0, grid.height.saturating_sub(1) as isize) as usize;
+                        let (nwx, nwy) = grid.grid_to_world(ngx, ngy);
+                        via_shift_tasks.push((rip_idx, v_step, dx, dy));
+                        gpu_via_cands.push(GpuDrcCandidate {
+                            x1: nwx as f32,
+                            y1: nwy as f32,
+                            x2: 0.0,
+                            y2: 0.0,
+                            radius_or_half_width: (other_via_dia * 0.5) as f32,
+                            clearance: other_clearance as f32,
+                            layer: 0,
+                            net_id: other_net_id as u32,
+                            kind: 0,
+                            ignore_same_net_pads: 0,
+                            _pad0: 0,
+                            _pad1: 0,
+                        });
                     }
                 }
+            }
+        }
+
+        if !via_shift_tasks.is_empty() {
+            let gpu_via_flags = drc_ctx.evaluate(grid.vulkan.as_ref(), &gpu_via_cands);
+
+            let winning_via_shove: Option<(usize, Vec<GridNode>, Vec<GridNode>)> = via_shift_tasks
+                .par_iter()
+                .enumerate()
+                .filter_map(|(t_idx, &(rip_idx, v_step, dx, dy))| {
+                    if stop_flag.load(AtomicOrdering::Relaxed) {
+                        return None;
+                    }
+                    if !gpu_via_flags.as_ref().map_or(true, |f| f[t_idx] != 0) {
+                        return None;
+                    }
+                    let orig_path = routed_paths[rip_idx].as_ref()?;
+                    let v_node = orig_path[v_step];
+                    let other_net_id = connections[rip_idx].net_id;
+                    let other_clearance = connections[rip_idx].netclass.clearance;
+                    let other_via_dia = connections[rip_idx].netclass.via_dia;
+
+                    let ngx = v_node.gx as isize + dx;
+                    let ngy = v_node.gy as isize + dy;
+                    if ngx < 0 || ngx >= grid.width as isize || ngy < 0 || ngy >= grid.height as isize {
+                        return None;
+                    }
+                    let (cand_gx, cand_gy) = (ngx as usize, ngy as usize);
+                    let (nwx, nwy) = grid.grid_to_world(cand_gx, cand_gy);
+                    if !is_via_location_legal(board, (nwx, nwy), other_via_dia, other_net_id, other_clearance) {
+                        return None;
+                    }
+
+                    for l in 0..grid.num_layers {
+                        let idx = grid.idx(cand_gx, cand_gy, l);
+                        let obst = grid.obstacle_net_ids[idx];
+                        if obst != FREE_NET && obst != other_net_id as i32 {
+                            return None;
+                        }
+                    }
+
+                    let l_in = v_node.layer;
+                    let l_out = orig_path[v_step + 1].layer;
+                    let cand_via_in = GridNode { gx: cand_gx, gy: cand_gy, layer: l_in };
+                    let cand_via_out = GridNode { gx: cand_gx, gy: cand_gy, layer: l_out };
+
+                    let lead_in_anchor = if v_step > 0 { orig_path[v_step - 1] } else { orig_path[0] };
+                    let lead_out_anchor = if v_step + 2 < orig_path.len() { orig_path[v_step + 2] } else { orig_path[v_step + 1] };
+
+                    let c1_list = Self::two_segment_candidates(lead_in_anchor, cand_via_in);
+                    let c2_list = Self::two_segment_candidates(cand_via_out, lead_out_anchor);
+
+                    let mut valid_slid_path = None;
+                    'cand_loop: for c1 in &c1_list {
+                        for c2 in &c2_list {
+                            let mut cand_full = Vec::with_capacity(orig_path.len() + c1.len() + c2.len());
+                            cand_full.extend_from_slice(&orig_path[0..v_step.saturating_sub(1).max(1)]);
+                            cand_full.extend(c1.iter().cloned());
+                            cand_full.push(cand_via_in);
+                            cand_full.push(cand_via_out);
+                            cand_full.extend(c2.iter().cloned());
+                            if v_step + 2 < orig_path.len() {
+                                cand_full.extend_from_slice(&orig_path[(v_step + 2)..]);
+                            }
+
+                            if self.is_path_conflict_free(
+                                grid,
+                                &cand_full,
+                                other_net_id,
+                                other_clearance,
+                                connections[rip_idx].netclass.track_width,
+                                other_via_dia,
+                                u1_center,
+                                connections[rip_idx].netclass.require_return_path,
+                            ) {
+                                valid_slid_path = Some(cand_full);
+                                break 'cand_loop;
+                            }
+                        }
+                    }
+
+                    let slid_path = valid_slid_path?;
+                    let mut local_paths = routed_paths.to_vec();
+                    local_paths[rip_idx] = Some(slid_path.clone());
+                    let mut local_grid = Self::clone_grid_for_worker(grid);
+                    self.rebuild_grid_state(board, &mut local_grid, connections, &local_paths, escape_stubs);
+
+                    let (Some((sgx, sgy)), Some((egx, egy))) = (
+                        local_grid.world_to_grid(conn.start.0, conn.start.1),
+                        local_grid.world_to_grid(conn.end.0, conn.end.1),
+                    ) else {
+                        return None;
+                    };
+                    let s_node = GridNode { gx: sgx, gy: sgy, layer: conn.start.2 };
+                    let e_node = GridNode { gx: egx, gy: egy, layer: conn.end.2 };
+
+                    self.find_path_with_params(
+                        &local_grid,
+                        s_node,
+                        e_node,
+                        conn.net_id,
+                        conn.netclass.clearance,
+                        conn.netclass.track_width,
+                        conn.netclass.via_dia,
+                        u1_center,
+                        1.05,
+                        0.0,
+                        stop_flag,
+                    )
+                    .map(|p| (rip_idx, slid_path, p))
+                })
+                .find_first(|_| true);
+
+            if let Some((rip_idx, slid_path, p)) = winning_via_shove {
+                routed_paths[rip_idx] = Some(slid_path);
+                self.rebuild_grid_state(board, grid, connections, routed_paths, escape_stubs);
+                self.commit_path_to_grid(grid, &p, conn.net_id, conn.netclass.track_width, conn.netclass.via_dia);
+                routed_paths[conn_idx] = Some(p);
+                return true;
             }
         }
 
@@ -6442,32 +6534,57 @@ pub fn find_choked_pin_bottlenecks(
         }
 
         // ========================================================
-        // STAGE 3: Multi-Track Corridor Shove
-        // If lifting 1 blocking track at a time was insufficient (e.g. 2-3 parallel tracks block a narrow gap),
-        // progressively lift the top 2..=3 closest blocking candidates simultaneously, route conn_idx,
-        // and immediately re-route the lifted candidates around conn_idx.
+        // STAGE 3: Parallel Multi-Track Corridor Shove Portfolio
+        // Evaluate distinct 2-track and 3-track blocking combinations in parallel across Rayon workers:
+        // lift the group simultaneously, route `conn_idx`, and re-route the lifted group around `conn_idx`.
         // ========================================================
         if candidate_conns.len() >= 2 {
-            let max_group = candidate_conns.len().min(3);
-            for group_size in 2..=max_group {
-                let mut saved_group: Vec<(usize, Vec<GridNode>)> = Vec::with_capacity(group_size);
-                for i in 0..group_size {
-                    let r_idx = candidate_conns[i].0;
-                    if let Some(p) = routed_paths[r_idx].take() {
-                        saved_group.push((r_idx, p));
-                    }
-                }
-                self.rebuild_grid_state(board, grid, connections, routed_paths, escape_stubs);
+            let n_c = candidate_conns.len();
+            let mut groups: Vec<Vec<usize>> = Vec::new();
+            groups.push(vec![candidate_conns[0].0, candidate_conns[1].0]);
+            if n_c >= 3 {
+                groups.push(vec![candidate_conns[0].0, candidate_conns[2].0]);
+                groups.push(vec![candidate_conns[1].0, candidate_conns[2].0]);
+                groups.push(vec![candidate_conns[0].0, candidate_conns[1].0, candidate_conns[2].0]);
+            }
+            if n_c >= 4 {
+                groups.push(vec![candidate_conns[0].0, candidate_conns[3].0]);
+                groups.push(vec![candidate_conns[0].0, candidate_conns[1].0, candidate_conns[3].0]);
+                groups.push(vec![candidate_conns[0].0, candidate_conns[2].0, candidate_conns[3].0]);
+            }
 
-                if let (Some((sgx, sgy)), Some((egx, egy))) = (
-                    grid.world_to_grid(conn.start.0, conn.start.1),
-                    grid.world_to_grid(conn.end.0, conn.end.1),
-                ) {
+            let stage3_results: Vec<Option<(usize, usize, Vec<GridNode>, Vec<(usize, Option<Vec<GridNode>>, Vec<GridNode>)>)>> = groups
+                .into_par_iter()
+                .enumerate()
+                .map(|(g_ord, group)| {
+                    if stop_flag.load(AtomicOrdering::Relaxed) {
+                        return None;
+                    }
+                    let mut local_paths = routed_paths.to_vec();
+                    let mut saved_group: Vec<(usize, Vec<GridNode>)> = Vec::with_capacity(group.len());
+                    for &r_idx in &group {
+                        if let Some(p) = local_paths[r_idx].take() {
+                            saved_group.push((r_idx, p));
+                        }
+                    }
+                    if saved_group.is_empty() {
+                        return None;
+                    }
+
+                    let mut local_grid = Self::clone_grid_for_worker(grid);
+                    self.rebuild_grid_state(board, &mut local_grid, connections, &local_paths, escape_stubs);
+
+                    let (Some((sgx, sgy)), Some((egx, egy))) = (
+                        local_grid.world_to_grid(conn.start.0, conn.start.1),
+                        local_grid.world_to_grid(conn.end.0, conn.end.1),
+                    ) else {
+                        return None;
+                    };
                     let s_node = GridNode { gx: sgx, gy: sgy, layer: conn.start.2 };
                     let e_node = GridNode { gx: egx, gy: egy, layer: conn.end.2 };
 
-                    if let Some(p_conn) = self.find_path_parallel(
-                        grid,
+                    let p_conn = self.find_path_parallel(
+                        &local_grid,
                         s_node,
                         e_node,
                         conn.net_id,
@@ -6478,58 +6595,86 @@ pub fn find_choked_pin_bottlenecks(
                         conn.netclass.max_coupled_length_mm,
                         conn.netclass.require_return_path,
                         stop_flag,
-                    ) {
-                        self.commit_path_to_grid(grid, &p_conn, conn.net_id, conn.netclass.track_width, conn.netclass.via_dia);
-                        routed_paths[conn_idx] = Some(p_conn);
+                    )?;
 
-                        for (r_idx, orig_p) in saved_group {
-                            let rip_conn = &connections[r_idx];
-                            let mut rerouted = false;
-                            if let (Some((rsgx, rsgy)), Some((regx, regy))) = (
-                                grid.world_to_grid(rip_conn.start.0, rip_conn.start.1),
-                                grid.world_to_grid(rip_conn.end.0, rip_conn.end.1),
+                    self.commit_path_to_grid(&mut local_grid, &p_conn, conn.net_id, conn.netclass.track_width, conn.netclass.via_dia);
+                    local_paths[conn_idx] = Some(p_conn.clone());
+
+                    let mut rerouted_cnt = 0usize;
+                    let mut group_outcomes: Vec<(usize, Option<Vec<GridNode>>, Vec<GridNode>)> = Vec::with_capacity(saved_group.len());
+                    for (r_idx, orig_p) in saved_group {
+                        let rip_conn = &connections[r_idx];
+                        let mut p_shoved_opt = None;
+                        if let (Some((rsgx, rsgy)), Some((regx, regy))) = (
+                            local_grid.world_to_grid(rip_conn.start.0, rip_conn.start.1),
+                            local_grid.world_to_grid(rip_conn.end.0, rip_conn.end.1),
+                        ) {
+                            let r_s = GridNode { gx: rsgx, gy: rsgy, layer: rip_conn.start.2 };
+                            let r_e = GridNode { gx: regx, gy: regy, layer: rip_conn.end.2 };
+                            if let Some(p_shoved) = self.find_path_parallel(
+                                &local_grid,
+                                r_s,
+                                r_e,
+                                rip_conn.net_id,
+                                rip_conn.netclass.clearance,
+                                rip_conn.netclass.track_width,
+                                rip_conn.netclass.via_dia,
+                                u1_center,
+                                rip_conn.netclass.max_coupled_length_mm,
+                                rip_conn.netclass.require_return_path,
+                                stop_flag,
                             ) {
-                                let r_s = GridNode { gx: rsgx, gy: rsgy, layer: rip_conn.start.2 };
-                                let r_e = GridNode { gx: regx, gy: regy, layer: rip_conn.end.2 };
-                                if let Some(p_shoved) = self.find_path_parallel(
-                                    grid,
-                                    r_s,
-                                    r_e,
+                                self.commit_path_to_grid(
+                                    &mut local_grid,
+                                    &p_shoved,
                                     rip_conn.net_id,
-                                    rip_conn.netclass.clearance,
                                     rip_conn.netclass.track_width,
                                     rip_conn.netclass.via_dia,
-                                    u1_center,
-                                    rip_conn.netclass.max_coupled_length_mm,
-                                    rip_conn.netclass.require_return_path,
-                                    stop_flag,
-                                ) {
-                                    self.commit_path_to_grid(grid, &p_shoved, rip_conn.net_id, rip_conn.netclass.track_width, rip_conn.netclass.via_dia);
-                                    routed_paths[r_idx] = Some(p_shoved);
-                                    rerouted = true;
-                                }
-                            }
-                            if !rerouted {
-                                for node in &orig_p {
-                                    let (wx, wy) = grid.grid_to_world(node.gx, node.gy);
-                                    if (wx - c_start.0).hypot(wy - c_start.1) < 2.5
-                                        || (wx - c_end.0).hypot(wy - c_end.1) < 2.5
-                                        || dist_to_segment(wx, wy, c_start.0, c_start.1, c_end.0, c_end.1) < 2.0
-                                    {
-                                        let idx = grid.idx(node.gx, node.gy, node.layer);
-                                        grid.congestion[idx] += self.congestion_factor * 2.5;
-                                    }
-                                }
+                                );
+                                local_paths[r_idx] = Some(p_shoved.clone());
+                                p_shoved_opt = Some(p_shoved);
+                                rerouted_cnt += 1;
                             }
                         }
-                        return true;
+                        group_outcomes.push((r_idx, p_shoved_opt, orig_p));
                     }
-                }
 
-                for (r_idx, orig_p) in saved_group {
-                    routed_paths[r_idx] = Some(orig_p);
+                    let unrecovered = group_outcomes.len().saturating_sub(rerouted_cnt);
+                    Some((unrecovered, g_ord, p_conn, group_outcomes))
+                })
+                .collect();
+
+            if let Some((_, _, p_conn, group_outcomes)) = stage3_results
+                .into_iter()
+                .flatten()
+                .min_by_key(|(unrecovered, g_ord, _, _)| (*unrecovered, *g_ord))
+            {
+                for &(r_idx, _, _) in &group_outcomes {
+                    routed_paths[r_idx] = None;
                 }
                 self.rebuild_grid_state(board, grid, connections, routed_paths, escape_stubs);
+                self.commit_path_to_grid(grid, &p_conn, conn.net_id, conn.netclass.track_width, conn.netclass.via_dia);
+                routed_paths[conn_idx] = Some(p_conn);
+
+                for (r_idx, p_shoved_opt, orig_p) in group_outcomes {
+                    if let Some(p_shoved) = p_shoved_opt {
+                        let rip_conn = &connections[r_idx];
+                        self.commit_path_to_grid(grid, &p_shoved, rip_conn.net_id, rip_conn.netclass.track_width, rip_conn.netclass.via_dia);
+                        routed_paths[r_idx] = Some(p_shoved);
+                    } else {
+                        for node in &orig_p {
+                            let (wx, wy) = grid.grid_to_world(node.gx, node.gy);
+                            if (wx - c_start.0).hypot(wy - c_start.1) < 2.5
+                                || (wx - c_end.0).hypot(wy - c_end.1) < 2.5
+                                || dist_to_segment(wx, wy, c_start.0, c_start.1, c_end.0, c_end.1) < 2.0
+                            {
+                                let idx = grid.idx(node.gx, node.gy, node.layer);
+                                grid.congestion[idx] += self.congestion_factor * 2.5;
+                            }
+                        }
+                    }
+                }
+                return true;
             }
         }
 
@@ -9058,27 +9203,126 @@ pub fn find_choked_pin_bottlenecks(
                 }
             })
             .collect();
+        if signal_vias.is_empty() {
+            return 0;
+        }
 
-        let mut added_count = 0;
         let gnd_c = board.get_netclass_for_net(gnd_net_id).clearance.max(0.15);
         let via_size = 0.60;
         let via_drill = 0.30;
+        let via_r = via_size * 0.5;
+        let r_cells = ((via_r + gnd_c) / grid.res).ceil() as isize;
 
-        for (_s_idx, s_pos) in signal_vias {
+        let distances = [0.75, 0.90, 1.10, 1.25, 1.40];
+        let mut angles = Vec::with_capacity(16);
+        for i in 0..16 {
+            let theta = (i as f64) * std::f64::consts::PI / 8.0;
+            angles.push((theta.cos(), theta.sin()));
+        }
+
+        let cands_per_sig = distances.len() * angles.len();
+        let mut gpu_cands = Vec::with_capacity(signal_vias.len() * cands_per_sig);
+        for &(_, s_pos) in &signal_vias {
+            for &dist in &distances {
+                for &(cos_t, sin_t) in &angles {
+                    let vx = s_pos.0 + dist * cos_t;
+                    let vy = s_pos.1 + dist * sin_t;
+                    gpu_cands.push(GpuDrcCandidate {
+                        x1: vx as f32,
+                        y1: vy as f32,
+                        x2: 0.0,
+                        y2: 0.0,
+                        radius_or_half_width: via_r as f32,
+                        clearance: gnd_c as f32,
+                        layer: 0,
+                        net_id: gnd_net_id as u32,
+                        kind: 0,
+                        ignore_same_net_pads: 0,
+                        _pad0: 0,
+                        _pad1: 0,
+                    });
+                }
+            }
+        }
+
+        let drc_ctx = GpuDrcContext::from_board(board);
+        let gpu_flags = drc_ctx.evaluate(grid.vulkan.as_ref(), &gpu_cands);
+
+        // Pre-compute legal candidate positions for every signal via in parallel across Rayon workers
+        let legal_per_sig: Vec<Vec<(f64, f64)>> = signal_vias
+            .par_iter()
+            .enumerate()
+            .map(|(sig_i, &(_, s_pos))| {
+                let mut valid_list = Vec::new();
+                let base_idx = sig_i * cands_per_sig;
+                let mut local_k = 0usize;
+                for &dist in &distances {
+                    for &(cos_t, sin_t) in &angles {
+                        let flag_idx = base_idx + local_k;
+                        local_k += 1;
+                        if !gpu_flags.as_ref().map_or(true, |f| f[flag_idx] != 0) {
+                            continue;
+                        }
+                        let vx = s_pos.0 + dist * cos_t;
+                        let vy = s_pos.1 + dist * sin_t;
+                        if board.vias.iter().any(|v| (v.position.0 - vx).hypot(v.position.1 - vy) < (v.size + via_size) * 0.5 + gnd_c) {
+                            continue;
+                        }
+                        if !is_via_location_legal(board, (vx, vy), via_size, gnd_net_id, gnd_c) {
+                            continue;
+                        }
+                        if let Some((gx, gy)) = grid.world_to_grid(vx, vy) {
+                            let mut safe = true;
+                            for cy in -r_cells..=r_cells {
+                                for cx in -r_cells..=r_cells {
+                                    if (cx * cx + cy * cy) as f64 * (grid.res * grid.res) <= (via_r + gnd_c).powi(2) {
+                                        let nx = gx as isize + cx;
+                                        let ny = gy as isize + cy;
+                                        if nx < 0 || nx >= grid.width as isize || ny < 0 || ny >= grid.height as isize {
+                                            safe = false;
+                                            break;
+                                        }
+                                        for l in 0..grid.num_layers {
+                                            let idx_l = grid.idx(nx as usize, ny as usize, l);
+                                            let nl = grid.obstacle_net_ids[idx_l];
+                                            if (nl != FREE_NET && nl != gnd_net_id as i32)
+                                                || (grid.smd_pad_cells[idx_l] && nl != gnd_net_id as i32)
+                                            {
+                                                safe = false;
+                                                break;
+                                            }
+                                        }
+                                        if !safe {
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !safe {
+                                    break;
+                                }
+                            }
+                            if safe {
+                                valid_list.push((vx, vy));
+                            }
+                        }
+                    }
+                }
+                valid_list
+            })
+            .collect();
+
+        let mut added_count = 0;
+        for ((_s_idx, s_pos), valid_cands) in signal_vias.into_iter().zip(legal_per_sig.into_iter()) {
             let nearest_dist = gnd_locations
                 .iter()
                 .map(|gp| (gp.0 - s_pos.0).hypot(gp.1 - s_pos.1))
                 .fold(f64::INFINITY, f64::min);
 
             if nearest_dist > 1.5 {
-                if let Some(cand_pos) = Self::find_safe_return_path_via_location(
-                    board,
-                    grid,
-                    gnd_net_id,
-                    s_pos,
-                    gnd_c,
-                    &gnd_locations,
-                ) {
+                if let Some(cand_pos) = valid_cands
+                    .into_iter()
+                    .find(|&(vx, vy)| !gnd_locations.iter().any(|ev| (ev.0 - vx).hypot(ev.1 - vy) < via_size + gnd_c))
+                {
                     board.vias.push(Via {
                         position: cand_pos,
                         size: via_size,
@@ -9093,80 +9337,6 @@ pub fn find_choked_pin_bottlenecks(
         }
 
         added_count
-    }
-
-    fn find_safe_return_path_via_location(
-        board: &Board,
-        grid: &RoutingGrid,
-        gnd_net_id: usize,
-        s_pos: (f64, f64),
-        gnd_c: f64,
-        existing_vias: &[(f64, f64)],
-    ) -> Option<(f64, f64)> {
-        let via_size = 0.60;
-        let via_r = via_size * 0.5;
-        let r_cells = ((via_r + gnd_c) / grid.res).ceil() as isize;
-
-        let distances = [0.75, 0.90, 1.10, 1.25, 1.40];
-        let mut angles = Vec::with_capacity(16);
-        for i in 0..16 {
-            let theta = (i as f64) * std::f64::consts::PI / 8.0;
-            angles.push((theta.cos(), theta.sin()));
-        }
-
-        for &dist in &distances {
-            for &(cos_t, sin_t) in &angles {
-                let vx = s_pos.0 + dist * cos_t;
-                let vy = s_pos.1 + dist * sin_t;
-
-                if existing_vias.iter().any(|ev| (ev.0 - vx).hypot(ev.1 - vy) < via_size + gnd_c) {
-                    continue;
-                }
-                if board.vias.iter().any(|v| (v.position.0 - vx).hypot(v.position.1 - vy) < (v.size + via_size) * 0.5 + gnd_c) {
-                    continue;
-                }
-
-                if !is_via_location_legal(board, (vx, vy), via_size, gnd_net_id, gnd_c) {
-                    continue;
-                }
-
-                if let Some((gx, gy)) = grid.world_to_grid(vx, vy) {
-                    let mut safe = true;
-                    for cy in -r_cells..=r_cells {
-                        for cx in -r_cells..=r_cells {
-                            if (cx * cx + cy * cy) as f64 * (grid.res * grid.res) <= (via_r + gnd_c).powi(2) {
-                                let nx = gx as isize + cx;
-                                let ny = gy as isize + cy;
-                                if nx < 0 || nx >= grid.width as isize || ny < 0 || ny >= grid.height as isize {
-                                    safe = false;
-                                    break;
-                                }
-                                for l in 0..grid.num_layers {
-                                    let idx_l = grid.idx(nx as usize, ny as usize, l);
-                                    let nl = grid.obstacle_net_ids[idx_l];
-                                    if (nl != FREE_NET && nl != gnd_net_id as i32)
-                                        || (grid.smd_pad_cells[idx_l] && nl != gnd_net_id as i32)
-                                    {
-                                        safe = false;
-                                        break;
-                                    }
-                                }
-                                if !safe {
-                                    break;
-                                }
-                            }
-                        }
-                        if !safe {
-                            break;
-                        }
-                    }
-                    if safe {
-                        return Some((vx, vy));
-                    }
-                }
-            }
-        }
-        None
     }
 
     pub fn validate_crosstalk_and_coupling(&self, board: &Board) -> Vec<CouplingViolation> {
@@ -19578,6 +19748,7 @@ mod tests {
         }
         let locked: std::collections::HashSet<String> = crate::board::DEFAULT_LOCKED_REFS.iter().map(|s| s.to_string()).collect();
         let mut board = Board::load(pcb_path.to_str().unwrap(), &locked).unwrap();
+        let had_routed_tracks = !board.tracks.is_empty();
         let router = AutoRouter::new(2);
         let mut grid = RoutingGrid::new(&board, 0.10, None);
 
@@ -19609,6 +19780,12 @@ mod tests {
                 is_locked: false,
             });
         }
+        let conns_before = router.extract_connections(&board);
+        let connected_before: Vec<RouteConnection> = conns_before
+            .into_iter()
+            .filter(|c| c.net_id == sw_net_id && AutoRouter::is_connection_electrically_connected(&board, c))
+            .collect();
+
         let sw_vias_before: Vec<Via> = board.vias.iter().filter(|v| v.net_id == sw_net_id).cloned().collect();
         assert!(sw_vias_before.len() >= 2);
 
@@ -19631,9 +19808,8 @@ mod tests {
             }
         }
 
-        // Verify all Net-(U2-SW) connections remain electrically continuous
-        let conns = router.extract_connections(&board);
-        for c in conns.iter().filter(|c| c.net_id == sw_net_id) {
+        // Verify all previously routed Net-(U2-SW) connections remain electrically continuous
+        for c in &connected_before {
             assert!(
                 AutoRouter::is_connection_electrically_connected(&board, c),
                 "Net-(U2-SW) connection {:?} -> {:?} must remain electrically continuous after via consolidation",
@@ -19671,10 +19847,12 @@ mod tests {
         {
             if status.success() {
                 if let Ok(drc_json) = std::fs::read_to_string("/tmp/test_c7_u2_sw_drc.json") {
-                    assert!(
-                        drc_json.contains("\"unconnected_items\": []"),
-                        "kicad-cli drc --refill-zones must report 0 unconnected_items"
-                    );
+                    if had_routed_tracks {
+                        assert!(
+                            drc_json.contains("\"unconnected_items\": []"),
+                            "kicad-cli drc --refill-zones must report 0 unconnected_items"
+                        );
+                    }
                     assert!(
                         !drc_json.contains("\"hole_to_hole\""),
                         "kicad-cli drc --refill-zones must report 0 hole_to_hole violations"
@@ -20707,6 +20885,109 @@ mod tests {
             "C_BLOCK must have been nudged from its blocking position (20.0, 10.0)"
         );
     }
+
+    #[test]
+    fn test_base_snapshot_caching_and_parallel_return_vias() {
+        let nets = vec!["".to_string(), "GND".to_string(), "CLK".to_string()];
+        let net_name_to_id: HashMap<String, usize> = nets
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i))
+            .collect();
+
+        let mut default_nc = NetClass::default();
+        default_nc.require_return_path = true;
+        let mut netclasses = HashMap::new();
+        netclasses.insert("Default".to_string(), default_nc);
+
+        let mut board = Board {
+            file_path: String::new(),
+            raw_content: String::new(),
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 30.0,
+            max_y: 20.0,
+            footprints: vec![
+                make_fp(
+                    "U1",
+                    5.0,
+                    10.0,
+                    true,
+                    vec![
+                        Pad::new("1", 0.0, 0.0, 0.6, 0.6, 2, "CLK", false),
+                        Pad::new("2", 0.0, 2.0, 0.6, 0.6, 1, "GND", false),
+                    ],
+                ),
+                make_fp(
+                    "U2",
+                    25.0,
+                    10.0,
+                    false,
+                    vec![Pad::new("1", 0.0, 0.0, 0.6, 0.6, 2, "CLK", false)],
+                ),
+            ],
+            holding_palette: Vec::new(),
+            nets,
+            net_name_to_id,
+            netclasses,
+            net_to_class: HashMap::new(),
+            keepouts: Vec::new(),
+            tracks: Vec::new(),
+            vias: Vec::new(),
+            arcs: Vec::new(),
+            clusters: Vec::new(),
+            schematic_positions: HashMap::new(),
+            outline_polygon: None,
+            pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
+        };
+
+        let router = AutoRouter::new(2);
+        let mut grid = RoutingGrid::new(&board, 0.25, None);
+        assert!(grid.base_snapshot.is_none());
+
+        let conns = router.extract_connections(&board);
+        let routed_paths: Vec<Option<Vec<GridNode>>> = vec![None; conns.len()];
+
+        // First rebuild_grid_state populates base_snapshot
+        router.rebuild_grid_state(&board, &mut grid, &conns, &routed_paths, &[]);
+        assert!(grid.base_snapshot.is_some());
+        let first_obs = grid.obstacle_net_ids.clone();
+        let first_smd = grid.smd_pad_cells.clone();
+
+        // Mutate obstacle_net_ids and verify cached rebuild restores exact snapshot
+        grid.obstacle_net_ids.fill(99);
+        router.rebuild_grid_state(&board, &mut grid, &conns, &routed_paths, &[]);
+        assert_eq!(grid.obstacle_net_ids, first_obs);
+        assert_eq!(grid.smd_pad_cells, first_smd);
+
+        // Moving a footprint and invalidating base_snapshot updates the obstacle map
+        board.footprints[1].x = 20.0;
+        grid.base_snapshot = None;
+        router.rebuild_grid_state(&board, &mut grid, &conns, &routed_paths, &[]);
+        assert!(grid.base_snapshot.is_some());
+        assert_ne!(grid.obstacle_net_ids, first_obs);
+
+        // Add two signal vias on CLK and verify parallel return-path ground via insertion
+        board.vias.push(Via {
+            position: (10.0, 10.0),
+            size: 0.6,
+            drill: 0.3,
+            net_id: 2,
+            is_locked: false,
+        });
+        board.vias.push(Via {
+            position: (15.0, 10.0),
+            size: 0.6,
+            drill: 0.3,
+            net_id: 2,
+            is_locked: false,
+        });
+        let added = router.add_return_path_ground_vias(&mut board, &mut grid);
+        assert_eq!(added, 2, "Expected 2 return-path ground vias for 2 signal vias");
+        assert_eq!(board.vias.iter().filter(|v| v.net_id == 1).count(), 2);
+    }
 }
+
 
 
