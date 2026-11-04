@@ -2088,6 +2088,73 @@ impl Board {
             fp.infer_swap_groups();
         }
 
+        // Heal any multi-pad footprint whose on-disk (at ...) was left stale relative to routed tracks
+        if !board.tracks.is_empty() {
+            for fp_idx in 0..board.footprints.len() {
+                let fp = &board.footprints[fp_idx];
+                if fp.pads.len() < 12 {
+                    continue;
+                }
+                let cur_matches = fp
+                    .pads
+                    .iter()
+                    .filter(|p| {
+                        p.net_id > 1 && !board.is_plane_net(p.net_id) && {
+                            let (px, py) = fp.pad_absolute_position(p);
+                            board.tracks.iter().any(|t| {
+                                t.net_id == p.net_id
+                                    && ((t.start.0 - px).hypot(t.start.1 - py) < 0.05
+                                        || (t.end.0 - px).hypot(t.end.1 - py) < 0.05)
+                            })
+                        }
+                    })
+                    .count();
+                if cur_matches >= 2 {
+                    continue;
+                }
+                let mut best_pose: Option<(usize, f64, f64, f64)> = None;
+                for cand_rot in [0.0, 90.0, 180.0, 270.0] {
+                    let mut test_fp = fp.clone();
+                    test_fp.rotation = cand_rot;
+                    for p0 in fp.pads.iter().filter(|p| p.net_id > 1 && !board.is_plane_net(p.net_id)) {
+                        test_fp.x = 0.0;
+                        test_fp.y = 0.0;
+                        let (ox0, oy0) = test_fp.pad_absolute_position(p0);
+                        for t in board.tracks.iter().filter(|t| t.net_id == p0.net_id) {
+                            for end_pt in [t.start, t.end] {
+                                let cx = ((end_pt.0 - ox0) * 1e4).round() / 1e4;
+                                let cy = ((end_pt.1 - oy0) * 1e4).round() / 1e4;
+                                test_fp.x = cx;
+                                test_fp.y = cy;
+                                let hits = test_fp
+                                    .pads
+                                    .iter()
+                                    .filter(|p| {
+                                        p.net_id > 1 && !board.is_plane_net(p.net_id) && {
+                                            let (px, py) = test_fp.pad_absolute_position(p);
+                                            board.tracks.iter().any(|ot| {
+                                                ot.net_id == p.net_id
+                                                    && ((ot.start.0 - px).hypot(ot.start.1 - py) < 0.02
+                                                        || (ot.end.0 - px).hypot(ot.end.1 - py) < 0.02)
+                                            })
+                                        }
+                                    })
+                                    .count();
+                                if hits >= 8 && best_pose.map_or(true, |(bh, _, _, _)| hits > bh) {
+                                    best_pose = Some((hits, cx, cy, cand_rot));
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((_, cx, cy, crot)) = best_pose {
+                    board.footprints[fp_idx].x = cx;
+                    board.footprints[fp_idx].y = cy;
+                    board.footprints[fp_idx].rotation = crot;
+                }
+            }
+        }
+
         Ok(board)
     }
 
@@ -2805,7 +2872,23 @@ impl Board {
 
         let mut replacements: Vec<(usize, usize, String)> = Vec::new();
         for fp in &self.footprints {
-            if fp.is_locked && fp.layer == fp.orig_layer {
+            let (orig_x, orig_y, orig_rot) = fp
+                .at_span
+                .and_then(|(s, e)| {
+                    if s < e && e <= self.raw_content.len() {
+                        parse_at_xy_rot(&self.raw_content[s..e])
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or((fp.x, fp.y, fp.rotation));
+            let delta_rot = fp.rotation - orig_rot;
+            if fp.is_locked
+                && fp.layer == fp.orig_layer
+                && (fp.x - orig_x).abs() < 1e-4
+                && (fp.y - orig_y).abs() < 1e-4
+                && delta_rot.abs() < 1e-3
+            {
                 continue;
             }
             let rot_norm = ((fp.rotation % 360.0) + 360.0) % 360.0;
@@ -2814,17 +2897,6 @@ impl Board {
             } else {
                 format!("(at {:.4} {:.4} {:.1})", fp.x, fp.y, rot_norm)
             };
-            let orig_rot = fp
-                .at_span
-                .and_then(|(s, e)| {
-                    if s < e && e <= self.raw_content.len() {
-                        parse_at_xy_rot(&self.raw_content[s..e]).map(|(_, _, r)| r)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(fp.rotation);
-            let delta_rot = fp.rotation - orig_rot;
 
             if fp.layer != fp.orig_layer {
                 if let Some((f_start, f_end)) = fp.fp_span {
