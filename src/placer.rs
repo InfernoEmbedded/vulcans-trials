@@ -1467,6 +1467,8 @@ pub fn prioritize_and_position_initial_components(
         placed[diff_idx] = true;
     }
 
+    let mut spatial_index = PlacedBoardSpatialIndex::from_board(board, config.min_spacing_mm);
+
     // 2. Priority 2: Decoupling capacitors — situating them as close to the connected non-ground pin as possible!
     for tie in &ties {
         if !tie.is_decoupling {
@@ -1498,15 +1500,24 @@ pub fn prioritize_and_position_initial_components(
         }
         let base_angle = dy.atan2(dx);
 
-        let mut placed_courtyards: Vec<Vec<Polygon>> = Vec::new();
+        let mut placed_courtyards: Vec<(AABB, Vec<Polygon>)> = Vec::new();
         for (i, fp) in board.footprints.iter().enumerate() {
             if placed[i] && i != cap_idx {
-                placed_courtyards.push(fp.transformed_courtyards_layered(
+                let polys = fp.transformed_courtyards_layered(
                     Point::new(fp.x, fp.y),
                     fp.rotation,
                     fp.layer,
                     fp.effective_spacing(config),
-                ));
+                );
+                let mut aabb = AABB::new(f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+                for p in &polys {
+                    let pa = p.aabb();
+                    aabb.min_x = aabb.min_x.min(pa.min_x);
+                    aabb.min_y = aabb.min_y.min(pa.min_y);
+                    aabb.max_x = aabb.max_x.max(pa.max_x);
+                    aabb.max_y = aabb.max_y.max(pa.max_y);
+                }
+                placed_courtyards.push((aabb, polys));
             }
         }
 
@@ -1541,11 +1552,18 @@ pub fn prioritize_and_position_initial_components(
                     );
                     let c_pos = Point::new(cx, cy);
 
+                    if !spatial_index.is_placement_legal(board, cap, c_pos, rot, cap.layer) {
+                        continue;
+                    }
+
                     let polys = cap.transformed_courtyards_layered(c_pos, rot, cap.layer, cap_spacing);
                     let mut collides = false;
-                    'check: for group in &placed_courtyards {
-                        for p_placed in group {
-                            for p_cand in &polys {
+                    'check: for (group_aabb, group) in &placed_courtyards {
+                        for p_cand in &polys {
+                            if !p_cand.aabb().overlaps(group_aabb) {
+                                continue;
+                            }
+                            for p_placed in group {
                                 if p_cand.intersects_convex(p_placed) {
                                     collides = true;
                                     break 'check;
@@ -1553,7 +1571,7 @@ pub fn prioritize_and_position_initial_components(
                             }
                         }
                     }
-                    if !collides && is_placement_legal(board, cap, c_pos, rot, cap.layer, config.min_spacing_mm) {
+                    if !collides {
                         let cap_pad_world = cap.pad_world_point_layered(cap_pad_idx, c_pos, rot, cap.layer);
                         let pad_dist = cap_pad_world.distance_to(&pin_pt);
                         if best_cand.is_none_or(|b| pad_dist < b.0) {
@@ -1572,6 +1590,7 @@ pub fn prioritize_and_position_initial_components(
             board.footprints[cap_idx].y = best_y;
             board.footprints[cap_idx].rotation = best_rot;
             placed[cap_idx] = true;
+            spatial_index.update_footprint(board, cap_idx);
         }
     }
 
@@ -1581,6 +1600,277 @@ pub fn prioritize_and_position_initial_components(
         if let Ok(mut g) = st.lock() {
             g.push_log("[Auto-Placer] Prioritized differential pairs and situated decoupling caps near device power pins".to_string());
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PlacedFootprintSpatialEntry {
+    reference: String,
+    layer: usize,
+    is_smd_only: bool,
+    courtyards: Vec<(Polygon, AABB)>,
+    overall_aabb: AABB,
+}
+
+/// Precomputed spatial index over placed board footprints and keepouts using a 2D Morton LBVH
+/// (`Vec<GpuBvhNode>`) to accelerate candidate pose legality queries from $O(N_f)$ polygon
+/// transformations per candidate to $O(\log N_f)$ AABB-BVH pruning + exact SAT verification.
+#[derive(Clone, Debug)]
+pub struct PlacedBoardSpatialIndex {
+    pub min_spacing_mm: f64,
+    footprints: Vec<PlacedFootprintSpatialEntry>,
+    primitives: Vec<([f32; 4], u32, u32)>,
+    keepout_aabbs: Vec<AABB>,
+    bvh_nodes: Vec<crate::vulkan::GpuBvhNode>,
+}
+
+impl PlacedBoardSpatialIndex {
+    fn build_entry(
+        fp: &crate::board::Footprint,
+        min_spacing_mm: f64,
+        idx: usize,
+    ) -> (PlacedFootprintSpatialEntry, ([f32; 4], u32, u32)) {
+        let spacing = fp.placement_spacing(min_spacing_mm);
+        let polys = fp.transformed_courtyards_layered(
+            Point::new(fp.x, fp.y),
+            fp.rotation,
+            fp.layer,
+            spacing,
+        );
+        let mut overall = AABB::new(
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        );
+        let mut courtyards = Vec::with_capacity(polys.len());
+        for p in polys {
+            let aabb = p.aabb();
+            overall.min_x = overall.min_x.min(aabb.min_x);
+            overall.min_y = overall.min_y.min(aabb.min_y);
+            overall.max_x = overall.max_x.max(aabb.max_x);
+            overall.max_y = overall.max_y.max(aabb.max_y);
+            courtyards.push((p, aabb));
+        }
+        if courtyards.is_empty() {
+            overall = AABB::new(fp.x, fp.y, fp.x, fp.y);
+        }
+        let is_smd = fp.is_smd_only();
+        let layer_mask = if is_smd {
+            1u32 << (fp.layer & 31)
+        } else {
+            0xFFFF_FFFFu32
+        };
+        let eps = 1e-3f32;
+        let prim = (
+            [
+                (overall.min_x as f32) - eps,
+                (overall.min_y as f32) - eps,
+                (overall.max_x as f32) + eps,
+                (overall.max_y as f32) + eps,
+            ],
+            layer_mask,
+            idx as u32,
+        );
+        (
+            PlacedFootprintSpatialEntry {
+                reference: fp.reference.clone(),
+                layer: fp.layer,
+                is_smd_only: is_smd,
+                courtyards,
+                overall_aabb: overall,
+            },
+            prim,
+        )
+    }
+
+    pub fn from_board(board: &Board, min_spacing_mm: f64) -> Self {
+        let mut footprints = Vec::with_capacity(board.footprints.len());
+        let mut primitives = Vec::with_capacity(board.footprints.len());
+        for (idx, fp) in board.footprints.iter().enumerate() {
+            let (entry, prim) = Self::build_entry(fp, min_spacing_mm, idx);
+            footprints.push(entry);
+            primitives.push(prim);
+        }
+        let keepout_aabbs = board
+            .keepouts
+            .iter()
+            .map(|ko| AABB::new(ko.min_x, ko.min_y, ko.max_x, ko.max_y))
+            .collect();
+        let bvh_nodes = crate::vulkan::build_gpu_lbvh(&primitives);
+        Self {
+            min_spacing_mm,
+            footprints,
+            primitives,
+            keepout_aabbs,
+            bvh_nodes,
+        }
+    }
+
+    pub fn update_footprint(&mut self, board: &Board, fp_idx: usize) {
+        if fp_idx >= board.footprints.len() || fp_idx >= self.footprints.len() {
+            return;
+        }
+        let (entry, prim) = Self::build_entry(&board.footprints[fp_idx], self.min_spacing_mm, fp_idx);
+        self.footprints[fp_idx] = entry;
+        self.primitives[fp_idx] = prim;
+        self.bvh_nodes = crate::vulkan::build_gpu_lbvh(&self.primitives);
+    }
+
+    pub fn push_footprint(&mut self, fp: &crate::board::Footprint) {
+        let idx = self.footprints.len();
+        let (entry, prim) = Self::build_entry(fp, self.min_spacing_mm, idx);
+        self.footprints.push(entry);
+        self.primitives.push(prim);
+        self.bvh_nodes = crate::vulkan::build_gpu_lbvh(&self.primitives);
+    }
+
+    #[inline]
+    pub fn collides_with_placed_courtyards(
+        &self,
+        fp: &crate::board::Footprint,
+        layer: usize,
+        cand_polys: &[Polygon],
+    ) -> bool {
+        if self.footprints.is_empty() || cand_polys.is_empty() {
+            return false;
+        }
+
+        let mut cand_overall = AABB::new(
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        );
+        let mut cand_aabbs: Vec<AABB> = Vec::with_capacity(cand_polys.len());
+        for p in cand_polys {
+            let a = p.aabb();
+            cand_overall.min_x = cand_overall.min_x.min(a.min_x);
+            cand_overall.min_y = cand_overall.min_y.min(a.min_y);
+            cand_overall.max_x = cand_overall.max_x.max(a.max_x);
+            cand_overall.max_y = cand_overall.max_y.max(a.max_y);
+            cand_aabbs.push(a);
+        }
+
+        let cand_is_smd = fp.is_smd_only();
+        let query_layer_mask = if cand_is_smd {
+            1u32 << (layer & 31)
+        } else {
+            0xFFFF_FFFFu32
+        };
+        let eps = 1e-3f32;
+        let q_min_x = (cand_overall.min_x as f32) - eps;
+        let q_min_y = (cand_overall.min_y as f32) - eps;
+        let q_max_x = (cand_overall.max_x as f32) + eps;
+        let q_max_y = (cand_overall.max_y as f32) + eps;
+
+        let mut stack = [0usize; 64];
+        let mut stack_ptr = 1usize;
+
+        while stack_ptr > 0 {
+            stack_ptr -= 1;
+            let node = self.bvh_nodes[stack[stack_ptr]];
+            if node.right_or_count == 0 {
+                continue;
+            }
+            if (node.layer_mask & query_layer_mask) == 0 {
+                continue;
+            }
+            if q_max_x < node.min_x
+                || q_min_x > node.max_x
+                || q_max_y < node.min_y
+                || q_min_y > node.max_y
+            {
+                continue;
+            }
+            if node.right_or_count > 0 {
+                let placed_idx = node.left_or_prim as usize;
+                let entry = &self.footprints[placed_idx];
+                if entry.reference == fp.reference {
+                    continue;
+                }
+                if layer != entry.layer && cand_is_smd && entry.is_smd_only {
+                    continue;
+                }
+                if !cand_overall.overlaps(&entry.overall_aabb) {
+                    continue;
+                }
+                for (pa, pa_aabb) in cand_polys.iter().zip(cand_aabbs.iter()) {
+                    for (pb, pb_aabb) in &entry.courtyards {
+                        if pa_aabb.overlaps(pb_aabb) && pa.intersects_convex(pb) {
+                            return true;
+                        }
+                    }
+                }
+            } else if stack_ptr + 2 <= stack.len() {
+                stack[stack_ptr] = (-node.right_or_count) as usize;
+                stack[stack_ptr + 1] = node.left_or_prim as usize;
+                stack_ptr += 2;
+            }
+        }
+
+        false
+    }
+
+    /// Evaluates whether placing `fp` at `(pos, rot, layer)` is legal using the precomputed
+    /// 2D Morton LBVH over placed footprints and keepouts, with 100% exact SAT courtyard and boundary checks.
+    pub fn is_placement_legal(
+        &self,
+        board: &Board,
+        fp: &crate::board::Footprint,
+        pos: Point,
+        rot: f64,
+        layer: usize,
+    ) -> bool {
+        if !board.contains_point_in_boundary(&pos) {
+            return false;
+        }
+
+        let raw_polys = fp.transformed_courtyards_layered(pos, rot, layer, self.min_spacing_mm);
+        for poly in &raw_polys {
+            for v in &poly.vertices {
+                if !board.contains_point_in_boundary(v) {
+                    return false;
+                }
+            }
+            if !self.keepout_aabbs.is_empty() {
+                let pa = poly.aabb();
+                for ko_aabb in &self.keepout_aabbs {
+                    if pa.overlaps(ko_aabb) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        for pad in &fp.pads {
+            for corner_pt in fp.pad_corners_at(pad, pos, rot, layer) {
+                if !board.contains_point_in_boundary(&corner_pt) {
+                    return false;
+                }
+            }
+        }
+
+        let cand_spacing = fp.placement_spacing(self.min_spacing_mm);
+        if (cand_spacing - self.min_spacing_mm).abs() < 1e-9 {
+            !self.collides_with_placed_courtyards(fp, layer, &raw_polys)
+        } else {
+            let cand_polys = fp.transformed_courtyards_layered(pos, rot, layer, cand_spacing);
+            !self.collides_with_placed_courtyards(fp, layer, &cand_polys)
+        }
+    }
+
+    /// Batch-evaluates candidate `(pos, rot, layer)` poses against the spatial index.
+    pub fn filter_legal_poses_batch(
+        &self,
+        board: &Board,
+        fp: &crate::board::Footprint,
+        candidates: &[(Point, f64, usize)],
+    ) -> Vec<bool> {
+        candidates
+            .iter()
+            .map(|&(pos, rot, layer)| self.is_placement_legal(board, fp, pos, rot, layer))
+            .collect()
     }
 }
 
@@ -1717,6 +2007,8 @@ pub fn shove_overlapping_components(
         .map(|fp| (fp.x, fp.y, fp.rotation, fp.layer))
         .collect();
 
+    let mut spatial_index = PlacedBoardSpatialIndex::from_board(board, min_spacing_mm);
+
     // 2. Directional shove for each colliding unlocked component
     for &idx in &colliding_unlocked_indices {
         let other_fp = board.footprints[idx].clone();
@@ -1741,7 +2033,7 @@ pub fn shove_overlapping_components(
                 let ny = other_fp.y + dir_y * d;
 
                 let cand_pt = Point::new(nx, ny);
-                if is_placement_legal(board, &other_fp, cand_pt, other_fp.rotation, other_fp.layer, min_spacing_mm) {
+                if spatial_index.is_placement_legal(board, &other_fp, cand_pt, other_fp.rotation, other_fp.layer) {
                     best_pos = Some((nx, ny));
                     break 'search;
                 }
@@ -1751,6 +2043,7 @@ pub fn shove_overlapping_components(
         if let Some((nx, ny)) = best_pos {
             board.footprints[idx].x = nx;
             board.footprints[idx].y = ny;
+            spatial_index.update_footprint(board, idx);
             shoved_count += 1;
         }
     }
@@ -1799,6 +2092,16 @@ pub fn find_most_favourable_placement(
     board: &Board,
     fp: &crate::board::Footprint,
     config: &PlacementConfig,
+) -> (f64, f64, f64, usize) {
+    let spatial_index = PlacedBoardSpatialIndex::from_board(board, config.min_spacing_mm);
+    find_most_favourable_placement_with_index(board, fp, config, &spatial_index)
+}
+
+pub fn find_most_favourable_placement_with_index(
+    board: &Board,
+    fp: &crate::board::Footprint,
+    config: &PlacementConfig,
+    spatial_index: &PlacedBoardSpatialIndex,
 ) -> (f64, f64, f64, usize) {
     let boundary = board.boundary_aabb();
     let min_spacing = config.min_spacing_mm;
@@ -1893,28 +2196,28 @@ pub fn find_most_favourable_placement(
                 for &da in &angle_deltas {
                     let angle = base_angle + da;
                     for &rot in &rotations {
-                    let (cx_min, cx_max, cy_min, cy_max) = fp.origin_clamp_range(rot, fp.layer, min_spacing, &boundary);
-                    let cx = snap_to_grid(
-                        (pin_x + d * angle.cos()).clamp(cx_min, cx_max),
-                        grid_step,
-                    );
-                    let cy = snap_to_grid(
-                        (pin_y + d * angle.sin()).clamp(cy_min, cy_max),
-                        grid_step,
-                    );
-                    let c_pos = Point::new(cx, cy);
+                        let (cx_min, cx_max, cy_min, cy_max) = fp.origin_clamp_range(rot, fp.layer, min_spacing, &boundary);
+                        let cx = snap_to_grid(
+                            (pin_x + d * angle.cos()).clamp(cx_min, cx_max),
+                            grid_step,
+                        );
+                        let cy = snap_to_grid(
+                            (pin_y + d * angle.sin()).clamp(cy_min, cy_max),
+                            grid_step,
+                        );
+                        let c_pos = Point::new(cx, cy);
 
-                    if is_placement_legal(board, fp, c_pos, rot, fp.layer, min_spacing) {
-                        let pwr_pad_world = fp.pad_world_point_layered(pwr_idx, c_pos, rot, fp.layer);
-                        let pad_dist = pwr_pad_world.distance_to(&pin_pt);
-                        if best_cand.as_ref().map_or(true, |b| pad_dist < b.0) {
-                            best_cand = Some((pad_dist, cx, cy, rot, fp.layer));
-                            if pad_dist <= 1.0 {
-                                return (cx, cy, rot, fp.layer);
+                        if spatial_index.is_placement_legal(board, fp, c_pos, rot, fp.layer) {
+                            let pwr_pad_world = fp.pad_world_point_layered(pwr_idx, c_pos, rot, fp.layer);
+                            let pad_dist = pwr_pad_world.distance_to(&pin_pt);
+                            if best_cand.as_ref().map_or(true, |b| pad_dist < b.0) {
+                                best_cand = Some((pad_dist, cx, cy, rot, fp.layer));
+                                if pad_dist <= 1.0 {
+                                    return (cx, cy, rot, fp.layer);
+                                }
                             }
                         }
                     }
-                }
                 }
             }
 
@@ -1981,7 +2284,7 @@ pub fn find_most_favourable_placement(
                 );
                 let c_pos = Point::new(cx, cy);
 
-                if is_placement_legal(board, fp, c_pos, rot, fp.layer, min_spacing) {
+                if spatial_index.is_placement_legal(board, fp, c_pos, rot, fp.layer) {
                     let mut cost = 0.1 * r;
                     for &(pidx, target_pt, w) in &targets {
                         let pad_pt = fp.pad_world_point_layered(pidx, c_pos, rot, fp.layer);
@@ -2063,13 +2366,15 @@ pub fn place_all_holding_components_at_best_locations(
         prio(a).cmp(&prio(b))
     });
 
+    let mut spatial_index = PlacedBoardSpatialIndex::from_board(board, config.min_spacing_mm);
     let count = palette.len();
     for mut fp in palette {
-        let (bx, by, brot, blayer) = find_most_favourable_placement(board, &fp, config);
+        let (bx, by, brot, blayer) = find_most_favourable_placement_with_index(board, &fp, config, &spatial_index);
         fp.x = bx;
         fp.y = by;
         fp.rotation = brot;
         fp.layer = blayer;
+        spatial_index.push_footprint(&fp);
         board.footprints.push(fp);
     }
     count
@@ -4792,5 +5097,97 @@ mod tests {
         assert_eq!(final_st.boundary_violations, 0, "Annealing must keep all components within board boundary");
         assert!(final_st.cost.is_finite(), "Placement cost must be finite");
     }
+
+    #[test]
+    fn test_placed_board_spatial_index_lbvh_legality_equivalence() {
+        let mut board = make_synthetic_board();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 60.0;
+        board.max_y = 60.0;
+        board.keepouts.push(crate::board::KeepoutZone {
+            min_x: 20.0,
+            min_y: 20.0,
+            max_x: 28.0,
+            max_y: 28.0,
+            layers: vec![0, 1],
+        });
+
+        // Populate 20 footprints across both F.Cu (layer 0) and B.Cu (layer 1), plus through-hole
+        for k in 0..16usize {
+            let fx = 6.0 + (k % 4) as f64 * 12.0;
+            let fy = 6.0 + (k / 4) as f64 * 12.0;
+            let is_th = k % 5 == 0;
+            let mut fp = make_test_fp(
+                &format!("U_GRID_{}", k),
+                fx,
+                fy,
+                true,
+                vec![Pad::new("1", 0.0, 0.0, 0.6, 0.6, 1, "SIG1", is_th)],
+            );
+            fp.layer = if k % 3 == 0 { 1 } else { 0 };
+            fp.rotation = ((k % 4) as f64) * 90.0;
+            if k % 4 == 0 {
+                fp.escape_margin = 0.8;
+            }
+            board.footprints.push(fp);
+        }
+
+        let min_spacing = 0.25;
+        let spatial_index = PlacedBoardSpatialIndex::from_board(&board, min_spacing);
+
+        let mut cand_fp = make_test_fp(
+            "C_PROBE",
+            10.0,
+            10.0,
+            false,
+            vec![
+                Pad::new("1", -0.8, 0.0, 0.6, 0.6, 1, "+3V3", false),
+                Pad::new("2", 0.8, 0.0, 0.6, 0.6, 2, "GND", false),
+            ],
+        );
+        cand_fp.escape_margin = 0.35;
+
+        let mut rng = StdRng::seed_from_u64(0xCAFE_BABE_2026);
+        let rotations = [0.0, 45.0, 90.0, 180.0, 270.0];
+        let mut candidates = Vec::with_capacity(260);
+        let mut legal_count = 0usize;
+        let mut illegal_count = 0usize;
+
+        for i in 0..260usize {
+            let x = rng.gen_range(-2.0..62.0);
+            let y = rng.gen_range(-2.0..62.0);
+            let rot = rotations[i % rotations.len()];
+            let layer = i % 2;
+            let pos = Point::new(x, y);
+            candidates.push((pos, rot, layer));
+
+            let ref_legal = is_placement_legal(&board, &cand_fp, pos, rot, layer, min_spacing);
+            let bvh_legal = spatial_index.is_placement_legal(&board, &cand_fp, pos, rot, layer);
+            assert_eq!(
+                bvh_legal, ref_legal,
+                "Legality mismatch at candidate {} pos=({:.2}, {:.2}), rot={}, layer={}",
+                i, x, y, rot, layer
+            );
+            if ref_legal {
+                legal_count += 1;
+            } else {
+                illegal_count += 1;
+            }
+        }
+
+        assert!(legal_count > 20, "Must test sufficient legal poses");
+        assert!(illegal_count > 20, "Must test sufficient colliding/out-of-bounds poses");
+
+        let batch_res = spatial_index.filter_legal_poses_batch(&board, &cand_fp, &candidates);
+        assert_eq!(batch_res.len(), candidates.len());
+        for (i, &(pos, rot, layer)) in candidates.iter().enumerate() {
+            assert_eq!(
+                batch_res[i],
+                is_placement_legal(&board, &cand_fp, pos, rot, layer, min_spacing)
+            );
+        }
+    }
 }
+
 

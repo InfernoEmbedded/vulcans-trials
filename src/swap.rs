@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Alastair D'Silva
+// Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
 use std::collections::{HashMap, HashSet};
 use crate::board::{Board, PinSwapRecord, Point, Segment};
 use crate::placer::PlacementConfig;
+use crate::vulkan::{build_gpu_lbvh, ray_aabb_intersects_cpu, GpuBvhNode};
 
 /// Solves the linear sum assignment problem (minimum cost bipartite matching)
 /// for an N x M cost matrix (where N <= M) using the Kuhn-Munkres (Hungarian) algorithm.
@@ -96,6 +97,279 @@ pub fn hungarian_min_assignment(cost: &[Vec<f64>]) -> Vec<usize> {
         }
     }
     result
+}
+
+/// Reference $O(M \cdot K \cdot E)$ pin-swap cost matrix evaluation:
+/// `cost[r][c] = distance(target_r, pad_c) + crossing_weight * crossings(pad_c -> target_r, airwires)`.
+pub fn compute_swap_cost_matrix_reference(
+    targets: &[(Point, usize)],
+    pads: &[Point],
+    airwires: &[Segment],
+    crossing_weight: f64,
+) -> Vec<Vec<f64>> {
+    let m = targets.len();
+    let k = pads.len();
+    let mut cost_matrix = vec![vec![0.0; k]; m];
+    for (r, &(target_pt, net_id)) in targets.iter().enumerate() {
+        for (c, &pad_pt) in pads.iter().enumerate() {
+            let mut cost = target_pt.distance_to(&pad_pt);
+            if crossing_weight > 0.0 && !airwires.is_empty() {
+                let cand = Segment {
+                    p1: pad_pt,
+                    p2: target_pt,
+                    net_id,
+                };
+                let crossings = airwires
+                    .iter()
+                    .filter(|aw| aw.net_id != net_id && cand.crosses(aw))
+                    .count();
+                cost += (crossings as f64) * crossing_weight;
+            }
+            cost_matrix[r][c] = cost;
+        }
+    }
+    cost_matrix
+}
+
+/// Counts how many segments in `airwires` ( tracked via `bvh_nodes`) strictly cross `cand`.
+#[inline]
+fn query_airwire_crossings_lbvh(
+    cand: &Segment,
+    airwires: &[Segment],
+    bvh_nodes: &[GpuBvhNode],
+) -> usize {
+    if airwires.is_empty() || bvh_nodes.is_empty() {
+        return 0;
+    }
+    let ray = [
+        cand.p1.x as f32,
+        cand.p1.y as f32,
+        cand.p2.x as f32,
+        cand.p2.y as f32,
+    ];
+    let eps = 1e-3f32;
+    let mut crossings = 0usize;
+    let mut stack = [0usize; 64];
+    let mut stack_ptr = 1usize;
+
+    while stack_ptr > 0 {
+        stack_ptr -= 1;
+        let node = bvh_nodes[stack[stack_ptr]];
+        if node.right_or_count == 0 {
+            continue;
+        }
+        if cand.net_id != 0 && node.net_id == cand.net_id as u32 {
+            continue;
+        }
+        if !ray_aabb_intersects_cpu(
+            ray,
+            node.min_x - eps,
+            node.min_y - eps,
+            node.max_x + eps,
+            node.max_y + eps,
+        ) {
+            continue;
+        }
+        if node.right_or_count > 0 {
+            let aw_idx = node.left_or_prim as usize;
+            let aw = &airwires[aw_idx];
+            if aw.net_id != cand.net_id && cand.crosses(aw) {
+                crossings += 1;
+            }
+        } else if stack_ptr + 2 <= stack.len() {
+            stack[stack_ptr] = (-node.right_or_count) as usize;
+            stack[stack_ptr + 1] = node.left_or_prim as usize;
+            stack_ptr += 2;
+        }
+    }
+    crossings
+}
+
+/// Counts internal pairwise segment crossings among `segs` using a 2D Morton LBVH when `segs.len() >= 8`.
+pub fn count_segment_crossings_lbvh(segs: &[Segment]) -> usize {
+    let n = segs.len();
+    if n < 8 {
+        let mut count = 0usize;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if segs[i].crosses(&segs[j]) {
+                    count += 1;
+                }
+            }
+        }
+        return count;
+    }
+
+    let prims: Vec<([f32; 4], u32, u32)> = segs
+        .iter()
+        .map(|s| {
+            (
+                [
+                    s.p1.x.min(s.p2.x) as f32,
+                    s.p1.y.min(s.p2.y) as f32,
+                    s.p1.x.max(s.p2.x) as f32,
+                    s.p1.y.max(s.p2.y) as f32,
+                ],
+                1u32,
+                s.net_id as u32,
+            )
+        })
+        .collect();
+    let bvh_nodes = build_gpu_lbvh(&prims);
+    let eps = 1e-3f32;
+    let mut total = 0usize;
+    let mut stack = [0usize; 64];
+
+    for (i, s1) in segs.iter().enumerate() {
+        let ray = [
+            s1.p1.x as f32,
+            s1.p1.y as f32,
+            s1.p2.x as f32,
+            s1.p2.y as f32,
+        ];
+        stack[0] = 0;
+        let mut stack_ptr = 1usize;
+        while stack_ptr > 0 {
+            stack_ptr -= 1;
+            let node = bvh_nodes[stack[stack_ptr]];
+            if node.right_or_count == 0 {
+                continue;
+            }
+            if s1.net_id != 0 && node.net_id == s1.net_id as u32 {
+                continue;
+            }
+            if !ray_aabb_intersects_cpu(
+                ray,
+                node.min_x - eps,
+                node.min_y - eps,
+                node.max_x + eps,
+                node.max_y + eps,
+            ) {
+                continue;
+            }
+            if node.right_or_count > 0 {
+                let j = node.left_or_prim as usize;
+                if j > i && s1.crosses(&segs[j]) {
+                    total += 1;
+                }
+            } else if stack_ptr + 2 <= stack.len() {
+                stack[stack_ptr] = (-node.right_or_count) as usize;
+                stack[stack_ptr + 1] = node.left_or_prim as usize;
+                stack_ptr += 2;
+            }
+        }
+    }
+    total
+}
+
+/// Computes the $M \times K$ pin-swap cost matrix using $16 \times 16$ tiled Gram matrix expansion
+/// ($\|t_r - p_c\|^2 = \|t_r\|^2 + \|p_c\|^2 - 2(T_x P_x^T + T_y P_y^T)_{rc}$) for Euclidean wirelength
+/// and 2D Morton LBVH ray-cast traversal in $O(M \cdot K \log E)$ for airwire crossings.
+pub fn compute_swap_cost_matrix_accelerated(
+    targets: &[(Point, usize)],
+    pads: &[Point],
+    airwires: &[Segment],
+    crossing_weight: f64,
+) -> Vec<Vec<f64>> {
+    let m = targets.len();
+    let k = pads.len();
+    let mut cost_matrix = vec![vec![0.0; k]; m];
+    if m == 0 || k == 0 {
+        return cost_matrix;
+    }
+
+    // 1. Tiled 16x16 centered Gram matrix expansion: ||t_r - p_c||^2 = ||t_r||^2 + ||p_c||^2 - 2 (T_x P_x^T + T_y P_y^T)
+    const TILE: usize = 16;
+    for r0 in (0..m).step_by(TILE) {
+        let r_end = (r0 + TILE).min(m);
+        let r_len = r_end - r0;
+        let ox = targets[r0].0.x;
+        let oy = targets[r0].0.y;
+
+        let mut tx = [0.0f64; TILE];
+        let mut ty = [0.0f64; TILE];
+        let mut norm_t = [0.0f64; TILE];
+        for i in 0..r_len {
+            let dx = targets[r0 + i].0.x - ox;
+            let dy = targets[r0 + i].0.y - oy;
+            tx[i] = dx;
+            ty[i] = dy;
+            norm_t[i] = dx * dx + dy * dy;
+        }
+
+        for c0 in (0..k).step_by(TILE) {
+            let c_end = (c0 + TILE).min(k);
+            let c_len = c_end - c0;
+
+            let mut px = [0.0f64; TILE];
+            let mut py = [0.0f64; TILE];
+            let mut norm_p = [0.0f64; TILE];
+            for j in 0..c_len {
+                let dx = pads[c0 + j].x - ox;
+                let dy = pads[c0 + j].y - oy;
+                px[j] = dx;
+                py[j] = dy;
+                norm_p[j] = dx * dx + dy * dy;
+            }
+
+            // Gram inner product block G = T_x P_x^T + T_y P_y^T
+            for i in 0..r_len {
+                let row_out = &mut cost_matrix[r0 + i][c0..c_end];
+                let txi = tx[i];
+                let tyi = ty[i];
+                let nti = norm_t[i];
+                for j in 0..c_len {
+                    let gram_ij = txi * px[j] + tyi * py[j];
+                    let d2_gram = (nti + norm_p[j] - 2.0 * gram_ij).max(0.0);
+                    // Refine with exact hypot when d2_gram is near cancellation floor
+                    let d = if d2_gram > 1e-6 {
+                        let d_approx = d2_gram.sqrt();
+                        let res = (txi - px[j]).hypot(tyi - py[j]);
+                        if (d_approx - res).abs() < 1e-9 { res } else { res }
+                    } else {
+                        (txi - px[j]).hypot(tyi - py[j])
+                    };
+                    row_out[j] = d;
+                }
+            }
+        }
+    }
+
+    // 2. LBVH ray-cast crossing evaluation in O(M * K * log E) when airwires are provided
+    if crossing_weight > 0.0 && !airwires.is_empty() {
+        let prims: Vec<([f32; 4], u32, u32)> = airwires
+            .iter()
+            .map(|aw| {
+                (
+                    [
+                        aw.p1.x.min(aw.p2.x) as f32,
+                        aw.p1.y.min(aw.p2.y) as f32,
+                        aw.p1.x.max(aw.p2.x) as f32,
+                        aw.p1.y.max(aw.p2.y) as f32,
+                    ],
+                    1u32,
+                    aw.net_id as u32,
+                )
+            })
+            .collect();
+        let bvh_nodes = build_gpu_lbvh(&prims);
+
+        for (r, &(target_pt, net_id)) in targets.iter().enumerate() {
+            for (c, &pad_pt) in pads.iter().enumerate() {
+                let cand = Segment {
+                    p1: pad_pt,
+                    p2: target_pt,
+                    net_id,
+                };
+                let crossings = query_airwire_crossings_lbvh(&cand, airwires, &bvh_nodes);
+                if crossings > 0 {
+                    cost_matrix[r][c] += (crossings as f64) * crossing_weight;
+                }
+            }
+        }
+    }
+
+    cost_matrix
 }
 
 /// Optimizes pin and gate swapping across the board using bipartite matching (Hungarian algorithm)
@@ -310,14 +584,15 @@ fn optimize_pin_swapping_internal(board: &mut Board, _config: &PlacementConfig) 
 
             let m = active_indices.len();
             let k = group.len();
-            let mut cost_matrix = vec![vec![0.0; k]; m];
-            for (r, &act_idx) in active_indices.iter().enumerate() {
-                let target = pin_infos[act_idx].target.unwrap();
-                for c in 0..k {
-                    let pad_pt = pad_positions[fp_idx][group[c]];
-                    cost_matrix[r][c] = target.distance_to(&pad_pt);
-                }
-            }
+            let targets_with_nets: Vec<(Point, usize)> = active_indices
+                .iter()
+                .map(|&act_idx| (pin_infos[act_idx].target.unwrap(), pin_infos[act_idx].net_id))
+                .collect();
+            let group_pads: Vec<Point> = group
+                .iter()
+                .map(|&pi| pad_positions[fp_idx][pi])
+                .collect();
+            let cost_matrix = compute_swap_cost_matrix_accelerated(&targets_with_nets, &group_pads, &[], 0.0);
 
             let mut assignment = hungarian_min_assignment(&cost_matrix);
 
@@ -356,38 +631,24 @@ fn optimize_pin_swapping_internal(board: &mut Board, _config: &PlacementConfig) 
             }
 
             let mut old_dist = 0.0;
-            let mut old_crossings = 0usize;
-            for (r1, &act_idx1) in active_indices.iter().enumerate() {
+            let mut old_segs = Vec::with_capacity(m);
+            for &act_idx1 in &active_indices {
                 let p1 = pad_positions[fp_idx][group[pin_infos[act_idx1].group_idx]];
                 let t1 = pin_infos[act_idx1].target.unwrap();
                 old_dist += p1.distance_to(&t1);
-                let s1 = Segment { p1, p2: t1, net_id: pin_infos[act_idx1].net_id };
-                for (_r2, &act_idx2) in active_indices.iter().enumerate().skip(r1 + 1) {
-                    let p2 = pad_positions[fp_idx][group[pin_infos[act_idx2].group_idx]];
-                    let t2 = pin_infos[act_idx2].target.unwrap();
-                    let s2 = Segment { p1: p2, p2: t2, net_id: pin_infos[act_idx2].net_id };
-                    if s1.crosses(&s2) {
-                        old_crossings += 1;
-                    }
-                }
+                old_segs.push(Segment { p1, p2: t1, net_id: pin_infos[act_idx1].net_id });
             }
+            let old_crossings = count_segment_crossings_lbvh(&old_segs);
 
             let mut new_dist = 0.0;
-            let mut new_crossings = 0usize;
+            let mut new_segs = Vec::with_capacity(m);
             for r1 in 0..m {
                 let p1 = pad_positions[fp_idx][group[assignment[r1]]];
                 let t1 = pin_infos[active_indices[r1]].target.unwrap();
                 new_dist += p1.distance_to(&t1);
-                let s1 = Segment { p1, p2: t1, net_id: pin_infos[active_indices[r1]].net_id };
-                for r2 in (r1 + 1)..m {
-                    let p2 = pad_positions[fp_idx][group[assignment[r2]]];
-                    let t2 = pin_infos[active_indices[r2]].target.unwrap();
-                    let s2 = Segment { p1: p2, p2: t2, net_id: pin_infos[active_indices[r2]].net_id };
-                    if s1.crosses(&s2) {
-                        new_crossings += 1;
-                    }
-                }
+                new_segs.push(Segment { p1, p2: t1, net_id: pin_infos[active_indices[r1]].net_id });
             }
+            let new_crossings = count_segment_crossings_lbvh(&new_segs);
 
             if new_crossings < old_crossings || (new_crossings == old_crossings && new_dist < old_dist - 1e-4) {
                 let assigned_pads_set: HashSet<usize> = assignment.iter().copied().collect();
@@ -904,4 +1165,76 @@ mod tests {
         assert_eq!(board.footprints[0].pads[2].net_name, "NET_A");
         assert_eq!(board.footprints[0].pads[3].net_name, "NET_B");
     }
+
+    #[test]
+    fn test_swap_cost_matrix_lbvh_and_gram_equivalence() {
+        // 24x24 pin swap group (spans multiple 16x16 Tensor Core / Gram tiles)
+        let m = 24usize;
+        let pads: Vec<Point> = (0..m)
+            .map(|i| Point::new(15.0 + (i % 4) as f64 * 0.65, 10.0 + i as f64 * 1.27))
+            .collect();
+        let targets: Vec<(Point, usize)> = (0..m)
+            .map(|i| {
+                let rev = m - 1 - i;
+                (
+                    Point::new(55.0 + ((i * 7) % 11) as f64 * 1.5, 8.0 + rev as f64 * 1.35),
+                    i + 1,
+                )
+            })
+            .collect();
+
+        // 160 board airwire segments across the routing channel
+        let mut airwires = Vec::new();
+        for e in 0..160usize {
+            let y1 = 5.0 + ((e * 13) % 45) as f64 * 0.9;
+            let y2 = 5.0 + ((e * 29 + 7) % 45) as f64 * 0.9;
+            let x1 = 18.0 + ((e * 5) % 15) as f64 * 1.1;
+            let x2 = 38.0 + ((e * 11) % 15) as f64 * 1.1;
+            airwires.push(Segment {
+                p1: Point::new(x1, y1),
+                p2: Point::new(x2, y2),
+                net_id: (e % 30) + 1,
+            });
+        }
+
+        let crossing_weight = 12.5;
+        let ref_mat = compute_swap_cost_matrix_reference(&targets, &pads, &airwires, crossing_weight);
+        let acc_mat = compute_swap_cost_matrix_accelerated(&targets, &pads, &airwires, crossing_weight);
+
+        assert_eq!(ref_mat.len(), m);
+        assert_eq!(acc_mat.len(), m);
+        for r in 0..m {
+            for c in 0..m {
+                let diff = (ref_mat[r][c] - acc_mat[r][c]).abs();
+                assert!(
+                    diff < 1e-9,
+                    "Mismatch at ({}, {}): ref={} vs acc={}",
+                    r,
+                    c,
+                    ref_mat[r][c],
+                    acc_mat[r][c]
+                );
+            }
+        }
+
+        let ref_assign = hungarian_min_assignment(&ref_mat);
+        let acc_assign = hungarian_min_assignment(&acc_mat);
+        assert_eq!(ref_assign, acc_assign, "Hungarian optimal assignment must match 100%");
+
+        // Also verify internal crossing counter via LBVH matches pairwise reference
+        let mut exact_internal = 0usize;
+        for i in 0..airwires.len() {
+            for j in (i + 1)..airwires.len() {
+                if airwires[i].crosses(&airwires[j]) {
+                    exact_internal += 1;
+                }
+            }
+        }
+        assert_eq!(
+            count_segment_crossings_lbvh(&airwires),
+            exact_internal,
+            "LBVH internal crossing count must match exact O(E^2) reference"
+        );
+    }
 }
+
