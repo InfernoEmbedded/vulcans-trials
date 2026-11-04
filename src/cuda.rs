@@ -4,10 +4,15 @@
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use crate::vulkan::{GpuSaParams, PlacementBatchParams};
+use crate::vulkan::{
+    DrcBatchParams, GpuDrcCandidate, GpuDrcPad, GpuDrcTrack, GpuDrcVia, GpuSaParams,
+    PlacementBatchParams,
+};
+
+static ALL_CUDA_ENGINES: OnceLock<Vec<Arc<CudaEngine>>> = OnceLock::new();
 
 pub const KERNELS_PTX: &str = include_str!("../cuda/kernels.ptx");
 pub const AMPERE_KERNELS_PTX: &str = include_str!("../cuda/ampere_kernels.ptx");
@@ -189,6 +194,7 @@ pub struct CudaEngine {
     fn_dist_field_tiled: CUfunction,
     fn_batch_placement: CUfunction,
     fn_gpu_sa_placer: CUfunction,
+    fn_batch_drc: CUfunction,
     pub fn_df_ampere: Option<CUfunction>,
     pub fn_df_ampere_tiled: Option<CUfunction>,
     pub fn_bp_ampere: Option<CUfunction>,
@@ -228,41 +234,45 @@ impl Drop for CudaEngine {
 
 impl CudaEngine {
     pub fn all_devices() -> Vec<Arc<Self>> {
-        let api = match CudaDriverApi::load() {
-            Some(a) => a,
-            None => return Vec::new(),
-        };
-        unsafe {
-            if (api.cuInit)(0) != CUDA_SUCCESS {
-                return Vec::new();
-            }
-            let mut count: c_int = 0;
-            if (api.cuDeviceGetCount)(&mut count) != CUDA_SUCCESS || count <= 0 {
-                return Vec::new();
-            }
-            let mut engines = Vec::new();
-            for ord in 0..count {
-                if let Some(engine) = Self::new_with_device(ord) {
-                    engines.push(engine);
-                }
-            }
-            engines.sort_by(|a, b| {
-                let score = |name: &str| {
-                    if name.contains("5090") { 5090 }
-                    else if name.contains("4090") { 4090 }
-                    else if name.contains("4080") { 4080 }
-                    else if name.contains("3090") { 3090 }
-                    else if name.contains("3080") { 3080 }
-                    else if name.contains("4070") { 4070 }
-                    else if name.contains("3070") { 3070 }
-                    else if name.contains("4060") { 4060 }
-                    else if name.contains("3060") { 3060 }
-                    else { 1000 }
+        ALL_CUDA_ENGINES
+            .get_or_init(|| {
+                let api = match CudaDriverApi::load() {
+                    Some(a) => a,
+                    None => return Vec::new(),
                 };
-                score(&b.device_name).cmp(&score(&a.device_name))
-            });
-            engines
-        }
+                unsafe {
+                    if (api.cuInit)(0) != CUDA_SUCCESS {
+                        return Vec::new();
+                    }
+                    let mut count: c_int = 0;
+                    if (api.cuDeviceGetCount)(&mut count) != CUDA_SUCCESS || count <= 0 {
+                        return Vec::new();
+                    }
+                    let mut engines = Vec::new();
+                    for ord in 0..count {
+                        if let Some(engine) = Self::new_with_device(ord) {
+                            engines.push(engine);
+                        }
+                    }
+                    engines.sort_by(|a, b| {
+                        let score = |name: &str| {
+                            if name.contains("5090") { 5090 }
+                            else if name.contains("4090") { 4090 }
+                            else if name.contains("4080") { 4080 }
+                            else if name.contains("3090") { 3090 }
+                            else if name.contains("3080") { 3080 }
+                            else if name.contains("4070") { 4070 }
+                            else if name.contains("3070") { 3070 }
+                            else if name.contains("4060") { 4060 }
+                            else if name.contains("3060") { 3060 }
+                            else { 1000 }
+                        };
+                        score(&b.device_name).cmp(&score(&a.device_name))
+                    });
+                    engines
+                }
+            })
+            .clone()
     }
 
     pub fn new() -> Option<Arc<Self>> {
@@ -317,16 +327,19 @@ impl CudaEngine {
             let mut fn_dist_field_tiled: CUfunction = ptr::null_mut();
             let mut fn_batch_placement: CUfunction = ptr::null_mut();
             let mut fn_gpu_sa_placer: CUfunction = ptr::null_mut();
+            let mut fn_batch_drc: CUfunction = ptr::null_mut();
 
             let c_df = CString::new("distance_field_kernel").unwrap();
             let c_dft = CString::new("distance_field_tiled_kernel").unwrap();
             let c_bp = CString::new("batch_placement_eval_kernel").unwrap();
             let c_sa = CString::new("gpu_sa_placer_kernel").unwrap();
+            let c_drc = CString::new("batch_drc_eval_kernel").unwrap();
 
             if (api.cuModuleGetFunction)(&mut fn_dist_field, module, c_df.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_dist_field_tiled, module, c_dft.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_batch_placement, module, c_bp.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_gpu_sa_placer, module, c_sa.as_ptr()) != CUDA_SUCCESS
+                || (api.cuModuleGetFunction)(&mut fn_batch_drc, module, c_drc.as_ptr()) != CUDA_SUCCESS
             {
                 let _ = (api.cuModuleUnload)(module);
                 let _ = (api.cuCtxDestroy_v2)(ctx);
@@ -372,6 +385,7 @@ impl CudaEngine {
                 fn_dist_field_tiled,
                 fn_batch_placement,
                 fn_gpu_sa_placer,
+                fn_batch_drc,
                 fn_df_ampere,
                 fn_df_ampere_tiled,
                 fn_bp_ampere,
@@ -953,6 +967,206 @@ impl CudaEngine {
             Some((best_poses, final_scores))
         }
     }
+
+    pub fn evaluate_drc_candidates(
+        &self,
+        pads: &[GpuDrcPad],
+        tracks: &[GpuDrcTrack],
+        vias: &[GpuDrcVia],
+        candidates: &[GpuDrcCandidate],
+    ) -> Option<Vec<u32>> {
+        let nc = candidates.len();
+        if nc == 0 {
+            return Some(Vec::new());
+        }
+
+        if nc >= 128 {
+            let devs = Self::all_devices();
+            if devs.len() > 1 {
+                let num_devs = devs.len();
+                let chunk_size = (nc + num_devs - 1) / num_devs;
+                let mut chunks_out: Vec<Option<Vec<u32>>> = (0..num_devs).map(|_| None).collect();
+                std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(num_devs);
+                    for (idx, dev) in devs.iter().enumerate() {
+                        let start = idx * chunk_size;
+                        let end = (start + chunk_size).min(nc);
+                        if start >= end {
+                            continue;
+                        }
+                        let dev_ref = Arc::clone(dev);
+                        let cand_slice = &candidates[start..end];
+                        handles.push((
+                            idx,
+                            scope.spawn(move || {
+                                dev_ref.evaluate_drc_candidates_single(pads, tracks, vias, cand_slice)
+                            }),
+                        ));
+                    }
+                    for (idx, handle) in handles {
+                        if let Ok(res) = handle.join() {
+                            chunks_out[idx] = res;
+                        }
+                    }
+                });
+
+                let mut combined = Vec::with_capacity(nc);
+                for opt in chunks_out {
+                    if let Some(part) = opt {
+                        combined.extend_from_slice(&part);
+                    }
+                }
+                if combined.len() == nc {
+                    return Some(combined);
+                }
+            }
+        }
+
+        self.evaluate_drc_candidates_single(pads, tracks, vias, candidates)
+    }
+
+    pub fn evaluate_drc_candidates_single(
+        &self,
+        pads: &[GpuDrcPad],
+        tracks: &[GpuDrcTrack],
+        vias: &[GpuDrcVia],
+        candidates: &[GpuDrcCandidate],
+    ) -> Option<Vec<u32>> {
+        let nc = candidates.len();
+        if nc == 0 {
+            return Some(Vec::new());
+        }
+
+        let _guard = self.dispatch_lock.lock().ok()?;
+        unsafe {
+            let _ = (self.cuda.cuCtxSetCurrent)(self.ctx);
+
+            let dummy_pad = [bytemuck::Zeroable::zeroed(); 1];
+            let pad_slice: &[GpuDrcPad] = if pads.is_empty() { &dummy_pad } else { pads };
+            let pads_bytes = pad_slice.len() * std::mem::size_of::<GpuDrcPad>();
+
+            let dummy_trk = [bytemuck::Zeroable::zeroed(); 1];
+            let trk_slice: &[GpuDrcTrack] = if tracks.is_empty() { &dummy_trk } else { tracks };
+            let tracks_bytes = trk_slice.len() * std::mem::size_of::<GpuDrcTrack>();
+
+            let dummy_via = [bytemuck::Zeroable::zeroed(); 1];
+            let via_slice: &[GpuDrcVia] = if vias.is_empty() { &dummy_via } else { vias };
+            let vias_bytes = via_slice.len() * std::mem::size_of::<GpuDrcVia>();
+
+            let cands_bytes = nc * std::mem::size_of::<GpuDrcCandidate>();
+            let out_bytes = nc * std::mem::size_of::<u32>();
+
+            let mut d_pads: CUdeviceptr = 0;
+            let mut d_tracks: CUdeviceptr = 0;
+            let mut d_vias: CUdeviceptr = 0;
+            let mut d_cands: CUdeviceptr = 0;
+            let mut d_out: CUdeviceptr = 0;
+
+            if (self.cuda.cuMemAlloc_v2)(&mut d_pads, pads_bytes) != CUDA_SUCCESS {
+                return None;
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_tracks, tracks_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_pads);
+                return None;
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_vias, vias_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_pads);
+                let _ = (self.cuda.cuMemFree_v2)(d_tracks);
+                return None;
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_cands, cands_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_pads);
+                let _ = (self.cuda.cuMemFree_v2)(d_tracks);
+                let _ = (self.cuda.cuMemFree_v2)(d_vias);
+                return None;
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_out, out_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_pads);
+                let _ = (self.cuda.cuMemFree_v2)(d_tracks);
+                let _ = (self.cuda.cuMemFree_v2)(d_vias);
+                let _ = (self.cuda.cuMemFree_v2)(d_cands);
+                return None;
+            }
+
+            let start_t = Instant::now();
+
+            if (self.cuda.cuMemcpyHtoD_v2)(d_pads, pad_slice.as_ptr() as *const c_void, pads_bytes) != CUDA_SUCCESS
+                || (self.cuda.cuMemcpyHtoD_v2)(d_tracks, trk_slice.as_ptr() as *const c_void, tracks_bytes) != CUDA_SUCCESS
+                || (self.cuda.cuMemcpyHtoD_v2)(d_vias, via_slice.as_ptr() as *const c_void, vias_bytes) != CUDA_SUCCESS
+                || (self.cuda.cuMemcpyHtoD_v2)(d_cands, candidates.as_ptr() as *const c_void, cands_bytes) != CUDA_SUCCESS
+            {
+                let _ = (self.cuda.cuMemFree_v2)(d_pads);
+                let _ = (self.cuda.cuMemFree_v2)(d_tracks);
+                let _ = (self.cuda.cuMemFree_v2)(d_vias);
+                let _ = (self.cuda.cuMemFree_v2)(d_cands);
+                let _ = (self.cuda.cuMemFree_v2)(d_out);
+                return None;
+            }
+
+            let block_x: c_uint = 64;
+            let grid_x: c_uint = ((nc as c_uint) + block_x - 1) / block_x;
+
+            let mut params = DrcBatchParams {
+                num_pads: pads.len() as u32,
+                num_tracks: tracks.len() as u32,
+                num_vias: vias.len() as u32,
+                num_candidates: nc as u32,
+            };
+
+            let mut args = [
+                &mut d_pads as *mut _ as *mut c_void,
+                &mut d_tracks as *mut _ as *mut c_void,
+                &mut d_vias as *mut _ as *mut c_void,
+                &mut d_cands as *mut _ as *mut c_void,
+                &mut d_out as *mut _ as *mut c_void,
+                &mut params as *mut _ as *mut c_void,
+            ];
+
+            if (self.cuda.cuLaunchKernel)(
+                self.fn_batch_drc,
+                grid_x,
+                1,
+                1,
+                block_x,
+                1,
+                1,
+                0,
+                ptr::null_mut(),
+                args.as_mut_ptr(),
+                ptr::null_mut(),
+            ) != CUDA_SUCCESS
+            {
+                let _ = (self.cuda.cuMemFree_v2)(d_pads);
+                let _ = (self.cuda.cuMemFree_v2)(d_tracks);
+                let _ = (self.cuda.cuMemFree_v2)(d_vias);
+                let _ = (self.cuda.cuMemFree_v2)(d_cands);
+                let _ = (self.cuda.cuMemFree_v2)(d_out);
+                return None;
+            }
+
+            let mut result = vec![0u32; nc];
+            if (self.cuda.cuMemcpyDtoH_v2)(result.as_mut_ptr() as *mut c_void, d_out, out_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_pads);
+                let _ = (self.cuda.cuMemFree_v2)(d_tracks);
+                let _ = (self.cuda.cuMemFree_v2)(d_vias);
+                let _ = (self.cuda.cuMemFree_v2)(d_cands);
+                let _ = (self.cuda.cuMemFree_v2)(d_out);
+                return None;
+            }
+
+            let _ = (self.cuda.cuCtxSynchronize)();
+            let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+            self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+            let _ = (self.cuda.cuMemFree_v2)(d_pads);
+            let _ = (self.cuda.cuMemFree_v2)(d_tracks);
+            let _ = (self.cuda.cuMemFree_v2)(d_vias);
+            let _ = (self.cuda.cuMemFree_v2)(d_cands);
+            let _ = (self.cuda.cuMemFree_v2)(d_out);
+
+            Some(result)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1177,5 +1391,243 @@ mod tests {
             assert!((df[4 * 16 + 8] - 4.0).abs() < 1e-3);
         }
         assert!(!devs.is_empty());
+    }
+
+    #[test]
+    fn test_gpu_batch_drc_eval_via_and_segment_clearance() {
+        let cuda = match CudaEngine::new() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let pads = vec![
+            // Foreign SMD pad on F.Cu (layer 0, mask = 1) at (10.0, 10.0), size 1.0 x 1.0 (hw=0.5, hh=0.5), net 2
+            GpuDrcPad {
+                x: 10.0,
+                y: 10.0,
+                hw: 0.5,
+                hh: 0.5,
+                rot_rad: 0.0,
+                clearance: 0.20,
+                layer_mask: 1,
+                net_id: 2,
+            },
+            // Same-net SMD pad on F.Cu at (20.0, 10.0), size 1.0 x 1.0, net 1
+            GpuDrcPad {
+                x: 20.0,
+                y: 10.0,
+                hw: 0.5,
+                hh: 0.5,
+                rot_rad: 0.0,
+                clearance: 0.20,
+                layer_mask: 1,
+                net_id: 1,
+            },
+        ];
+
+        let tracks = vec![
+            // Foreign track on F.Cu (layer 0) from (5.0, 20.0) to (15.0, 20.0), half_width=0.125, net 3
+            GpuDrcTrack {
+                x1: 5.0,
+                y1: 20.0,
+                x2: 15.0,
+                y2: 20.0,
+                half_width: 0.125,
+                clearance: 0.20,
+                layer: 0,
+                net_id: 3,
+            },
+        ];
+
+        let vias = vec![
+            // Foreign via at (30.0, 30.0), radius=0.30, net 4
+            GpuDrcVia {
+                x: 30.0,
+                y: 30.0,
+                radius: 0.30,
+                clearance: 0.20,
+                net_id: 4,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            },
+        ];
+
+        let candidates = vec![
+            // 0: Legal via at (2.0, 2.0), net 1
+            GpuDrcCandidate {
+                x1: 2.0,
+                y1: 2.0,
+                x2: 0.0,
+                y2: 0.0,
+                radius_or_half_width: 0.30,
+                clearance: 0.20,
+                layer: 0,
+                net_id: 1,
+                kind: 0,
+                ignore_same_net_pads: 0,
+                _pad0: 0,
+                _pad1: 0,
+            },
+            // 1: Illegal via too close to foreign pad at (10.8, 10.0) -> dist to pad box is 0.3 < 0.30 + 0.20 = 0.50
+            GpuDrcCandidate {
+                x1: 10.8,
+                y1: 10.0,
+                x2: 0.0,
+                y2: 0.0,
+                radius_or_half_width: 0.30,
+                clearance: 0.20,
+                layer: 0,
+                net_id: 1,
+                kind: 0,
+                ignore_same_net_pads: 0,
+                _pad0: 0,
+                _pad1: 0,
+            },
+            // 2: Illegal via overlapping same-net SMD pad at (20.2, 10.0) when ignore_same_net_pads == 0
+            GpuDrcCandidate {
+                x1: 20.2,
+                y1: 10.0,
+                x2: 0.0,
+                y2: 0.0,
+                radius_or_half_width: 0.30,
+                clearance: 0.20,
+                layer: 0,
+                net_id: 1,
+                kind: 0,
+                ignore_same_net_pads: 0,
+                _pad0: 0,
+                _pad1: 0,
+            },
+            // 3: Illegal segment crossing foreign track on layer 0
+            GpuDrcCandidate {
+                x1: 10.0,
+                y1: 18.0,
+                x2: 10.0,
+                y2: 22.0,
+                radius_or_half_width: 0.125,
+                clearance: 0.20,
+                layer: 0,
+                net_id: 1,
+                kind: 1,
+                ignore_same_net_pads: 0,
+                _pad0: 0,
+                _pad1: 0,
+            },
+            // 4: Legal segment crossing foreign track's XY on layer 1 (B.Cu)
+            GpuDrcCandidate {
+                x1: 10.0,
+                y1: 18.0,
+                x2: 10.0,
+                y2: 22.0,
+                radius_or_half_width: 0.125,
+                clearance: 0.20,
+                layer: 1,
+                net_id: 1,
+                kind: 1,
+                ignore_same_net_pads: 0,
+                _pad0: 0,
+                _pad1: 0,
+            },
+            // 5: Illegal segment too close to foreign via at (30.0, 30.0) even on layer 1 (vias span all layers)
+            GpuDrcCandidate {
+                x1: 28.0,
+                y1: 30.3,
+                x2: 32.0,
+                y2: 30.3,
+                radius_or_half_width: 0.125,
+                clearance: 0.20,
+                layer: 1,
+                net_id: 1,
+                kind: 1,
+                ignore_same_net_pads: 0,
+                _pad0: 0,
+                _pad1: 0,
+            },
+        ];
+
+        let res = cuda
+            .evaluate_drc_candidates(&pads, &tracks, &vias, &candidates)
+            .expect("GPU DRC eval");
+        assert_eq!(res, vec![1, 0, 0, 0, 1, 0]);
+    }
+
+    #[test]
+    fn test_cuda_vs_vulkan_batch_drc_equivalence() {
+        let cuda = match CudaEngine::new() {
+            Some(c) => c,
+            None => return,
+        };
+        let vk = match crate::vulkan::VulkanEngine::new_vulkan_only() {
+            Some(v) => v,
+            None => return,
+        };
+
+        let pads = vec![
+            GpuDrcPad {
+                x: 12.0,
+                y: 12.0,
+                hw: 0.6,
+                hh: 0.4,
+                rot_rad: 0.7853982, // 45 deg
+                clearance: 0.20,
+                layer_mask: 0xFFFF_FFFF,
+                net_id: 2,
+            },
+        ];
+        let tracks = vec![
+            GpuDrcTrack {
+                x1: 0.0,
+                y1: 5.0,
+                x2: 20.0,
+                y2: 5.0,
+                half_width: 0.125,
+                clearance: 0.20,
+                layer: 0,
+                net_id: 3,
+            },
+        ];
+        let vias = vec![
+            GpuDrcVia {
+                x: 8.0,
+                y: 8.0,
+                radius: 0.30,
+                clearance: 0.20,
+                net_id: 4,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            },
+        ];
+
+        // Generate 200 candidates (>= 128 to exercise multi-GPU splitting on CUDA as well)
+        let mut candidates = Vec::with_capacity(200);
+        for i in 0..200 {
+            let x = (i % 20) as f32 * 1.0 + 1.0;
+            let y = (i / 20) as f32 * 2.0 + 1.0;
+            candidates.push(GpuDrcCandidate {
+                x1: x,
+                y1: y,
+                x2: x + 1.5,
+                y2: y + 0.5,
+                radius_or_half_width: if i % 2 == 0 { 0.30 } else { 0.125 },
+                clearance: 0.20,
+                layer: (i % 2) as u32,
+                net_id: 1,
+                kind: (i % 2) as u32,
+                ignore_same_net_pads: 0,
+                _pad0: 0,
+                _pad1: 0,
+            });
+        }
+
+        let cu_res = cuda
+            .evaluate_drc_candidates(&pads, &tracks, &vias, &candidates)
+            .expect("CUDA DRC batch");
+        let vk_res = vk
+            .evaluate_drc_candidates_vulkan(&pads, &tracks, &vias, &candidates)
+            .expect("Vulkan DRC batch");
+        assert_eq!(cu_res.len(), 200);
+        assert_eq!(cu_res, vk_res, "CUDA and Vulkan WGSL DRC batch kernels must return identical results");
     }
 }

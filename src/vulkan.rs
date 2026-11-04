@@ -412,6 +412,296 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+const BATCH_DRC_EVAL_WGSL: &str = r#"
+struct DrcBatchParams {
+    num_pads: u32,
+    num_tracks: u32,
+    num_vias: u32,
+    num_candidates: u32,
+}
+
+struct GpuDrcPad {
+    x: f32,
+    y: f32,
+    hw: f32,
+    hh: f32,
+    rot_rad: f32,
+    clearance: f32,
+    layer_mask: u32,
+    net_id: u32,
+}
+
+struct GpuDrcTrack {
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    half_width: f32,
+    clearance: f32,
+    layer: u32,
+    net_id: u32,
+}
+
+struct GpuDrcVia {
+    x: f32,
+    y: f32,
+    radius: f32,
+    clearance: f32,
+    net_id: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+}
+
+struct GpuDrcCandidate {
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    radius_or_half_width: f32,
+    clearance: f32,
+    layer: u32,
+    net_id: u32,
+    kind: u32,
+    ignore_same_net_pads: u32,
+    pad0: u32,
+    pad1: u32,
+}
+
+@group(0) @binding(0) var<storage, read> pads: array<GpuDrcPad>;
+@group(0) @binding(1) var<storage, read> tracks: array<GpuDrcTrack>;
+@group(0) @binding(2) var<storage, read> vias: array<GpuDrcVia>;
+@group(0) @binding(3) var<storage, read> candidates: array<GpuDrcCandidate>;
+@group(0) @binding(4) var<storage, read_write> results_out: array<u32>;
+@group(0) @binding(5) var<uniform> params: DrcBatchParams;
+
+fn drc_dist_point_to_seg(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len_sq = dx * dx + dy * dy;
+    if (len_sq < 1e-6) {
+        let ex = px - x1;
+        let ey = py - y1;
+        return sqrt(ex * ex + ey * ey);
+    }
+    let t = clamp(((px - x1) * dx + (py - y1) * dy) / len_sq, 0.0, 1.0);
+    let ex = px - (x1 + t * dx);
+    let ey = py - (y1 + t * dy);
+    return sqrt(ex * ex + ey * ey);
+}
+
+fn drc_segs_intersect(ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32, dx: f32, dy: f32) -> bool {
+    let d1 = (dy - cy) * (ax - cx) - (dx - cx) * (ay - cy);
+    let d2 = (dy - cy) * (bx - cx) - (dx - cx) * (by - cy);
+    let d3 = (by - ay) * (cx - ax) - (bx - ax) * (cy - ay);
+    let d4 = (by - ay) * (dx - ax) - (bx - ax) * (dy - ay);
+    return ((d1 > 1e-7 && d2 < -1e-7) || (d1 < -1e-7 && d2 > 1e-7)) &&
+           ((d3 > 1e-7 && d4 < -1e-7) || (d3 < -1e-7 && d4 > 1e-7));
+}
+
+fn drc_dist_seg_to_seg(ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32, dx: f32, dy: f32) -> f32 {
+    if (drc_segs_intersect(ax, ay, bx, by, cx, cy, dx, dy)) {
+        return 0.0;
+    }
+    let d1 = drc_dist_point_to_seg(ax, ay, cx, cy, dx, dy);
+    let d2 = drc_dist_point_to_seg(bx, by, cx, cy, dx, dy);
+    let d3 = drc_dist_point_to_seg(cx, cy, ax, ay, bx, by);
+    let d4 = drc_dist_point_to_seg(dx, dy, ax, ay, bx, by);
+    return min(min(d1, d2), min(d3, d4));
+}
+
+fn drc_dist_point_to_pad(px: f32, py: f32, pad: GpuDrcPad) -> f32 {
+    let shape = pad.layer_mask >> 16u;
+    let rx = px - pad.x;
+    let ry = py - pad.y;
+    if (shape == 1u) {
+        let r = max(pad.hw, pad.hh);
+        return max(sqrt(rx * rx + ry * ry) - r, 0.0);
+    }
+    let c = cos(-pad.rot_rad);
+    let s = sin(-pad.rot_rad);
+    let lx = rx * c - ry * s;
+    let ly = rx * s + ry * c;
+    if (shape == 2u) {
+        let r = min(pad.hw, pad.hh);
+        if (pad.hw >= pad.hh) {
+            let cap_dx = pad.hw - r;
+            let cx = clamp(lx, -cap_dx, cap_dx);
+            let dx = lx - cx;
+            return max(sqrt(dx * dx + ly * ly) - r, 0.0);
+        } else {
+            let cap_dy = pad.hh - r;
+            let cy = clamp(ly, -cap_dy, cap_dy);
+            let dy = ly - cy;
+            return max(sqrt(lx * lx + dy * dy) - r, 0.0);
+        }
+    }
+    let dx = max(abs(lx) - pad.hw, 0.0);
+    let dy = max(abs(ly) - pad.hh, 0.0);
+    return sqrt(dx * dx + dy * dy);
+}
+
+fn drc_dist_seg_to_pad(x1: f32, y1: f32, x2: f32, y2: f32, pad: GpuDrcPad) -> f32 {
+    if ((pad.layer_mask >> 16u) == 1u) {
+        let r = max(pad.hw, pad.hh);
+        return max(drc_dist_point_to_seg(pad.x, pad.y, x1, y1, x2, y2) - r, 0.0);
+    }
+    let c = cos(-pad.rot_rad);
+    let s = sin(-pad.rot_rad);
+    let rx1 = x1 - pad.x;
+    let ry1 = y1 - pad.y;
+    let lsx = rx1 * c - ry1 * s;
+    let lsy = rx1 * s + ry1 * c;
+    let rx2 = x2 - pad.x;
+    let ry2 = y2 - pad.y;
+    let lex = rx2 * c - ry2 * s;
+    let ley = rx2 * s + ry2 * c;
+    let hw = pad.hw;
+    let hh = pad.hh;
+
+    if (abs(lsx) <= hw && abs(lsy) <= hh) {
+        return 0.0;
+    }
+    if (abs(lex) <= hw && abs(ley) <= hh) {
+        return 0.0;
+    }
+
+    if (drc_segs_intersect(lsx, lsy, lex, ley, -hw, -hh, hw, -hh) ||
+        drc_segs_intersect(lsx, lsy, lex, ley, hw, -hh, hw, hh) ||
+        drc_segs_intersect(lsx, lsy, lex, ley, hw, hh, -hw, hh) ||
+        drc_segs_intersect(lsx, lsy, lex, ley, -hw, hh, -hw, -hh)) {
+        return 0.0;
+    }
+
+    let dx1 = max(abs(lsx) - hw, 0.0);
+    let dy1 = max(abs(lsy) - hh, 0.0);
+    let d1 = sqrt(dx1 * dx1 + dy1 * dy1);
+
+    let dx2 = max(abs(lex) - hw, 0.0);
+    let dy2 = max(abs(ley) - hh, 0.0);
+    let d2 = sqrt(dx2 * dx2 + dy2 * dy2);
+
+    let d3 = drc_dist_point_to_seg(-hw, -hh, lsx, lsy, lex, ley);
+    let d4 = drc_dist_point_to_seg(hw, -hh, lsx, lsy, lex, ley);
+    let d5 = drc_dist_point_to_seg(hw, hh, lsx, lsy, lex, ley);
+    let d6 = drc_dist_point_to_seg(-hw, hh, lsx, lsy, lex, ley);
+
+    return min(min(min(d1, d2), min(d3, d4)), min(d5, d6));
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    if (c >= params.num_candidates) {
+        return;
+    }
+
+    let cand = candidates[c];
+    let eps = 1e-4;
+
+    if (cand.kind == 0u) {
+        for (var i: u32 = 0u; i < params.num_pads; i = i + 1u) {
+            let p = pads[i];
+            if (p.net_id != cand.net_id) {
+                let req_dist = cand.radius_or_half_width + max(cand.clearance, p.clearance);
+                let d = drc_dist_point_to_pad(cand.x1, cand.y1, p);
+                if (d < req_dist - eps) {
+                    results_out[c] = 0u;
+                    return;
+                }
+            } else if (cand.ignore_same_net_pads == 0u && (p.layer_mask & 0xFFFFu) != 0xFFFFu) {
+                let d = drc_dist_point_to_pad(cand.x1, cand.y1, p);
+                if (d < cand.radius_or_half_width - eps) {
+                    results_out[c] = 0u;
+                    return;
+                }
+            }
+        }
+
+        for (var i: u32 = 0u; i < params.num_tracks; i = i + 1u) {
+            let t = tracks[i];
+            if (t.net_id != cand.net_id) {
+                let req_dist = cand.radius_or_half_width + max(cand.clearance, t.clearance) + t.half_width;
+                let d = drc_dist_point_to_seg(cand.x1, cand.y1, t.x1, t.y1, t.x2, t.y2);
+                if (d < req_dist - eps) {
+                    results_out[c] = 0u;
+                    return;
+                }
+            }
+        }
+
+        for (var i: u32 = 0u; i < params.num_vias; i = i + 1u) {
+            let v = vias[i];
+            let dx = cand.x1 - v.x;
+            let dy = cand.y1 - v.y;
+            let d = sqrt(dx * dx + dy * dy);
+            if (d < eps) {
+                continue;
+            }
+            if (cand.pad0 != 0u) {
+                let idx = cand.x2 - v.x;
+                let idy = cand.y2 - v.y;
+                if (sqrt(idx * idx + idy * idy) < eps) {
+                    continue;
+                }
+            }
+            if (v.net_id != cand.net_id) {
+                let req_dist = cand.radius_or_half_width + max(cand.clearance, v.clearance) + v.radius;
+                if (d < req_dist - eps) {
+                    results_out[c] = 0u;
+                    return;
+                }
+            } else {
+                let req_dist = select(0.55, 0.25, cand.radius_or_half_width <= 0.18 && v.radius <= 0.18);
+                if (d < req_dist - eps) {
+                    results_out[c] = 0u;
+                    return;
+                }
+            }
+        }
+    } else {
+        let layer_bit = select(0u, 1u << (cand.layer & 31u), cand.layer < 32u);
+        for (var i: u32 = 0u; i < params.num_pads; i = i + 1u) {
+            let p = pads[i];
+            if ((p.layer_mask & layer_bit) != 0u && p.net_id != cand.net_id) {
+                let req_dist = cand.radius_or_half_width + max(cand.clearance, p.clearance);
+                let d = drc_dist_seg_to_pad(cand.x1, cand.y1, cand.x2, cand.y2, p);
+                if (d < req_dist - eps) {
+                    results_out[c] = 0u;
+                    return;
+                }
+            }
+        }
+
+        for (var i: u32 = 0u; i < params.num_tracks; i = i + 1u) {
+            let t = tracks[i];
+            if (t.layer == cand.layer && t.net_id != cand.net_id) {
+                let req_dist = cand.radius_or_half_width + max(cand.clearance, t.clearance) + t.half_width;
+                let d = drc_dist_seg_to_seg(cand.x1, cand.y1, cand.x2, cand.y2, t.x1, t.y1, t.x2, t.y2);
+                if (d < req_dist - eps) {
+                    results_out[c] = 0u;
+                    return;
+                }
+            }
+        }
+
+        for (var i: u32 = 0u; i < params.num_vias; i = i + 1u) {
+            let v = vias[i];
+            if (v.net_id != cand.net_id) {
+                let req_dist = cand.radius_or_half_width + max(cand.clearance, v.clearance) + v.radius;
+                let d = drc_dist_point_to_seg(v.x, v.y, cand.x1, cand.y1, cand.x2, cand.y2);
+                if (d < req_dist - eps) {
+                    results_out[c] = 0u;
+                    return;
+                }
+            }
+        }
+    }
+
+    results_out[c] = 1u;
+}
+"#;
+
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct GridParams {
@@ -419,6 +709,71 @@ struct GridParams {
     height: u32,
     radius: i32,
     _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DrcBatchParams {
+    pub num_pads: u32,
+    pub num_tracks: u32,
+    pub num_vias: u32,
+    pub num_candidates: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuDrcPad {
+    pub x: f32,
+    pub y: f32,
+    pub hw: f32,
+    pub hh: f32,
+    pub rot_rad: f32,
+    pub clearance: f32,
+    pub layer_mask: u32,
+    pub net_id: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuDrcTrack {
+    pub x1: f32,
+    pub y1: f32,
+    pub x2: f32,
+    pub y2: f32,
+    pub half_width: f32,
+    pub clearance: f32,
+    pub layer: u32,
+    pub net_id: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuDrcVia {
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
+    pub clearance: f32,
+    pub net_id: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuDrcCandidate {
+    pub x1: f32,
+    pub y1: f32,
+    pub x2: f32,
+    pub y2: f32,
+    pub radius_or_half_width: f32,
+    pub clearance: f32,
+    pub layer: u32,
+    pub net_id: u32,
+    pub kind: u32,
+    pub ignore_same_net_pads: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
 }
 
 #[repr(C)]
@@ -483,6 +838,8 @@ pub struct VulkanEngine {
     placement_bgl: wgpu::BindGroupLayout,
     sa_pipeline: wgpu::ComputePipeline,
     sa_bgl: wgpu::BindGroupLayout,
+    drc_pipeline: wgpu::ComputePipeline,
+    drc_bgl: wgpu::BindGroupLayout,
     dispatch_lock: Mutex<()>,
     pub compute_busy_ns: Arc<AtomicU64>,
     pub extra_devices: Vec<Arc<VulkanEngine>>,
@@ -837,6 +1194,92 @@ impl VulkanEngine {
             cache: None,
         });
 
+        let drc_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Vulkan Batch DRC Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(BATCH_DRC_EVAL_WGSL.into()),
+        });
+
+        let drc_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("BatchDrc BindGroupLayout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let drc_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("BatchDrc PipelineLayout"),
+            bind_group_layouts: &[&drc_bgl],
+            push_constant_ranges: &[],
+        });
+
+        let drc_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("BatchDrc ComputePipeline"),
+            layout: Some(&drc_pl_layout),
+            module: &drc_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         let mut cuda_engine = None;
         let mut backend_kind = GpuBackendKind::Vulkan;
 
@@ -884,6 +1327,8 @@ impl VulkanEngine {
             placement_bgl,
             sa_pipeline,
             sa_bgl,
+            drc_pipeline,
+            drc_bgl,
             dispatch_lock: Mutex::new(()),
             compute_busy_ns,
             extra_devices,
@@ -1312,6 +1757,180 @@ impl VulkanEngine {
         scores_buf.destroy();
         fp_buf.destroy();
         edges_buf.destroy();
+        param_buf.destroy();
+
+        result
+    }
+
+    pub fn evaluate_drc_candidates(
+        &self,
+        pads: &[GpuDrcPad],
+        tracks: &[GpuDrcTrack],
+        vias: &[GpuDrcVia],
+        candidates: &[GpuDrcCandidate],
+    ) -> Option<Vec<u32>> {
+        if candidates.is_empty() {
+            return Some(Vec::new());
+        }
+
+        if self.backend_kind == GpuBackendKind::CudaPtx {
+            if let Some(cuda) = &self.cuda_engine {
+                if let Some(res) = cuda.evaluate_drc_candidates(pads, tracks, vias, candidates) {
+                    self.compute_busy_ns.fetch_add(cuda.compute_busy_ns.load(Ordering::Relaxed), Ordering::Relaxed);
+                    return Some(res);
+                }
+            }
+        }
+
+        self.evaluate_drc_candidates_vulkan(pads, tracks, vias, candidates)
+    }
+
+    pub fn evaluate_drc_candidates_vulkan(
+        &self,
+        pads: &[GpuDrcPad],
+        tracks: &[GpuDrcTrack],
+        vias: &[GpuDrcVia],
+        candidates: &[GpuDrcCandidate],
+    ) -> Option<Vec<u32>> {
+        let nc = candidates.len();
+        if nc == 0 {
+            return Some(Vec::new());
+        }
+
+        let _guard = self.dispatch_lock.lock().ok()?;
+        let out_byte_size = (nc * std::mem::size_of::<u32>()) as u64;
+
+        let dummy_pad = [bytemuck::Zeroable::zeroed(); 1];
+        let pad_slice: &[GpuDrcPad] = if pads.is_empty() { &dummy_pad } else { pads };
+        let pads_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("DRC Pads Buffer"),
+            contents: bytemuck::cast_slice(pad_slice),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let dummy_trk = [bytemuck::Zeroable::zeroed(); 1];
+        let trk_slice: &[GpuDrcTrack] = if tracks.is_empty() { &dummy_trk } else { tracks };
+        let tracks_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("DRC Tracks Buffer"),
+            contents: bytemuck::cast_slice(trk_slice),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let dummy_via = [bytemuck::Zeroable::zeroed(); 1];
+        let via_slice: &[GpuDrcVia] = if vias.is_empty() { &dummy_via } else { vias };
+        let vias_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("DRC Vias Buffer"),
+            contents: bytemuck::cast_slice(via_slice),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let cands_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("DRC Candidates Buffer"),
+            contents: bytemuck::cast_slice(candidates),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("DRC Results Out Buffer"),
+            size: out_byte_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("DRC Results Staging Buffer"),
+            size: out_byte_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let params = DrcBatchParams {
+            num_pads: pads.len() as u32,
+            num_tracks: tracks.len() as u32,
+            num_vias: vias.len() as u32,
+            num_candidates: nc as u32,
+        };
+        let param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("DrcBatchParams Uniform"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("BatchDrc BindGroup"),
+            layout: &self.drc_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: pads_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: tracks_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: vias_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: cands_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: param_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("BatchDrc CommandEncoder"),
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("BatchDrc ComputePass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.drc_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let wg_x = ((nc as u32) + 63) / 64;
+            cpass.dispatch_workgroups(wg_x, 1, 1);
+        }
+
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging_buf, 0, out_byte_size);
+        let start_t = Instant::now();
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging_buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+        let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
+            let data = slice.get_mapped_range();
+            let vec: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            staging_buf.unmap();
+            Some(vec)
+        } else {
+            None
+        };
+
+        staging_buf.destroy();
+        out_buf.destroy();
+        pads_buf.destroy();
+        tracks_buf.destroy();
+        vias_buf.destroy();
+        cands_buf.destroy();
         param_buf.destroy();
 
         result
