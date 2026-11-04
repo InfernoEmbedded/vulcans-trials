@@ -173,6 +173,84 @@ __global__ void distance_field_tiled_kernel(
     dist_out[idx] = sqrtf(min_d2);
 }
 
+// Multi-Layer 3D Batched Distance Field Kernel with 2D Shared Memory Tiling per Z-Layer
+__global__ void distance_field_3d_tiled_kernel(
+    const unsigned int* __restrict__ obstacles,
+    float* __restrict__ dist_out,
+    unsigned int width,
+    unsigned int height,
+    unsigned int num_layers,
+    int radius
+) {
+    unsigned int layer = blockIdx.z;
+    if (layer >= num_layers) {
+        return;
+    }
+
+    extern __shared__ unsigned char smem_raw[];
+    unsigned int* s_tile = (unsigned int*)smem_raw;
+
+    int bx = blockIdx.x * blockDim.x;
+    int by = blockIdx.y * blockDim.y;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int tid = ty * blockDim.x + tx;
+    int num_threads = blockDim.x * blockDim.y;
+
+    int w = (int)width;
+    int h = (int)height;
+    int r = radius;
+    unsigned int layer_offset = layer * width * height;
+
+    int tile_w = blockDim.x + 2 * r;
+    int tile_h = blockDim.y + 2 * r;
+    int total_smem_elems = tile_w * tile_h;
+
+    for (int i = tid; i < total_smem_elems; i += num_threads) {
+        int smem_y = i / tile_w;
+        int smem_x = i % tile_w;
+        int gx = bx - r + smem_x;
+        int gy = by - r + smem_y;
+        if (gx >= 0 && gx < w && gy >= 0 && gy < h) {
+            s_tile[i] = obstacles[layer_offset + (unsigned int)(gy * w + gx)];
+        } else {
+            s_tile[i] = 0u;
+        }
+    }
+
+    __syncthreads();
+
+    int gx = bx + tx;
+    int gy = by + ty;
+    if (gx >= w || gy >= h) {
+        return;
+    }
+
+    unsigned int idx = layer_offset + (unsigned int)(gy * w + gx);
+    int center_smem_idx = (ty + r) * tile_w + (tx + r);
+
+    if (s_tile[center_smem_idx] != 0u) {
+        dist_out[idx] = 0.0f;
+        return;
+    }
+
+    float min_d2 = (float)(r * r + 1);
+
+    for (int dy = -r; dy <= r; ++dy) {
+        int smem_row = (ty + r + dy) * tile_w;
+        for (int dx = -r; dx <= r; ++dx) {
+            if (s_tile[smem_row + (tx + r + dx)] != 0u) {
+                float d2 = (float)(dx * dx + dy * dy);
+                if (d2 < min_d2) {
+                    min_d2 = d2;
+                }
+            }
+        }
+    }
+
+    dist_out[idx] = sqrtf(min_d2);
+}
+
 // -----------------------------------------------------------------------------
 // 2. Batch Placement Evaluation Kernel
 // -----------------------------------------------------------------------------

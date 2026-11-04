@@ -1016,6 +1016,39 @@ impl VulkanEngine {
         result
     }
 
+    pub fn compute_distance_field_layers(
+        &self,
+        obstacles_flat: &[u32],
+        width: u32,
+        height: u32,
+        num_layers: u32,
+        radius: i32,
+    ) -> Option<Vec<f32>> {
+        let layer_cells = (width * height) as usize;
+        let total = layer_cells * (num_layers as usize);
+        if obstacles_flat.len() != total || total == 0 || num_layers == 0 {
+            return None;
+        }
+
+        if self.backend_kind == GpuBackendKind::CudaPtx {
+            if let Some(cuda) = &self.cuda_engine {
+                if let Some(res) = cuda.compute_distance_field_layers(obstacles_flat, width, height, num_layers, radius) {
+                    self.compute_busy_ns.fetch_add(cuda.compute_busy_ns.load(Ordering::Relaxed), Ordering::Relaxed);
+                    return Some(res);
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(total);
+        for l in 0..(num_layers as usize) {
+            let offset = l * layer_cells;
+            let df = self.compute_distance_field(&obstacles_flat[offset..offset + layer_cells], width, height, radius)?;
+            out.extend_from_slice(&df);
+        }
+        Some(out)
+    }
+
+
     pub fn evaluate_placement_batch(
         &self,
         boxes: &[[f32; 4]],

@@ -178,6 +178,13 @@ impl CudaDriverApi {
     }
 }
 
+struct PersistentDeviceBuffers {
+    d_obs: CUdeviceptr,
+    obs_cap_bytes: usize,
+    d_out: CUdeviceptr,
+    out_cap_bytes: usize,
+}
+
 pub struct CudaEngine {
     pub device_name: String,
     pub backend_name: String,
@@ -187,6 +194,7 @@ pub struct CudaEngine {
     ampere_module: CUmodule,
     fn_dist_field: CUfunction,
     fn_dist_field_tiled: CUfunction,
+    fn_dist_field_3d_tiled: CUfunction,
     fn_batch_placement: CUfunction,
     fn_gpu_sa_placer: CUfunction,
     pub fn_df_ampere: Option<CUfunction>,
@@ -194,6 +202,7 @@ pub struct CudaEngine {
     pub fn_bp_ampere: Option<CUfunction>,
     cuda: Arc<CudaDriverApi>,
     dispatch_lock: Mutex<()>,
+    persistent_buffers: Mutex<PersistentDeviceBuffers>,
     pub compute_busy_ns: Arc<AtomicU64>,
 }
 
@@ -213,6 +222,18 @@ impl Drop for CudaEngine {
     fn drop(&mut self) {
         unsafe {
             let _ = (self.cuda.cuCtxSetCurrent)(self.ctx);
+            if let Ok(mut bufs) = self.persistent_buffers.lock() {
+                if bufs.d_obs != 0 {
+                    let _ = (self.cuda.cuMemFree_v2)(bufs.d_obs);
+                    bufs.d_obs = 0;
+                    bufs.obs_cap_bytes = 0;
+                }
+                if bufs.d_out != 0 {
+                    let _ = (self.cuda.cuMemFree_v2)(bufs.d_out);
+                    bufs.d_out = 0;
+                    bufs.out_cap_bytes = 0;
+                }
+            }
             if !self.ampere_module.is_null() {
                 let _ = (self.cuda.cuModuleUnload)(self.ampere_module);
             }
@@ -315,16 +336,19 @@ impl CudaEngine {
 
             let mut fn_dist_field: CUfunction = ptr::null_mut();
             let mut fn_dist_field_tiled: CUfunction = ptr::null_mut();
+            let mut fn_dist_field_3d_tiled: CUfunction = ptr::null_mut();
             let mut fn_batch_placement: CUfunction = ptr::null_mut();
             let mut fn_gpu_sa_placer: CUfunction = ptr::null_mut();
 
             let c_df = CString::new("distance_field_kernel").unwrap();
             let c_dft = CString::new("distance_field_tiled_kernel").unwrap();
+            let c_df3d = CString::new("distance_field_3d_tiled_kernel").unwrap();
             let c_bp = CString::new("batch_placement_eval_kernel").unwrap();
             let c_sa = CString::new("gpu_sa_placer_kernel").unwrap();
 
             if (api.cuModuleGetFunction)(&mut fn_dist_field, module, c_df.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_dist_field_tiled, module, c_dft.as_ptr()) != CUDA_SUCCESS
+                || (api.cuModuleGetFunction)(&mut fn_dist_field_3d_tiled, module, c_df3d.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_batch_placement, module, c_bp.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_gpu_sa_placer, module, c_sa.as_ptr()) != CUDA_SUCCESS
             {
@@ -370,6 +394,7 @@ impl CudaEngine {
                 ampere_module,
                 fn_dist_field,
                 fn_dist_field_tiled,
+                fn_dist_field_3d_tiled,
                 fn_batch_placement,
                 fn_gpu_sa_placer,
                 fn_df_ampere,
@@ -377,9 +402,46 @@ impl CudaEngine {
                 fn_bp_ampere,
                 cuda: api,
                 dispatch_lock: Mutex::new(()),
+                persistent_buffers: Mutex::new(PersistentDeviceBuffers {
+                    d_obs: 0,
+                    obs_cap_bytes: 0,
+                    d_out: 0,
+                    out_cap_bytes: 0,
+                }),
                 compute_busy_ns: Arc::new(AtomicU64::new(0)),
             }))
         }
+    }
+
+    unsafe fn ensure_persistent_buffers(&self, in_bytes: usize, out_bytes: usize) -> Option<(CUdeviceptr, CUdeviceptr)> {
+        let mut bufs = self.persistent_buffers.lock().ok()?;
+        if bufs.obs_cap_bytes < in_bytes || bufs.d_obs == 0 {
+            if bufs.d_obs != 0 {
+                let _ = (self.cuda.cuMemFree_v2)(bufs.d_obs);
+                bufs.d_obs = 0;
+                bufs.obs_cap_bytes = 0;
+            }
+            let mut new_obs: CUdeviceptr = 0;
+            if (self.cuda.cuMemAlloc_v2)(&mut new_obs, in_bytes) != CUDA_SUCCESS {
+                return None;
+            }
+            bufs.d_obs = new_obs;
+            bufs.obs_cap_bytes = in_bytes;
+        }
+        if bufs.out_cap_bytes < out_bytes || bufs.d_out == 0 {
+            if bufs.d_out != 0 {
+                let _ = (self.cuda.cuMemFree_v2)(bufs.d_out);
+                bufs.d_out = 0;
+                bufs.out_cap_bytes = 0;
+            }
+            let mut new_out: CUdeviceptr = 0;
+            if (self.cuda.cuMemAlloc_v2)(&mut new_out, out_bytes) != CUDA_SUCCESS {
+                return None;
+            }
+            bufs.d_out = new_out;
+            bufs.out_cap_bytes = out_bytes;
+        }
+        Some((bufs.d_obs, bufs.d_out))
     }
 
     pub fn compute_distance_field(&self, obstacles: &[u32], width: u32, height: u32, radius: i32) -> Option<Vec<f32>> {
@@ -405,22 +467,11 @@ impl CudaEngine {
             let in_bytes = total * std::mem::size_of::<u32>();
             let out_bytes = total * std::mem::size_of::<f32>();
 
-            let mut d_obs: CUdeviceptr = 0;
-            let mut d_out: CUdeviceptr = 0;
-
-            if (self.cuda.cuMemAlloc_v2)(&mut d_obs, in_bytes) != CUDA_SUCCESS {
-                return None;
-            }
-            if (self.cuda.cuMemAlloc_v2)(&mut d_out, out_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_obs);
-                return None;
-            }
+            let (mut d_obs, mut d_out) = self.ensure_persistent_buffers(in_bytes, out_bytes)?;
 
             let start_t = Instant::now();
 
             if (self.cuda.cuMemcpyHtoD_v2)(d_obs, obstacles.as_ptr() as *const c_void, in_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_obs);
-                let _ = (self.cuda.cuMemFree_v2)(d_out);
                 return None;
             }
 
@@ -478,25 +529,18 @@ impl CudaEngine {
                     ptr::null_mut(),
                 ) != CUDA_SUCCESS
                 {
-                    let _ = (self.cuda.cuMemFree_v2)(d_obs);
-                    let _ = (self.cuda.cuMemFree_v2)(d_out);
                     return None;
                 }
             }
 
             let mut result = vec![0.0f32; total];
             if (self.cuda.cuMemcpyDtoH_v2)(result.as_mut_ptr() as *mut c_void, d_out, out_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_obs);
-                let _ = (self.cuda.cuMemFree_v2)(d_out);
                 return None;
             }
 
             let _ = (self.cuda.cuCtxSynchronize)();
             let elapsed_ns = start_t.elapsed().as_nanos() as u64;
             self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-
-            let _ = (self.cuda.cuMemFree_v2)(d_obs);
-            let _ = (self.cuda.cuMemFree_v2)(d_out);
 
             Some(result)
         }
@@ -527,22 +571,11 @@ impl CudaEngine {
             let in_bytes = total * std::mem::size_of::<u32>();
             let out_bytes = total * std::mem::size_of::<f32>();
 
-            let mut d_obs: CUdeviceptr = 0;
-            let mut d_out: CUdeviceptr = 0;
-
-            if (self.cuda.cuMemAlloc_v2)(&mut d_obs, in_bytes) != CUDA_SUCCESS {
-                return None;
-            }
-            if (self.cuda.cuMemAlloc_v2)(&mut d_out, out_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_obs);
-                return None;
-            }
+            let (mut d_obs, mut d_out) = self.ensure_persistent_buffers(in_bytes, out_bytes)?;
 
             let start_t = Instant::now();
 
             if (self.cuda.cuMemcpyHtoD_v2)(d_obs, obstacles.as_ptr() as *const c_void, in_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_obs);
-                let _ = (self.cuda.cuMemFree_v2)(d_out);
                 return None;
             }
 
@@ -594,16 +627,12 @@ impl CudaEngine {
                     ptr::null_mut(),
                 ) != CUDA_SUCCESS
                 {
-                    let _ = (self.cuda.cuMemFree_v2)(d_obs);
-                    let _ = (self.cuda.cuMemFree_v2)(d_out);
                     return None;
                 }
             }
 
             let mut result = vec![0.0f32; total];
             if (self.cuda.cuMemcpyDtoH_v2)(result.as_mut_ptr() as *mut c_void, d_out, out_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_obs);
-                let _ = (self.cuda.cuMemFree_v2)(d_out);
                 return None;
             }
 
@@ -611,12 +640,113 @@ impl CudaEngine {
             let elapsed_ns = start_t.elapsed().as_nanos() as u64;
             self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
 
-            let _ = (self.cuda.cuMemFree_v2)(d_obs);
-            let _ = (self.cuda.cuMemFree_v2)(d_out);
+            Some(result)
+        }
+    }
+
+    pub fn compute_distance_field_layers(
+        &self,
+        obstacles_flat: &[u32],
+        width: u32,
+        height: u32,
+        num_layers: u32,
+        radius: i32,
+    ) -> Option<Vec<f32>> {
+        self.compute_distance_field_batch_layers(obstacles_flat, width, height, num_layers, radius)
+    }
+
+    pub fn compute_distance_field_batch_layers(
+        &self,
+        obstacles_flat: &[u32],
+        width: u32,
+        height: u32,
+        num_layers: u32,
+        radius: i32,
+    ) -> Option<Vec<f32>> {
+        let layer_cells = (width * height) as usize;
+        let total = layer_cells * (num_layers as usize);
+        if obstacles_flat.len() != total || total == 0 || num_layers == 0 {
+            return None;
+        }
+
+        let _guard = self.dispatch_lock.lock().ok()?;
+        unsafe {
+            let _ = (self.cuda.cuCtxSetCurrent)(self.ctx);
+            let in_bytes = total * std::mem::size_of::<u32>();
+            let out_bytes = total * std::mem::size_of::<f32>();
+
+            let (mut d_obs, mut d_out) = self.ensure_persistent_buffers(in_bytes, out_bytes)?;
+
+            let start_t = Instant::now();
+
+            if (self.cuda.cuMemcpyHtoD_v2)(d_obs, obstacles_flat.as_ptr() as *const c_void, in_bytes) != CUDA_SUCCESS {
+                return None;
+            }
+
+            let block_x: c_uint = 16;
+            let block_y: c_uint = 16;
+            let grid_x: c_uint = (width + block_x - 1) / block_x;
+            let grid_y: c_uint = (height + block_y - 1) / block_y;
+            let grid_z: c_uint = num_layers;
+
+            let tile_w = block_x as i32 + 2 * radius;
+            let tile_h = block_y as i32 + 2 * radius;
+            let smem_bytes = (tile_w * tile_h * 4) as c_uint;
+
+            let passes = if layer_cells >= 4096 && radius > 12 {
+                16
+            } else if layer_cells >= 4096 {
+                4
+            } else {
+                1
+            };
+
+            let mut w_arg = width;
+            let mut h_arg = height;
+            let mut l_arg = num_layers;
+            let mut r_arg = radius;
+
+            let mut args = [
+                &mut d_obs as *mut _ as *mut c_void,
+                &mut d_out as *mut _ as *mut c_void,
+                &mut w_arg as *mut _ as *mut c_void,
+                &mut h_arg as *mut _ as *mut c_void,
+                &mut l_arg as *mut _ as *mut c_void,
+                &mut r_arg as *mut _ as *mut c_void,
+            ];
+
+            for _ in 0..passes {
+                if (self.cuda.cuLaunchKernel)(
+                    self.fn_dist_field_3d_tiled,
+                    grid_x,
+                    grid_y,
+                    grid_z,
+                    block_x,
+                    block_y,
+                    1,
+                    smem_bytes,
+                    ptr::null_mut(),
+                    args.as_mut_ptr(),
+                    ptr::null_mut(),
+                ) != CUDA_SUCCESS
+                {
+                    return None;
+                }
+            }
+
+            let mut result = vec![0.0f32; total];
+            if (self.cuda.cuMemcpyDtoH_v2)(result.as_mut_ptr() as *mut c_void, d_out, out_bytes) != CUDA_SUCCESS {
+                return None;
+            }
+
+            let _ = (self.cuda.cuCtxSynchronize)();
+            let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+            self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
 
             Some(result)
         }
     }
+
 
     pub fn evaluate_placement_ampere(
         &self,
@@ -1178,4 +1308,112 @@ mod tests {
         }
         assert!(!devs.is_empty());
     }
+
+    #[test]
+    fn test_cuda_persistent_vram_buffer_reuse() {
+        let cuda = match CudaEngine::new() {
+            Some(c) => c,
+            None => return,
+        };
+
+        // 1. First dispatch (32x32) allocates initial persistent VRAM buffers
+        let mut obs_32 = vec![0u32; 32 * 32];
+        obs_32[10 * 32 + 10] = 1;
+        let df_32 = cuda.compute_distance_field(&obs_32, 32, 32, 12).expect("32x32 df");
+        assert_eq!(df_32[10 * 32 + 10], 0.0);
+        assert!((df_32[10 * 32 + 15] - 5.0).abs() < 1e-4);
+
+        let (ptr_32_obs, cap_32_obs, ptr_32_out, cap_32_out) = {
+            let b = cuda.persistent_buffers.lock().unwrap();
+            (b.d_obs, b.obs_cap_bytes, b.d_out, b.out_cap_bytes)
+        };
+        assert_ne!(ptr_32_obs, 0);
+        assert_ne!(ptr_32_out, 0);
+        assert_eq!(cap_32_obs, 32 * 32 * 4);
+        assert_eq!(cap_32_out, 32 * 32 * 4);
+
+        // 2. Smaller dispatch (16x16) must reuse the exact same VRAM pointers and capacity
+        let mut obs_16 = vec![0u32; 16 * 16];
+        obs_16[4 * 16 + 4] = 1;
+        let df_16 = cuda.compute_distance_field(&obs_16, 16, 16, 8).expect("16x16 df");
+        assert_eq!(df_16[4 * 16 + 4], 0.0);
+        assert!((df_16[4 * 16 + 7] - 3.0).abs() < 1e-4);
+
+        {
+            let b = cuda.persistent_buffers.lock().unwrap();
+            assert_eq!(b.d_obs, ptr_32_obs, "Persistent d_obs must be reused for smaller grid");
+            assert_eq!(b.d_out, ptr_32_out, "Persistent d_out must be reused for smaller grid");
+            assert_eq!(b.obs_cap_bytes, cap_32_obs);
+            assert_eq!(b.out_cap_bytes, cap_32_out);
+        }
+
+        // 3. Larger dispatch (64x64) grows capacity cleanly and subsequent 64x64 calls reuse it
+        let mut obs_64 = vec![0u32; 64 * 64];
+        obs_64[20 * 64 + 20] = 1;
+        let df_64_a = cuda.compute_distance_field(&obs_64, 64, 64, 12).expect("64x64 df A");
+        let (ptr_64_obs, cap_64_obs, ptr_64_out, cap_64_out) = {
+            let b = cuda.persistent_buffers.lock().unwrap();
+            (b.d_obs, b.obs_cap_bytes, b.d_out, b.out_cap_bytes)
+        };
+        assert_eq!(cap_64_obs, 64 * 64 * 4);
+        assert_eq!(cap_64_out, 64 * 64 * 4);
+
+        let df_64_b = cuda.compute_distance_field(&obs_64, 64, 64, 12).expect("64x64 df B");
+        {
+            let b = cuda.persistent_buffers.lock().unwrap();
+            assert_eq!(b.d_obs, ptr_64_obs, "Persistent d_obs must be reused on equal size");
+            assert_eq!(b.d_out, ptr_64_out, "Persistent d_out must be reused on equal size");
+        }
+        assert_eq!(df_64_a, df_64_b);
+    }
+
+    #[test]
+    fn test_cuda_3d_multi_layer_batch_distance_field() {
+        let cuda = match CudaEngine::new() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let w = 24u32;
+        let h = 20u32;
+        let num_layers = 4u32;
+        let radius = 12i32;
+        let layer_cells = (w * h) as usize;
+
+        let mut obstacles_flat = vec![0u32; layer_cells * (num_layers as usize)];
+        // Place distinct obstacle coordinates on each of the 4 layers
+        let layer_coords = [(3usize, 4usize), (10, 8), (18, 15), (6, 12)];
+        for (layer, &(ox, oy)) in layer_coords.iter().enumerate() {
+            obstacles_flat[layer * layer_cells + oy * (w as usize) + ox] = 1;
+            // Add a second obstacle on each layer
+            let ox2 = (ox + 5) % (w as usize);
+            let oy2 = (oy + 3) % (h as usize);
+            obstacles_flat[layer * layer_cells + oy2 * (w as usize) + ox2] = 1;
+        }
+
+        let batch_df = cuda
+            .compute_distance_field_layers(&obstacles_flat, w, h, num_layers, radius)
+            .expect("3D batched multi-layer distance field");
+        assert_eq!(batch_df.len(), layer_cells * (num_layers as usize));
+
+        for layer in 0..(num_layers as usize) {
+            let offset = layer * layer_cells;
+            let single_df = cuda
+                .compute_distance_field(&obstacles_flat[offset..offset + layer_cells], w, h, radius)
+                .expect("Single-layer distance field");
+            for i in 0..layer_cells {
+                let diff = (batch_df[offset + i] - single_df[i]).abs();
+                assert!(
+                    diff < 1e-4,
+                    "Layer {} cell {} mismatch: batch={} single={} (diff={})",
+                    layer,
+                    i,
+                    batch_df[offset + i],
+                    single_df[i],
+                    diff
+                );
+            }
+        }
+    }
 }
+

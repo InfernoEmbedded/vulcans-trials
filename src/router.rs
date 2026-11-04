@@ -412,13 +412,13 @@ impl RoutingGrid {
         let layer_cells = self.width * self.height;
         if let Some(ref vk) = self.vulkan {
             let engines = vk.all_engines();
-            if engines.len() > 1 && self.num_layers > 1 {
-                let num_engines = engines.len();
-                let w = self.width as u32;
-                let h = self.height as u32;
-                let res = self.res as f32;
-                let num_layers = self.num_layers;
+            let w = self.width as u32;
+            let h = self.height as u32;
+            let res = self.res as f32;
+            let num_layers = self.num_layers;
 
+            if engines.len() > 1 && num_layers > 1 {
+                let num_engines = engines.len();
                 let mut layer_obs: Vec<Vec<u32>> = Vec::with_capacity(num_layers);
                 for layer in 0..num_layers {
                     let offset = layer * layer_cells;
@@ -436,17 +436,22 @@ impl RoutingGrid {
                         let assigned_layers: Vec<usize> = (0..num_layers)
                             .filter(|&l| l % num_engines == eng_idx)
                             .collect();
+                        if assigned_layers.is_empty() {
+                            continue;
+                        }
                         let eng_ref = Arc::clone(engine);
-                        let obs_refs: Vec<(usize, Vec<u32>)> = assigned_layers
-                            .into_iter()
-                            .map(|l| (l, layer_obs[l].clone()))
-                            .collect();
+                        let mut flat_obs = Vec::with_capacity(assigned_layers.len() * layer_cells);
+                        for &l in &assigned_layers {
+                            flat_obs.extend_from_slice(&layer_obs[l]);
+                        }
 
                         handles.push(scope.spawn(move || {
                             let mut results = Vec::new();
-                            for (l, obs) in obs_refs {
-                                if let Some(df) = eng_ref.compute_distance_field(&obs, w, h, 12) {
-                                    results.push((l, df));
+                            let sub_layers = assigned_layers.len() as u32;
+                            if let Some(batch_df) = eng_ref.compute_distance_field_layers(&flat_obs, w, h, sub_layers, 12) {
+                                for (i, &l) in assigned_layers.iter().enumerate() {
+                                    let off = i * layer_cells;
+                                    results.push((l, batch_df[off..off + layer_cells].to_vec()));
                                 }
                             }
                             results
@@ -469,22 +474,21 @@ impl RoutingGrid {
                         }
                     }
                 }
-            } else {
-                for layer in 0..self.num_layers {
-                    let offset = layer * layer_cells;
-                    let obs: Vec<u32> = self.obstacle_net_ids[offset..offset + layer_cells]
-                        .iter()
-                        .map(|&n| if n != FREE_NET { 1u32 } else { 0u32 })
-                        .collect();
-                    if let Some(df) = vk.compute_distance_field(&obs, self.width as u32, self.height as u32, 12) {
-                        for (dst, &val) in self.dist_field[offset..offset + layer_cells].iter_mut().zip(df.iter()) {
-                            *dst = val * (self.res as f32);
-                        }
+            } else if num_layers > 0 {
+                let total_cells = num_layers * layer_cells;
+                let obs_flat: Vec<u32> = self.obstacle_net_ids[..total_cells]
+                    .iter()
+                    .map(|&n| if n != FREE_NET { 1u32 } else { 0u32 })
+                    .collect();
+                if let Some(batch_df) = vk.compute_distance_field_layers(&obs_flat, w, h, num_layers as u32, 12) {
+                    for (dst, &val) in self.dist_field[..total_cells].iter_mut().zip(batch_df.iter()) {
+                        *dst = val * res;
                     }
                 }
             }
         }
     }
+
 
     pub fn get_neighbors(
         &self,
@@ -9108,6 +9112,7 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid) -> bool {
                     .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
                     .sum();
 
+                let clearance = board.get_netclass_for_net(net_id).clearance;
                 let mut winner_path = None;
 
                 // Priority 1: Direct segment on l_orig (strictly octilinear 0°, 45°, 90°)
@@ -9116,6 +9121,7 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid) -> bool {
                     && direct_len <= orig_len * 1.25 + 1e-4
                     && (direct_len - orig_len) <= 5.0 + 1e-4
                     && is_segment_clear(board, Some(grid), v1_pos, v2_pos, l_orig, net_id, track_width)
+                    && is_track_segment_legal(board, v1_pos, v2_pos, track_width, l_orig, net_id, clearance)
                 {
                     winner_path = Some(vec![v1_pos, v2_pos]);
                 }
@@ -9124,7 +9130,10 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid) -> bool {
                 if winner_path.is_none() {
                     let all_clear = chain_pts
                         .windows(2)
-                        .all(|w| is_segment_clear(board, Some(grid), w[0], w[1], l_orig, net_id, track_width));
+                        .all(|w| {
+                            is_segment_clear(board, Some(grid), w[0], w[1], l_orig, net_id, track_width)
+                                && is_track_segment_legal(board, w[0], w[1], track_width, l_orig, net_id, clearance)
+                        });
                     if all_clear {
                         winner_path = Some(chain_pts.clone());
                     }
@@ -9150,6 +9159,8 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid) -> bool {
                             if budget_ok
                                 && is_segment_clear(board, Some(grid), v1_pos, c, l_orig, net_id, track_width)
                                 && is_segment_clear(board, Some(grid), c, v2_pos, l_orig, net_id, track_width)
+                                && is_track_segment_legal(board, v1_pos, c, track_width, l_orig, net_id, clearance)
+                                && is_track_segment_legal(board, c, v2_pos, track_width, l_orig, net_id, clearance)
                             {
                                 winner_path = Some(vec![v1_pos, c, v2_pos]);
                                 break;
@@ -9874,6 +9885,16 @@ fn slide_and_align_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
             .collect();
 
         if incident.is_empty() {
+            continue;
+        }
+
+        let has_off_center_touch = board.tracks.iter().any(|t| {
+            t.net_id == net_id
+                && (t.start.0 - v_pos.0).hypot(t.start.1 - v_pos.1) >= 1e-4
+                && (t.end.0 - v_pos.0).hypot(t.end.1 - v_pos.1) >= 1e-4
+                && dist_point_to_segment(v_pos, t.start, t.end) <= via_size * 0.5 + 0.05
+        });
+        if has_off_center_touch {
             continue;
         }
 
