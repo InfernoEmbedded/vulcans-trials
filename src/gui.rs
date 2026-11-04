@@ -30,6 +30,9 @@ pub const COL_RATSNEST: Color32 = Color32::from_rgb(0x00, 0xF8, 0xFF);
 // Keepout: Color32::from_rgba_unmultiplied(255, 0, 5, 128) (#FF000580)
 pub const COL_KEEPOUT: Color32 = Color32::from_rgba_premultiplied(0xBC, 0x00, 0x03, 0x80);
 pub const COL_CANVAS_BG: Color32 = Color32::from_rgb(0x00, 0x10, 0x23);
+pub const COL_HIGHLIGHT_FILL: Color32 = Color32::from_rgb(255, 245, 140);
+pub const COL_HIGHLIGHT_HALO: Color32 = Color32::from_rgba_premultiplied(160, 138, 25, 160);
+pub const COL_HIGHLIGHT_RING: Color32 = Color32::WHITE;
 
 /// Canvas copper draw order for standard 4-layer boards (KiCad: B.Cu, inner layers, F.Cu).
 pub const COPPER_DRAW_ORDER: [&str; 4] = ["B.Cu", "In2.Cu", "In1.Cu", "F.Cu"];
@@ -376,6 +379,7 @@ pub struct VulcansTrialsApp {
     pub show_refs: bool,
     pub show_holding_palette: bool,
     pub selected_net: Option<String>,
+    pub selected_net_id: Option<usize>,
     pub moving_footprint: Option<MovingFootprint>,
     pub hovered_footprint: Option<usize>,
     pub active_route: Option<ActiveRoute>,
@@ -451,6 +455,7 @@ impl VulcansTrialsApp {
             show_refs: true,
             show_holding_palette: true,
             selected_net: None,
+            selected_net_id: None,
             moving_footprint: None,
             hovered_footprint: None,
             active_route: None,
@@ -815,24 +820,210 @@ impl VulcansTrialsApp {
         }
     }
 
+    pub fn resolve_net_name(board: &Board, net_id: usize) -> String {
+        if net_id == 0 {
+            return String::new();
+        }
+        if let Some(name) = board.nets.get(net_id) {
+            if !name.is_empty() {
+                return name.clone();
+            }
+        }
+        for (name, &id) in &board.net_name_to_id {
+            if id == net_id && !name.is_empty() {
+                return name.clone();
+            }
+        }
+        for fp in &board.footprints {
+            for pad in &fp.pads {
+                if pad.net_id == net_id && !pad.net_name.is_empty() {
+                    return pad.net_name.clone();
+                }
+            }
+        }
+        format!("Net#{}", net_id)
+    }
+
+    pub fn selected_net_id(&self, board: &Board) -> Option<usize> {
+        if let Some(ref name) = self.selected_net {
+            if name.is_empty() {
+                return None;
+            }
+            if let Some(&id) = board.net_name_to_id.get(name) {
+                if id > 0 {
+                    return Some(id);
+                }
+            }
+            if let Some(id) = board.nets.iter().position(|n| n == name) {
+                if id > 0 {
+                    return Some(id);
+                }
+            }
+            for fp in &board.footprints {
+                for pad in &fp.pads {
+                    if &pad.net_name == name && pad.net_id > 0 {
+                        return Some(pad.net_id);
+                    }
+                }
+            }
+            if let Some(num_str) = name.strip_prefix("Net#") {
+                if let Ok(id) = num_str.parse::<usize>() {
+                    if id > 0 {
+                        return Some(id);
+                    }
+                }
+            }
+            return self.selected_net_id.filter(|&id| id > 0);
+        }
+        self.selected_net_id.filter(|&id| id > 0)
+    }
+
+    pub fn is_net_id_highlighted(&self, board: &Board, net_id: usize) -> bool {
+        net_id > 0 && self.selected_net_id(board) == Some(net_id)
+    }
+
+    pub fn is_pad_highlighted(&self, board: &Board, pad: &crate::board::Pad) -> bool {
+        if self.is_net_id_highlighted(board, pad.net_id) {
+            return true;
+        }
+        self.selected_net
+            .as_ref()
+            .is_some_and(|sn| !sn.is_empty() && sn == &pad.net_name)
+    }
+
+    pub fn is_track_highlighted(&self, board: &Board, tr: &TrackSegment) -> bool {
+        self.is_net_id_highlighted(board, tr.net_id)
+            && self.is_layer_visible(board.layer_name(tr.layer))
+    }
+
+    pub fn is_via_highlighted(&self, board: &Board, via: &Via) -> bool {
+        self.show_vias && self.is_net_id_highlighted(board, via.net_id)
+    }
+
+    pub fn is_ratsnest_highlighted(&self, board: &Board, seg: &crate::board::Segment) -> bool {
+        self.show_ratsnest && self.is_net_id_highlighted(board, seg.net_id)
+    }
+
+    /// Hit-tests pads, vias, and routed trace segments at `world_pos` (mm) on visible layers,
+    /// returning `Some((net_id, net_name))` for the clicked net element.
+    pub fn hit_test_net_at_world(&self, board: &Board, world_pos: Point) -> Option<(usize, String)> {
+        // 1. Pads
+        for fp in &board.footprints {
+            let fp_layer_name = board.layer_name(fp.layer);
+            for pad in &fp.pads {
+                if !pad.is_through_hole && !self.is_layer_visible(fp_layer_name) {
+                    continue;
+                }
+                if is_world_point_in_pad(fp, pad, world_pos) {
+                    let net_id = if pad.net_id != 0 {
+                        pad.net_id
+                    } else {
+                        board.net_name_to_id.get(&pad.net_name).copied().unwrap_or(0)
+                    };
+                    let net_name = if !pad.net_name.is_empty() {
+                        pad.net_name.clone()
+                    } else {
+                        Self::resolve_net_name(board, net_id)
+                    };
+                    if net_id > 0 || !net_name.is_empty() {
+                        return Some((net_id, net_name));
+                    }
+                }
+            }
+        }
+
+        // 2. Vias
+        if self.show_vias {
+            let min_pick_r = 0.25 / (self.zoom as f64).max(0.25);
+            let mut best_via: Option<(usize, f64)> = None;
+            for via in &board.vias {
+                if via.net_id == 0 {
+                    continue;
+                }
+                if let Some(d) = hit_test_via_world(via, world_pos, min_pick_r) {
+                    if best_via.map_or(true, |(_, best_d)| d < best_d) {
+                        best_via = Some((via.net_id, d));
+                    }
+                }
+            }
+            if let Some((net_id, _)) = best_via {
+                return Some((net_id, Self::resolve_net_name(board, net_id)));
+            }
+        }
+
+        // 3. Routed traces (tracks and arcs) on visible layers
+        let mut best_trace: Option<(usize, f64)> = None;
+        for tr in &board.tracks {
+            if tr.net_id == 0 || !self.is_layer_visible(board.layer_name(tr.layer)) {
+                continue;
+            }
+            if let Some(d) = hit_test_track_world(tr, world_pos, self.zoom) {
+                if best_trace.map_or(true, |(_, best_d)| d < best_d) {
+                    best_trace = Some((tr.net_id, d));
+                }
+            }
+        }
+        let arc_tol_base = 0.25 / (self.zoom as f64).max(0.25);
+        for arc in &board.arcs {
+            if arc.net_id == 0 || !self.is_layer_visible(board.layer_name(arc.layer)) {
+                continue;
+            }
+            let d = arc.distance_to_point((world_pos.x, world_pos.y));
+            let tol = (arc.width * 0.5).max(arc_tol_base);
+            if d <= tol && best_trace.map_or(true, |(_, best_d)| d < best_d) {
+                best_trace = Some((arc.net_id, d));
+            }
+        }
+        if let Some((net_id, _)) = best_trace {
+            return Some((net_id, Self::resolve_net_name(board, net_id)));
+        }
+
+        None
+    }
+
     pub fn handle_canvas_click_at(&mut self, rect: Rect, click_pos: Pos2) -> Option<String> {
-        let (clicked_pad, clicked_fp_body) = {
+        let (clicked_pad, clicked_copper_net, clicked_fp_body) = {
             let g = self.live.lock().unwrap();
             let b = &g.board;
+            let world_pos = self.screen_to_board(b, rect, click_pos);
+
             // 1. First check if any pad was clicked
-            let mut found_pad: Option<(usize, usize, String)> = None;
+            let mut found_pad: Option<(usize, usize, usize, String)> = None;
             'outer: for (fp_idx, fp) in b.footprints.iter().enumerate() {
+                let fp_layer_name = b.layer_name(fp.layer);
                 for (p_idx, pad) in fp.pads.iter().enumerate() {
-                    if self.is_point_in_pad(b, rect, fp, pad, click_pos) {
-                        found_pad = Some((fp_idx, p_idx, pad.net_name.clone()));
+                    if !pad.is_through_hole && !self.is_layer_visible(fp_layer_name) {
+                        continue;
+                    }
+                    if self.is_point_in_pad(b, rect, fp, pad, click_pos)
+                        || is_world_point_in_pad(fp, pad, world_pos)
+                    {
+                        let net_id = if pad.net_id != 0 {
+                            pad.net_id
+                        } else {
+                            b.net_name_to_id.get(&pad.net_name).copied().unwrap_or(0)
+                        };
+                        let net_name = if !pad.net_name.is_empty() {
+                            pad.net_name.clone()
+                        } else {
+                            Self::resolve_net_name(b, net_id)
+                        };
+                        found_pad = Some((fp_idx, p_idx, net_id, net_name));
                         break 'outer;
                     }
                 }
             }
 
-            // 2. If no pad was clicked, check if a footprint body was clicked
+            // 2. If no pad was clicked, check if a via or routed trace segment was clicked
+            let found_copper_net = if found_pad.is_none() {
+                self.hit_test_net_at_world(b, world_pos)
+            } else {
+                None
+            };
+
+            // 3. If no pad, via, or trace was clicked, check if a footprint body was clicked
             let mut found_fp: Option<usize> = None;
-            if found_pad.is_none() {
+            if found_pad.is_none() && found_copper_net.is_none() {
                 let mut best_idx: Option<(usize, f32, f32)> = None;
                 for (idx, fp) in b.footprints.iter().enumerate() {
                     let fp_rect = self.footprint_screen_rect(b, rect, fp);
@@ -848,36 +1039,68 @@ impl VulcansTrialsApp {
                 }
                 found_fp = best_idx.map(|(i, _, _)| i);
             }
-            (found_pad, found_fp)
+            (found_pad, found_copper_net, found_fp)
         };
 
-        if let Some((fp_idx, pad_idx, net_name)) = clicked_pad {
+        if let Some((fp_idx, pad_idx, 0, ref net_name)) = clicked_pad {
             if net_name.is_empty() {
                 self.selected_net = None;
+                self.selected_net_id = None;
                 let mut g = self.live.lock().unwrap();
                 let ref_des = g.board.footprints[fp_idx].reference.clone();
                 let pad_num = g.board.footprints[fp_idx].pads[pad_idx].number.clone();
                 g.push_log(format!("[Pad] {}.{} has no net assigned", ref_des, pad_num));
-                Some(format!("{}.{}", ref_des, pad_num))
-            } else if self.selected_net.as_deref() == Some(&net_name) {
-                // Toggle off highlighting if clicking pad on the already highlighted net
+                return Some(format!("{}.{}", ref_des, pad_num));
+            }
+        }
+
+        if let Some((net_id, net_name)) = clicked_pad
+            .map(|(_, _, nid, nname)| (nid, nname))
+            .or(clicked_copper_net)
+        {
+            let already_selected = {
+                let g = self.live.lock().unwrap();
+                (net_id > 0 && self.is_net_id_highlighted(&g.board, net_id))
+                    || (!net_name.is_empty() && self.selected_net.as_deref() == Some(net_name.as_str()))
+            };
+            if already_selected {
+                // Toggle off highlighting if clicking any pad, via, or trace on the already highlighted net
                 self.selected_net = None;
+                self.selected_net_id = None;
                 let mut g = self.live.lock().unwrap();
                 g.push_log(format!("[Highlight] Cleared net highlight for \"{}\"", net_name));
                 Some(format!("Cleared {}", net_name))
             } else {
                 self.selected_net = Some(net_name.clone());
+                self.selected_net_id = if net_id > 0 { Some(net_id) } else { None };
                 let mut g = self.live.lock().unwrap();
-                let count = g
+                let pad_count = g
                     .board
                     .footprints
                     .iter()
                     .flat_map(|f| &f.pads)
-                    .filter(|p| p.net_name == net_name)
+                    .filter(|p| (net_id > 0 && p.net_id == net_id) || (!net_name.is_empty() && p.net_name == net_name))
+                    .count();
+                let trace_count = g
+                    .board
+                    .tracks
+                    .iter()
+                    .filter(|t| net_id > 0 && t.net_id == net_id)
+                    .count()
+                    + g.board
+                        .arcs
+                        .iter()
+                        .filter(|a| net_id > 0 && a.net_id == net_id)
+                        .count();
+                let via_count = g
+                    .board
+                    .vias
+                    .iter()
+                    .filter(|v| net_id > 0 && v.net_id == net_id)
                     .count();
                 g.push_log(format!(
-                    "[Highlight] Net \"{}\" selected: {} connected pads highlighted",
-                    net_name, count
+                    "[Highlight] Net \"{}\" selected: {} connected pads, {} traces, {} vias highlighted",
+                    net_name, pad_count, trace_count, via_count
                 ));
                 Some(format!("Net: {}", net_name))
             }
@@ -898,8 +1121,9 @@ impl VulcansTrialsApp {
             Some(format!("{}: {}", r, if locked { "LOCKED" } else { "UNLOCKED" }))
         } else {
             // Clicking empty canvas clears selected net highlight
-            if self.selected_net.is_some() {
+            if self.selected_net.is_some() || self.selected_net_id.is_some() {
                 self.selected_net = None;
+                self.selected_net_id = None;
                 let mut g = self.live.lock().unwrap();
                 g.push_log("[Highlight] Cleared net highlight".to_string());
             }
@@ -2466,6 +2690,36 @@ impl VulcansTrialsApp {
                 }
             }
 
+            // Highlighted routed traces (tracks & arcs) across all visible layers
+            for &layer_name in &draw_order {
+                if let Some(layer_idx) = copper_layers.iter().position(|&l| l == layer_name) {
+                    if self.is_layer_visible(layer_name) {
+                        for tr in &b.tracks {
+                            if tr.layer == layer_idx && self.is_track_highlighted(b, tr) {
+                                let p1 = to_screen(tr.start.0, tr.start.1);
+                                let p2 = to_screen(tr.end.0, tr.end.1);
+                                let w = ((tr.width as f32) * scale).max(1.5);
+                                draw_track_segment(&painter, p1, p2, w + 5.0, COL_HIGHLIGHT_HALO);
+                                draw_track_segment(&painter, p1, p2, w + 2.0, COL_HIGHLIGHT_RING);
+                                draw_track_segment(&painter, p1, p2, w, COL_HIGHLIGHT_FILL);
+                            }
+                        }
+                        for arc in &b.arcs {
+                            if arc.layer == layer_idx && self.is_net_id_highlighted(b, arc.net_id) {
+                                let w = ((arc.width as f32) * scale).max(1.5);
+                                for seg in arc.to_segments(16) {
+                                    let p1 = to_screen(seg.start.0, seg.start.1);
+                                    let p2 = to_screen(seg.end.0, seg.end.1);
+                                    draw_track_segment(&painter, p1, p2, w + 5.0, COL_HIGHLIGHT_HALO);
+                                    draw_track_segment(&painter, p1, p2, w + 2.0, COL_HIGHLIGHT_RING);
+                                    draw_track_segment(&painter, p1, p2, w, COL_HIGHLIGHT_FILL);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // 7. Draw Footprints, Courtyards, Rotated Pads, and Lock Icons
             for (idx, fp) in b.footprints.iter().enumerate() {
                 let fp_rect = self.footprint_screen_rect(b, rect, fp);
@@ -2475,15 +2729,12 @@ impl VulcansTrialsApp {
                 // Two passes: render SMD pads first, then through-hole pads (thermal vias) on top
                 for is_th in [false, true] {
                     for pad in fp.pads.iter().filter(|p| p.is_through_hole == is_th) {
-                        let is_highlighted = self
-                            .selected_net
-                            .as_ref()
-                            .map_or(false, |sn| !sn.is_empty() && sn == &pad.net_name);
+                        let is_highlighted = self.is_pad_highlighted(b, pad);
 
                         let (px, py) = fp.pad_absolute_position(pad);
                         let center = to_screen(px, py);
                         let pad_col = if is_highlighted {
-                            Color32::from_rgb(255, 245, 140)
+                            COL_HIGHLIGHT_FILL
                         } else if pad.is_through_hole {
                             COL_PAD_TH
                         } else if fp.layer == 1 {
@@ -2495,8 +2746,8 @@ impl VulcansTrialsApp {
                         if pad.shape == "circle" {
                             let r = ((pad.width.max(pad.height) as f32) * 0.5 * scale).max(1.0);
                             if is_highlighted {
-                                painter.circle_filled(center, r + 2.5, Color32::from_rgba_unmultiplied(255, 220, 40, 160));
-                                painter.circle_stroke(center, r + 3.0, Stroke::new(1.8_f32, Color32::WHITE));
+                                painter.circle_filled(center, r + 2.5, COL_HIGHLIGHT_HALO);
+                                painter.circle_stroke(center, r + 3.0, Stroke::new(1.8_f32, COL_HIGHLIGHT_RING));
                             }
                             painter.circle_filled(center, r, pad_col);
                         } else {
@@ -2507,8 +2758,8 @@ impl VulcansTrialsApp {
                                 let halo_pts: Vec<Pos2> = halo_poly.vertices.iter().map(|p| to_screen(p.x, p.y)).collect();
                                 painter.add(egui::Shape::convex_polygon(
                                     halo_pts.clone(),
-                                    Color32::from_rgba_unmultiplied(255, 220, 40, 160),
-                                    Stroke::new(1.8_f32, Color32::WHITE),
+                                    COL_HIGHLIGHT_HALO,
+                                    Stroke::new(1.8_f32, COL_HIGHLIGHT_RING),
                                 ));
                             }
                             painter.add(egui::Shape::convex_polygon(
@@ -2566,7 +2817,13 @@ impl VulcansTrialsApp {
                     let c = to_screen(v.position.0, v.position.1);
                     let outer_r = ((v.size as f32) * 0.5 * scale).max(2.5);
                     let inner_r = ((v.drill as f32) * 0.5 * scale).max(1.0);
-                    painter.circle_filled(c, outer_r, COL_VIA);
+                    if self.is_via_highlighted(b, v) {
+                        painter.circle_filled(c, outer_r + 2.5, COL_HIGHLIGHT_HALO);
+                        painter.circle_stroke(c, outer_r + 3.0, Stroke::new(1.8_f32, COL_HIGHLIGHT_RING));
+                        painter.circle_filled(c, outer_r, COL_HIGHLIGHT_FILL);
+                    } else {
+                        painter.circle_filled(c, outer_r, COL_VIA);
+                    }
                     painter.circle_filled(c, inner_r, Color32::from_rgb(25, 30, 35));
                 }
             }
@@ -2576,10 +2833,21 @@ impl VulcansTrialsApp {
                 for seg in &snap.ratsnest {
                     let p1 = to_screen(seg.p1.x, seg.p1.y);
                     let p2 = to_screen(seg.p2.x, seg.p2.y);
-                    painter.line_segment(
-                        [p1, p2],
-                        Stroke::new(0.8_f32, COL_RATSNEST),
-                    );
+                    if self.is_ratsnest_highlighted(b, seg) {
+                        painter.line_segment(
+                            [p1, p2],
+                            Stroke::new(3.2_f32, COL_HIGHLIGHT_HALO),
+                        );
+                        painter.line_segment(
+                            [p1, p2],
+                            Stroke::new(1.8_f32, COL_HIGHLIGHT_FILL),
+                        );
+                    } else {
+                        painter.line_segment(
+                            [p1, p2],
+                            Stroke::new(0.8_f32, COL_RATSNEST),
+                        );
+                    }
                 }
             }
 
@@ -2823,6 +3091,43 @@ pub fn draw_track_segment(painter: &egui::Painter, p1: Pos2, p2: Pos2, width: f3
     let r = width * 0.5;
     painter.circle_filled(p1, r, color);
     painter.circle_filled(p2, r, color);
+}
+
+/// Point-in-pad hit test in board world coordinates (mm).
+pub fn is_world_point_in_pad(fp: &crate::board::Footprint, pad: &crate::board::Pad, world_pos: Point) -> bool {
+    let (px, py) = fp.pad_absolute_position(pad);
+    if pad.shape == "circle" {
+        let r = (pad.width.max(pad.height) * 0.5).max(0.10);
+        world_pos.distance_to(&Point::new(px, py)) <= r
+    } else {
+        let corners = fp.pad_world_corners(pad);
+        Polygon::new(corners).contains_point(&world_pos)
+    }
+}
+
+/// Point-to-via hit test in board world coordinates (mm).
+pub fn hit_test_via_world(via: &Via, world_pos: Point, min_pick_radius_mm: f64) -> Option<f64> {
+    let dist = world_pos.distance_to(&Point::new(via.position.0, via.position.1));
+    let radius = (via.size * 0.5).max(min_pick_radius_mm);
+    if dist <= radius {
+        Some(dist)
+    } else {
+        None
+    }
+}
+
+/// Point-to-trace segment hit test in board world coordinates (mm).
+pub fn hit_test_track_world(seg: &TrackSegment, world_pos: Point, zoom: f32) -> Option<f64> {
+    let dist = world_pos.distance_to_segment(
+        &Point::new(seg.start.0, seg.start.1),
+        &Point::new(seg.end.0, seg.end.1),
+    );
+    let tol = (seg.width * 0.5).max(0.25 / (zoom as f64).max(0.25));
+    if dist <= tol {
+        Some(dist)
+    } else {
+        None
+    }
 }
 
 /// Renders a miniature scaled preview of a footprint's courtyards and pads inside a fixed-size rect.
@@ -4383,5 +4688,144 @@ mod tests {
         let _ = fs::remove_file(&in_path);
         let _ = fs::remove_file(&temp_pref_path);
     }
+
+    #[test]
+    fn test_hit_test_pad_via_and_trace_resolves_net_id() {
+        let in_path = format!("/tmp/vulcan_gui_hittest_net_{}.kicad_pcb", std::process::id());
+        let mut board = make_gui_test_board(&in_path);
+        let sig_id = board.net_name_to_id["SIG"];
+        let gnd_id = board.net_name_to_id["GND"];
+        board.tracks[0].net_id = sig_id;
+        board.tracks[1].net_id = sig_id;
+        board.vias[0].net_id = sig_id;
+        // Add a second net track (GND) on B.Cu and a GND via
+        board.tracks.push(TrackSegment {
+            start: (120.5, 115.0),
+            end: (125.0, 115.0),
+            width: 0.40,
+            layer: 1,
+            net_id: gnd_id,
+            is_locked: false,
+        });
+        board.vias.push(Via {
+            position: (125.0, 115.0),
+            size: 0.80,
+            drill: 0.40,
+            net_id: gnd_id,
+            is_locked: false,
+        });
+
+        let mut app = VulcansTrialsApp::new(in_path.clone(), String::new(), board.clone(), None);
+
+        // 1. Point-to-pad hit-testing (circle thru-hole pad J1.1 at 110.0, 115.0 -> "SIG", and rect SMD pad R10.2 at 120.5, 115.0 -> "GND")
+        assert!(is_world_point_in_pad(&board.footprints[0], &board.footprints[0].pads[0], Point::new(110.2, 115.0)));
+        assert!(!is_world_point_in_pad(&board.footprints[0], &board.footprints[0].pads[0], Point::new(111.0, 115.0)));
+        assert_eq!(app.hit_test_net_at_world(&board, Point::new(110.0, 115.0)), Some((sig_id, "SIG".to_string())));
+        assert_eq!(app.hit_test_net_at_world(&board, Point::new(120.5, 115.0)), Some((gnd_id, "GND".to_string())));
+
+        // 2. Point-to-via hit-testing (via at 115.0, 115.0 size 0.6 -> "SIG"; via at 125.0, 115.0 size 0.8 -> "GND")
+        assert!(hit_test_via_world(&board.vias[0], Point::new(115.25, 115.0), 0.25).is_some());
+        assert!(hit_test_via_world(&board.vias[0], Point::new(115.40, 115.0), 0.25).is_none());
+        assert_eq!(app.hit_test_net_at_world(&board, Point::new(115.0, 115.20)), Some((sig_id, "SIG".to_string())));
+        assert_eq!(app.hit_test_net_at_world(&board, Point::new(125.0, 115.35)), Some((gnd_id, "GND".to_string())));
+
+        // When vias are hidden, via hit-test skips vias
+        app.show_vias = false;
+        assert_eq!(app.hit_test_net_at_world(&board, Point::new(125.35, 115.0)), None);
+        app.show_vias = true;
+
+        // 3. Point-to-trace hit-testing (track on F.Cu from 110..115 -> "SIG", track on B.Cu from 120.5..125 -> "GND")
+        assert!(hit_test_track_world(&board.tracks[0], Point::new(112.5, 115.20), 1.0).is_some());
+        assert!(hit_test_track_world(&board.tracks[0], Point::new(112.5, 115.30), 1.0).is_none());
+        assert_eq!(app.hit_test_net_at_world(&board, Point::new(112.5, 115.10)), Some((sig_id, "SIG".to_string())));
+        assert_eq!(app.hit_test_net_at_world(&board, Point::new(123.0, 115.15)), Some((gnd_id, "GND".to_string())));
+
+        // Hiding B.Cu disables hit-testing for B.Cu traces while keeping F.Cu traces active
+        app.set_layer_visible("B.Cu", false);
+        assert_eq!(app.hit_test_net_at_world(&board, Point::new(123.0, 115.0)), None);
+        assert_eq!(app.hit_test_net_at_world(&board, Point::new(112.5, 115.0)), Some((sig_id, "SIG".to_string())));
+        app.set_layer_visible("B.Cu", true);
+
+        let _ = fs::remove_file(&in_path);
+    }
+
+    #[test]
+    fn test_clicking_pad_via_or_trace_selects_and_highlights_all_net_elements() {
+        let in_path = format!("/tmp/vulcan_gui_net_all_elements_{}.kicad_pcb", std::process::id());
+        let mut board = make_gui_test_board(&in_path);
+        let sig_id = board.net_name_to_id["SIG"];
+        let gnd_id = board.net_name_to_id["GND"];
+        board.tracks[0].net_id = sig_id;
+        board.tracks[1].net_id = sig_id;
+        board.vias[0].net_id = sig_id;
+        board.tracks.push(TrackSegment {
+            start: (120.5, 115.0),
+            end: (125.0, 115.0),
+            width: 0.25,
+            layer: 0,
+            net_id: gnd_id,
+            is_locked: false,
+        });
+        board.vias.push(Via {
+            position: (125.0, 115.0),
+            size: 0.60,
+            drill: 0.30,
+            net_id: gnd_id,
+            is_locked: false,
+        });
+
+        let mut app = VulcansTrialsApp::new(in_path.clone(), String::new(), board.clone(), None);
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 600.0));
+
+        // 1. Click a routed trace segment on net "SIG" at (112.5, 115.0)
+        let (trace_sig_screen, _) = app.board_to_screen(&board, rect, 112.5, 115.0);
+        let res1 = app.handle_canvas_click_at(rect, trace_sig_screen);
+        assert_eq!(res1, Some("Net: SIG".to_string()));
+        assert_eq!(app.selected_net.as_deref(), Some("SIG"));
+        assert_eq!(app.selected_net_id(&board), Some(sig_id));
+
+        // Verify all elements of net "SIG" are highlighted, and net "GND" elements are NOT
+        assert!(app.is_pad_highlighted(&board, &board.footprints[0].pads[0])); // J1.1 (SIG)
+        assert!(app.is_pad_highlighted(&board, &board.footprints[1].pads[0])); // R10.1 (SIG)
+        assert!(!app.is_pad_highlighted(&board, &board.footprints[1].pads[1])); // R10.2 (GND)
+        assert!(app.is_track_highlighted(&board, &board.tracks[0])); // SIG on F.Cu
+        assert!(app.is_track_highlighted(&board, &board.tracks[1])); // SIG on B.Cu
+        assert!(!app.is_track_highlighted(&board, &board.tracks[2])); // GND on F.Cu
+        assert!(app.is_via_highlighted(&board, &board.vias[0])); // SIG via
+        assert!(!app.is_via_highlighted(&board, &board.vias[1])); // GND via
+        let ratsnest = app.live.lock().unwrap().ratsnest.clone();
+        for seg in &ratsnest {
+            assert_eq!(app.is_ratsnest_highlighted(&board, seg), seg.net_id == sig_id);
+        }
+
+        // Render UI with active net highlight to exercise trace, via, pad, and ratsnest highlight rendering
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.render_ui(ctx);
+        });
+
+        // 2. Click a via on the same net ("SIG") at (115.0, 115.0) -> toggles off selection
+        let (via_sig_screen, _) = app.board_to_screen(&board, rect, 115.0, 115.0);
+        let res2 = app.handle_canvas_click_at(rect, via_sig_screen);
+        assert_eq!(res2, Some("Cleared SIG".to_string()));
+        assert_eq!(app.selected_net, None);
+        assert_eq!(app.selected_net_id(&board), None);
+        assert!(!app.is_track_highlighted(&board, &board.tracks[0]));
+        assert!(!app.is_via_highlighted(&board, &board.vias[0]));
+
+        // 3. Click the via on net "GND" at (125.0, 115.0) -> selects net "GND"
+        let (via_gnd_screen, _) = app.board_to_screen(&board, rect, 125.0, 115.0);
+        let res3 = app.handle_canvas_click_at(rect, via_gnd_screen);
+        assert_eq!(res3, Some("Net: GND".to_string()));
+        assert_eq!(app.selected_net.as_deref(), Some("GND"));
+        assert_eq!(app.selected_net_id(&board), Some(gnd_id));
+        assert!(app.is_pad_highlighted(&board, &board.footprints[1].pads[1]));
+        assert!(app.is_track_highlighted(&board, &board.tracks[2]));
+        assert!(app.is_via_highlighted(&board, &board.vias[1]));
+        assert!(!app.is_track_highlighted(&board, &board.tracks[0]));
+
+        let _ = fs::remove_file(&in_path);
+    }
 }
+
 
