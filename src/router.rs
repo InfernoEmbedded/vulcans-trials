@@ -3,8 +3,9 @@
 
 use crate::board::{ArcSegment, Board, Footprint, LiveTrialState, NetClass, NetTopology, Pad, Point, TrackSegment, TrialPhase, Via};
 pub use crate::board::BusBundle;
+use crate::cuda::CudaEngine;
 use crate::ipc::KiCadIpcClient;
-use crate::vulkan::{GpuRouteCostParams, VulkanEngine};
+use crate::vulkan::{GpuDrcCandidate, GpuDrcPad, GpuDrcTrack, GpuDrcVia, GpuRouteCostParams, VulkanEngine};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -7071,7 +7072,28 @@ pub fn find_choked_pin_bottlenecks(
             fallback_offsets.push((-dist * 0.25, -dist));
         }
 
+        let drc_ctx = GpuDrcContext::from_board(board);
+        let confirm_cpu = |vx: f64, vy: f64, try_w: f64, try_c: f64| -> bool {
+            if !is_via_location_legal(board, (vx, vy), 0.60, plane_net_id, try_c) {
+                return false;
+            }
+            let direct_ok = is_octilinear_segment((px, py), (vx, vy))
+                && is_track_segment_legal(board, (px, py), (vx, vy), try_w, layer, plane_net_id, try_c);
+            if direct_ok {
+                return true;
+            }
+            [false, true].into_iter().any(|df| {
+                let dl = compute_45_dogleg((px, py), (vx, vy), df);
+                dl.windows(2).all(|w| {
+                    (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) <= 1e-4
+                        || is_track_segment_legal(board, w[0], w[1], try_w, layer, plane_net_id, try_c)
+                })
+            })
+        };
+
         for (try_w, try_c, offsets) in [(track_w, plane_c, &primary_offsets), (0.15, 0.15, &fallback_offsets)] {
+            let mut valid_coords = Vec::with_capacity(offsets.len());
+            let mut gpu_cands = Vec::with_capacity(offsets.len() * 2);
             for &(dx, dy) in offsets {
                 let vx = px + dx;
                 let vy = py + dy;
@@ -7081,27 +7103,51 @@ pub fn find_choked_pin_bottlenecks(
                 if existing_vias.iter().any(|ev| (ev.0 - vx).hypot(ev.1 - vy) < 0.65) {
                     continue;
                 }
-                if !is_via_location_legal(board, (vx, vy), 0.60, plane_net_id, try_c) {
+                if grid.world_to_grid(vx, vy).is_none() {
                     continue;
                 }
-                let direct_ok = is_octilinear_segment((px, py), (vx, vy))
-                    && is_track_segment_legal(board, (px, py), (vx, vy), try_w, layer, plane_net_id, try_c);
-                let dogleg_ok = if direct_ok {
-                    true
-                } else {
-                    [false, true].into_iter().any(|df| {
-                        let dl = compute_45_dogleg((px, py), (vx, vy), df);
-                        dl.windows(2).all(|w| {
-                            (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) <= 1e-4
-                                || is_track_segment_legal(board, w[0], w[1], try_w, layer, plane_net_id, try_c)
-                        })
-                    })
-                };
-                if !dogleg_ok {
-                    continue;
+                valid_coords.push((vx, vy));
+                gpu_cands.push(GpuDrcCandidate {
+                    x1: vx as f32,
+                    y1: vy as f32,
+                    x2: 0.0,
+                    y2: 0.0,
+                    radius_or_half_width: 0.30,
+                    clearance: try_c as f32,
+                    layer: layer as u32,
+                    net_id: plane_net_id as u32,
+                    kind: 0,
+                    ignore_same_net_pads: 0,
+                    _pad0: 0,
+                    _pad1: 0,
+                });
+                gpu_cands.push(GpuDrcCandidate {
+                    x1: px as f32,
+                    y1: py as f32,
+                    x2: vx as f32,
+                    y2: vy as f32,
+                    radius_or_half_width: (try_w * 0.5) as f32,
+                    clearance: try_c as f32,
+                    layer: layer as u32,
+                    net_id: plane_net_id as u32,
+                    kind: 1,
+                    ignore_same_net_pads: 1,
+                    _pad0: 0,
+                    _pad1: 0,
+                });
+            }
+
+            if let Some(res) = drc_ctx.evaluate(grid.vulkan.as_ref(), &gpu_cands) {
+                for (i, &(vx, vy)) in valid_coords.iter().enumerate() {
+                    if res[i * 2] != 0 && confirm_cpu(vx, vy, try_w, try_c) {
+                        return Some((vx, vy));
+                    }
                 }
-                if grid.world_to_grid(vx, vy).is_some() {
-                    return Some((vx, vy));
+            } else {
+                for &(vx, vy) in &valid_coords {
+                    if confirm_cpu(vx, vy, try_w, try_c) {
+                        return Some((vx, vy));
+                    }
                 }
             }
         }
@@ -10035,26 +10081,15 @@ fn slide_and_align_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
             })
             .collect();
 
-        let has_off_center_connection = board.tracks.iter().any(|t| {
-            t.net_id == net_id && {
-                let d_seg = dist_point_to_segment(v_pos, t.start, t.end);
-                let d_min_end = (t.start.0 - v_pos.0)
-                    .hypot(t.start.1 - v_pos.1)
-                    .min((t.end.0 - v_pos.0).hypot(t.end.1 - v_pos.1));
-                d_seg <= via_size * 0.5 + 0.05 && d_min_end >= 1e-4
-            }
-        });
-        if incident.is_empty() || has_off_center_connection {
-            continue;
-        }
-
-        let has_off_center_touch = board.tracks.iter().any(|t| {
+        let mut inc_layers: Vec<usize> = incident.iter().map(|&(_, l, _, _)| l).collect();
+        inc_layers.sort_unstable();
+        inc_layers.dedup();
+        let has_unanchored_touch = board.tracks.iter().enumerate().any(|(idx, t)| {
             t.net_id == net_id
-                && (t.start.0 - v_pos.0).hypot(t.start.1 - v_pos.1) >= 1e-4
-                && (t.end.0 - v_pos.0).hypot(t.end.1 - v_pos.1) >= 1e-4
+                && !incident.iter().any(|&(i, _, _, _)| i == idx)
                 && dist_point_to_segment(v_pos, t.start, t.end) <= via_size * 0.5 + 0.05
         });
-        if has_off_center_touch {
+        if incident.is_empty() || inc_layers.len() < 2 || has_unanchored_touch {
             continue;
         }
 
@@ -10143,9 +10178,9 @@ fn slide_and_align_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
         }
 
         // 3. Vector Sliding:
-        // Test candidate positions along vectors of connected tracks
+        // Test candidate positions along vectors of connected tracks (batch-evaluated on GPU when available)
         let orig_tot_len: f64 = incident.iter().map(|&(_, _, other, _)| (other.0 - v_pos.0).hypot(other.1 - v_pos.1)).sum();
-        let mut best_cand: Option<((f64, f64), f64)> = None;
+        let mut raw_cands: Vec<((f64, f64), f64)> = Vec::new();
 
         for &(_, _, other_pt, _) in &incident {
             let dx = other_pt.0 - v_pos.0;
@@ -10163,27 +10198,90 @@ fn slide_and_align_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
                     break;
                 }
                 let cand = (v_pos.0 + s * ux, v_pos.1 + s * uy);
-                if !is_via_location_legal_ignoring(board, cand, via_size, net_id, clearance, Some(v_pos)) {
+                let cand_len: f64 = incident.iter().map(|&(_, _, other, _)| (other.0 - cand.0).hypot(other.1 - cand.1)).sum();
+                if cand_len >= orig_tot_len - 0.05 {
                     continue;
                 }
+                let oct_ok = incident.iter().all(|&(_, _, other, _)| {
+                    (other.0 - cand.0).hypot(other.1 - cand.1) < 1e-4 || is_octilinear_segment(cand, other)
+                });
+                if oct_ok {
+                    raw_cands.push((cand, cand_len));
+                }
+            }
+        }
 
-                let all_ok = incident.iter().all(|&(_, l, other, w)| {
+        let mut best_cand: Option<((f64, f64), f64)> = None;
+        if !raw_cands.is_empty() {
+            let gpu_flags: Option<Vec<bool>> = if raw_cands.len() >= 4 {
+                let drc_ctx = GpuDrcContext::from_board(board);
+                let mut gpu_batch = Vec::with_capacity(raw_cands.len() * (1 + incident.len()));
+                let mut spans = Vec::with_capacity(raw_cands.len());
+                for &(cand, _) in &raw_cands {
+                    let start_idx = gpu_batch.len();
+                    gpu_batch.push(GpuDrcCandidate {
+                        x1: cand.0 as f32,
+                        y1: cand.1 as f32,
+                        x2: v_pos.0 as f32,
+                        y2: v_pos.1 as f32,
+                        radius_or_half_width: (via_size * 0.5) as f32,
+                        clearance: clearance as f32,
+                        layer: 0,
+                        net_id: net_id as u32,
+                        kind: 0,
+                        ignore_same_net_pads: 0,
+                        _pad0: 1,
+                        _pad1: 0,
+                    });
+                    for &(_, l, other, w) in &incident {
+                        if (other.0 - cand.0).hypot(other.1 - cand.1) >= 1e-4 {
+                            gpu_batch.push(GpuDrcCandidate {
+                                x1: cand.0 as f32,
+                                y1: cand.1 as f32,
+                                x2: other.0 as f32,
+                                y2: other.1 as f32,
+                                radius_or_half_width: (w * 0.5) as f32,
+                                clearance: clearance as f32,
+                                layer: l as u32,
+                                net_id: net_id as u32,
+                                kind: 1,
+                                ignore_same_net_pads: 1,
+                                _pad0: 0,
+                                _pad1: 0,
+                            });
+                        }
+                    }
+                    spans.push((start_idx, gpu_batch.len()));
+                }
+                drc_ctx.evaluate(grid.vulkan.as_ref(), &gpu_batch).map(|res| {
+                    spans
+                        .into_iter()
+                        .map(|(s, e)| res[s..e].iter().all(|&v| v != 0))
+                        .collect()
+                })
+            } else {
+                None
+            };
+
+            let verify_cand = |cand: (f64, f64)| -> bool {
+                if !is_via_location_legal_ignoring(board, cand, via_size, net_id, clearance, Some(v_pos)) {
+                    return false;
+                }
+                incident.iter().all(|&(_, l, other, w)| {
                     if (other.0 - cand.0).hypot(other.1 - cand.1) < 1e-4 {
                         true
                     } else {
-                        is_octilinear_segment(cand, other)
-                            && is_track_segment_legal(board, cand, other, w, l, net_id, clearance)
+                        is_track_segment_legal(board, cand, other, w, l, net_id, clearance)
                             && is_segment_clear(board, Some(grid), cand, other, l, net_id, w)
                     }
-                });
+                })
+            };
 
-                if all_ok {
-                    let cand_len: f64 = incident.iter().map(|&(_, _, other, _)| (other.0 - cand.0).hypot(other.1 - cand.1)).sum();
-                    if cand_len < orig_tot_len - 0.05 {
-                        let min_len = best_cand.map(|(_, l)| l).unwrap_or(orig_tot_len - 0.05);
-                        if cand_len < min_len - 1e-4 {
-                            best_cand = Some((cand, cand_len));
-                        }
+            for (idx, &(cand, cand_len)) in raw_cands.iter().enumerate() {
+                let min_len = best_cand.map(|(_, l)| l).unwrap_or(orig_tot_len - 0.05);
+                if cand_len < min_len - 1e-4 {
+                    if gpu_flags.as_ref().map(|f| f[idx]).unwrap_or(true) && verify_cand(cand) {
+                        best_cand = Some((cand, cand_len));
                     }
                 }
             }
@@ -10758,6 +10856,129 @@ pub fn apply_any_angle_tangent_arcs(board: &mut Board) {
 // ============================================================================
 // Robust Copper Geometry, DRC Validation & Automated Pruning
 // ============================================================================
+
+/// Flat GPU-ready copper obstacle snapshot for batch DRC clearance evaluation.
+pub struct GpuDrcContext {
+    pub pads: Vec<GpuDrcPad>,
+    pub tracks: Vec<GpuDrcTrack>,
+    pub vias: Vec<GpuDrcVia>,
+}
+
+impl GpuDrcContext {
+    /// Extracts all pads, tracks, and vias from `board` into flat `#[repr(C)]` POD arrays
+    /// suitable for CUDA (`batch_drc_eval_kernel`) or Vulkan (`BATCH_DRC_EVAL_WGSL`).
+    pub fn from_board(board: &Board) -> Self {
+        Self::build(board, false)
+    }
+
+    /// Extracts all pads, tracks, and vias with `clearance = 0.0` for physical copper
+    /// short-circuit detection (`validate_and_clean_copper`).
+    pub fn from_board_with_zero_clearance(board: &Board) -> Self {
+        Self::build(board, true)
+    }
+
+    fn build(board: &Board, zero_clearance: bool) -> Self {
+        let mut net_clearances = HashMap::with_capacity(board.netclasses.len() * 4 + 8);
+        let default_clr = if zero_clearance {
+            0.0f32
+        } else {
+            board.get_netclass_for_net(0).clearance as f32
+        };
+
+        let mut get_clr = |net_id: usize| -> f32 {
+            if zero_clearance {
+                return 0.0;
+            }
+            if net_id == 0 {
+                return default_clr;
+            }
+            *net_clearances
+                .entry(net_id)
+                .or_insert_with(|| board.get_netclass_for_net(net_id).clearance as f32)
+        };
+
+        let mut pads = Vec::new();
+        for fp in &board.footprints {
+            let flipped = fp.layer != fp.orig_layer;
+            let layer_mask = if fp.layer < 32 { 1u32 << fp.layer } else { 1u32 };
+            for pad in &fp.pads {
+                let (px, py) = fp.pad_absolute_position(pad);
+                let pad_rot = if flipped { -pad.rotation } else { pad.rotation };
+                let total_rot = ((fp.rotation + pad_rot) % 360.0 + 360.0) % 360.0;
+                let rot_rad = total_rot.to_radians() as f32;
+                let shape_bits = match pad.shape.as_str() {
+                    "circle" => 1u32 << 16,
+                    "oval" => 2u32 << 16,
+                    _ => 0u32,
+                };
+                let p_mask = shape_bits | if pad.is_through_hole { 0xFFFFu32 } else { layer_mask & 0xFFFFu32 };
+                let clr = get_clr(pad.net_id);
+                pads.push(GpuDrcPad {
+                    x: px as f32,
+                    y: py as f32,
+                    hw: (pad.width * 0.5) as f32,
+                    hh: (pad.height * 0.5) as f32,
+                    rot_rad,
+                    clearance: clr,
+                    layer_mask: p_mask,
+                    net_id: pad.net_id as u32,
+                });
+            }
+        }
+
+        let mut tracks = Vec::with_capacity(board.tracks.len());
+        for t in &board.tracks {
+            let clr = get_clr(t.net_id);
+            tracks.push(GpuDrcTrack {
+                x1: t.start.0 as f32,
+                y1: t.start.1 as f32,
+                x2: t.end.0 as f32,
+                y2: t.end.1 as f32,
+                half_width: (t.width * 0.5) as f32,
+                clearance: clr,
+                layer: t.layer as u32,
+                net_id: t.net_id as u32,
+            });
+        }
+
+        let mut vias = Vec::with_capacity(board.vias.len());
+        for v in &board.vias {
+            let clr = get_clr(v.net_id);
+            vias.push(GpuDrcVia {
+                x: v.position.0 as f32,
+                y: v.position.1 as f32,
+                radius: (v.size * 0.5) as f32,
+                clearance: clr,
+                net_id: v.net_id as u32,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            });
+        }
+
+        Self { pads, tracks, vias }
+    }
+
+    /// Evaluates a batch of candidate vias/segments on the GPU (preferring CUDA, falling back to Vulkan).
+    pub fn evaluate(
+        &self,
+        vulkan: Option<&Arc<VulkanEngine>>,
+        candidates: &[GpuDrcCandidate],
+    ) -> Option<Vec<u32>> {
+        if candidates.is_empty() {
+            return Some(Vec::new());
+        }
+        if let Some(cuda) = CudaEngine::new() {
+            if let Some(res) = cuda.evaluate_drc_candidates(&self.pads, &self.tracks, &self.vias, candidates) {
+                return Some(res);
+            }
+        }
+        if let Some(vk) = vulkan {
+            return vk.evaluate_drc_candidates(&self.pads, &self.tracks, &self.vias, candidates);
+        }
+        None
+    }
+}
 
 /// Computes the Euclidean distance from a point `p` to a line segment `(a, b)`.
 pub fn dist_point_to_segment(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
@@ -12284,6 +12505,18 @@ pub fn add_teardrops(_board: &mut Board) {
 /// Comprehensive pre-export DRC validation: detects and eliminates any residual shorts
 /// or clearance violations between tracks, vias, and pads of different nets.
 pub fn validate_and_clean_copper(board: &mut Board) {
+    if let Some(nc_idx) = board.raw_content.find("\n  (net_class \"") {
+        let max_fp_end = board
+            .footprints
+            .iter()
+            .filter_map(|fp| fp.fp_span.map(|(_, e)| e))
+            .max()
+            .unwrap_or(0);
+        if nc_idx >= max_fp_end {
+            board.raw_content.truncate(nc_idx);
+            board.raw_content.push_str("\n)\n");
+        }
+    }
     let mut changed = true;
     let mut iteration = 0;
     while changed && iteration < 10 {
@@ -12292,6 +12525,31 @@ pub fn validate_and_clean_copper(board: &mut Board) {
 
         let mut bad_track_indices = HashSet::new();
         let track_count = board.tracks.len();
+        let gpu_track_ok: Option<Vec<u32>> = if track_count >= 16 {
+            let drc_ctx = GpuDrcContext::from_board_with_zero_clearance(board);
+            let cands: Vec<GpuDrcCandidate> = board
+                .tracks
+                .iter()
+                .map(|t| GpuDrcCandidate {
+                    x1: t.start.0 as f32,
+                    y1: t.start.1 as f32,
+                    x2: t.end.0 as f32,
+                    y2: t.end.1 as f32,
+                    radius_or_half_width: (t.width * 0.5) as f32,
+                    clearance: 0.0,
+                    layer: t.layer as u32,
+                    net_id: t.net_id as u32,
+                    kind: 1,
+                    ignore_same_net_pads: 0,
+                    _pad0: 0,
+                    _pad1: 0,
+                })
+                .collect();
+            drc_ctx.evaluate(None, &cands)
+        } else {
+            None
+        };
+
         for i in 0..track_count {
             if board.tracks[i].is_locked {
                 continue;
@@ -12333,6 +12591,10 @@ pub fn validate_and_clean_copper(board: &mut Board) {
                         continue;
                     }
                 }
+            }
+
+            if gpu_track_ok.as_ref().map(|v| v[i] == 1).unwrap_or(false) {
+                continue;
             }
 
             for j in 0..track_count {
@@ -17348,6 +17610,137 @@ mod tests {
         assert!(d1 > d0 && d2 > d1, "Wavefront potential must increase monotonically with distance");
         assert!((d_via - 3.5).abs() < 1e-4, "Via transition cost must equal via_cost");
         assert!(d_via_step > d_via, "Planar steps on adjacent layer must accumulate over via cost");
+    }
+
+    #[test]
+    fn test_gpu_batch_drc_eval_via_and_segment_clearance() {
+        let mut board = make_router_test_board();
+        board.tracks.push(TrackSegment {
+            start: (138.0, 100.0),
+            end: (146.0, 100.0),
+            width: 0.25,
+            layer: 0,
+            net_id: 2,
+            is_locked: false,
+        });
+        board.vias.push(Via {
+            position: (142.0, 104.0),
+            size: 0.60,
+            drill: 0.30,
+            net_id: 2,
+            is_locked: false,
+        });
+
+        let drc_ctx = GpuDrcContext::from_board(&board);
+        let vk = VulkanEngine::new();
+
+        let via_pts = [
+            (142.0, 100.25), // Collides with net 2 track at y=100.0
+            (142.0, 102.0),  // Clear of track and via
+            (142.3, 104.0),  // Collides with net 2 via at (142.0, 104.0)
+            (142.0, 95.0),   // Collides with C14 pad 1 (net 1) for net 3
+        ];
+
+        let mut cands = Vec::new();
+        for &(vx, vy) in &via_pts {
+            cands.push(GpuDrcCandidate {
+                x1: vx as f32,
+                y1: vy as f32,
+                x2: 0.0,
+                y2: 0.0,
+                radius_or_half_width: 0.30,
+                clearance: 0.20,
+                layer: 0,
+                net_id: 3,
+                kind: 0,
+                ignore_same_net_pads: 0,
+                _pad0: 0,
+                _pad1: 0,
+            });
+        }
+
+        let segs = [
+            ((140.0, 99.0), (140.0, 101.0), 0usize), // Crosses net 2 track on layer 0 -> illegal
+            ((140.0, 99.0), (140.0, 101.0), 1usize), // Crosses on layer 1 -> legal
+            ((138.0, 101.5), (146.0, 101.5), 0usize), // Parallel 1.5mm away -> legal
+        ];
+        for &(s, e, layer) in &segs {
+            cands.push(GpuDrcCandidate {
+                x1: s.0 as f32,
+                y1: s.1 as f32,
+                x2: e.0 as f32,
+                y2: e.1 as f32,
+                radius_or_half_width: 0.125,
+                clearance: 0.20,
+                layer: layer as u32,
+                net_id: 3,
+                kind: 1,
+                ignore_same_net_pads: 0,
+                _pad0: 0,
+                _pad1: 0,
+            });
+        }
+
+        if let Some(res) = drc_ctx.evaluate(vk.as_ref(), &cands) {
+            for (i, &pt) in via_pts.iter().enumerate() {
+                let cpu_ok = is_via_location_legal(&board, pt, 0.60, 3, 0.20);
+                assert_eq!(res[i] != 0, cpu_ok, "Via candidate {} at {:?} mismatch", i, pt);
+            }
+            for (j, &(s, e, layer)) in segs.iter().enumerate() {
+                let cpu_ok = is_track_segment_legal(&board, s, e, 0.25, layer, 3, 0.20);
+                assert_eq!(
+                    res[via_pts.len() + j] != 0,
+                    cpu_ok,
+                    "Segment candidate {} ({:?} -> {:?} on L{}) mismatch",
+                    j,
+                    s,
+                    e,
+                    layer
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cuda_vs_vulkan_batch_drc_equivalence() {
+        let (Some(cuda), Some(vk)) = (CudaEngine::new(), VulkanEngine::new()) else {
+            return;
+        };
+        let mut board = make_router_test_board();
+        board.tracks.push(TrackSegment {
+            start: (136.0, 100.0),
+            end: (148.0, 100.0),
+            width: 0.25,
+            layer: 0,
+            net_id: 2,
+            is_locked: false,
+        });
+        let drc_ctx = GpuDrcContext::from_board(&board);
+        let mut cands = Vec::with_capacity(160);
+        for i in 0..160 {
+            let y = 96.0 + (i as f32) * 0.05;
+            cands.push(GpuDrcCandidate {
+                x1: 140.0,
+                y1: y,
+                x2: 142.0,
+                y2: y + 0.2,
+                radius_or_half_width: if i % 2 == 0 { 0.30 } else { 0.125 },
+                clearance: 0.20,
+                layer: 0,
+                net_id: 3,
+                kind: (i % 2) as u32,
+                ignore_same_net_pads: 0,
+                _pad0: 0,
+                _pad1: 0,
+            });
+        }
+        let cuda_res = cuda
+            .evaluate_drc_candidates(&drc_ctx.pads, &drc_ctx.tracks, &drc_ctx.vias, &cands)
+            .expect("CUDA evaluate_drc_candidates failed");
+        let vk_res = vk
+            .evaluate_drc_candidates(&drc_ctx.pads, &drc_ctx.tracks, &drc_ctx.vias, &cands)
+            .expect("Vulkan evaluate_drc_candidates failed");
+        assert_eq!(cuda_res, vk_res, "CUDA and Vulkan DRC batch results must match identically");
     }
 }
 

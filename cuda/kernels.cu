@@ -1562,5 +1562,314 @@ __global__ void rt_bvh_line_of_sight_drc_kernel(
     violations_out[q_idx] = violations;
 }
 
+// -----------------------------------------------------------------------------
+// 7. Batch DRC Clearance & Candidate Via/Segment Evaluation Kernel
+// -----------------------------------------------------------------------------
+
+struct DrcBatchParams {
+    unsigned int num_pads;
+    unsigned int num_tracks;
+    unsigned int num_vias;
+    unsigned int num_candidates;
+};
+
+struct GpuDrcPad {
+    float x;
+    float y;
+    float hw;
+    float hh;
+    float rot_rad;
+    float clearance;
+    unsigned int layer_mask;
+    unsigned int net_id;
+};
+
+struct GpuDrcTrack {
+    float x1;
+    float y1;
+    float x2;
+    float y2;
+    float half_width;
+    float clearance;
+    unsigned int layer;
+    unsigned int net_id;
+};
+
+struct GpuDrcVia {
+    float x;
+    float y;
+    float radius;
+    float clearance;
+    unsigned int net_id;
+    unsigned int _pad0;
+    unsigned int _pad1;
+    unsigned int _pad2;
+};
+
+struct GpuDrcCandidate {
+    float x1;
+    float y1;
+    float x2;
+    float y2;
+    float radius_or_half_width;
+    float clearance;
+    unsigned int layer;
+    unsigned int net_id;
+    unsigned int kind;
+    unsigned int ignore_same_net_pads;
+    unsigned int _pad0;
+    unsigned int _pad1;
+};
+
+__device__ __forceinline__ float drc_dist_point_to_seg(
+    float px, float py,
+    float x1, float y1,
+    float x2, float y2
+) {
+    float dx = x2 - x1;
+    float dy = y2 - y1;
+    float len_sq = dx * dx + dy * dy;
+    if (len_sq < 1e-6f) {
+        float ex = px - x1;
+        float ey = py - y1;
+        return sqrtf(ex * ex + ey * ey);
+    }
+    float t = fminf(fmaxf(((px - x1) * dx + (py - y1) * dy) / len_sq, 0.0f), 1.0f);
+    float ex = px - (x1 + t * dx);
+    float ey = py - (y1 + t * dy);
+    return sqrtf(ex * ex + ey * ey);
+}
+
+__device__ __forceinline__ bool drc_segs_intersect(
+    float ax, float ay, float bx, float by,
+    float cx, float cy, float dx, float dy
+) {
+    float d1 = (dy - cy) * (ax - cx) - (dx - cx) * (ay - cy);
+    float d2 = (dy - cy) * (bx - cx) - (dx - cx) * (by - cy);
+    float d3 = (by - ay) * (cx - ax) - (bx - ax) * (cy - ay);
+    float d4 = (by - ay) * (dx - ax) - (bx - ax) * (dy - ay);
+    return (((d1 > 1e-7f && d2 < -1e-7f) || (d1 < -1e-7f && d2 > 1e-7f)) &&
+            ((d3 > 1e-7f && d4 < -1e-7f) || (d3 < -1e-7f && d4 > 1e-7f)));
+}
+
+__device__ __forceinline__ float drc_dist_seg_to_seg(
+    float ax, float ay, float bx, float by,
+    float cx, float cy, float dx, float dy
+) {
+    if (drc_segs_intersect(ax, ay, bx, by, cx, cy, dx, dy)) {
+        return 0.0f;
+    }
+    float d1 = drc_dist_point_to_seg(ax, ay, cx, cy, dx, dy);
+    float d2 = drc_dist_point_to_seg(bx, by, cx, cy, dx, dy);
+    float d3 = drc_dist_point_to_seg(cx, cy, ax, ay, bx, by);
+    float d4 = drc_dist_point_to_seg(dx, dy, ax, ay, bx, by);
+    return fminf(fminf(d1, d2), fminf(d3, d4));
+}
+
+__device__ __forceinline__ float drc_dist_point_to_pad(
+    float px, float py,
+    GpuDrcPad pad
+) {
+    unsigned int shape = pad.layer_mask >> 16u;
+    float rx = px - pad.x;
+    float ry = py - pad.y;
+    if (shape == 1u) {
+        float r = fmaxf(pad.hw, pad.hh);
+        return fmaxf(sqrtf(rx * rx + ry * ry) - r, 0.0f);
+    }
+    float c = cosf(-pad.rot_rad);
+    float s = sinf(-pad.rot_rad);
+    float lx = rx * c - ry * s;
+    float ly = rx * s + ry * c;
+    if (shape == 2u) {
+        float r = fminf(pad.hw, pad.hh);
+        if (pad.hw >= pad.hh) {
+            float cap_dx = pad.hw - r;
+            float cx = fminf(fmaxf(lx, -cap_dx), cap_dx);
+            float dx = lx - cx;
+            return fmaxf(sqrtf(dx * dx + ly * ly) - r, 0.0f);
+        } else {
+            float cap_dy = pad.hh - r;
+            float cy = fminf(fmaxf(ly, -cap_dy), cap_dy);
+            float dy = ly - cy;
+            return fmaxf(sqrtf(lx * lx + dy * dy) - r, 0.0f);
+        }
+    }
+    float dx = fmaxf(fabsf(lx) - pad.hw, 0.0f);
+    float dy = fmaxf(fabsf(ly) - pad.hh, 0.0f);
+    return sqrtf(dx * dx + dy * dy);
+}
+
+__device__ __forceinline__ float drc_dist_seg_to_pad(
+    float x1, float y1, float x2, float y2,
+    GpuDrcPad pad
+) {
+    if ((pad.layer_mask >> 16u) == 1u) {
+        float r = fmaxf(pad.hw, pad.hh);
+        return fmaxf(drc_dist_point_to_seg(pad.x, pad.y, x1, y1, x2, y2) - r, 0.0f);
+    }
+    float c = cosf(-pad.rot_rad);
+    float s = sinf(-pad.rot_rad);
+    float rx1 = x1 - pad.x;
+    float ry1 = y1 - pad.y;
+    float lsx = rx1 * c - ry1 * s;
+    float lsy = rx1 * s + ry1 * c;
+    float rx2 = x2 - pad.x;
+    float ry2 = y2 - pad.y;
+    float lex = rx2 * c - ry2 * s;
+    float ley = rx2 * s + ry2 * c;
+    float hw = pad.hw;
+    float hh = pad.hh;
+
+    if (fabsf(lsx) <= hw && fabsf(lsy) <= hh) {
+        return 0.0f;
+    }
+    if (fabsf(lex) <= hw && fabsf(ley) <= hh) {
+        return 0.0f;
+    }
+
+    if (drc_segs_intersect(lsx, lsy, lex, ley, -hw, -hh, hw, -hh) ||
+        drc_segs_intersect(lsx, lsy, lex, ley, hw, -hh, hw, hh) ||
+        drc_segs_intersect(lsx, lsy, lex, ley, hw, hh, -hw, hh) ||
+        drc_segs_intersect(lsx, lsy, lex, ley, -hw, hh, -hw, -hh)) {
+        return 0.0f;
+    }
+
+    float dx1 = fmaxf(fabsf(lsx) - hw, 0.0f);
+    float dy1 = fmaxf(fabsf(lsy) - hh, 0.0f);
+    float d1 = sqrtf(dx1 * dx1 + dy1 * dy1);
+
+    float dx2 = fmaxf(fabsf(lex) - hw, 0.0f);
+    float dy2 = fmaxf(fabsf(ley) - hh, 0.0f);
+    float d2 = sqrtf(dx2 * dx2 + dy2 * dy2);
+
+    float d3 = drc_dist_point_to_seg(-hw, -hh, lsx, lsy, lex, ley);
+    float d4 = drc_dist_point_to_seg(hw, -hh, lsx, lsy, lex, ley);
+    float d5 = drc_dist_point_to_seg(hw, hh, lsx, lsy, lex, ley);
+    float d6 = drc_dist_point_to_seg(-hw, hh, lsx, lsy, lex, ley);
+
+    return fminf(fminf(fminf(d1, d2), fminf(d3, d4)), fminf(d5, d6));
+}
+
+__global__ void batch_drc_eval_kernel(
+    const GpuDrcPad* __restrict__ pads,
+    const GpuDrcTrack* __restrict__ tracks,
+    const GpuDrcVia* __restrict__ vias,
+    const GpuDrcCandidate* __restrict__ candidates,
+    unsigned int* __restrict__ results_out,
+    DrcBatchParams params
+) {
+    unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= params.num_candidates) {
+        return;
+    }
+
+    GpuDrcCandidate cand = candidates[c];
+    const float eps = 1e-4f;
+
+    if (cand.kind == 0u) {
+        // Candidate Via at (cand.x1, cand.y1) checking all layers
+        for (unsigned int i = 0u; i < params.num_pads; ++i) {
+            GpuDrcPad p = pads[i];
+            if (p.net_id != cand.net_id) {
+                float req_dist = cand.radius_or_half_width + fmaxf(cand.clearance, p.clearance);
+                float d = drc_dist_point_to_pad(cand.x1, cand.y1, p);
+                if (d < req_dist - eps) {
+                    results_out[c] = 0u;
+                    return;
+                }
+            } else if (cand.ignore_same_net_pads == 0u && (p.layer_mask & 0xFFFFu) != 0xFFFFu) {
+                float d = drc_dist_point_to_pad(cand.x1, cand.y1, p);
+                if (d < cand.radius_or_half_width - eps) {
+                    results_out[c] = 0u;
+                    return;
+                }
+            }
+        }
+
+        for (unsigned int i = 0u; i < params.num_tracks; ++i) {
+            GpuDrcTrack t = tracks[i];
+            if (t.net_id != cand.net_id) {
+                float req_dist = cand.radius_or_half_width + fmaxf(cand.clearance, t.clearance) + t.half_width;
+                float d = drc_dist_point_to_seg(cand.x1, cand.y1, t.x1, t.y1, t.x2, t.y2);
+                if (d < req_dist - eps) {
+                    results_out[c] = 0u;
+                    return;
+                }
+            }
+        }
+
+        for (unsigned int i = 0u; i < params.num_vias; ++i) {
+            GpuDrcVia v = vias[i];
+            float dx = cand.x1 - v.x;
+            float dy = cand.y1 - v.y;
+            float d = sqrtf(dx * dx + dy * dy);
+            if (d < eps) {
+                continue;
+            }
+            if (cand._pad0 != 0u) {
+                float idx = cand.x2 - v.x;
+                float idy = cand.y2 - v.y;
+                if (sqrtf(idx * idx + idy * idy) < eps) {
+                    continue;
+                }
+            }
+            if (v.net_id != cand.net_id) {
+                float req_dist = cand.radius_or_half_width + fmaxf(cand.clearance, v.clearance) + v.radius;
+                if (d < req_dist - eps) {
+                    results_out[c] = 0u;
+                    return;
+                }
+            } else {
+                float req_dist = (cand.radius_or_half_width <= 0.18f && v.radius <= 0.18f) ? 0.25f : 0.55f;
+                if (d < req_dist - eps) {
+                    results_out[c] = 0u;
+                    return;
+                }
+            }
+        }
+    } else {
+        // Candidate Track Segment (cand.x1, cand.y1) -> (cand.x2, cand.y2) on cand.layer
+        unsigned int layer_bit = (cand.layer < 32u) ? (1u << cand.layer) : 0u;
+        for (unsigned int i = 0u; i < params.num_pads; ++i) {
+            GpuDrcPad p = pads[i];
+            if ((p.layer_mask & layer_bit) != 0u && p.net_id != cand.net_id) {
+                float req_dist = cand.radius_or_half_width + fmaxf(cand.clearance, p.clearance);
+                float d = drc_dist_seg_to_pad(cand.x1, cand.y1, cand.x2, cand.y2, p);
+                if (d < req_dist - eps) {
+                    results_out[c] = 0u;
+                    return;
+                }
+            }
+        }
+
+        for (unsigned int i = 0u; i < params.num_tracks; ++i) {
+            GpuDrcTrack t = tracks[i];
+            if (t.layer == cand.layer && t.net_id != cand.net_id) {
+                float req_dist = cand.radius_or_half_width + fmaxf(cand.clearance, t.clearance) + t.half_width;
+                float d = drc_dist_seg_to_seg(cand.x1, cand.y1, cand.x2, cand.y2, t.x1, t.y1, t.x2, t.y2);
+                if (d < req_dist - eps) {
+                    results_out[c] = 0u;
+                    return;
+                }
+            }
+        }
+
+        for (unsigned int i = 0u; i < params.num_vias; ++i) {
+            GpuDrcVia v = vias[i];
+            if (v.net_id != cand.net_id) {
+                float req_dist = cand.radius_or_half_width + fmaxf(cand.clearance, v.clearance) + v.radius;
+                float d = drc_dist_point_to_seg(v.x, v.y, cand.x1, cand.y1, cand.x2, cand.y2);
+                if (d < req_dist - eps) {
+                    results_out[c] = 0u;
+                    return;
+                }
+            }
+        }
+    }
+
+    results_out[c] = 1u;
+}
+
 } // extern "C"
 
