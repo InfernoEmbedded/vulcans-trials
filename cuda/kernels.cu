@@ -2004,6 +2004,154 @@ __global__ void wavefront_3d_relax_kernel(
     wavefront_out[idx] = best;
 }
 
+__global__ void wavefront_3d_backtrack_kernel(
+    const float* __restrict__ dist_grid,
+    const float* __restrict__ cell_costs,
+    GpuRouteCostParams params,
+    float via_cost,
+    unsigned int src_x,
+    unsigned int src_y,
+    unsigned int src_layer,
+    unsigned int dst_x,
+    unsigned int dst_y,
+    unsigned int dst_layer,
+    unsigned int max_path_len,
+    unsigned int* __restrict__ path_out,
+    unsigned int* __restrict__ path_len_out
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+
+    int w = (int)params.width;
+    int h = (int)params.height;
+    int nl = (int)params.num_layers;
+
+    if ((int)src_x >= w || (int)src_y >= h || (int)src_layer >= nl ||
+        (int)dst_x >= w || (int)dst_y >= h || (int)dst_layer >= nl ||
+        max_path_len == 0) {
+        *path_len_out = 0;
+        return;
+    }
+
+    unsigned int layer_stride = params.width * params.height;
+    unsigned int dst_idx = dst_layer * layer_stride + dst_y * params.width + dst_x;
+    if (dist_grid[dst_idx] >= 1.0e19f) {
+        *path_len_out = 0;
+        return;
+    }
+
+    int cx = (int)dst_x;
+    int cy = (int)dst_y;
+    int cl = (int)dst_layer;
+    unsigned int step_count = 0;
+
+    while (step_count < max_path_len) {
+        path_out[step_count * 3 + 0] = (unsigned int)cx;
+        path_out[step_count * 3 + 1] = (unsigned int)cy;
+        path_out[step_count * 3 + 2] = (unsigned int)cl;
+        step_count++;
+
+        if (cx == (int)src_x && cy == (int)src_y && cl == (int)src_layer) {
+            for (unsigned int i = 0; i < step_count / 2; ++i) {
+                unsigned int j = step_count - 1 - i;
+                for (unsigned int k = 0; k < 3; ++k) {
+                    unsigned int tmp = path_out[i * 3 + k];
+                    path_out[i * 3 + k] = path_out[j * 3 + k];
+                    path_out[j * 3 + k] = tmp;
+                }
+            }
+            *path_len_out = step_count;
+            return;
+        }
+
+        unsigned int layer_base = (unsigned int)cl * layer_stride;
+        unsigned int cur_idx = layer_base + (unsigned int)(cy * w + cx);
+        float cur_dist = dist_grid[cur_idx];
+        float my_cost = cell_costs[cur_idx] >= 0.0f ? cell_costs[cur_idx] : 1.0f;
+
+        int best_nx = -1;
+        int best_ny = -1;
+        int best_nl = -1;
+        float best_score = 1.0e20f;
+        float best_ndist = 1.0e20f;
+
+        for (int dy = -1; dy <= 1; ++dy) {
+            int ny = cy + dy;
+            if (ny < 0 || ny >= h) {
+                continue;
+            }
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) {
+                    continue;
+                }
+                int nx = cx + dx;
+                if (nx < 0 || nx >= w) {
+                    continue;
+                }
+                unsigned int n_idx = layer_base + (unsigned int)(ny * w + nx);
+                float n_dist = dist_grid[n_idx];
+                if (n_dist >= cur_dist || n_dist >= 1.0e19f) {
+                    continue;
+                }
+                if (cell_costs[n_idx] < 0.0f && n_dist > 0.0f) {
+                    continue;
+                }
+                float step_len = (dx != 0 && dy != 0) ? 1.41421356f : 1.0f;
+                if (dx != 0 && dy != 0) {
+                    unsigned int idx_h = layer_base + (unsigned int)(cy * w + nx);
+                    unsigned int idx_v = layer_base + (unsigned int)(ny * w + cx);
+                    if (cell_costs[idx_h] < 0.0f || cell_costs[idx_v] < 0.0f) {
+                        continue;
+                    }
+                }
+                float cand_score = n_dist + my_cost * step_len;
+                if (cand_score < best_score - 1.0e-4f ||
+                    (fabsf(cand_score - best_score) <= 1.0e-4f && n_dist < best_ndist)) {
+                    best_score = cand_score;
+                    best_ndist = n_dist;
+                    best_nx = nx;
+                    best_ny = ny;
+                    best_nl = cl;
+                }
+            }
+        }
+
+        for (int ol = 0; ol < nl; ++ol) {
+            if (ol == cl) {
+                continue;
+            }
+            unsigned int o_idx = (unsigned int)ol * layer_stride + (unsigned int)(cy * w + cx);
+            float o_dist = dist_grid[o_idx];
+            if (o_dist >= cur_dist || o_dist >= 1.0e19f) {
+                continue;
+            }
+            if (cell_costs[o_idx] < 0.0f && o_dist > 0.0f) {
+                continue;
+            }
+            float cand_score = o_dist + via_cost;
+            if (cand_score < best_score - 1.0e-4f ||
+                (fabsf(cand_score - best_score) <= 1.0e-4f && o_dist < best_ndist)) {
+                best_score = cand_score;
+                best_ndist = o_dist;
+                best_nx = cx;
+                best_ny = cy;
+                best_nl = ol;
+            }
+        }
+
+        if (best_nx < 0) {
+            *path_len_out = 0;
+            return;
+        }
+        cx = best_nx;
+        cy = best_ny;
+        cl = best_nl;
+    }
+
+    *path_len_out = 0;
+}
+
 // -----------------------------------------------------------------------------
 // 6. Hardware-Friendly GPU LBVH Ray-Cast Kernels (Segment Crossings & DRC)
 // -----------------------------------------------------------------------------

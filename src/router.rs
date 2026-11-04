@@ -3,7 +3,7 @@
 
 use crate::board::{ArcSegment, Board, Footprint, LiveTrialState, NetClass, NetTopology, Pad, Point, TrackSegment, TrialPhase, Via};
 pub use crate::board::BusBundle;
-use crate::cuda::CudaEngine;
+use crate::cuda::{CudaEngine, MultiGpuRouterPool};
 use crate::ipc::KiCadIpcClient;
 use crate::vulkan::{GpuDrcCandidate, GpuDrcPad, GpuDrcTrack, GpuDrcVia, GpuRouteCostParams, VulkanEngine};
 use rayon::prelude::*;
@@ -973,6 +973,106 @@ impl RoutingGrid {
             }
         }
         false
+    }
+
+    /// Checks whether all cells within a circle of `radius_cells` around `(gx, gy)` on `layer`
+    /// are free of foreign-net obstacles for `net_id`.
+    #[allow(non_snake_case)]
+    pub fn is_circle_clear_SpecifyRadius(
+        &self,
+        gx: usize,
+        gy: usize,
+        layer: usize,
+        radius_cells: i32,
+        net_id: usize,
+    ) -> bool {
+        if gx >= self.width || gy >= self.height || layer >= self.num_layers {
+            return false;
+        }
+        let r = radius_cells.max(0) as isize;
+        let r2 = r * r;
+        let target = net_id as i32;
+        for dy in -r..=r {
+            let ny = gy as isize + dy;
+            if ny < 0 || ny >= self.height as isize {
+                continue;
+            }
+            for dx in -r..=r {
+                if dx * dx + dy * dy > r2 {
+                    continue;
+                }
+                let nx = gx as isize + dx;
+                if nx < 0 || nx >= self.width as isize {
+                    continue;
+                }
+                let c_idx = self.idx(nx as usize, ny as usize, layer);
+                let obs = self.obstacle_net_ids[c_idx];
+                if obs != FREE_NET && obs != target {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    pub fn is_circle_clear_specify_radius(
+        &self,
+        gx: usize,
+        gy: usize,
+        layer: usize,
+        radius_cells: i32,
+        net_id: usize,
+    ) -> bool {
+        self.is_circle_clear_SpecifyRadius(gx, gy, layer, radius_cells, net_id)
+    }
+
+    /// Solves a batch of 3D shortest paths across all available GPUs using `MultiGpuRouterPool`
+    /// and validates every returned node against `is_circle_clear_SpecifyRadius`.
+    pub fn solve_batch_3d_wavefront_paths(
+        &self,
+        requests: &[((usize, usize, usize), (usize, usize, usize), u32, f32)],
+        clearance_cells: i32,
+    ) -> Vec<Option<Vec<GridNode>>> {
+        if requests.is_empty() {
+            return Vec::new();
+        }
+        let obs_u32: Vec<u32> = self.obstacle_net_ids.iter().map(|&n| n as u32).collect();
+        let reqs_with_clearance: Vec<((usize, usize, usize), (usize, usize, usize), u32, f32, i32)> =
+            requests
+                .iter()
+                .map(|&(src, dst, net_id, via_cost)| {
+                    (src, dst, net_id, via_cost, clearance_cells.max(0))
+                })
+                .collect();
+        let pool = MultiGpuRouterPool::new();
+        let raw_paths = pool.solve_batch_3d_wavefront_paths_with_clearance(
+            &obs_u32,
+            self.width,
+            self.height,
+            self.num_layers,
+            &reqs_with_clearance,
+        );
+        raw_paths
+            .into_iter()
+            .zip(requests.iter())
+            .map(|(path_opt, &(_src, _dst, net_id, _via_cost))| {
+                let coords = path_opt?;
+                let mut nodes = Vec::with_capacity(coords.len());
+                for (gx, gy, layer) in coords {
+                    if !self.is_circle_clear_SpecifyRadius(
+                        gx,
+                        gy,
+                        layer,
+                        clearance_cells.max(0),
+                        net_id as usize,
+                    ) {
+                        return None;
+                    }
+                    nodes.push(GridNode { gx, gy, layer });
+                }
+                Some(nodes)
+            })
+            .collect()
     }
 }
 
@@ -7466,6 +7566,28 @@ pub fn find_choked_pin_bottlenecks(
 
     pub fn validate_crosstalk_and_coupling(&self, board: &Board) -> Vec<CouplingViolation> {
         validate_crosstalk_and_coupling(board)
+    }
+
+    /// Dispatches a batch of 3D wavefront pathfinding requests across all available GPUs
+    /// via `MultiGpuRouterPool` and returns obstacle-free `GridNode` paths.
+    pub fn solve_batch_gpu_wavefront_paths(
+        &self,
+        grid: &RoutingGrid,
+        requests: &[(GridNode, GridNode, usize, f32)],
+        clearance_cells: i32,
+    ) -> Vec<Option<Vec<GridNode>>> {
+        let raw_reqs: Vec<((usize, usize, usize), (usize, usize, usize), u32, f32)> = requests
+            .iter()
+            .map(|&(src, dst, net_id, via_cost)| {
+                (
+                    (src.gx, src.gy, src.layer),
+                    (dst.gx, dst.gy, dst.layer),
+                    net_id as u32,
+                    via_cost,
+                )
+            })
+            .collect();
+        grid.solve_batch_3d_wavefront_paths(&raw_reqs, clearance_cells)
     }
 }
 
@@ -17875,6 +17997,93 @@ mod tests {
             .evaluate_drc_candidates(&drc_ctx.pads, &drc_ctx.tracks, &drc_ctx.vias, &cands)
             .expect("Vulkan evaluate_drc_candidates failed");
         assert_eq!(cuda_res, vk_res, "CUDA and Vulkan DRC batch results must match identically");
+    }
+
+    #[test]
+    fn test_gpu_3d_wavefront_backtrack_path_valid_and_obstacle_free() {
+        let vk = VulkanEngine::new();
+        let board = make_router_test_board();
+        let mut grid = RoutingGrid::new(&board, 0.25, vk);
+
+        // Clear synthetic grid interior so we can construct a deterministic obstacle barrier
+        grid.obstacle_net_ids.fill(FREE_NET);
+        let gw = grid.width;
+        let gh = grid.height;
+        assert!(gw >= 24 && gh >= 24);
+
+        let mid_x = gw / 2;
+        let clearance_cells = 1i32;
+        // Place a foreign obstacle barrier (net 99) at x = mid_x, y = 2..(gh - 6) on all layers
+        for l in 0..grid.num_layers {
+            for y in 2..(gh - 6) {
+                let idx = grid.idx(mid_x, y, l);
+                grid.obstacle_net_ids[idx] = 99;
+            }
+        }
+
+        let router = AutoRouter::new(1);
+        let src1 = GridNode {
+            gx: mid_x.saturating_sub(5),
+            gy: gh / 2,
+            layer: 0,
+        };
+        let dst1 = GridNode {
+            gx: (mid_x + 5).min(gw - 3),
+            gy: gh / 2,
+            layer: 0,
+        };
+        let src2 = GridNode {
+            gx: mid_x.saturating_sub(4),
+            gy: gh - 3,
+            layer: 1,
+        };
+        let dst2 = GridNode {
+            gx: (mid_x + 4).min(gw - 3),
+            gy: gh - 3,
+            layer: 1,
+        };
+
+        let requests = vec![
+            (src1, dst1, 1usize, 3.0f32),
+            (src2, dst2, 2usize, 3.0f32),
+        ];
+        let results = router.solve_batch_gpu_wavefront_paths(&grid, &requests, clearance_cells);
+        assert_eq!(results.len(), 2);
+
+        for (req_idx, &(src, dst, net_id, _)) in requests.iter().enumerate() {
+            let path = results[req_idx]
+                .as_ref()
+                .expect("GPU 3D wavefront solver must return a valid obstacle-free path");
+            assert_eq!(path.first().copied(), Some(src));
+            assert_eq!(path.last().copied(), Some(dst));
+            for w in path.windows(2) {
+                let dx = (w[1].gx as isize - w[0].gx as isize).abs();
+                let dy = (w[1].gy as isize - w[0].gy as isize).abs();
+                let dl = (w[1].layer as isize - w[0].layer as isize).abs();
+                assert!(
+                    (dl == 0 && dx <= 1 && dy <= 1 && (dx + dy > 0))
+                        || (dl > 0 && dx == 0 && dy == 0),
+                    "Invalid step {:?} -> {:?}",
+                    w[0],
+                    w[1]
+                );
+            }
+            for node in path {
+                assert!(
+                    grid.is_circle_clear_SpecifyRadius(
+                        node.gx,
+                        node.gy,
+                        node.layer,
+                        clearance_cells,
+                        net_id
+                    ),
+                    "Node {:?} violated clearance radius {} for net {}",
+                    node,
+                    clearance_cells,
+                    net_id
+                );
+            }
+        }
     }
 }
 
