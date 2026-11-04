@@ -807,6 +807,169 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+const WAVEFRONT_3D_BACKTRACK_WGSL: &str = r#"
+struct WavefrontBacktrackUniformParams {
+    width: u32,
+    height: u32,
+    num_layers: u32,
+    via_cost: f32,
+    src_x: u32,
+    src_y: u32,
+    src_layer: u32,
+    dst_x: u32,
+    dst_y: u32,
+    dst_layer: u32,
+    max_path_len: u32,
+    pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> dist_grid: array<f32>;
+@group(0) @binding(1) var<storage, read> cell_costs: array<f32>;
+@group(0) @binding(2) var<storage, read_write> path_out: array<u32>;
+@group(0) @binding(3) var<storage, read_write> path_len_out: array<u32>;
+@group(0) @binding(4) var<uniform> params: WavefrontBacktrackUniformParams;
+
+@compute @workgroup_size(1, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x != 0u || gid.y != 0u || gid.z != 0u) {
+        return;
+    }
+
+    let w = i32(params.width);
+    let h = i32(params.height);
+    let nl = i32(params.num_layers);
+
+    if (i32(params.src_x) >= w || i32(params.src_y) >= h || i32(params.src_layer) >= nl ||
+        i32(params.dst_x) >= w || i32(params.dst_y) >= h || i32(params.dst_layer) >= nl ||
+        params.max_path_len == 0u) {
+        path_len_out[0] = 0u;
+        return;
+    }
+
+    let layer_stride = params.width * params.height;
+    let dst_idx = params.dst_layer * layer_stride + params.dst_y * params.width + params.dst_x;
+    if (dist_grid[dst_idx] >= 1.0e19) {
+        path_len_out[0] = 0u;
+        return;
+    }
+
+    var cx = i32(params.dst_x);
+    var cy = i32(params.dst_y);
+    var cl = i32(params.dst_layer);
+    var step_count: u32 = 0u;
+
+    loop {
+        if (step_count >= params.max_path_len) {
+            break;
+        }
+        path_out[step_count * 3u + 0u] = u32(cx);
+        path_out[step_count * 3u + 1u] = u32(cy);
+        path_out[step_count * 3u + 2u] = u32(cl);
+        step_count = step_count + 1u;
+
+        if (cx == i32(params.src_x) && cy == i32(params.src_y) && cl == i32(params.src_layer)) {
+            let half = step_count / 2u;
+            for (var i: u32 = 0u; i < half; i = i + 1u) {
+                let j = step_count - 1u - i;
+                for (var k: u32 = 0u; k < 3u; k = k + 1u) {
+                    let tmp = path_out[i * 3u + k];
+                    path_out[i * 3u + k] = path_out[j * 3u + k];
+                    path_out[j * 3u + k] = tmp;
+                }
+            }
+            path_len_out[0] = step_count;
+            return;
+        }
+
+        let layer_base = u32(cl) * layer_stride;
+        let cur_idx = layer_base + u32(cy * w + cx);
+        let cur_dist = dist_grid[cur_idx];
+        let my_cost = select(1.0, cell_costs[cur_idx], cell_costs[cur_idx] >= 0.0);
+
+        var best_nx: i32 = -1;
+        var best_ny: i32 = -1;
+        var best_nl: i32 = -1;
+        var best_score: f32 = 1.0e20;
+        var best_ndist: f32 = 1.0e20;
+
+        for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+            let ny = cy + dy;
+            if (ny < 0 || ny >= h) {
+                continue;
+            }
+            for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+                if (dx == 0 && dy == 0) {
+                    continue;
+                }
+                let nx = cx + dx;
+                if (nx < 0 || nx >= w) {
+                    continue;
+                }
+                let n_idx = layer_base + u32(ny * w + nx);
+                let n_dist = dist_grid[n_idx];
+                if (n_dist >= cur_dist || n_dist >= 1.0e19) {
+                    continue;
+                }
+                if (cell_costs[n_idx] < 0.0 && n_dist > 0.0) {
+                    continue;
+                }
+                let is_diag = dx != 0 && dy != 0;
+                let step_len = select(1.0, 1.41421356, is_diag);
+                if (is_diag) {
+                    let idx_h = layer_base + u32(cy * w + nx);
+                    let idx_v = layer_base + u32(ny * w + cx);
+                    if (cell_costs[idx_h] < 0.0 || cell_costs[idx_v] < 0.0) {
+                        continue;
+                    }
+                }
+                let cand_score = n_dist + my_cost * step_len;
+                if (cand_score < best_score - 1.0e-4 ||
+                    (abs(cand_score - best_score) <= 1.0e-4 && n_dist < best_ndist)) {
+                    best_score = cand_score;
+                    best_ndist = n_dist;
+                    best_nx = nx;
+                    best_ny = ny;
+                    best_nl = cl;
+                }
+            }
+        }
+
+        for (var ol: i32 = 0; ol < nl; ol = ol + 1) {
+            if (ol == cl) {
+                continue;
+            }
+            let o_idx = u32(ol) * layer_stride + u32(cy * w + cx);
+            let o_dist = dist_grid[o_idx];
+            if (o_dist >= cur_dist || o_dist >= 1.0e19) {
+                continue;
+            }
+            if (cell_costs[o_idx] < 0.0 && o_dist > 0.0) {
+                continue;
+            }
+            let cand_score = o_dist + params.via_cost;
+            if (cand_score < best_score - 1.0e-4 ||
+                (abs(cand_score - best_score) <= 1.0e-4 && o_dist < best_ndist)) {
+                best_score = cand_score;
+                best_ndist = o_dist;
+                best_nx = cx;
+                best_ny = cy;
+                best_nl = ol;
+            }
+        }
+
+        if (best_nx < 0) {
+            path_len_out[0] = 0u;
+            return;
+        }
+        cx = best_nx;
+        cy = best_ny;
+        cl = best_nl;
+    }
+
+    path_len_out[0] = 0u;
+}
+"#;
+
 const RT_BVH_SEGMENT_CROSSINGS_WGSL: &str = r#"
 struct GpuBvhNode {
     min_x: f32,
@@ -1848,6 +2011,23 @@ struct WavefrontUniformParams {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct WavefrontBacktrackUniformParams {
+    width: u32,
+    height: u32,
+    num_layers: u32,
+    via_cost: f32,
+    src_x: u32,
+    src_y: u32,
+    src_layer: u32,
+    dst_x: u32,
+    dst_y: u32,
+    dst_layer: u32,
+    max_path_len: u32,
+    pad: u32,
+}
+
+#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrcBatchParams {
     pub num_pads: u32,
@@ -1979,6 +2159,8 @@ pub struct VulkanEngine {
     route_cost_bgl: wgpu::BindGroupLayout,
     wavefront_pipeline: wgpu::ComputePipeline,
     wavefront_bgl: wgpu::BindGroupLayout,
+    wavefront_backtrack_pipeline: wgpu::ComputePipeline,
+    wavefront_backtrack_bgl: wgpu::BindGroupLayout,
     bvh_crossings_pipeline: wgpu::ComputePipeline,
     bvh_crossings_bgl: wgpu::BindGroupLayout,
     bvh_corridor_cuts_pipeline: wgpu::ComputePipeline,
@@ -2505,6 +2687,82 @@ impl VulkanEngine {
             cache: None,
         });
 
+        let wavefront_backtrack_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Vulkan 3D Wavefront Backtrack Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(WAVEFRONT_3D_BACKTRACK_WGSL.into()),
+        });
+
+        let wavefront_backtrack_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("WavefrontBacktrack3D BindGroupLayout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let wavefront_backtrack_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("WavefrontBacktrack3D PipelineLayout"),
+            bind_group_layouts: &[&wavefront_backtrack_bgl],
+            push_constant_ranges: &[],
+        });
+
+        let wavefront_backtrack_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("WavefrontBacktrack3D ComputePipeline"),
+            layout: Some(&wavefront_backtrack_pl_layout),
+            module: &wavefront_backtrack_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         let bvh_crossings_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Vulkan RT BVH Segment Crossings Compute Shader"),
             source: wgpu::ShaderSource::Wgsl(RT_BVH_SEGMENT_CROSSINGS_WGSL.into()),
@@ -2854,6 +3112,8 @@ impl VulkanEngine {
             route_cost_bgl,
             wavefront_pipeline,
             wavefront_bgl,
+            wavefront_backtrack_pipeline,
+            wavefront_backtrack_bgl,
             bvh_crossings_pipeline,
             bvh_crossings_bgl,
             bvh_corridor_cuts_pipeline,
@@ -3736,6 +3996,509 @@ impl VulkanEngine {
         param_buf.destroy();
 
         result
+    }
+
+    pub fn solve_3d_wavefront_path(
+        &self,
+        obstacle_grid: &[u32],
+        gw: usize,
+        gh: usize,
+        layers: usize,
+        src: (usize, usize, usize),
+        dst: (usize, usize, usize),
+        net_id: u32,
+        via_cost: f32,
+    ) -> Option<Vec<(usize, usize, usize)>> {
+        self.solve_3d_wavefront_path_with_clearance(
+            obstacle_grid,
+            gw,
+            gh,
+            layers,
+            src,
+            dst,
+            net_id,
+            via_cost,
+            0,
+        )
+    }
+
+    pub fn solve_3d_wavefront_path_with_clearance(
+        &self,
+        obstacle_grid: &[u32],
+        gw: usize,
+        gh: usize,
+        layers: usize,
+        src: (usize, usize, usize),
+        dst: (usize, usize, usize),
+        net_id: u32,
+        via_cost: f32,
+        clearance_cells: i32,
+    ) -> Option<Vec<(usize, usize, usize)>> {
+        if self.backend_kind == GpuBackendKind::CudaPtx {
+            if let Some(cuda) = &self.cuda_engine {
+                let res = cuda.solve_3d_wavefront_path_with_clearance(
+                    obstacle_grid,
+                    gw,
+                    gh,
+                    layers,
+                    src,
+                    dst,
+                    net_id,
+                    via_cost,
+                    clearance_cells,
+                );
+                self.compute_busy_ns.fetch_add(
+                    cuda.compute_busy_ns.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                return res;
+            }
+        }
+        self.solve_3d_wavefront_path_vulkan_wgsl(
+            obstacle_grid,
+            gw,
+            gh,
+            layers,
+            src,
+            dst,
+            net_id,
+            via_cost,
+            clearance_cells,
+        )
+    }
+
+    pub fn solve_3d_wavefront_path_vulkan_wgsl(
+        &self,
+        obstacle_grid: &[u32],
+        gw: usize,
+        gh: usize,
+        layers: usize,
+        src: (usize, usize, usize),
+        dst: (usize, usize, usize),
+        net_id: u32,
+        via_cost: f32,
+        clearance_cells: i32,
+    ) -> Option<Vec<(usize, usize, usize)>> {
+        if gw == 0 || gh == 0 || layers == 0 {
+            return None;
+        }
+        let total = gw.checked_mul(gh)?.checked_mul(layers)?;
+        if total == 0 || obstacle_grid.len() != total {
+            return None;
+        }
+        if src.0 >= gw
+            || src.1 >= gh
+            || src.2 >= layers
+            || dst.0 >= gw
+            || dst.1 >= gh
+            || dst.2 >= layers
+        {
+            return None;
+        }
+
+        let layer_stride = gw * gh;
+        let src_idx = src.2 * layer_stride + src.1 * gw + src.0;
+        let dst_idx = dst.2 * layer_stride + dst.1 * gw + dst.0;
+        let src_obs = obstacle_grid[src_idx];
+        let dst_obs = obstacle_grid[dst_idx];
+        if (src_obs != 0 && src_obs != net_id) || (dst_obs != 0 && dst_obs != net_id) {
+            return None;
+        }
+        if src == dst {
+            return Some(vec![src]);
+        }
+
+        let _guard = self.dispatch_lock.lock().ok()?;
+        let f32_byte_size = (total * std::mem::size_of::<f32>()) as u64;
+        let max_path_len = total.min(65536).max(64) as u32;
+        let path_byte_size = (max_path_len as usize * 3 * std::mem::size_of::<u32>()) as u64;
+        let len_byte_size = std::mem::size_of::<u32>() as u64;
+
+        let zero_f32 = vec![0.0f32; total];
+        let zero_u32 = vec![0u32; total];
+        let mut init_wf = vec![1.0e20f32; total];
+        init_wf[src_idx] = 0.0;
+
+        let obs_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("WavefrontSolve Obstacles Buffer"),
+            contents: bytemuck::cast_slice(obstacle_grid),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let df_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("WavefrontSolve ZeroDF Buffer"),
+            contents: bytemuck::cast_slice(&zero_f32),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let hist_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("WavefrontSolve ZeroHist Buffer"),
+            contents: bytemuck::cast_slice(&zero_f32),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let usage_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("WavefrontSolve ZeroUsage Buffer"),
+            contents: bytemuck::cast_slice(&zero_u32),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let costs_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("WavefrontSolve CellCosts Buffer"),
+            size: f32_byte_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let rc_params = GpuRouteCostParams {
+            width: gw as u32,
+            height: gh as u32,
+            num_layers: layers as u32,
+            net_id,
+            clearance_cells: clearance_cells.max(0),
+            present_congestion_factor: 0.0,
+            obstacle_clearance_weight: 0.0,
+            plane_layer_mask: 0,
+        };
+        let rc_param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("WavefrontSolve RouteCostParams Buffer"),
+            contents: bytemuck::bytes_of(&rc_params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let wf_buf_a = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("WavefrontSolve WF Buffer A"),
+            contents: bytemuck::cast_slice(&init_wf),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let wf_buf_b = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("WavefrontSolve WF Buffer B"),
+            contents: bytemuck::cast_slice(&init_wf),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let wf_params = WavefrontUniformParams {
+            width: gw as u32,
+            height: gh as u32,
+            num_layers: layers as u32,
+            via_cost,
+        };
+        let wf_param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("WavefrontSolve WFParams Buffer"),
+            contents: bytemuck::bytes_of(&wf_params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let path_out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("WavefrontSolve PathOut Buffer"),
+            size: path_byte_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let path_len_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("WavefrontSolve PathLen Buffer"),
+            contents: bytemuck::bytes_of(&0u32),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let bt_params = WavefrontBacktrackUniformParams {
+            width: gw as u32,
+            height: gh as u32,
+            num_layers: layers as u32,
+            via_cost,
+            src_x: src.0 as u32,
+            src_y: src.1 as u32,
+            src_layer: src.2 as u32,
+            dst_x: dst.0 as u32,
+            dst_y: dst.1 as u32,
+            dst_layer: dst.2 as u32,
+            max_path_len,
+            pad: 0,
+        };
+        let bt_param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("WavefrontSolve BacktrackParams Buffer"),
+            contents: bytemuck::bytes_of(&bt_params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let staging_len_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("WavefrontSolve Staging PathLen Buffer"),
+            size: len_byte_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let staging_path_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("WavefrontSolve Staging Path Buffer"),
+            size: path_byte_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bg_rc = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("WavefrontSolve RouteCost BindGroup"),
+            layout: &self.route_cost_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: obs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: df_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: hist_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: usage_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: costs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: rc_param_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let bg_wf_ab = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("WavefrontSolve WF BindGroup A->B"),
+            layout: &self.wavefront_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: costs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wf_buf_a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wf_buf_b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wf_param_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let bg_wf_ba = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("WavefrontSolve WF BindGroup B->A"),
+            layout: &self.wavefront_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: costs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wf_buf_b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wf_buf_a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wf_param_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let iterations = ((gw + gh + (gw * gh / 2).min(512) + layers * 4)
+            .max(32)
+            .min(4096)) as u32;
+        let final_wf_buf = if iterations % 2 == 1 { &wf_buf_b } else { &wf_buf_a };
+
+        let bg_bt = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("WavefrontSolve Backtrack BindGroup"),
+            layout: &self.wavefront_backtrack_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: final_wf_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: costs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: path_out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: path_len_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: bt_param_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("WavefrontSolve CommandEncoder"),
+        });
+
+        let wg_x = (gw as u32 + 15) / 16;
+        let wg_y = (gh as u32 + 15) / 16;
+        let wg_z = layers as u32;
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("WavefrontSolve RouteCost Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.route_cost_pipeline);
+            cpass.set_bind_group(0, &bg_rc, &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
+        }
+
+        for iter in 0..iterations {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("WavefrontSolve Relax Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.wavefront_pipeline);
+            cpass.set_bind_group(0, if iter % 2 == 0 { &bg_wf_ab } else { &bg_wf_ba }, &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
+        }
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("WavefrontSolve Backtrack Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.wavefront_backtrack_pipeline);
+            cpass.set_bind_group(0, &bg_bt, &[]);
+            cpass.dispatch_workgroups(1, 1, 1);
+        }
+
+        encoder.copy_buffer_to_buffer(&path_len_buf, 0, &staging_len_buf, 0, len_byte_size);
+        encoder.copy_buffer_to_buffer(&path_out_buf, 0, &staging_path_buf, 0, path_byte_size);
+
+        let start_t = Instant::now();
+        self.queue.submit(Some(encoder.finish()));
+
+        let len_slice = staging_len_buf.slice(..);
+        let path_slice = staging_path_buf.slice(..);
+        let (tx1, rx1) = std::sync::mpsc::channel();
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        len_slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx1.send(res);
+        });
+        path_slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx2.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+        let mut result = None;
+        if rx1.recv().ok().and_then(|r| r.ok()).is_some()
+            && rx2.recv().ok().and_then(|r| r.ok()).is_some()
+        {
+            let len_data = len_slice.get_mapped_range();
+            let path_len = bytemuck::cast_slice::<u8, u32>(&len_data)[0];
+            drop(len_data);
+            staging_len_buf.unmap();
+
+            if path_len > 0 && path_len <= max_path_len {
+                let path_data = path_slice.get_mapped_range();
+                let words = &bytemuck::cast_slice::<u8, u32>(&path_data)[..(path_len as usize * 3)];
+                let mut path = Vec::with_capacity(path_len as usize);
+                for c in words.chunks_exact(3) {
+                    path.push((c[0] as usize, c[1] as usize, c[2] as usize));
+                }
+                result = Some(path);
+            }
+            staging_path_buf.unmap();
+        }
+
+        staging_len_buf.destroy();
+        staging_path_buf.destroy();
+        bt_param_buf.destroy();
+        path_len_buf.destroy();
+        path_out_buf.destroy();
+        wf_param_buf.destroy();
+        wf_buf_b.destroy();
+        wf_buf_a.destroy();
+        rc_param_buf.destroy();
+        costs_buf.destroy();
+        usage_buf.destroy();
+        hist_buf.destroy();
+        df_buf.destroy();
+        obs_buf.destroy();
+
+        result
+    }
+
+    pub fn solve_batch_3d_wavefront_paths(
+        &self,
+        obstacle_grid: &[u32],
+        gw: usize,
+        gh: usize,
+        layers: usize,
+        requests: &[((usize, usize, usize), (usize, usize, usize), u32, f32)],
+    ) -> Vec<Option<Vec<(usize, usize, usize)>>> {
+        let reqs_with_clearance: Vec<((usize, usize, usize), (usize, usize, usize), u32, f32, i32)> =
+            requests
+                .iter()
+                .map(|&(src, dst, net_id, via_cost)| (src, dst, net_id, via_cost, 0))
+                .collect();
+        self.solve_batch_3d_wavefront_paths_with_clearance(
+            obstacle_grid,
+            gw,
+            gh,
+            layers,
+            &reqs_with_clearance,
+        )
+    }
+
+    pub fn solve_batch_3d_wavefront_paths_with_clearance(
+        &self,
+        obstacle_grid: &[u32],
+        gw: usize,
+        gh: usize,
+        layers: usize,
+        requests: &[((usize, usize, usize), (usize, usize, usize), u32, f32, i32)],
+    ) -> Vec<Option<Vec<(usize, usize, usize)>>> {
+        if requests.is_empty() {
+            return Vec::new();
+        }
+        if self.backend_kind == GpuBackendKind::CudaPtx {
+            let cuda_devs = crate::cuda::CudaEngine::all_devices();
+            if !cuda_devs.is_empty() {
+                let pool = crate::cuda::MultiGpuRouterPool {
+                    cuda_engines: cuda_devs,
+                    vulkan_fallback: None,
+                };
+                return pool.solve_batch_3d_wavefront_paths_with_clearance(
+                    obstacle_grid,
+                    gw,
+                    gh,
+                    layers,
+                    requests,
+                );
+            }
+        }
+        requests
+            .iter()
+            .map(|&(src, dst, net_id, via_cost, clearance_cells)| {
+                self.solve_3d_wavefront_path_vulkan_wgsl(
+                    obstacle_grid,
+                    gw,
+                    gh,
+                    layers,
+                    src,
+                    dst,
+                    net_id,
+                    via_cost,
+                    clearance_cells,
+                )
+            })
+            .collect()
     }
 
     pub fn evaluate_segment_crossings_rt_bvh(
@@ -4861,6 +5624,64 @@ mod tests {
         assert_eq!(cpu_lbvh, cpu_brute);
         assert_eq!(dispatch_cuts, cpu_brute);
         assert_eq!(wgsl_cuts, cpu_brute);
+    }
+
+    #[test]
+    fn test_gpu_3d_wavefront_backtrack_path_valid_and_obstacle_free() {
+        let vk = VulkanEngine::new().expect("VulkanEngine must initialize");
+        let gw = 18usize;
+        let gh = 18usize;
+        let layers = 2usize;
+        let layer_stride = gw * gh;
+        let mut obs = vec![0u32; gw * gh * layers];
+
+        // Wall on both layers at x = 9, y = 0..13 (foreign net 7)
+        for l in 0..layers {
+            for y in 0..13 {
+                obs[l * layer_stride + y * gw + 9] = 7;
+            }
+        }
+
+        let src = (3usize, 4usize, 0usize);
+        let dst = (14usize, 4usize, 0usize);
+
+        let path_wgsl = vk
+            .solve_3d_wavefront_path_vulkan_wgsl(&obs, gw, gh, layers, src, dst, 1, 3.0, 0)
+            .expect("Vulkan WGSL 3D wavefront backtracker must find valid path");
+        let path_dispatch = vk
+            .solve_3d_wavefront_path(&obs, gw, gh, layers, src, dst, 1, 3.0)
+            .expect("Dispatch 3D wavefront backtracker must find valid path");
+
+        for path in [&path_wgsl, &path_dispatch] {
+            assert_eq!(path.first().copied(), Some(src));
+            assert_eq!(path.last().copied(), Some(dst));
+            for w in path.windows(2) {
+                let (x0, y0, l0) = w[0];
+                let (x1, y1, l1) = w[1];
+                let dx = (x1 as isize - x0 as isize).abs();
+                let dy = (y1 as isize - y0 as isize).abs();
+                let dl = (l1 as isize - l0 as isize).abs();
+                assert!(
+                    (dl == 0 && dx <= 1 && dy <= 1 && (dx + dy > 0))
+                        || (dl > 0 && dx == 0 && dy == 0),
+                    "Invalid step {:?} -> {:?}",
+                    w[0],
+                    w[1]
+                );
+            }
+            for &(gx, gy, l) in path {
+                let cell_obs = obs[l * layer_stride + gy * gw + gx];
+                assert!(
+                    cell_obs == 0 || cell_obs == 1,
+                    "Path stepped onto foreign obstacle {} at ({}, {}, {})",
+                    cell_obs,
+                    gx,
+                    gy,
+                    l
+                );
+            }
+        }
+        assert_eq!(path_wgsl.len(), path_dispatch.len());
     }
 }
 
