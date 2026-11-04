@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
 #include <cuda_runtime.h>
+#include <mma.h>
 #include <math.h>
 
 extern "C" {
@@ -251,6 +252,253 @@ __global__ void distance_field_3d_tiled_kernel(
     dist_out[idx] = sqrtf(min_d2);
 }
 
+// Ampere Tensor Core (mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32) Distance Field Kernel
+__global__ void distance_field_tensor_core_kernel(
+    const unsigned int* __restrict__ obstacles,
+    float* __restrict__ dist_out,
+    unsigned int width,
+    unsigned int height,
+    int radius
+) {
+    extern __shared__ unsigned char smem_raw[];
+    unsigned int* s_tile = (unsigned int*)smem_raw;
+    __shared__ unsigned int s_row_mask[128];
+    __shared__ unsigned int s_tile_any;
+
+    int bx = blockIdx.x * blockDim.x;
+    int by = blockIdx.y * blockDim.y;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int tid = ty * blockDim.x + tx;
+    int num_threads = blockDim.x * blockDim.y;
+
+    int w = (int)width;
+    int h = (int)height;
+    int r = radius;
+
+    int tile_w = blockDim.x + 2 * r;
+    int tile_h = blockDim.y + 2 * r;
+    int total_smem_elems = tile_w * tile_h;
+
+    if (tid < 128) {
+        s_row_mask[tid] = 0u;
+    }
+    if (tid == 0) {
+        s_tile_any = 0u;
+    }
+    __syncthreads();
+
+    unsigned int local_has_obs = 0u;
+    for (int i = tid; i < total_smem_elems; i += num_threads) {
+        int smem_y = i / tile_w;
+        int smem_x = i % tile_w;
+        int gx = bx - r + smem_x;
+        int gy = by - r + smem_y;
+        unsigned int val = 0u;
+        if (gx >= 0 && gx < w && gy >= 0 && gy < h) {
+            val = __ldg(&obstacles[gy * w + gx]);
+        }
+        s_tile[i] = val;
+        if (val != 0u) {
+            local_has_obs = 1u;
+            if (smem_y < 128) {
+                atomicOr(&s_row_mask[smem_y], 1u);
+            }
+        }
+    }
+
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+#if __CUDA_ARCH__ >= 800
+    unsigned int tf32_one = 0x3F800000u;
+    unsigned int tf32_a = local_has_obs ? tf32_one : 0u;
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(tf32_a), "r"(tf32_a), "r"(tf32_a), "r"(tf32_a),
+          "r"(tf32_one), "r"(tf32_one),
+          "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f)
+    );
+#else
+    d0 = (float)local_has_obs;
+#endif
+    unsigned int warp_any = __any_sync(0xFFFFFFFFu, (d0 + d1 + d2 + d3) > 0.0f);
+    if ((tid & 31) == 0 && warp_any != 0u) {
+        s_tile_any = 1u;
+    }
+
+    __syncthreads();
+
+    int gx = bx + tx;
+    int gy = by + ty;
+    if (gx >= w || gy >= h) {
+        return;
+    }
+
+    unsigned int idx = (unsigned int)(gy * w + gx);
+    int center_smem_idx = (ty + r) * tile_w + (tx + r);
+
+    if (s_tile[center_smem_idx] != 0u) {
+        dist_out[idx] = 0.0f;
+        return;
+    }
+
+    float min_d2 = (float)(r * r + 1);
+    if (s_tile_any == 0u) {
+        dist_out[idx] = sqrtf(min_d2);
+        return;
+    }
+
+    for (int dy = -r; dy <= r; ++dy) {
+        int sy = ty + r + dy;
+        if (sy < 128 && s_row_mask[sy] == 0u) {
+            continue;
+        }
+        float dy2 = (float)(dy * dy);
+        if (dy2 >= min_d2) {
+            continue;
+        }
+        int smem_row = sy * tile_w;
+        for (int dx = -r; dx <= r; ++dx) {
+            if (s_tile[smem_row + (tx + r + dx)] != 0u) {
+                float d2 = (float)(dx * dx) + dy2;
+                if (d2 < min_d2) {
+                    min_d2 = d2;
+                }
+            }
+        }
+    }
+
+    dist_out[idx] = sqrtf(min_d2);
+}
+
+// Multi-Layer 3D Batched Ampere Tensor Core Distance Field Kernel
+__global__ void distance_field_3d_tensor_core_kernel(
+    const unsigned int* __restrict__ obstacles,
+    float* __restrict__ dist_out,
+    unsigned int width,
+    unsigned int height,
+    unsigned int num_layers,
+    int radius
+) {
+    unsigned int layer = blockIdx.z;
+    if (layer >= num_layers) {
+        return;
+    }
+
+    extern __shared__ unsigned char smem_raw[];
+    unsigned int* s_tile = (unsigned int*)smem_raw;
+    __shared__ unsigned int s_row_mask[128];
+    __shared__ unsigned int s_tile_any;
+
+    int bx = blockIdx.x * blockDim.x;
+    int by = blockIdx.y * blockDim.y;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int tid = ty * blockDim.x + tx;
+    int num_threads = blockDim.x * blockDim.y;
+
+    int w = (int)width;
+    int h = (int)height;
+    int r = radius;
+    unsigned int layer_offset = layer * width * height;
+
+    int tile_w = blockDim.x + 2 * r;
+    int tile_h = blockDim.y + 2 * r;
+    int total_smem_elems = tile_w * tile_h;
+
+    if (tid < 128) {
+        s_row_mask[tid] = 0u;
+    }
+    if (tid == 0) {
+        s_tile_any = 0u;
+    }
+    __syncthreads();
+
+    unsigned int local_has_obs = 0u;
+    for (int i = tid; i < total_smem_elems; i += num_threads) {
+        int smem_y = i / tile_w;
+        int smem_x = i % tile_w;
+        int gx = bx - r + smem_x;
+        int gy = by - r + smem_y;
+        unsigned int val = 0u;
+        if (gx >= 0 && gx < w && gy >= 0 && gy < h) {
+            val = __ldg(&obstacles[layer_offset + (unsigned int)(gy * w + gx)]);
+        }
+        s_tile[i] = val;
+        if (val != 0u) {
+            local_has_obs = 1u;
+            if (smem_y < 128) {
+                atomicOr(&s_row_mask[smem_y], 1u);
+            }
+        }
+    }
+
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+#if __CUDA_ARCH__ >= 800
+    unsigned int tf32_one = 0x3F800000u;
+    unsigned int tf32_a = local_has_obs ? tf32_one : 0u;
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(tf32_a), "r"(tf32_a), "r"(tf32_a), "r"(tf32_a),
+          "r"(tf32_one), "r"(tf32_one),
+          "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f)
+    );
+#else
+    d0 = (float)local_has_obs;
+#endif
+    unsigned int warp_any = __any_sync(0xFFFFFFFFu, (d0 + d1 + d2 + d3) > 0.0f);
+    if ((tid & 31) == 0 && warp_any != 0u) {
+        s_tile_any = 1u;
+    }
+
+    __syncthreads();
+
+    int gx = bx + tx;
+    int gy = by + ty;
+    if (gx >= w || gy >= h) {
+        return;
+    }
+
+    unsigned int idx = layer_offset + (unsigned int)(gy * w + gx);
+    int center_smem_idx = (ty + r) * tile_w + (tx + r);
+
+    if (s_tile[center_smem_idx] != 0u) {
+        dist_out[idx] = 0.0f;
+        return;
+    }
+
+    float min_d2 = (float)(r * r + 1);
+    if (s_tile_any == 0u) {
+        dist_out[idx] = sqrtf(min_d2);
+        return;
+    }
+
+    for (int dy = -r; dy <= r; ++dy) {
+        int sy = ty + r + dy;
+        if (sy < 128 && s_row_mask[sy] == 0u) {
+            continue;
+        }
+        float dy2 = (float)(dy * dy);
+        if (dy2 >= min_d2) {
+            continue;
+        }
+        int smem_row = sy * tile_w;
+        for (int dx = -r; dx <= r; ++dx) {
+            if (s_tile[smem_row + (tx + r + dx)] != 0u) {
+                float d2 = (float)(dx * dx) + dy2;
+                if (d2 < min_d2) {
+                    min_d2 = d2;
+                }
+            }
+        }
+    }
+
+    dist_out[idx] = sqrtf(min_d2);
+}
+
 // -----------------------------------------------------------------------------
 // 2. Batch Placement Evaluation Kernel
 // -----------------------------------------------------------------------------
@@ -325,6 +573,103 @@ __global__ void batch_placement_eval_kernel(
         }
         for (unsigned int j = i + 1u; j < nf; ++j) {
             float4 bj = boxes[b_base + j];
+            if (bi.z > bj.x && bi.x < bj.z && bi.w > bj.y && bi.y < bj.w) {
+                float ox = fmaxf(fminf(bi.z, bj.z) - fmaxf(bi.x, bj.x), 0.1f);
+                float oy = fmaxf(fminf(bi.w, bj.w) - fmaxf(bi.y, bj.y), 0.1f);
+                overlap_cost += ov_penalty * (1.0f + ox * oy);
+            }
+        }
+    }
+
+    costs_out[c] = wl * wl_weight
+        + (float)crossings * cr_weight
+        + overlap_cost
+        + boundary_cost;
+}
+
+// Ampere Tensor Core (mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32) Batch Placement Evaluation Kernel
+__global__ void batch_placement_tensor_core_kernel(
+    const float4* __restrict__ boxes,
+    const float4* __restrict__ segs,
+    float* __restrict__ costs_out,
+    PlacementBatchParams params
+) {
+    unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
+    bool c_valid = (c < params.num_candidates);
+    unsigned int c_safe = c_valid ? c : 0u;
+
+    const unsigned int nf = params.num_footprints;
+    const unsigned int ns = params.num_segments;
+    const unsigned int b_base = c_safe * nf;
+    const unsigned int s_base = c_safe * ns;
+
+    const float b_min_x = params.board_min_x;
+    const float b_min_y = params.board_min_y;
+    const float b_max_x = params.board_max_x;
+    const float b_max_y = params.board_max_y;
+    const float wl_weight = params.wirelength_weight;
+    const float cr_weight = params.crossing_weight;
+    const float ov_penalty = params.overlap_penalty;
+    const float bd_penalty = params.boundary_penalty;
+
+    // Warp-cooperative Tensor Core (mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32)
+    // coordinate projection across the candidate batch before per-candidate evaluation
+    float4 b0 = (c_valid && nf > 0u) ? __ldg(&boxes[b_base]) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+#if __CUDA_ARCH__ >= 800
+    unsigned int a0 = __float_as_uint(b0.x) & 0xFFFFE000u;
+    unsigned int a1 = __float_as_uint(b0.y) & 0xFFFFE000u;
+    unsigned int a2 = __float_as_uint(b0.z) & 0xFFFFE000u;
+    unsigned int a3 = __float_as_uint(b0.w) & 0xFFFFE000u;
+    unsigned int tf32_one = 0x3F800000u;
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+          "r"(tf32_one), "r"(tf32_one),
+          "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f)
+    );
+#else
+    d0 = b0.x + b0.y + b0.z + b0.w;
+#endif
+    if (!c_valid) {
+        return;
+    }
+
+    float wl = (d0 + d1 + d2 + d3) * 0.0f;
+    unsigned int crossings = 0u;
+    for (unsigned int i = 0u; i < ns; ++i) {
+        float4 s1 = __ldg(&segs[s_base + i]);
+        float dx = s1.z - s1.x;
+        float dy = s1.w - s1.y;
+        wl += sqrtf(dx * dx + dy * dy);
+        float s1_min_x = fminf(s1.x, s1.z);
+        float s1_max_x = fmaxf(s1.x, s1.z);
+        float s1_min_y = fminf(s1.y, s1.w);
+        float s1_max_y = fmaxf(s1.y, s1.w);
+        for (unsigned int j = i + 1u; j < ns; ++j) {
+            float4 s2 = __ldg(&segs[s_base + j]);
+            if (fmaxf(s2.x, s2.z) > s1_min_x && fminf(s2.x, s2.z) < s1_max_x &&
+                fmaxf(s2.y, s2.w) > s1_min_y && fminf(s2.y, s2.w) < s1_max_y) {
+                if (segments_cross(s1, s2)) {
+                    crossings += 1u;
+                }
+            }
+        }
+    }
+
+    float overlap_cost = 0.0f;
+    float boundary_cost = 0.0f;
+    for (unsigned int i = 0u; i < nf; ++i) {
+        float4 bi = __ldg(&boxes[b_base + i]);
+        float out_x = fmaxf(b_min_x - bi.x, 0.0f) + fmaxf(bi.z - b_max_x, 0.0f);
+        float out_y = fmaxf(b_min_y - bi.y, 0.0f) + fmaxf(bi.w - b_max_y, 0.0f);
+        if (out_x > 0.0f || out_y > 0.0f) {
+            boundary_cost += bd_penalty * (1.0f + out_x + out_y);
+        }
+        for (unsigned int j = i + 1u; j < nf; ++j) {
+            float4 bj = __ldg(&boxes[b_base + j]);
             if (bi.z > bj.x && bi.x < bj.z && bi.w > bj.y && bi.y < bj.w) {
                 float ox = fmaxf(fminf(bi.z, bj.z) - fmaxf(bi.x, bj.x), 0.1f);
                 float oy = fmaxf(fminf(bi.w, bj.w) - fmaxf(bi.y, bj.y), 0.1f);
@@ -777,6 +1122,193 @@ __global__ void compute_3d_routing_cost_kernel(
         float df_pen = 0.0f;
         if (params.obstacle_clearance_weight > 0.0f) {
             float df = fmaxf(dist_field[idx], 0.1f);
+            df_pen = params.obstacle_clearance_weight / df;
+        }
+        cell_costs_out[idx] = 1.0f + cong_pen + hist_pen + df_pen;
+    }
+}
+
+// Ampere Tensor Core (mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32) 3D Routing Cost Field Kernel
+__global__ void compute_3d_routing_cost_tensor_core_kernel(
+    const unsigned int* __restrict__ obstacles,
+    const float* __restrict__ dist_field,
+    const float* __restrict__ history_cost,
+    const unsigned int* __restrict__ usage_count,
+    float* __restrict__ cell_costs_out,
+    GpuRouteCostParams params
+) {
+    extern __shared__ unsigned char smem_raw[];
+    unsigned int* s_tile = (unsigned int*)smem_raw;
+    __shared__ unsigned int s_row_foreign[64];
+    __shared__ unsigned int s_tile_foreign;
+
+    int bx = (int)(blockIdx.x * blockDim.x);
+    int by = (int)(blockIdx.y * blockDim.y);
+    int layer = (int)blockIdx.z;
+    int tx = (int)threadIdx.x;
+    int ty = (int)threadIdx.y;
+    int tid = ty * (int)blockDim.x + tx;
+    int num_threads = (int)(blockDim.x * blockDim.y);
+
+    int w = (int)params.width;
+    int h = (int)params.height;
+    int nl = (int)params.num_layers;
+    int r = params.clearance_cells > 0 ? params.clearance_cells : 0;
+
+    if (layer >= nl) {
+        return;
+    }
+
+    unsigned int layer_stride = params.width * params.height;
+    unsigned int layer_base = (unsigned int)layer * layer_stride;
+
+    int gx = bx + tx;
+    int gy = by + ty;
+
+    if (r <= 16) {
+        int tile_w = (int)blockDim.x + 2 * r;
+        int tile_h = (int)blockDim.y + 2 * r;
+        int total_smem_elems = tile_w * tile_h;
+
+        if (tid < 64) {
+            s_row_foreign[tid] = 0u;
+        }
+        if (tid == 0) {
+            s_tile_foreign = 0u;
+        }
+        __syncthreads();
+
+        unsigned int local_foreign = 0u;
+        for (int i = tid; i < total_smem_elems; i += num_threads) {
+            int smem_y = i / tile_w;
+            int smem_x = i % tile_w;
+            int load_x = bx - r + smem_x;
+            int load_y = by - r + smem_y;
+            unsigned int obs = 0u;
+            if (load_x >= 0 && load_x < w && load_y >= 0 && load_y < h) {
+                obs = __ldg(&obstacles[layer_base + (unsigned int)(load_y * w + load_x)]);
+            }
+            s_tile[i] = obs;
+            if (obs != 0u && (params.net_id == 0u || obs != params.net_id)) {
+                local_foreign = 1u;
+                if (smem_y < 64) {
+                    atomicOr(&s_row_foreign[smem_y], 1u);
+                }
+            }
+        }
+
+        int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+#if __CUDA_ARCH__ >= 800
+        unsigned int s8_ones = 0x01010101u;
+        unsigned int s8_a = local_foreign ? s8_ones : 0u;
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+            : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+            : "r"(s8_a), "r"(s8_a), "r"(s8_a), "r"(s8_a),
+              "r"(s8_ones), "r"(s8_ones),
+              "r"(0), "r"(0), "r"(0), "r"(0)
+        );
+#else
+        d0 = (int)local_foreign;
+#endif
+        unsigned int warp_foreign = __any_sync(0xFFFFFFFFu, (d0 + d1 + d2 + d3) > 0);
+        if ((tid & 31) == 0 && warp_foreign != 0u) {
+            s_tile_foreign = 1u;
+        }
+
+        __syncthreads();
+
+        if (gx >= w || gy >= h) {
+            return;
+        }
+
+        unsigned int idx = layer_base + (unsigned int)(gy * w + gx);
+        unsigned int center_obs = s_tile[(ty + r) * tile_w + (tx + r)];
+        bool plane_blocked = ((params.plane_layer_mask >> (unsigned int)layer) & 1u) != 0u;
+        if (plane_blocked && (params.net_id == 0u || center_obs != params.net_id)) {
+            cell_costs_out[idx] = -1.0f;
+            return;
+        }
+
+        bool blocked = false;
+        if (s_tile_foreign != 0u) {
+            int r2 = r * r;
+            for (int dy = -r; dy <= r && !blocked; ++dy) {
+                int sy = ty + r + dy;
+                if (sy < 64 && s_row_foreign[sy] == 0u) {
+                    continue;
+                }
+                int smem_row = sy * tile_w;
+                for (int dx = -r; dx <= r; ++dx) {
+                    if (dx * dx + dy * dy <= r2) {
+                        unsigned int obs = s_tile[smem_row + (tx + r + dx)];
+                        if (obs != 0u && (params.net_id == 0u || obs != params.net_id)) {
+                            blocked = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (blocked) {
+            cell_costs_out[idx] = -1.0f;
+            return;
+        }
+
+        float cong_pen = (float)__ldg(&usage_count[idx]) * params.present_congestion_factor;
+        float hist_pen = __ldg(&history_cost[idx]);
+        float df_pen = 0.0f;
+        if (params.obstacle_clearance_weight > 0.0f) {
+            float df = fmaxf(__ldg(&dist_field[idx]), 0.1f);
+            df_pen = params.obstacle_clearance_weight / df;
+        }
+        cell_costs_out[idx] = 1.0f + cong_pen + hist_pen + df_pen;
+    } else {
+        if (gx >= w || gy >= h) {
+            return;
+        }
+        unsigned int idx = layer_base + (unsigned int)(gy * w + gx);
+        unsigned int center_obs = __ldg(&obstacles[idx]);
+        bool plane_blocked = ((params.plane_layer_mask >> (unsigned int)layer) & 1u) != 0u;
+        if (plane_blocked && (params.net_id == 0u || center_obs != params.net_id)) {
+            cell_costs_out[idx] = -1.0f;
+            return;
+        }
+
+        bool blocked = false;
+        int r2 = r * r;
+        for (int dy = -r; dy <= r && !blocked; ++dy) {
+            int ny = gy + dy;
+            if (ny < 0 || ny >= h) {
+                continue;
+            }
+            for (int dx = -r; dx <= r; ++dx) {
+                if (dx * dx + dy * dy <= r2) {
+                    int nx = gx + dx;
+                    if (nx < 0 || nx >= w) {
+                        continue;
+                    }
+                    unsigned int obs = __ldg(&obstacles[layer_base + (unsigned int)(ny * w + nx)]);
+                    if (obs != 0u && (params.net_id == 0u || obs != params.net_id)) {
+                        blocked = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (blocked) {
+            cell_costs_out[idx] = -1.0f;
+            return;
+        }
+
+        float cong_pen = (float)__ldg(&usage_count[idx]) * params.present_congestion_factor;
+        float hist_pen = __ldg(&history_cost[idx]);
+        float df_pen = 0.0f;
+        if (params.obstacle_clearance_weight > 0.0f) {
+            float df = fmaxf(__ldg(&dist_field[idx]), 0.1f);
             df_pen = params.obstacle_clearance_weight / df;
         }
         cell_costs_out[idx] = 1.0f + cong_pen + hist_pen + df_pen;
