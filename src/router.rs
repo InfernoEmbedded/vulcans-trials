@@ -6615,12 +6615,53 @@ pub fn find_choked_pin_bottlenecks(
                 continue;
             }
 
-            let is_tht_start = board.footprints.get(conn.start_fp)
+            let start_tht_r = board.footprints.get(conn.start_fp)
                 .and_then(|fp| fp.pads.get(conn.start_pad))
-                .map_or(false, |p| p.is_through_hole);
-            let is_tht_end = board.footprints.get(conn.end_fp)
+                .filter(|p| p.is_through_hole)
+                .map(|p| p.width.max(p.height) * 0.5 + 0.1);
+            let end_tht_r = board.footprints.get(conn.end_fp)
                 .and_then(|fp| fp.pads.get(conn.end_pad))
-                .map_or(false, |p| p.is_through_hole);
+                .filter(|p| p.is_through_hole)
+                .map(|p| p.width.max(p.height) * 0.5 + 0.1);
+            let is_tht_start = start_tht_r.is_some();
+            let is_tht_end = end_tht_r.is_some();
+
+            if let Some(sr) = start_tht_r {
+                let lim = path.len().min(16);
+                let mut trim_start = 0;
+                for i in 1..lim {
+                    let w = grid.grid_to_world(path[i].gx, path[i].gy);
+                    if (w.0 - conn.start.0).hypot(w.1 - conn.start.1) > sr {
+                        break;
+                    }
+                    if path[i].layer != path[i - 1].layer
+                        || (path[i].gx == path[i - 1].gx && path[i].gy == path[i - 1].gy)
+                    {
+                        trim_start = i;
+                    }
+                }
+                if trim_start > 0 && trim_start < path.len() {
+                    path = &path[trim_start..];
+                }
+            }
+            if let Some(er) = end_tht_r {
+                let min_idx = path.len().saturating_sub(16);
+                let mut trim_end = path.len();
+                for i in (min_idx..path.len().saturating_sub(1)).rev() {
+                    let w = grid.grid_to_world(path[i].gx, path[i].gy);
+                    if (w.0 - conn.end.0).hypot(w.1 - conn.end.1) > er {
+                        break;
+                    }
+                    if path[i].layer != path[i + 1].layer
+                        || (path[i].gx == path[i + 1].gx && path[i].gy == path[i + 1].gy)
+                    {
+                        trim_end = i + 1;
+                    }
+                }
+                if trim_end < path.len() && trim_end > 0 {
+                    path = &path[..trim_end];
+                }
+            }
 
             let mut run_start_idx = 0;
             let mut last_trans_via: Option<(f64, f64)> = None;
@@ -6870,13 +6911,17 @@ pub fn find_choked_pin_bottlenecks(
                 if run_end_idx + 1 < path.len() {
                     let trans_node = path[run_end_idx];
                     let pt = grid.grid_to_world(trans_node.gx, trans_node.gy);
-                    let is_in_th_pad = board.footprints.iter().any(|fp| {
-                        fp.pads.iter().any(|pad| {
+                    let in_th_pad_pos = board.footprints.iter().find_map(|fp| {
+                        fp.pads.iter().find_map(|pad| {
                             if pad.is_through_hole && pad.net_id == conn.net_id {
                                 let (px, py) = fp.pad_absolute_position(pad);
-                                (px - pt.0).hypot(py - pt.1) <= pad.width.max(pad.height) / 2.0 + 0.1
+                                if (px - pt.0).hypot(py - pt.1) <= pad.width.max(pad.height) / 2.0 + 0.1 {
+                                    Some((px, py))
+                                } else {
+                                    None
+                                }
                             } else {
-                                false
+                                None
                             }
                         })
                     });
@@ -6885,7 +6930,7 @@ pub fn find_choked_pin_bottlenecks(
                         .iter()
                         .any(|v| v.net_id == conn.net_id && (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.25);
 
-                    if !is_in_th_pad && !already_has_via {
+                    if in_th_pad_pos.is_none() && !already_has_via {
                         let mut final_via_pt = pt;
                         if is_diff_pair {
                             let mate_conn_idx = if let Some(l_idx) = conn.diff_pair_leader {
@@ -7061,6 +7106,28 @@ pub fn find_choked_pin_bottlenecks(
                                                 is_locked: false,
                                             });
                                         }
+                                    }
+                                }
+                            }
+                        }
+                    } else if let Some(th_pos) = in_th_pad_pos {
+                        last_trans_via = Some(th_pos);
+                        if let Some(last_trk) = board.tracks.last().cloned() {
+                            if last_trk.net_id == conn.net_id && (last_trk.end.0 - pt.0).hypot(last_trk.end.1 - pt.1) < 1.0 {
+                                let end_layer = last_trk.layer;
+                                let start_pt = last_trk.start;
+                                let dogleg = compute_45_dogleg(start_pt, th_pos, false);
+                                board.tracks.pop();
+                                for w in dogleg.windows(2) {
+                                    if (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) > 1e-4 {
+                                        board.tracks.push(TrackSegment {
+                                            start: w[0],
+                                            end: w[1],
+                                            width,
+                                            layer: end_layer,
+                                            net_id: conn.net_id,
+                                            is_locked: false,
+                                        });
                                     }
                                 }
                             }
@@ -8120,6 +8187,191 @@ pub fn find_choked_pin_bottlenecks(
                                     db.partial_cmp(&da).unwrap_or(Ordering::Equal)
                                 });
 
+                                // First try sliding any nearby 45° diagonal segment horizontally along its connected horizontal neighbors
+                                for diag_t in &cand_tracks {
+                                    let ddx = diag_t.end.0 - diag_t.start.0;
+                                    let ddy = diag_t.end.1 - diag_t.start.1;
+                                    if (ddx.abs() - ddy.abs()).abs() > 1e-3 {
+                                        continue;
+                                    }
+                                    let p1 = diag_t.start;
+                                    let p2 = diag_t.end;
+                                    let find_horiz_neighbor = |b: &Board, pt: (f64, f64)| -> Option<(usize, (f64, f64))> {
+                                        b.tracks.iter().enumerate().find_map(|(idx, t)| {
+                                            if t.layer != diag_t.layer
+                                                || t.net_id != diag_t.net_id
+                                                || t.is_locked
+                                                || (t.start.1 - t.end.1).abs() > 1e-4
+                                            {
+                                                return None;
+                                            }
+                                            if (t.start.0 - pt.0).hypot(t.start.1 - pt.1) < 1e-4 {
+                                                Some((idx, t.end))
+                                            } else if (t.end.0 - pt.0).hypot(t.end.1 - pt.1) < 1e-4 {
+                                                Some((idx, t.start))
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    };
+                                    let Some((idx_d, _)) = board.tracks.iter().enumerate().find(|(_, t)| {
+                                        t.layer == diag_t.layer
+                                            && t.net_id == diag_t.net_id
+                                            && (t.start.0 - p1.0).abs() < 1e-5
+                                            && (t.start.1 - p1.1).abs() < 1e-5
+                                            && (t.end.0 - p2.0).abs() < 1e-5
+                                            && (t.end.1 - p2.1).abs() < 1e-5
+                                    }) else {
+                                        continue;
+                                    };
+                                    let (Some((idx_h1, o1)), Some((idx_h2, o2))) =
+                                        (find_horiz_neighbor(board, p1), find_horiz_neighbor(board, p2))
+                                    else {
+                                        continue;
+                                    };
+                                    if idx_h1 == idx_h2 || idx_h1 == idx_d || idx_h2 == idx_d {
+                                        continue;
+                                    }
+                                    let t_clr = board.get_netclass_for_net(diag_t.net_id).clearance;
+                                    let pre_slide = board.tracks.clone();
+                                    for &shift_x in &[-0.65_f64, -0.55, -0.45, -0.75, 0.45, 0.55, 0.65] {
+                                        let np1 = (p1.0 + shift_x, p1.1);
+                                        let np2 = (p2.0 + shift_x, p2.1);
+                                        if (o1.0 - np1.0).signum() != (o1.0 - p1.0).signum()
+                                            || (o1.0 - np1.0).abs() < 0.03
+                                            || (o2.0 - np2.0).signum() != (o2.0 - p2.0).signum()
+                                            || (o2.0 - np2.0).abs() < 0.03
+                                        {
+                                            continue;
+                                        }
+                                        let mut rem = [idx_d, idx_h1, idx_h2];
+                                        rem.sort_unstable_by(|a, b| b.cmp(a));
+                                        for &r in &rem {
+                                            board.tracks.remove(r);
+                                        }
+                                        let horiz_ext_legal = |b: &Board, s: (f64, f64), e: (f64, f64), orig_s: (f64, f64), orig_e: (f64, f64)| -> bool {
+                                            if is_track_segment_legal(b, s, e, diag_t.width, diag_t.layer, diag_t.net_id, t_clr) {
+                                                return true;
+                                            }
+                                            let half_w = diag_t.width * 0.5;
+                                            for trk in &b.tracks {
+                                                if trk.net_id != diag_t.net_id && trk.layer == diag_t.layer {
+                                                    let trk_c = t_clr.max(b.get_netclass_for_net(trk.net_id).clearance).max(0.12);
+                                                    if dist_segment_to_segment(s, e, trk.start, trk.end) < half_w + trk.width * 0.5 + trk_c - 1e-4 {
+                                                        return false;
+                                                    }
+                                                }
+                                            }
+                                            for v in &b.vias {
+                                                if v.net_id != diag_t.net_id {
+                                                    let v_c = t_clr.max(b.get_netclass_for_net(v.net_id).clearance).max(0.12);
+                                                    if dist_point_to_segment(v.position, s, e) < half_w + v.size * 0.5 + v_c - 1e-4 {
+                                                        return false;
+                                                    }
+                                                }
+                                            }
+                                            for ofp in &b.footprints {
+                                                for opad in &ofp.pads {
+                                                    if opad.net_id != diag_t.net_id && (opad.is_through_hole || ofp.layer == diag_t.layer) {
+                                                        let pad_c = t_clr.max(b.get_netclass_for_net(opad.net_id).clearance).max(0.12);
+                                                        let req_d = half_w + pad_c;
+                                                        let d_new = dist_segment_to_pad(s, e, ofp, opad);
+                                                        let d_old = dist_segment_to_pad(orig_s, orig_e, ofp, opad);
+                                                        if d_new < req_d.min(d_old) - 1e-4 {
+                                                            return false;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            true
+                                        };
+                                        let new_segs = [(o1, np1), (np1, np2), (np2, o2)];
+                                        if is_track_segment_legal(board, np1, np2, diag_t.width, diag_t.layer, diag_t.net_id, t_clr)
+                                            && horiz_ext_legal(board, o1, np1, o1, p1)
+                                            && horiz_ext_legal(board, np2, o2, p2, o2)
+                                        {
+                                            for &(s, e) in &new_segs {
+                                                board.tracks.push(TrackSegment {
+                                                    start: s,
+                                                    end: e,
+                                                    width: diag_t.width,
+                                                    layer: diag_t.layer,
+                                                    net_id: diag_t.net_id,
+                                                    is_locked: false,
+                                                });
+                                            }
+                                            if let Some((vx, vy)) = Self::find_safe_plane_via_location(
+                                                board,
+                                                grid,
+                                                plane_net_id,
+                                                px,
+                                                py,
+                                                fp.layer,
+                                                pad,
+                                                &added_via_positions,
+                                            ) {
+                                                for &(try_w, try_c) in &[(track_w, plane_c), (0.15, 0.15)] {
+                                                    let valid_dogleg = if is_octilinear_segment((px, py), (vx, vy))
+                                                        && is_track_segment_legal(board, (px, py), (vx, vy), try_w, fp.layer, plane_net_id, try_c)
+                                                    {
+                                                        Some(vec![(px, py), (vx, vy)])
+                                                    } else {
+                                                        [false, true]
+                                                            .into_iter()
+                                                            .map(|df| compute_45_dogleg((px, py), (vx, vy), df))
+                                                            .find(|dl| {
+                                                                dl.windows(2).all(|w| {
+                                                                    (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) <= 1e-4
+                                                                        || is_track_segment_legal(
+                                                                            board,
+                                                                            w[0],
+                                                                            w[1],
+                                                                            try_w,
+                                                                            fp.layer,
+                                                                            plane_net_id,
+                                                                            try_c,
+                                                                        )
+                                                                })
+                                                            })
+                                                    };
+                                                    if let Some(dogleg) = valid_dogleg {
+                                                        for w in dogleg.windows(2) {
+                                                            if (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) > 1e-4 {
+                                                                board.tracks.push(TrackSegment {
+                                                                    start: w[0],
+                                                                    end: w[1],
+                                                                    width: try_w,
+                                                                    layer: fp.layer,
+                                                                    net_id: plane_net_id,
+                                                                    is_locked: false,
+                                                                });
+                                                            }
+                                                        }
+                                                        board.vias.push(Via {
+                                                            position: (vx, vy),
+                                                            size: 0.60,
+                                                            drill: 0.30,
+                                                            net_id: plane_net_id,
+                                                            is_locked: false,
+                                                        });
+                                                        added_via_positions.push((vx, vy));
+                                                        connected_to_existing = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if connected_to_existing {
+                                            break;
+                                        }
+                                        board.tracks = pre_slide.clone();
+                                    }
+                                    if connected_to_existing {
+                                        break;
+                                    }
+                                }
+
+                                if !connected_to_existing {
                                 for orig_t in cand_tracks {
                                     let Some(t_idx) = board.tracks.iter().position(|t| {
                                         t.layer == orig_t.layer
@@ -8349,6 +8601,7 @@ pub fn find_choked_pin_bottlenecks(
                                     if connected_to_existing {
                                         break;
                                     }
+                                }
                                 }
                                 if !connected_to_existing {
                                     board.tracks = orig_tracks_snapshot;

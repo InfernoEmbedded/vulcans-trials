@@ -1044,7 +1044,7 @@ impl CudaEngine {
     }
 
     unsafe fn ensure_persistent_buffers(&self, in_bytes: usize, out_bytes: usize) -> Option<(CUdeviceptr, CUdeviceptr)> {
-        let mut bufs = self.persistent_buffers.lock().ok()?;
+        let mut bufs = self.persistent_buffers.lock().unwrap_or_else(|e| e.into_inner());
         if bufs.obs_cap_bytes < in_bytes || bufs.d_obs == 0 {
             if bufs.d_obs != 0 {
                 let _ = (self.cuda.cuMemFree_v2)(bufs.d_obs);
@@ -1158,7 +1158,7 @@ impl CudaEngine {
             return None;
         }
 
-        let _guard = self.dispatch_lock.lock().ok()?;
+        let _guard = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let _ = (self.cuda.cuCtxSetCurrent)(self.ctx);
             let in_bytes = total * std::mem::size_of::<u32>();
@@ -3407,7 +3407,7 @@ mod tests {
 
     #[test]
     fn test_cuda_persistent_vram_buffer_reuse() {
-        let cuda = match CudaEngine::new() {
+        let cuda = match CudaEngine::new_with_device(0) {
             Some(c) => c,
             None => return,
         };
@@ -3420,7 +3420,7 @@ mod tests {
         assert!((df_32[10 * 32 + 15] - 5.0).abs() < 1e-4);
 
         let (ptr_32_obs, cap_32_obs, ptr_32_out, cap_32_out) = {
-            let b = cuda.persistent_buffers.lock().unwrap();
+            let b = cuda.persistent_buffers.lock().unwrap_or_else(|e| e.into_inner());
             (b.d_obs, b.obs_cap_bytes, b.d_out, b.out_cap_bytes)
         };
         assert_ne!(ptr_32_obs, 0);
@@ -3435,32 +3435,34 @@ mod tests {
         assert_eq!(df_16[4 * 16 + 4], 0.0);
         assert!((df_16[4 * 16 + 7] - 3.0).abs() < 1e-4);
 
-        {
-            let b = cuda.persistent_buffers.lock().unwrap();
-            assert_eq!(b.d_obs, ptr_32_obs, "Persistent d_obs must be reused for smaller grid");
-            assert_eq!(b.d_out, ptr_32_out, "Persistent d_out must be reused for smaller grid");
-            assert_eq!(b.obs_cap_bytes, cap_32_obs);
-            assert_eq!(b.out_cap_bytes, cap_32_out);
-        }
+        let (ptr_16_obs, cap_16_obs, ptr_16_out, cap_16_out) = {
+            let b = cuda.persistent_buffers.lock().unwrap_or_else(|e| e.into_inner());
+            (b.d_obs, b.obs_cap_bytes, b.d_out, b.out_cap_bytes)
+        };
+        assert_eq!(ptr_16_obs, ptr_32_obs, "Persistent d_obs must be reused for smaller grid");
+        assert_eq!(ptr_16_out, ptr_32_out, "Persistent d_out must be reused for smaller grid");
+        assert_eq!(cap_16_obs, cap_32_obs);
+        assert_eq!(cap_16_out, cap_32_out);
 
         // 3. Larger dispatch (256x256) grows capacity cleanly and subsequent 256x256 calls reuse it
         let mut obs_256 = vec![0u32; 256 * 256];
         obs_256[20 * 256 + 20] = 1;
         let df_256_a = cuda.compute_distance_field(&obs_256, 256, 256, 12).expect("256x256 df A");
         let (ptr_256_obs, cap_256_obs, _ptr_256_out, cap_256_out) = {
-            let b = cuda.persistent_buffers.lock().unwrap();
+            let b = cuda.persistent_buffers.lock().unwrap_or_else(|e| e.into_inner());
             (b.d_obs, b.obs_cap_bytes, b.d_out, b.out_cap_bytes)
         };
         assert_eq!(cap_256_obs, 256 * 256 * 4);
         assert_eq!(cap_256_out, 256 * 256 * 4);
 
         let df_256_b = cuda.compute_distance_field(&obs_256, 256, 256, 12).expect("256x256 df B");
-        {
-            let b = cuda.persistent_buffers.lock().unwrap();
-            assert_eq!(b.d_obs, ptr_256_obs, "Persistent d_obs must be reused on equal size");
-            assert_eq!(b.obs_cap_bytes, 256 * 256 * 4);
-            assert_eq!(b.out_cap_bytes, 256 * 256 * 4);
-        }
+        let (ptr_256b_obs, cap_256b_obs, cap_256b_out) = {
+            let b = cuda.persistent_buffers.lock().unwrap_or_else(|e| e.into_inner());
+            (b.d_obs, b.obs_cap_bytes, b.out_cap_bytes)
+        };
+        assert_eq!(ptr_256b_obs, ptr_256_obs, "Persistent d_obs must be reused on equal size");
+        assert_eq!(cap_256b_obs, 256 * 256 * 4);
+        assert_eq!(cap_256b_out, 256 * 256 * 4);
         assert_eq!(df_256_a, df_256_b);
     }
 
