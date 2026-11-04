@@ -130,6 +130,38 @@ def connect_ipc(endpoint: str | None = None) -> bool:
         return False
 
 
+def import_ses_with_view_refresh(board, ses_path: str) -> bool:
+    """Import a Specctra .ses file into KiCad and force a KIGFX::VIEW R-tree update on all footprints.
+
+    Works around a KiCad 10.0 bug where PCB_EDIT_FRAME::ImportSpecctraSession leaves
+    '// Update footprint positions' unimplemented, causing moved footprints to retain stale
+    R-tree bounding boxes and disappear when panning the canvas.
+    """
+    if not HAS_GUI or not board or not os.path.isfile(ses_path):
+        return False
+
+    if not pcbnew.ImportSpecctraSES(board, ses_path):
+        return False
+
+    # Re-commit footprint positions via BOARD_COMMIT or Refresh so KIGFX::VIEW updates R-tree bounds
+    try:
+        commit = pcbnew.BOARD_COMMIT(board)
+        for fp in board.GetFootprints():
+            commit.Modify(fp)
+            fp.SetPosition(fp.GetPosition())
+            fp.SetOrientation(fp.GetOrientation())
+        commit.Push("Refresh Specctra Session Footprint Bounds")
+    except Exception:
+        pass
+
+    try:
+        pcbnew.Refresh()
+    except Exception:
+        pass
+
+    return True
+
+
 if HAS_GUI:
     class VulcansTrialsPlugin(pcbnew.ActionPlugin):
         def defaults(self):
@@ -179,3 +211,4 @@ try:
 except Exception:
     # Allows safe importing in headless/unit-test environments where KiCad's GUI program is not initialized
     pass
+

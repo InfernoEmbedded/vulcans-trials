@@ -3113,31 +3113,116 @@ impl Board {
     }
 
     pub fn save_ses(&self, ses_path: &Path) -> Result<(), String> {
-        let mut s = String::from("(session vulcans_trials\n  (base_design vulcans_trials)\n  (placement\n    (resolution mm 1000)\n");
+        let to_ses = |mm: f64| -> i64 { (mm * 10000.0).round() as i64 };
+        let mut s = String::from(
+            "(session vulcans_trials\n  (base_design vulcans_trials)\n  (placement\n    (resolution um 10)\n",
+        );
         for fp in &self.footprints {
             let side = if fp.layer == 1 { "back" } else { "front" };
+            let rot = if fp.layer == 1 {
+                (180.0 - fp.rotation).rem_euclid(360.0)
+            } else {
+                fp.rotation.rem_euclid(360.0)
+            };
             s.push_str(&format!(
-                "    (component \"{}\" (place \"{}\" {:.4} {:.4} {} {:.1}))\n",
-                fp.reference, fp.reference, fp.x, fp.y, side, fp.rotation
+                "    (component \"{}\" (place \"{}\" {} {} {} {:.1}))\n",
+                fp.reference,
+                fp.reference,
+                to_ses(fp.x),
+                -to_ses(fp.y),
+                side,
+                rot
             ));
         }
-        s.push_str("  )\n  (routes\n    (resolution mm 1000)\n    (network\n");
+        s.push_str("  )\n  (was_is\n  )\n  (routes\n    (resolution um 10)\n    (parser\n      (string_quote \")\n      (space_in_quoted_tokens on)\n      (host_cad \"Vulcans_Trials\")\n      (host_version \"1.0.0\")\n    )\n    (library_out\n");
+
+        let copper_layers = self.copper_layers();
+        let max_layer_idx = copper_layers.len().saturating_sub(1);
+        let mut via_padstacks: Vec<(i64, String)> = Vec::new();
+        for v in &self.vias {
+            let size_um = (v.size * 1000.0).round() as i64;
+            let drill_um = (v.drill * 1000.0).round() as i64;
+            let name = format!("Via[0-{}]_{}:{}_um", max_layer_idx, size_um, drill_um);
+            if !via_padstacks.iter().any(|(_, n)| n == &name) {
+                via_padstacks.push((to_ses(v.size), name));
+            }
+        }
+        for (size_ses, name) in &via_padstacks {
+            s.push_str(&format!("      (padstack \"{}\"\n", name));
+            for layer in &copper_layers {
+                s.push_str(&format!("        (shape (circle {} {}))\n", layer, size_ses));
+            }
+            s.push_str("        (attach off)\n      )\n");
+        }
+        s.push_str("    )\n    (network_out\n");
+
         let mut net_tracks: HashMap<usize, Vec<&TrackSegment>> = HashMap::new();
         for tr in &self.tracks {
             net_tracks.entry(tr.net_id).or_default().push(tr);
         }
-        for (net_id, tracks) in net_tracks {
-            if let Some(net_name) = self.nets.get(net_id) {
-                s.push_str(&format!("      (net \"{}\"\n        (wire\n", net_name));
-                for tr in tracks {
-                    let layer_name = self.layer_name(tr.layer);
+        let mut net_arcs: HashMap<usize, Vec<&ArcSegment>> = HashMap::new();
+        for arc in &self.arcs {
+            net_arcs.entry(arc.net_id).or_default().push(arc);
+        }
+        let mut net_vias: HashMap<usize, Vec<&Via>> = HashMap::new();
+        for v in &self.vias {
+            net_vias.entry(v.net_id).or_default().push(v);
+        }
+
+        for (net_id, net_name) in self.nets.iter().enumerate() {
+            if net_id == 0 || net_name.is_empty() {
+                continue;
+            }
+            let tracks = net_tracks.get(&net_id);
+            let arcs = net_arcs.get(&net_id);
+            let vias = net_vias.get(&net_id);
+            if tracks.is_none() && arcs.is_none() && vias.is_none() {
+                continue;
+            }
+            s.push_str(&format!("      (net \"{}\"\n", net_name));
+            if let Some(vs) = vias {
+                for v in vs {
+                    let size_um = (v.size * 1000.0).round() as i64;
+                    let drill_um = (v.drill * 1000.0).round() as i64;
+                    let ps_name = format!("Via[0-{}]_{}:{}_um", max_layer_idx, size_um, drill_um);
                     s.push_str(&format!(
-                        "          (path \"{}\" {:.4} {:.4} {:.4} {:.4} {:.4})\n",
-                        layer_name, tr.width, tr.start.0, tr.start.1, tr.end.0, tr.end.1
+                        "        (via \"{}\" {} {})\n",
+                        ps_name,
+                        to_ses(v.position.0),
+                        -to_ses(v.position.1)
                     ));
                 }
-                s.push_str("        )\n      )\n");
             }
+            if let Some(trs) = tracks {
+                for tr in trs {
+                    let layer_name = self.layer_name(tr.layer);
+                    s.push_str(&format!(
+                        "        (wire (path {} {} {} {} {} {}))\n",
+                        layer_name,
+                        to_ses(tr.width),
+                        to_ses(tr.start.0),
+                        -to_ses(tr.start.1),
+                        to_ses(tr.end.0),
+                        -to_ses(tr.end.1)
+                    ));
+                }
+            }
+            if let Some(as_list) = arcs {
+                for arc in as_list {
+                    let layer_name = self.layer_name(arc.layer);
+                    let steps = 8usize;
+                    s.push_str(&format!("        (wire (path {} {}", layer_name, to_ses(arc.width)));
+                    for i in 0..=steps {
+                        let t = i as f64 / steps as f64;
+                        let ang = arc.start_angle_rad + (arc.end_angle_rad - arc.start_angle_rad) * t;
+                        let px = arc.center.0 + arc.radius * ang.cos();
+                        let py = arc.center.1 + arc.radius * ang.sin();
+                        s.push_str(&format!(" {} {}", to_ses(px), -to_ses(py)));
+                    }
+                    s.push_str("))\n");
+                }
+            }
+            s.push_str("      )\n");
         }
         s.push_str("    )\n  )\n)\n");
         fs::write(ses_path, s).map_err(|e| e.to_string())

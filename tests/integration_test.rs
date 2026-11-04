@@ -524,11 +524,14 @@ fn test_roundtrip_kicad_pcb_and_specctra_ses_export() {
     // 2. Verify Specctra .ses session file structure, placement entries, and routed network paths
     let ses_text = fs::read_to_string(&out_ses).unwrap();
     assert!(ses_text.starts_with("(session vulcans_trials"));
-    assert!(ses_text.contains("(placement"));
-    assert!(ses_text.contains("(component \"R3\" (place \"R3\" 115.2500 108.7500 front 180.0))"));
-    assert!(ses_text.contains("(routes"));
+    assert!(ses_text.contains("(placement\n    (resolution um 10)"));
+    assert!(ses_text.contains("(component \"R3\" (place \"R3\" 1152500 -1087500 front 180.0))"));
+    assert!(ses_text.contains("(was_is"));
+    assert!(ses_text.contains("(routes\n    (resolution um 10)"));
+    assert!(ses_text.contains("(library_out"));
+    assert!(ses_text.contains("(network_out"));
     assert!(ses_text.contains("(net \"VRAW\""));
-    assert!(ses_text.contains("(path \"F.Cu\""));
+    assert!(ses_text.contains("(wire (path F.Cu "));
 
     let _ = fs::remove_dir_all(&dir);
 }
