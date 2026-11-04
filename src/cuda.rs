@@ -44,15 +44,24 @@ pub enum RoutingCost3DVariant {
     TensorCore,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaPlacerVariant {
+    SimtFullEval,
+    SimtIncrementalDeltaE,
+    TensorCore,
+}
+
 #[derive(Debug, Clone)]
 pub struct KernelDispatchProfile {
     pub device_name: String,
     pub best_distance_field: DistanceFieldVariant,
     pub best_placement_eval: PlacementEvalVariant,
     pub best_routing_cost_3d: RoutingCost3DVariant,
+    pub best_sa_placer: SaPlacerVariant,
     pub df_timings_us: Vec<(DistanceFieldVariant, f64)>,
     pub pe_timings_us: Vec<(PlacementEvalVariant, f64)>,
     pub rc_timings_us: Vec<(RoutingCost3DVariant, f64)>,
+    pub sa_timings_us: Vec<(SaPlacerVariant, f64)>,
 }
 
 static DISPATCH_PROFILE_CACHE: OnceLock<Mutex<HashMap<String, KernelDispatchProfile>>> = OnceLock::new();
@@ -367,6 +376,8 @@ pub struct CudaEngine {
     fn_batch_placement: CUfunction,
     pub fn_batch_placement_tensor_core: CUfunction,
     fn_gpu_sa_placer: CUfunction,
+    pub fn_gpu_sa_placer_delta_e: CUfunction,
+    pub fn_gpu_sa_placer_tensor_core: CUfunction,
     fn_route_cost_3d: CUfunction,
     pub fn_route_cost_3d_tensor_core: CUfunction,
     fn_wavefront_3d: CUfunction,
@@ -543,6 +554,8 @@ impl CudaEngine {
             let mut fn_batch_placement: CUfunction = ptr::null_mut();
             let mut fn_batch_placement_tensor_core: CUfunction = ptr::null_mut();
             let mut fn_gpu_sa_placer: CUfunction = ptr::null_mut();
+            let mut fn_gpu_sa_placer_delta_e: CUfunction = ptr::null_mut();
+            let mut fn_gpu_sa_placer_tensor_core: CUfunction = ptr::null_mut();
             let mut fn_route_cost_3d: CUfunction = ptr::null_mut();
             let mut fn_route_cost_3d_tensor_core: CUfunction = ptr::null_mut();
             let mut fn_wavefront_3d: CUfunction = ptr::null_mut();
@@ -559,6 +572,8 @@ impl CudaEngine {
             let c_bp = CString::new("batch_placement_eval_kernel").unwrap();
             let c_bptc = CString::new("batch_placement_tensor_core_kernel").unwrap();
             let c_sa = CString::new("gpu_sa_placer_kernel").unwrap();
+            let c_sade = CString::new("gpu_sa_placer_delta_e_kernel").unwrap();
+            let c_satc = CString::new("gpu_sa_placer_tensor_core_kernel").unwrap();
             let c_rc3d = CString::new("compute_3d_routing_cost_kernel").unwrap();
             let c_rc3dtc = CString::new("compute_3d_routing_cost_tensor_core_kernel").unwrap();
             let c_wf3d = CString::new("wavefront_3d_relax_kernel").unwrap();
@@ -575,6 +590,8 @@ impl CudaEngine {
                 || (api.cuModuleGetFunction)(&mut fn_batch_placement, module, c_bp.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_batch_placement_tensor_core, module, c_bptc.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_gpu_sa_placer, module, c_sa.as_ptr()) != CUDA_SUCCESS
+                || (api.cuModuleGetFunction)(&mut fn_gpu_sa_placer_delta_e, module, c_sade.as_ptr()) != CUDA_SUCCESS
+                || (api.cuModuleGetFunction)(&mut fn_gpu_sa_placer_tensor_core, module, c_satc.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_route_cost_3d, module, c_rc3d.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_route_cost_3d_tensor_core, module, c_rc3dtc.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_wavefront_3d, module, c_wf3d.as_ptr()) != CUDA_SUCCESS
@@ -630,9 +647,11 @@ impl CudaEngine {
                 best_distance_field: DistanceFieldVariant::SimtSharedTiled,
                 best_placement_eval: PlacementEvalVariant::SimtStandard,
                 best_routing_cost_3d: RoutingCost3DVariant::SimtSharedTiled,
+                best_sa_placer: SaPlacerVariant::SimtIncrementalDeltaE,
                 df_timings_us: Vec::new(),
                 pe_timings_us: Vec::new(),
                 rc_timings_us: Vec::new(),
+                sa_timings_us: Vec::new(),
             };
 
             let mut engine = Self {
@@ -653,6 +672,8 @@ impl CudaEngine {
                 fn_batch_placement,
                 fn_batch_placement_tensor_core,
                 fn_gpu_sa_placer,
+                fn_gpu_sa_placer_delta_e,
+                fn_gpu_sa_placer_tensor_core,
                 fn_route_cost_3d,
                 fn_route_cost_3d_tensor_core,
                 fn_wavefront_3d,
@@ -907,14 +928,111 @@ impl CudaEngine {
             }
         }
 
+        // 4. Calibrate GPU SA MCMC Placer (512 chains, 24 footprints, 48 edges, 18 steps/pass, 2 passes)
+        let sa_nc = 512u32;
+        let sa_nf = 24u32;
+        let sa_ne = 48u32;
+        let sa_params = GpuSaParams {
+            num_chains: sa_nc,
+            num_footprints: sa_nf,
+            num_edges: sa_ne,
+            steps_per_pass: 18,
+            seed: 0xC0FFEE42,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+            board_min_x: 0.0,
+            board_min_y: 0.0,
+            board_max_x: 80.0,
+            board_max_y: 60.0,
+            grid_step: 0.5,
+            wirelength_weight: 1.0,
+            crossing_weight: 200.0,
+            overlap_penalty: 25000.0,
+            boundary_penalty: 50000.0,
+            passive_affinity_weight: 80.0,
+            passive_max_dist: 3.5,
+            base_temp: 5.0,
+        };
+        let mut sa_fp_descs = Vec::with_capacity(sa_nf as usize);
+        for f in 0..sa_nf {
+            let locked = if f == 0 { 1.0 } else { 0.0 };
+            sa_fp_descs.push([1.5, 1.2, locked, 0.0]);
+        }
+        let mut sa_edges = Vec::with_capacity((sa_ne * 2) as usize);
+        for e in 0..sa_ne {
+            let fa = (e % sa_nf) as f32;
+            let fb = ((e * 5 + 1) % sa_nf) as f32;
+            let fa_safe = if (fa - fb).abs() < 0.5 { ((e + 2) % sa_nf) as f32 } else { fa };
+            let tag = if e >= 40 { 2.0 } else if e >= 32 { 1.0 } else { 0.0 };
+            sa_edges.push([fa_safe, -0.5, 0.2, tag]);
+            sa_edges.push([fb, 0.5, -0.2, tag]);
+        }
+        let mut sa_init_poses = Vec::with_capacity((sa_nc * sa_nf) as usize);
+        for _ in 0..sa_nc {
+            for f in 0..sa_nf {
+                let px = 6.0 + (f % 6) as f32 * 12.0;
+                let py = 6.0 + (f / 6) as f32 * 12.0;
+                sa_init_poses.push([px, py, 0.0, 0.0]);
+            }
+        }
+
+        let sa_candidates = [
+            SaPlacerVariant::SimtFullEval,
+            SaPlacerVariant::SimtIncrementalDeltaE,
+            SaPlacerVariant::TensorCore,
+        ];
+        let mut sa_timings_us = Vec::new();
+        let mut best_sa = SaPlacerVariant::SimtIncrementalDeltaE;
+        let mut best_sa_us = f64::INFINITY;
+
+        for &variant in &sa_candidates {
+            if let Some((poses, scores)) = self.run_gpu_sa_placer_chains_variant(
+                &sa_fp_descs,
+                &sa_edges,
+                &sa_init_poses,
+                &sa_params,
+                2,
+                variant,
+            ) {
+                let valid = poses.len() == (sa_nc * sa_nf) as usize
+                    && scores.len() == sa_nc as usize
+                    && scores.iter().all(|s| s[0].is_finite() && s[1] > 0.0 && s[1].is_finite() && s[2] >= 0.0)
+                    && poses.iter().all(|p| p[0].is_finite() && p[1].is_finite() && p[2].is_finite());
+                if valid {
+                    let mut samples = Vec::with_capacity(3);
+                    for _ in 0..3 {
+                        let t0 = Instant::now();
+                        let _ = self.run_gpu_sa_placer_chains_variant(
+                            &sa_fp_descs,
+                            &sa_edges,
+                            &sa_init_poses,
+                            &sa_params,
+                            2,
+                            variant,
+                        );
+                        samples.push(t0.elapsed().as_secs_f64() * 1e6);
+                    }
+                    let med = median_us(samples);
+                    sa_timings_us.push((variant, med));
+                    if med < best_sa_us {
+                        best_sa_us = med;
+                        best_sa = variant;
+                    }
+                }
+            }
+        }
+
         let profile = KernelDispatchProfile {
             device_name: self.device_name.clone(),
             best_distance_field: best_df,
             best_placement_eval: best_pe,
             best_routing_cost_3d: best_rc,
+            best_sa_placer: best_sa,
             df_timings_us,
             pe_timings_us,
             rc_timings_us,
+            sa_timings_us,
         };
         cache_guard.insert(cache_key.to_string(), profile.clone());
         self.dispatch_profile = profile;
@@ -1376,12 +1494,47 @@ impl CudaEngine {
         params: &GpuSaParams,
         num_passes: u32,
     ) -> Option<(Vec<[f32; 4]>, Vec<[f32; 4]>)> {
+        self.run_gpu_sa_placer_chains_variant(
+            fp_descs,
+            edges,
+            init_poses,
+            params,
+            num_passes,
+            self.dispatch_profile.best_sa_placer,
+        )
+        .or_else(|| {
+            self.run_gpu_sa_placer_chains_variant(
+                fp_descs,
+                edges,
+                init_poses,
+                params,
+                num_passes,
+                SaPlacerVariant::SimtFullEval,
+            )
+        })
+    }
+
+    pub fn run_gpu_sa_placer_chains_variant(
+        &self,
+        fp_descs: &[[f32; 4]],
+        edges: &[[f32; 4]],
+        init_poses: &[[f32; 4]],
+        params: &GpuSaParams,
+        num_passes: u32,
+        variant: SaPlacerVariant,
+    ) -> Option<(Vec<[f32; 4]>, Vec<[f32; 4]>)> {
         let nc = params.num_chains as usize;
         let nf = params.num_footprints as usize;
         let ne = params.num_edges as usize;
         if nc == 0 || nf == 0 || fp_descs.len() != nf || edges.len() != ne * 2 || init_poses.len() != nc * nf {
             return None;
         }
+
+        let kernel = match variant {
+            SaPlacerVariant::SimtFullEval => self.fn_gpu_sa_placer,
+            SaPlacerVariant::SimtIncrementalDeltaE => self.fn_gpu_sa_placer_delta_e,
+            SaPlacerVariant::TensorCore => self.fn_gpu_sa_placer_tensor_core,
+        };
 
         let _guard = self.dispatch_lock.lock().ok()?;
         unsafe {
@@ -1453,7 +1606,7 @@ impl CudaEngine {
             ];
 
             if (self.cuda.cuLaunchKernel)(
-                self.fn_gpu_sa_placer,
+                kernel,
                 grid_x,
                 1,
                 1,
@@ -3286,19 +3439,22 @@ mod tests {
         for dev in &devs {
             let p = &dev.dispatch_profile;
             println!(
-                "Auto-Dispatch Profile for {}: DF={:?} {:?}, PE={:?} {:?}, RC3D={:?} {:?}",
+                "Auto-Dispatch Profile for {}: DF={:?} {:?}, PE={:?} {:?}, RC3D={:?} {:?}, SA={:?} {:?}",
                 p.device_name,
                 p.best_distance_field,
                 p.df_timings_us,
                 p.best_placement_eval,
                 p.pe_timings_us,
                 p.best_routing_cost_3d,
-                p.rc_timings_us
+                p.rc_timings_us,
+                p.best_sa_placer,
+                p.sa_timings_us
             );
             assert_eq!(p.device_name, dev.device_name);
             assert_eq!(p.df_timings_us.len(), 5, "All 5 DistanceFieldVariants must be benchmarked");
             assert_eq!(p.pe_timings_us.len(), 3, "All 3 PlacementEvalVariants must be benchmarked");
             assert_eq!(p.rc_timings_us.len(), 2, "Both RoutingCost3DVariants must be benchmarked");
+            assert_eq!(p.sa_timings_us.len(), 3, "All 3 SaPlacerVariants must be benchmarked");
 
             for &(_, us) in &p.df_timings_us {
                 assert!(us > 0.0 && us.is_finite());
@@ -3307,6 +3463,9 @@ mod tests {
                 assert!(us > 0.0 && us.is_finite());
             }
             for &(_, us) in &p.rc_timings_us {
+                assert!(us > 0.0 && us.is_finite());
+            }
+            for &(_, us) in &p.sa_timings_us {
                 assert!(us > 0.0 && us.is_finite());
             }
 
@@ -3331,6 +3490,13 @@ mod tests {
                 .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
                 .unwrap();
             assert_eq!(p.best_routing_cost_3d, min_rc.0);
+
+            let min_sa = p
+                .sa_timings_us
+                .iter()
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .unwrap();
+            assert_eq!(p.best_sa_placer, min_sa.0);
         }
 
         // Verify process-wide cache hits immediately on subsequent initialization
@@ -3340,7 +3506,160 @@ mod tests {
             assert_eq!(a.dispatch_profile.best_distance_field, b.dispatch_profile.best_distance_field);
             assert_eq!(a.dispatch_profile.best_placement_eval, b.dispatch_profile.best_placement_eval);
             assert_eq!(a.dispatch_profile.best_routing_cost_3d, b.dispatch_profile.best_routing_cost_3d);
+            assert_eq!(a.dispatch_profile.best_sa_placer, b.dispatch_profile.best_sa_placer);
             assert_eq!(a.dispatch_profile.df_timings_us, b.dispatch_profile.df_timings_us);
+            assert_eq!(a.dispatch_profile.sa_timings_us, b.dispatch_profile.sa_timings_us);
+        }
+    }
+
+    #[test]
+    fn test_gpu_sa_placer_variants_equivalence_and_speedup() {
+        let devs = CudaEngine::all_devices();
+        if devs.is_empty() {
+            return;
+        }
+
+        let sa_nc = 64u32;
+        let sa_nf = 16u32;
+        let sa_ne = 24u32;
+        let sa_params = GpuSaParams {
+            num_chains: sa_nc,
+            num_footprints: sa_nf,
+            num_edges: sa_ne,
+            steps_per_pass: 16,
+            seed: 0xC0FFEE42,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+            board_min_x: 0.0,
+            board_min_y: 0.0,
+            board_max_x: 80.0,
+            board_max_y: 60.0,
+            grid_step: 0.5,
+            wirelength_weight: 1.0,
+            crossing_weight: 200.0,
+            overlap_penalty: 25000.0,
+            boundary_penalty: 50000.0,
+            passive_affinity_weight: 80.0,
+            passive_max_dist: 3.5,
+            base_temp: 5.0,
+        };
+
+        let mut sa_fp_descs = Vec::with_capacity(sa_nf as usize);
+        for f in 0..sa_nf {
+            let locked = if f == 0 { 1.0 } else { 0.0 };
+            let fine_pitch = if f == 1 { 1.0 } else { 0.0 };
+            sa_fp_descs.push([1.5, 1.2, locked, fine_pitch]);
+        }
+
+        let mut sa_edges = Vec::with_capacity((sa_ne * 2) as usize);
+        for e in 0..sa_ne {
+            let fa = (e % sa_nf) as f32;
+            let fb = ((e * 3 + 1) % sa_nf) as f32;
+            let fa_safe = if (fa - fb).abs() < 0.5 { ((e + 2) % sa_nf) as f32 } else { fa };
+            let tag = if e >= 20 { 2.0 } else if e >= 16 { 1.0 } else { 0.0 };
+            sa_edges.push([fa_safe, -0.5, 0.2, tag]);
+            sa_edges.push([fb, 0.5, -0.2, tag]);
+        }
+
+        let mut sa_poses = Vec::with_capacity((sa_nc * sa_nf) as usize);
+        for c in 0..sa_nc {
+            for f in 0..sa_nf {
+                let px = if f == 0 {
+                    10.0
+                } else {
+                    10.0 + ((f * 9 + c * 3) % 60) as f32
+                };
+                let py = if f == 0 {
+                    10.0
+                } else {
+                    10.0 + ((f * 7 + c * 5) % 40) as f32
+                };
+                sa_poses.push([px, py, ((f % 4) * 90) as f32, 0.0]);
+            }
+        }
+
+        for dev in &devs {
+            // Also verify 0-step initial energy evaluation matches across all 3 variants
+            let mut zero_params = sa_params;
+            zero_params.steps_per_pass = 0;
+            let (_, scores_full_0) = dev
+                .run_gpu_sa_placer_chains_variant(&sa_fp_descs, &sa_edges, &sa_poses, &zero_params, 1, SaPlacerVariant::SimtFullEval)
+                .expect("SimtFullEval 0-step");
+            let (_, scores_de_0) = dev
+                .run_gpu_sa_placer_chains_variant(&sa_fp_descs, &sa_edges, &sa_poses, &zero_params, 1, SaPlacerVariant::SimtIncrementalDeltaE)
+                .expect("SimtIncrementalDeltaE 0-step");
+            let (_, scores_tc_0) = dev
+                .run_gpu_sa_placer_chains_variant(&sa_fp_descs, &sa_edges, &sa_poses, &zero_params, 1, SaPlacerVariant::TensorCore)
+                .expect("TensorCore 0-step");
+
+            for c in 0..(sa_nc as usize) {
+                assert!(
+                    (scores_full_0[c][0] - scores_de_0[c][0]).abs() < 1e-2,
+                    "[{}] 0-step energy mismatch Full vs DeltaE on chain {}: {} vs {}",
+                    dev.device_name,
+                    c,
+                    scores_full_0[c][0],
+                    scores_de_0[c][0]
+                );
+                assert!(
+                    (scores_full_0[c][0] - scores_tc_0[c][0]).abs() <= 1e-2 * scores_full_0[c][0].abs().max(1.0),
+                    "[{}] 0-step energy mismatch Full vs TensorCore on chain {}: {} vs {}",
+                    dev.device_name,
+                    c,
+                    scores_full_0[c][0],
+                    scores_tc_0[c][0]
+                );
+            }
+
+            // Now run multi-pass MCMC annealing with each variant
+            for &variant in &[
+                SaPlacerVariant::SimtFullEval,
+                SaPlacerVariant::SimtIncrementalDeltaE,
+                SaPlacerVariant::TensorCore,
+            ] {
+                let t0 = std::time::Instant::now();
+                let (poses_out, scores_out) = dev
+                    .run_gpu_sa_placer_chains_variant(&sa_fp_descs, &sa_edges, &sa_poses, &sa_params, 4, variant)
+                    .expect("SA placer variant execution failed");
+                let elapsed_us = t0.elapsed().as_secs_f64() * 1e6;
+
+                let min_best = scores_out.iter().map(|s| s[1]).fold(f32::INFINITY, f32::min);
+                println!(
+                    "[{}] {:?}: {:.1} us, min_best_energy = {:.2}",
+                    dev.device_name, variant, elapsed_us, min_best
+                );
+
+                let nc = sa_nc as usize;
+                let nf = sa_nf as usize;
+                assert_eq!(poses_out.len(), nc * nf);
+                for c in 0..nc {
+                    let init_e = scores_full_0[c][0];
+                    let cur_e = scores_out[c][0];
+                    let best_e = scores_out[c][1];
+                    assert!(
+                        cur_e.is_finite() && cur_e > 0.0,
+                        "Chain {} current energy must be finite positive for {:?}",
+                        c,
+                        variant
+                    );
+                    assert!(
+                        best_e.is_finite() && best_e <= init_e + 1.0,
+                        "Chain {} best_energy ({}) must be <= initial energy ({}) for {:?}",
+                        c,
+                        best_e,
+                        init_e,
+                        variant
+                    );
+                    // Locked footprint 0 in best poses must remain at (10.0, 10.0)
+                    let fp0_best = poses_out[c * nf];
+                    assert!(
+                        (fp0_best[0] - 10.0).abs() < 1e-4 && (fp0_best[1] - 10.0).abs() < 1e-4,
+                        "Locked best footprint 0 moved on {:?}",
+                        variant
+                    );
+                }
+            }
         }
     }
 
