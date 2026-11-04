@@ -2989,184 +2989,1243 @@ impl AutoRouter {
                 net_batch.sort_unstable_by_key(|&(net_id, _)| net_id);
                 grid.precompute_gpu_routing_costs_batch(&net_batch, self.congestion_factor, 2.0);
 
-                // Phase 1: Speculative multi-core parallel A* wave across all remaining unrouted connections
-                let wave_grid: &RoutingGrid = &*grid;
-                let few_unrouted = unrouted_indices.len() <= 2;
-                let speculative_paths: Vec<(usize, Option<Vec<GridNode>>)> = unrouted_indices
-                    .par_iter()
-                    .map(|&conn_idx| {
-                        if stop_flag.load(AtomicOrdering::Relaxed) {
-                            return (conn_idx, None);
+                // Phase 1: Speculative multi-core parallel A* wave or Parallel Portfolio Ensemble
+                #[allow(non_local_definitions)]
+                impl RoutingGrid {
+                    pub fn clone_for_portfolio(&self) -> Self {
+                        Self {
+                            min_x: self.min_x,
+                            min_y: self.min_y,
+                            max_x: self.max_x,
+                            max_y: self.max_y,
+                            res: self.res,
+                            width: self.width,
+                            height: self.height,
+                            num_layers: self.num_layers,
+                            plane_nets: self.plane_nets.clone(),
+                            obstacle_net_ids: self.obstacle_net_ids.clone(),
+                            dist_field: self.dist_field.clone(),
+                            congestion: self.congestion.clone(),
+                            usage_count: self.usage_count.clone(),
+                            gpu_net_cost_maps: HashMap::new(),
+                            nudgeable_fp: self.nudgeable_fp.clone(),
+                            smd_pad_cells: self.smd_pad_cells.clone(),
+                            net_clearances: self.net_clearances.clone(),
+                            max_net_clearance: self.max_net_clearance,
+                            inner_layer_penalty: self.inner_layer_penalty,
+                            vulkan: self.vulkan.clone(),
                         }
-                        let conn = &connections[conn_idx];
-                        let Some((sgx, sgy)) = wave_grid.world_to_grid(conn.start.0, conn.start.1) else {
-                            return (conn_idx, None);
-                        };
-                        let Some((egx, egy)) = wave_grid.world_to_grid(conn.end.0, conn.end.1) else {
-                            return (conn_idx, None);
-                        };
-                        let start_grid = GridNode {
-                            gx: sgx,
-                            gy: sgy,
-                            layer: conn.start.2,
-                        };
-                        let end_grid = GridNode {
-                            gx: egx,
-                            gy: egy,
-                            layer: conn.end.2,
-                        };
-                        let p = if few_unrouted {
-                            self.find_path_parallel(
-                                wave_grid,
-                                start_grid,
-                                end_grid,
-                                conn.net_id,
-                                conn.netclass.clearance,
-                                conn.netclass.track_width,
-                                conn.netclass.via_dia,
-                                u1_center,
-                                conn.netclass.max_coupled_length_mm,
-                                conn.netclass.require_return_path,
-                                &stop_flag,
-                            )
+                    }
+                }
+
+                #[derive(Clone, Debug)]
+                struct PathConflictGeom {
+                    net_id: usize,
+                    width: f64,
+                    clearance: f64,
+                    via_dia: f64,
+                    min_x: f64,
+                    max_x: f64,
+                    min_y: f64,
+                    max_y: f64,
+                    max_radius: f64,
+                    layer_mask: u32,
+                    segs: Vec<((f64, f64), (f64, f64), usize)>,
+                    vias: Vec<(f64, f64)>,
+                }
+
+                impl PathConflictGeom {
+                    fn from_path(
+                        grid: &RoutingGrid,
+                        conn: &RouteConnection,
+                        path: &[GridNode],
+                    ) -> Self {
+                        let width = if conn.diff_pair_leader.is_some() || conn.netclass.name == "USB_Diff" {
+                            conn.netclass.diff_pair_width
                         } else {
-                            self.find_path_with_constraints(
-                                wave_grid,
-                                start_grid,
-                                end_grid,
-                                conn.net_id,
-                                conn.netclass.clearance,
-                                conn.netclass.track_width,
-                                conn.netclass.via_dia,
-                                u1_center,
-                                1.0,
-                                0.0,
-                                conn.netclass.max_coupled_length_mm,
-                                conn.netclass.require_return_path,
-                                None,
-                                &stop_flag,
-                            )
+                            conn.netclass.track_width
                         };
-                        (conn_idx, p)
-                    })
-                    .collect();
+                        let clearance = conn.netclass.clearance;
+                        let via_dia = conn.netclass.via_dia;
+                        let mut min_x = f64::INFINITY;
+                        let mut max_x = f64::NEG_INFINITY;
+                        let mut min_y = f64::INFINITY;
+                        let mut max_y = f64::NEG_INFINITY;
+                        let mut layer_mask = 0u32;
+                        let mut segs = Vec::new();
+                        let mut vias = Vec::new();
 
-                // Phase 2: Commit conflict-free speculative paths in priority order; re-route conflicts in parallel across cores
-                let mut _any_committed_in_wave = false;
-                let mut sorted_speculative_paths = speculative_paths;
-                sorted_speculative_paths.sort_by_key(|&(idx, _)| std::cmp::Reverse(unrouted_history[idx]));
-                for (conn_idx, spec_path) in sorted_speculative_paths {
-                    if stop_flag.load(AtomicOrdering::Relaxed) {
-                        break;
-                    }
-                    let Some(p) = spec_path else {
-                        continue;
-                    };
-                    let conn_start = connections[conn_idx].start;
-                    let conn_end = connections[conn_idx].end;
-                    let conn_net_id = connections[conn_idx].net_id;
-                    let req_clearance = connections[conn_idx].netclass.clearance;
-                    let track_width = connections[conn_idx].netclass.track_width;
-                    let via_dia = connections[conn_idx].netclass.via_dia;
-
-                    let start_grid = match grid.world_to_grid(conn_start.0, conn_start.1) {
-                        Some((gx, gy)) => GridNode {
-                            gx,
-                            gy,
-                            layer: conn_start.2,
-                        },
-                        None => continue,
-                    };
-                    let end_grid = match grid.world_to_grid(conn_end.0, conn_end.1) {
-                        Some((gx, gy)) => GridNode {
-                            gx,
-                            gy,
-                            layer: conn_end.2,
-                        },
-                        None => continue,
-                    };
-
-                    let valid_path = if self.is_path_conflict_free(
-                            grid,
-                            &p,
-                            conn_net_id,
-                            req_clearance,
-                            track_width,
-                            via_dia,
-                            u1_center,
-                            connections[conn_idx].netclass.require_return_path,
-                        ) {
-                        Some(p)
-                    } else {
-                        self.find_path_parallel(
-                            grid,
-                            start_grid,
-                            end_grid,
-                            conn_net_id,
-                            req_clearance,
-                            track_width,
-                            via_dia,
-                            u1_center,
-                            connections[conn_idx].netclass.max_coupled_length_mm,
-                            connections[conn_idx].netclass.require_return_path,
-                            &stop_flag,
-                        )
-                    };
-
-                    if let Some(p) = valid_path {
-                        self.commit_path_to_grid(grid, &p, conn_net_id, track_width, via_dia);
-                        routed_paths[conn_idx] = Some(p);
-                        _any_committed_in_wave = true;
-                        if let Ok(mut obs_g) = shared_obs.lock() {
-                            obs_g.clone_from(&grid.obstacle_net_ids);
+                        for &n in path {
+                            let (wx, wy) = grid.grid_to_world(n.gx, n.gy);
+                            min_x = min_x.min(wx);
+                            max_x = max_x.max(wx);
+                            min_y = min_y.min(wy);
+                            max_y = max_y.max(wy);
+                            if n.layer < 32 {
+                                layer_mask |= 1u32 << n.layer;
+                            }
                         }
-                    }
 
-                    // Stream live progress to GUI every 4 connections
-                    if conn_idx % 4 == 0 || conn_idx + 1 == total_conns {
-                        if let Some(ref st) = live {
-                            let done = routed_paths.iter().filter(|p| p.is_some()).count();
-                            self.reconstruct_tracks_and_vias(board, grid, &connections, &routed_paths, &escape_stubs);
-                            if let Some(ref ipc_lock) = self.ipc {
-                                if let Ok(mut client) = ipc_lock.lock() {
-                                    if client.is_connected() {
-                                        let _ = client.clear_tracks();
-                                        let _ = client.stream_tracks_and_vias(board);
+                        if path.len() == 1 {
+                            let p0 = grid.grid_to_world(path[0].gx, path[0].gy);
+                            segs.push((p0, p0, path[0].layer));
+                        } else if path.len() >= 2 {
+                            let mut run_start = 0usize;
+                            for i in 0..(path.len() - 1) {
+                                let u = path[i];
+                                let v = path[i + 1];
+                                if u.layer != v.layer {
+                                    if i > run_start {
+                                        let p1 = grid.grid_to_world(path[run_start].gx, path[run_start].gy);
+                                        let p2 = grid.grid_to_world(u.gx, u.gy);
+                                        segs.push((p1, p2, u.layer));
+                                    }
+                                    vias.push(grid.grid_to_world(u.gx, u.gy));
+                                    layer_mask = 0xFFFF_FFFF;
+                                    run_start = i + 1;
+                                } else if i + 2 < path.len() && path[i + 2].layer == v.layer {
+                                    let dx1 = v.gx as isize - u.gx as isize;
+                                    let dy1 = v.gy as isize - u.gy as isize;
+                                    let dx2 = path[i + 2].gx as isize - v.gx as isize;
+                                    let dy2 = path[i + 2].gy as isize - v.gy as isize;
+                                    if (dx1, dy1) != (dx2, dy2) {
+                                        let p1 = grid.grid_to_world(path[run_start].gx, path[run_start].gy);
+                                        let p2 = grid.grid_to_world(v.gx, v.gy);
+                                        segs.push((p1, p2, u.layer));
+                                        run_start = i + 1;
                                     }
                                 }
                             }
-                            let remaining_ratsnest: Vec<crate::board::Segment> = connections
-                                .iter()
-                                .enumerate()
-                                .filter(|&(i, _)| routed_paths[i].is_none())
-                                .map(|(_, c)| {
-                                    let p1 = board.footprints[c.start_fp].pad_absolute_position(&board.footprints[c.start_fp].pads[c.start_pad]);
-                                    let p2 = board.footprints[c.end_fp].pad_absolute_position(&board.footprints[c.end_fp].pads[c.end_pad]);
-                                    crate::board::Segment {
-                                        p1: Point::new(p1.0, p1.1),
-                                        p2: Point::new(p2.0, p2.1),
-                                        net_id: c.net_id,
-                                    }
-                                })
-                                .collect();
-                            if let Ok(mut g) = st.lock() {
-                                g.board.tracks = board.tracks.clone();
-                                g.board.vias = board.vias.clone();
-                                g.board.footprints = board.footprints.clone();
-                                g.ratsnest = remaining_ratsnest;
-                                g.routed_conns = done;
-                                g.routing_pass = iteration + 1;
-                                g.progress = 0.5 + 0.5 * (done as f32 / total_conns.max(1) as f32);
-                                g.status_text = format!(
-                                    "Pass {}/{}: Routed {}/{} ({:.1}%)",
-                                    iteration + 1,
-                                    self.max_ripup_iterations,
-                                    done,
-                                    total_conns,
-                                    (done as f64 / total_conns.max(1) as f64) * 100.0
-                                );
+                            if run_start + 1 < path.len() {
+                                let last = path.len() - 1;
+                                if path[run_start].layer == path[last].layer {
+                                    let p1 = grid.grid_to_world(path[run_start].gx, path[run_start].gy);
+                                    let p2 = grid.grid_to_world(path[last].gx, path[last].gy);
+                                    segs.push((p1, p2, path[run_start].layer));
+                                }
                             }
                         }
+
+                        let max_radius = (width * 0.5).max(if !vias.is_empty() { via_dia * 0.5 } else { 0.0 });
+                        Self {
+                            net_id: conn.net_id,
+                            width,
+                            clearance,
+                            via_dia,
+                            min_x,
+                            max_x,
+                            min_y,
+                            max_y,
+                            max_radius,
+                            layer_mask,
+                            segs,
+                            vias,
+                        }
+                    }
+
+                    #[inline]
+                    fn conflicts_with(&self, other: &Self, grid_res: f64) -> bool {
+                        if self.net_id == other.net_id {
+                            return false;
+                        }
+                        if (self.layer_mask & other.layer_mask) == 0 {
+                            return false;
+                        }
+                        let pair_clr = self.clearance.max(other.clearance) + grid_res * 1.5;
+                        let aabb_margin = self.max_radius + other.max_radius + pair_clr;
+                        if self.max_x + aabb_margin < other.min_x
+                            || other.max_x + aabb_margin < self.min_x
+                            || self.max_y + aabb_margin < other.min_y
+                            || other.max_y + aabb_margin < self.min_y
+                        {
+                            return false;
+                        }
+
+                        let req_seg = (self.width + other.width) * 0.5 + pair_clr;
+                        for &(sa1, sa2, la) in &self.segs {
+                            for &(sb1, sb2, lb) in &other.segs {
+                                if la == lb && dist_segment_to_segment(sa1, sa2, sb1, sb2) < req_seg {
+                                    return true;
+                                }
+                            }
+                        }
+
+                        if !self.vias.is_empty() && !other.vias.is_empty() {
+                            let req_vv = (self.via_dia + other.via_dia) * 0.5 + pair_clr;
+                            for &va in &self.vias {
+                                for &vb in &other.vias {
+                                    if (va.0 - vb.0).hypot(va.1 - vb.1) < req_vv {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+
+                        if !self.vias.is_empty() {
+                            let req_vs = (self.via_dia + other.width) * 0.5 + pair_clr;
+                            for &va in &self.vias {
+                                for &(sb1, sb2, _) in &other.segs {
+                                    if dist_to_segment(va.0, va.1, sb1.0, sb1.1, sb2.0, sb2.1) < req_vs {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+
+                        if !other.vias.is_empty() {
+                            let req_vs = (other.via_dia + self.width) * 0.5 + pair_clr;
+                            for &vb in &other.vias {
+                                for &(sa1, sa2, _) in &self.segs {
+                                    if dist_to_segment(vb.0, vb.1, sa1.0, sa1.1, sa2.0, sa2.1) < req_vs {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+
+                        false
+                    }
+                }
+
+                #[derive(Clone, Copy, Debug)]
+                struct PortfolioVariant {
+                    via_mult: f64,
+                    hist_w: f64,
+                    heur_w: f64,
+                    dist_bias: f64,
+                    reverse: bool,
+                    diag_first: bool,
+                }
+
+                const PORTFOLIO_VARIANTS: [PortfolioVariant; 12] = [
+                    PortfolioVariant { via_mult: 1.0,  hist_w: 1.0, heur_w: 1.0,  dist_bias: 0.0,  reverse: false, diag_first: false },
+                    PortfolioVariant { via_mult: 1.0,  hist_w: 1.0, heur_w: 1.0,  dist_bias: 0.0,  reverse: true,  diag_first: false },
+                    PortfolioVariant { via_mult: 0.5,  hist_w: 1.0, heur_w: 1.0,  dist_bias: 0.0,  reverse: false, diag_first: true  },
+                    PortfolioVariant { via_mult: 0.5,  hist_w: 1.0, heur_w: 1.0,  dist_bias: 0.0,  reverse: true,  diag_first: true  },
+                    PortfolioVariant { via_mult: 0.75, hist_w: 0.5, heur_w: 1.15, dist_bias: 0.0,  reverse: false, diag_first: false },
+                    PortfolioVariant { via_mult: 0.75, hist_w: 0.5, heur_w: 1.15, dist_bias: 0.0,  reverse: true,  diag_first: false },
+                    PortfolioVariant { via_mult: 1.25, hist_w: 1.5, heur_w: 1.0,  dist_bias: 0.01, reverse: false, diag_first: true  },
+                    PortfolioVariant { via_mult: 1.25, hist_w: 1.5, heur_w: 1.0,  dist_bias: 0.01, reverse: true,  diag_first: true  },
+                    PortfolioVariant { via_mult: 1.75, hist_w: 2.5, heur_w: 1.15, dist_bias: 0.02, reverse: false, diag_first: false },
+                    PortfolioVariant { via_mult: 1.75, hist_w: 2.5, heur_w: 1.15, dist_bias: 0.02, reverse: true,  diag_first: false },
+                    PortfolioVariant { via_mult: 2.5,  hist_w: 0.5, heur_w: 1.35, dist_bias: 0.0,  reverse: false, diag_first: true  },
+                    PortfolioVariant { via_mult: 2.5,  hist_w: 2.5, heur_w: 1.35, dist_bias: 0.01, reverse: true,  diag_first: true  },
+                ];
+
+                #[allow(non_local_definitions)]
+                impl AutoRouter {
+                    /// Partitions candidate `(conn_idx, path)` routes into conflict-free independent waves
+                    /// via greedy conflict-graph coloring. Two paths of different nets conflict when their
+                    /// clearance-inflated 2D/3D bounding boxes overlap AND their segments or vias encroach.
+                    pub fn partition_into_conflict_free_waves(
+                        grid: &RoutingGrid,
+                        connections: &[RouteConnection],
+                        candidates: Vec<(usize, Vec<GridNode>)>,
+                    ) -> Vec<Vec<(usize, Vec<GridNode>)>> {
+                        if candidates.is_empty() {
+                            return Vec::new();
+                        }
+                        let geoms: Vec<PathConflictGeom> = candidates
+                            .par_iter()
+                            .map(|(conn_idx, path)| PathConflictGeom::from_path(grid, &connections[*conn_idx], path))
+                            .collect();
+
+                        let mut waves: Vec<Vec<(usize, Vec<GridNode>)>> = Vec::new();
+                        let mut wave_geoms: Vec<Vec<PathConflictGeom>> = Vec::new();
+
+                        for (cand, geom) in candidates.into_iter().zip(geoms.into_iter()) {
+                            let mut placed_wave = None;
+                            for (w_idx, w_geoms) in wave_geoms.iter().enumerate() {
+                                let conflicts = if w_geoms.len() >= 12 {
+                                    w_geoms.par_iter().any(|other| geom.conflicts_with(other, grid.res))
+                                } else {
+                                    w_geoms.iter().any(|other| geom.conflicts_with(other, grid.res))
+                                };
+                                if !conflicts {
+                                    placed_wave = Some(w_idx);
+                                    break;
+                                }
+                            }
+                            if let Some(w_idx) = placed_wave {
+                                waves[w_idx].push(cand);
+                                wave_geoms[w_idx].push(geom);
+                            } else {
+                                waves.push(vec![cand]);
+                                wave_geoms.push(vec![geom]);
+                            }
+                        }
+                        waves
+                    }
+
+                    pub fn evaluate_path_cost(grid: &RoutingGrid, path: &[GridNode]) -> (usize, f64, f64) {
+                        let mut vias = 0usize;
+                        let mut wirelength = 0.0f64;
+                        let mut cong_sum = 0.0f64;
+                        for (i, &n) in path.iter().enumerate() {
+                            let idx = grid.idx(n.gx, n.gy, n.layer);
+                            cong_sum += grid.congestion[idx] as f64;
+                            if i + 1 < path.len() {
+                                let nxt = path[i + 1];
+                                if nxt.layer != n.layer {
+                                    vias += 1;
+                                } else {
+                                    let dx = (nxt.gx as isize - n.gx as isize).abs() as f64;
+                                    let dy = (nxt.gy as isize - n.gy as isize).abs() as f64;
+                                    wirelength += dx.hypot(dy) * grid.res;
+                                }
+                            }
+                        }
+                        (vias, wirelength, cong_sum)
+                    }
+
+                    #[allow(clippy::too_many_arguments)]
+                    pub fn find_path_portfolio_variant(
+                        &self,
+                        grid: &RoutingGrid,
+                        start: GridNode,
+                        goal: GridNode,
+                        net_id: usize,
+                        req_clearance: f64,
+                        track_width: f64,
+                        via_dia: f64,
+                        u1_center: Option<(f64, f64)>,
+                        max_coupled_length_mm: f64,
+                        require_return_path: bool,
+                        via_mult: f64,
+                        hist_w: f64,
+                        heur_w: f64,
+                        dist_bias: f64,
+                        reverse: bool,
+                        diag_first: bool,
+                        abort_flag: &AtomicBool,
+                        found_count: Option<&std::sync::atomic::AtomicUsize>,
+                        max_expansions_override: Option<usize>,
+                    ) -> Option<Vec<GridNode>> {
+                        let (s_node, g_node) = if reverse { (goal, start) } else { (start, goal) };
+                        let mut open_set = BinaryHeap::new();
+                        let mut came_from: HashMap<GridNode, GridNode> = HashMap::new();
+                        let mut g_score: HashMap<GridNode, f64> = HashMap::new();
+                        let mut coupled_length: HashMap<GridNode, f64> = HashMap::new();
+
+                        let heur = |a: GridNode, b: GridNode| -> f64 {
+                            let dx = (a.gx as isize - b.gx as isize).abs() as f64 * grid.res;
+                            let dy = (a.gy as isize - b.gy as isize).abs() as f64 * grid.res;
+                            let diag = dx.min(dy);
+                            let straight = (dx - dy).abs();
+                            let layer_pen = if a.layer != b.layer { 2.0 * via_mult } else { 0.0 };
+                            diag * std::f64::consts::SQRT_2 + straight + layer_pen
+                        };
+
+                        let h_start = heur(s_node, g_node) * heur_w;
+                        g_score.insert(s_node, 0.0);
+                        coupled_length.insert(s_node, 0.0);
+                        open_set.push(AStarNode {
+                            node: s_node,
+                            cost: 0.0,
+                            priority: h_start,
+                        });
+
+                        let start_is_smd = (0..grid.num_layers).any(|l| grid.smd_pad_cells[grid.idx(s_node.gx, s_node.gy, l)]);
+                        let start_is_tht = !start_is_smd
+                            && (0..grid.num_layers).all(|l| grid.obstacle_net_ids[grid.idx(s_node.gx, s_node.gy, l)] == net_id as i32);
+                        if start_is_tht {
+                            for l in 0..grid.num_layers {
+                                if l != s_node.layer {
+                                    if grid.plane_nets.contains_key(&l) && grid.plane_nets.get(&l) != Some(&net_id) {
+                                        continue;
+                                    }
+                                    let alt_start = GridNode { gx: s_node.gx, gy: s_node.gy, layer: l };
+                                    g_score.insert(alt_start, 0.0);
+                                    coupled_length.insert(alt_start, 0.0);
+                                    open_set.push(AStarNode {
+                                        node: alt_start,
+                                        cost: 0.0,
+                                        priority: heur(alt_start, g_node) * heur_w,
+                                    });
+                                }
+                            }
+                        }
+
+                        let dist_span = (g_node.gx as isize - s_node.gx as isize).abs() + (g_node.gy as isize - s_node.gy as isize).abs();
+                        let max_expansions = max_expansions_override.unwrap_or(if dist_span > 200 { 350_000 } else { 120_000 });
+                        let mut expansions = 0usize;
+
+                        while let Some(current) = open_set.pop() {
+                            expansions += 1;
+                            if expansions > max_expansions {
+                                return None;
+                            }
+                            if expansions & 255 == 0 {
+                                if abort_flag.load(AtomicOrdering::Relaxed) {
+                                    return None;
+                                }
+                                if expansions > 16_384 {
+                                    if let Some(fc) = found_count {
+                                        if fc.load(AtomicOrdering::Relaxed) >= 3 {
+                                            return None;
+                                        }
+                                    }
+                                }
+                            }
+
+                            let u = current.node;
+                            if u == g_node {
+                                let mut path = vec![g_node];
+                                let mut curr = g_node;
+                                while let Some(&prev) = came_from.get(&curr) {
+                                    path.push(prev);
+                                    curr = prev;
+                                }
+                                path.reverse();
+                                if reverse {
+                                    path.reverse();
+                                    if !self.is_path_conflict_free(
+                                        grid,
+                                        &path,
+                                        net_id,
+                                        req_clearance,
+                                        track_width,
+                                        via_dia,
+                                        u1_center,
+                                        require_return_path,
+                                    ) {
+                                        return None;
+                                    }
+                                }
+                                let smoothed = self.smooth_grid_path(
+                                    grid,
+                                    path,
+                                    net_id,
+                                    req_clearance,
+                                    track_width,
+                                    via_dia,
+                                    u1_center,
+                                    require_return_path,
+                                    max_coupled_length_mm,
+                                );
+                                if let Some(fc) = found_count {
+                                    fc.fetch_add(1, AtomicOrdering::Relaxed);
+                                }
+                                return Some(smoothed);
+                            }
+
+                            let Some(&current_g) = g_score.get(&u) else {
+                                continue;
+                            };
+                            if current.cost > current_g + 1e-6 {
+                                continue;
+                            }
+
+                            let prev_dir: Option<(isize, isize)> = came_from.get(&u).and_then(|prev| {
+                                if prev.layer == u.layer {
+                                    Some((u.gx as isize - prev.gx as isize, u.gy as isize - prev.gy as isize))
+                                } else {
+                                    None
+                                }
+                            });
+
+                            for (neighbor, mut edge_cost) in
+                                grid.get_neighbors(u, net_id, req_clearance, track_width, via_dia, u1_center)
+                            {
+                                let mut next_coupled = 0.0;
+                                let n_idx = grid.idx(neighbor.gx, neighbor.gy, neighbor.layer);
+                                if neighbor.layer == u.layer {
+                                    let is_diag = neighbor.gx != u.gx && neighbor.gy != u.gy;
+                                    if (diag_first && is_diag) || (!diag_first && !is_diag) {
+                                        edge_cost *= 0.97;
+                                    }
+                                    let cong = grid.congestion[n_idx] as f64;
+                                    let usage = grid.usage_count[n_idx] as f64;
+                                    if (hist_w - 1.0).abs() > 1e-3 || usage > 0.0 {
+                                        edge_cost += ((hist_w - 1.0) * cong + hist_w * 0.35 * usage).max(-0.4 * edge_cost) * grid.res;
+                                    }
+                                    if let Some((pdx, pdy)) = prev_dir {
+                                        let cur_dx = neighbor.gx as isize - u.gx as isize;
+                                        let cur_dy = neighbor.gy as isize - u.gy as isize;
+                                        if (cur_dx, cur_dy) != (pdx, pdy) {
+                                            let dot = pdx * cur_dx + pdy * cur_dy;
+                                            if dot > 0 {
+                                                edge_cost += 5.0 * grid.res;
+                                            } else if dot == 0 {
+                                                edge_cost += 15.0 * grid.res;
+                                            } else {
+                                                edge_cost += 45.0 * grid.res;
+                                            }
+                                        }
+                                    }
+                                    if require_return_path {
+                                        if let Some(ref_layer) = grid.adjacent_reference_plane(neighbor.layer) {
+                                            if grid.is_reference_plane_void_at(neighbor.gx, neighbor.gy, ref_layer) {
+                                                edge_cost += 35.0 * grid.res + 5.0;
+                                            }
+                                        }
+                                    }
+                                    let is_coupled = grid.is_step_coupled(u, neighbor, net_id, track_width, req_clearance);
+                                    let step_len = if is_diag { 1.41421356 * grid.res } else { grid.res };
+                                    if is_coupled {
+                                        let prev_coupled = coupled_length.get(&u).copied().unwrap_or(0.0);
+                                        next_coupled = prev_coupled + step_len;
+                                        if next_coupled > max_coupled_length_mm {
+                                            let excess = next_coupled - max_coupled_length_mm;
+                                            edge_cost += self.crosstalk_penalty * step_len * (1.0 + excess * 0.5);
+                                        }
+                                    }
+                                } else {
+                                    edge_cost = edge_cost * via_mult + 2.0 * via_mult;
+                                }
+
+                                if dist_bias > 0.0 {
+                                    let df_val = (grid.dist_field[n_idx] as f64).clamp(0.05, 2.0);
+                                    edge_cost += dist_bias / df_val;
+                                }
+                                let tentative_g = current_g + edge_cost;
+                                let is_better = g_score.get(&neighbor).is_none_or(|&prev_g| tentative_g < prev_g - 1e-6);
+                                if is_better {
+                                    g_score.insert(neighbor, tentative_g);
+                                    coupled_length.insert(neighbor, next_coupled);
+                                    came_from.insert(neighbor, u);
+                                    let priority = tentative_g + heur(neighbor, g_node) * heur_w;
+                                    open_set.push(AStarNode {
+                                        node: neighbor,
+                                        cost: tentative_g,
+                                        priority,
+                                    });
+                                }
+                            }
+                        }
+                        None
+                    }
+
+                    /// Batch-validates a slice of `(conn_idx, path)` candidates using `GpuDrcContext` on the GPU
+                    /// alongside parallel `is_path_conflict_free` checks across Rayon threads.
+                    pub fn batch_validate_paths_gpu(
+                        &self,
+                        board: &Board,
+                        grid: &RoutingGrid,
+                        connections: &[RouteConnection],
+                        candidates: &[(usize, Vec<GridNode>)],
+                        u1_center: Option<(f64, f64)>,
+                    ) -> Vec<(bool, bool)> {
+                        if candidates.is_empty() {
+                            return Vec::new();
+                        }
+                        let grid_valid: Vec<bool> = candidates
+                            .par_iter()
+                            .map(|(conn_idx, path)| {
+                                let conn = &connections[*conn_idx];
+                                let w = if conn.diff_pair_leader.is_some() || conn.netclass.name == "USB_Diff" {
+                                    conn.netclass.diff_pair_width
+                                } else {
+                                    conn.netclass.track_width
+                                };
+                                self.is_path_conflict_free(
+                                    grid,
+                                    path,
+                                    conn.net_id,
+                                    conn.netclass.clearance,
+                                    w,
+                                    conn.netclass.via_dia,
+                                    u1_center,
+                                    conn.netclass.require_return_path,
+                                )
+                            })
+                            .collect();
+
+                        let drc_ctx = GpuDrcContext::from_board(board);
+                        let mut gpu_cands = Vec::new();
+                        let mut cand_ranges: Vec<(usize, usize)> = Vec::with_capacity(candidates.len());
+
+                        for &(conn_idx, ref path) in candidates {
+                            let start_offset = gpu_cands.len();
+                            let conn = &connections[conn_idx];
+                            let geom = PathConflictGeom::from_path(grid, conn, path);
+                            let half_w = (geom.width * 0.5) as f32;
+                            let via_r = (geom.via_dia * 0.5) as f32;
+                            let clr = (geom.clearance.min(0.15)) as f32;
+                            for &(p1, p2, layer) in &geom.segs {
+                                let d_start = (p1.0 - conn.start.0).hypot(p1.1 - conn.start.1)
+                                    .min((p2.0 - conn.start.0).hypot(p2.1 - conn.start.1));
+                                let d_end = (p1.0 - conn.end.0).hypot(p1.1 - conn.end.1)
+                                    .min((p2.0 - conn.end.0).hypot(p2.1 - conn.end.1));
+                                if d_start > 0.85 && d_end > 0.85 {
+                                    gpu_cands.push(GpuDrcCandidate {
+                                        x1: p1.0 as f32,
+                                        y1: p1.1 as f32,
+                                        x2: p2.0 as f32,
+                                        y2: p2.1 as f32,
+                                        radius_or_half_width: half_w,
+                                        clearance: clr,
+                                        layer: layer as u32,
+                                        net_id: conn.net_id as u32,
+                                        kind: 1,
+                                        ignore_same_net_pads: 1,
+                                        _pad0: 0,
+                                        _pad1: 0,
+                                    });
+                                }
+                            }
+                            for &vp in &geom.vias {
+                                let d_start = (vp.0 - conn.start.0).hypot(vp.1 - conn.start.1);
+                                let d_end = (vp.0 - conn.end.0).hypot(vp.1 - conn.end.1);
+                                if d_start > 0.65 && d_end > 0.65 {
+                                    gpu_cands.push(GpuDrcCandidate {
+                                        x1: vp.0 as f32,
+                                        y1: vp.1 as f32,
+                                        x2: 0.0,
+                                        y2: 0.0,
+                                        radius_or_half_width: via_r,
+                                        clearance: clr,
+                                        layer: 0,
+                                        net_id: conn.net_id as u32,
+                                        kind: 0,
+                                        ignore_same_net_pads: 0,
+                                        _pad0: 0,
+                                        _pad1: 0,
+                                    });
+                                }
+                            }
+                            cand_ranges.push((start_offset, gpu_cands.len()));
+                        }
+
+                        let gpu_res = drc_ctx.evaluate(grid.vulkan.as_ref(), &gpu_cands);
+                        grid_valid
+                            .into_iter()
+                            .enumerate()
+                            .map(|(idx, g_ok)| {
+                                let (s, e) = cand_ranges[idx];
+                                let drc_ok = if s == e {
+                                    true
+                                } else if let Some(ref res) = gpu_res {
+                                    res[s..e].iter().all(|&v| v != 0)
+                                } else {
+                                    true
+                                };
+                                (g_ok, drc_ok)
+                            })
+                            .collect()
+                    }
+
+                    /// Expands `target_indices` across a Parallel Portfolio of `(conn_idx, variant_id)`
+                    /// trajectories in `par_iter()`, batch-validates all discovered candidates on the GPU
+                    /// (`GpuDrcContext`), and selects for each connection the legal path minimizing
+                    /// `(vias * 10.0 + wirelength)`.
+                    pub fn route_connections_portfolio(
+                        &self,
+                        board: &Board,
+                        grid: &RoutingGrid,
+                        connections: &[RouteConnection],
+                        target_indices: &[usize],
+                        u1_center: Option<(f64, f64)>,
+                        stop_flag: &AtomicBool,
+                    ) -> Vec<(usize, Option<Vec<GridNode>>)> {
+                        if target_indices.is_empty() {
+                            return Vec::new();
+                        }
+                        let num_variants = if target_indices.len() <= 12 {
+                            PORTFOLIO_VARIANTS.len()
+                        } else if target_indices.len() <= 24 {
+                            8
+                        } else {
+                            6
+                        };
+
+                        let found_counts: Vec<std::sync::atomic::AtomicUsize> = (0..target_indices.len())
+                            .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                            .collect();
+
+                        let mut tasks: Vec<(usize, usize, usize)> = Vec::with_capacity(target_indices.len() * num_variants);
+                        for (t_pos, &conn_idx) in target_indices.iter().enumerate() {
+                            for v_id in 0..num_variants {
+                                tasks.push((t_pos, conn_idx, v_id));
+                            }
+                        }
+
+                        let raw_candidates: Vec<(usize, usize, Vec<GridNode>)> = tasks
+                            .par_iter()
+                            .filter_map(|&(t_pos, conn_idx, v_id)| {
+                                if stop_flag.load(AtomicOrdering::Relaxed) {
+                                    return None;
+                                }
+                                let conn = &connections[conn_idx];
+                                let (sgx, sgy) = grid.world_to_grid(conn.start.0, conn.start.1)?;
+                                let (egx, egy) = grid.world_to_grid(conn.end.0, conn.end.1)?;
+                                let start_grid = GridNode { gx: sgx, gy: sgy, layer: conn.start.2 };
+                                let end_grid = GridNode { gx: egx, gy: egy, layer: conn.end.2 };
+                                let var = PORTFOLIO_VARIANTS[v_id];
+                                let w = if conn.diff_pair_leader.is_some() || conn.netclass.name == "USB_Diff" {
+                                    conn.netclass.diff_pair_width
+                                } else {
+                                    conn.netclass.track_width
+                                };
+                                let path = self.find_path_portfolio_variant(
+                                    grid,
+                                    start_grid,
+                                    end_grid,
+                                    conn.net_id,
+                                    conn.netclass.clearance,
+                                    w,
+                                    conn.netclass.via_dia,
+                                    u1_center,
+                                    conn.netclass.max_coupled_length_mm,
+                                    conn.netclass.require_return_path,
+                                    var.via_mult,
+                                    var.hist_w,
+                                    var.heur_w,
+                                    var.dist_bias,
+                                    var.reverse,
+                                    var.diag_first,
+                                    stop_flag,
+                                    Some(&found_counts[t_pos]),
+                                    None,
+                                )?;
+                                Some((conn_idx, v_id, path))
+                            })
+                            .collect();
+
+                        let flat_paths: Vec<(usize, Vec<GridNode>)> = raw_candidates
+                            .iter()
+                            .map(|(c_idx, _, p)| (*c_idx, p.clone()))
+                            .collect();
+                        let validations = self.batch_validate_paths_gpu(board, grid, connections, &flat_paths, u1_center);
+
+                        let mut best_per_conn: HashMap<usize, (f64, usize, Vec<GridNode>)> = HashMap::new();
+                        for ((conn_idx, v_id, path), (grid_ok, gpu_drc_ok)) in
+                            raw_candidates.into_iter().zip(validations.into_iter())
+                        {
+                            if !grid_ok {
+                                continue;
+                            }
+                            let (vias, wirelength, cong_sum) = Self::evaluate_path_cost(grid, &path);
+                            let bends = Self::count_path_bends(&path);
+                            let drc_pen = if gpu_drc_ok { 0.0 } else { 25.0 };
+                            let score = (vias as f64) * 10.0
+                                + wirelength
+                                + (bends as f64) * 0.20
+                                + cong_sum * 0.02
+                                + drc_pen;
+                            let entry = best_per_conn.entry(conn_idx).or_insert((f64::INFINITY, usize::MAX, Vec::new()));
+                            if score < entry.0 - 1e-6 || ((score - entry.0).abs() <= 1e-6 && v_id < entry.1) {
+                                *entry = (score, v_id, path);
+                            }
+                        }
+
+                        target_indices
+                            .iter()
+                            .map(|&conn_idx| {
+                                let p_opt = best_per_conn.remove(&conn_idx).map(|(_, _, p)| p);
+                                (conn_idx, p_opt)
+                            })
+                            .collect()
+                    }
+
+                    /// Parallel Multi-Net Rip-Up Portfolio for resolving stubborn late-pass deadlocks
+                    /// when `unrouted_indices.len() <= 6` and `iteration >= 2`.
+                    #[allow(clippy::too_many_arguments)]
+                    pub fn try_parallel_ripup_portfolio(
+                        &self,
+                        board: &Board,
+                        grid: &mut RoutingGrid,
+                        connections: &[RouteConnection],
+                        routed_paths: &mut Vec<Option<Vec<GridNode>>>,
+                        escape_stubs: &[EscapeStub],
+                        unrouted_indices: &[usize],
+                        u1_center: Option<(f64, f64)>,
+                        stop_flag: &AtomicBool,
+                    ) -> bool {
+                        if unrouted_indices.is_empty() || stop_flag.load(AtomicOrdering::Relaxed) {
+                            return false;
+                        }
+                        let total_conns = connections.len();
+                        let current_done = routed_paths.iter().filter(|p| p.is_some()).count();
+
+                        // Identify blocking routed connections near the unrouted endpoints/corridors
+                        let mut blocker_scores: HashMap<usize, f64> = HashMap::new();
+                        for &u_idx in unrouted_indices {
+                            let uc = &connections[u_idx];
+                            let mut choked_nets = Vec::new();
+                            if let Some((sgx, sgy)) = grid.world_to_grid(uc.start.0, uc.start.1) {
+                                let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, sgx, sgy, uc.start.2, uc.net_id, 400);
+                                if reach < 300 {
+                                    choked_nets.extend(nets);
+                                }
+                            }
+                            if let Some((egx, egy)) = grid.world_to_grid(uc.end.0, uc.end.1) {
+                                let (reach, nets) = Self::find_choked_pin_bottlenecks(grid, egx, egy, uc.end.2, uc.net_id, 400);
+                                if reach < 300 {
+                                    choked_nets.extend(nets);
+                                }
+                            }
+                            for rip_idx in 0..total_conns {
+                                if rip_idx == u_idx || routed_paths[rip_idx].is_none() {
+                                    continue;
+                                }
+                                let rc = &connections[rip_idx];
+                                if rc.net_id == uc.net_id
+                                    || rc.diff_pair_leader.is_some()
+                                    || connections.iter().any(|c| c.diff_pair_leader == Some(rip_idx))
+                                    || rc.net_name.contains("USB")
+                                {
+                                    continue;
+                                }
+                                let path = routed_paths[rip_idx].as_ref().unwrap();
+                                let is_choked = choked_nets.contains(&rc.net_id);
+                                let mut min_d = f64::INFINITY;
+                                for node in path {
+                                    let (wx, wy) = grid.grid_to_world(node.gx, node.gy);
+                                    let d = (wx - uc.start.0).hypot(wy - uc.start.1)
+                                        .min((wx - uc.end.0).hypot(wy - uc.end.1))
+                                        .min(dist_to_segment(wx, wy, uc.start.0, uc.start.1, uc.end.0, uc.end.1));
+                                    if d < min_d {
+                                        min_d = d;
+                                    }
+                                }
+                                if is_choked || min_d < 2.2 {
+                                    let s = if is_choked { min_d * 0.25 } else { min_d };
+                                    let entry = blocker_scores.entry(rip_idx).or_insert(f64::INFINITY);
+                                    if s < *entry {
+                                        *entry = s;
+                                    }
+                                }
+                            }
+                        }
+
+                        let mut blockers: Vec<(usize, f64)> = blocker_scores.into_iter().collect();
+                        blockers.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+                        blockers.truncate(8);
+                        if blockers.is_empty() {
+                            return false;
+                        }
+
+                        let num_replicas = 8usize;
+                        let replica_results: Vec<(usize, f64, usize, Vec<Option<Vec<GridNode>>>)> = (0..num_replicas)
+                            .into_par_iter()
+                            .filter_map(|rep_id| {
+                                if stop_flag.load(AtomicOrdering::Relaxed) {
+                                    return None;
+                                }
+                                let mut local_paths = routed_paths.clone();
+                                let mut local_grid = grid.clone_for_portfolio();
+
+                                // Select distinct subset of blockers to rip up for this portfolio replica
+                                let mut ripped_conns = Vec::new();
+                                for (b_pos, &(b_idx, _)) in blockers.iter().enumerate() {
+                                    let take_it = match rep_id {
+                                        0 => b_pos < 2,
+                                        1 => b_pos < 3,
+                                        2 => b_pos < 4,
+                                        3 => b_pos % 2 == 0 && b_pos < 6,
+                                        4 => (b_pos % 2 == 1 || b_pos == 0) && b_pos < 6,
+                                        5 => b_pos < 5,
+                                        6 => b_pos >= 1 && b_pos < 5,
+                                        _ => b_pos < blockers.len().min(6),
+                                    };
+                                    if take_it {
+                                        if let Some(old_p) = local_paths[b_idx].take() {
+                                            for node in &old_p {
+                                                let idx = local_grid.idx(node.gx, node.gy, node.layer);
+                                                local_grid.congestion[idx] += self.congestion_factor * 1.5;
+                                            }
+                                            ripped_conns.push(b_idx);
+                                        }
+                                    }
+                                }
+                                if ripped_conns.is_empty() {
+                                    return None;
+                                }
+
+                                self.rebuild_grid_state(board, &mut local_grid, connections, &local_paths, escape_stubs);
+
+                                // Build local subgraph target ordering permutation for this replica
+                                let mut order: Vec<usize> = Vec::with_capacity(unrouted_indices.len() + ripped_conns.len());
+                                match rep_id % 4 {
+                                    0 => {
+                                        order.extend_from_slice(unrouted_indices);
+                                        order.extend_from_slice(&ripped_conns);
+                                    }
+                                    1 => {
+                                        for &u in unrouted_indices.iter().rev() {
+                                            order.push(u);
+                                        }
+                                        order.extend_from_slice(&ripped_conns);
+                                    }
+                                    2 => {
+                                        order.extend_from_slice(unrouted_indices);
+                                        for &r in ripped_conns.iter().rev() {
+                                            order.push(r);
+                                        }
+                                    }
+                                    _ => {
+                                        // Interleave unrouted and highest-priority ripped nets
+                                        order.extend_from_slice(unrouted_indices);
+                                        order.extend_from_slice(&ripped_conns);
+                                        if order.len() > 2 {
+                                            let rot = (rep_id / 4) % order.len();
+                                            order.rotate_left(rot);
+                                        }
+                                    }
+                                }
+
+                                let var_pair = [
+                                    PORTFOLIO_VARIANTS[rep_id % PORTFOLIO_VARIANTS.len()],
+                                    PORTFOLIO_VARIANTS[(rep_id + 1) % PORTFOLIO_VARIANTS.len()],
+                                    PORTFOLIO_VARIANTS[0],
+                                    PORTFOLIO_VARIANTS[1],
+                                ];
+
+                                for &c_idx in &order {
+                                    if local_paths[c_idx].is_some() || stop_flag.load(AtomicOrdering::Relaxed) {
+                                        continue;
+                                    }
+                                    let conn = &connections[c_idx];
+                                    let (Some((sgx, sgy)), Some((egx, egy))) = (
+                                        local_grid.world_to_grid(conn.start.0, conn.start.1),
+                                        local_grid.world_to_grid(conn.end.0, conn.end.1),
+                                    ) else {
+                                        continue;
+                                    };
+                                    let s_node = GridNode { gx: sgx, gy: sgy, layer: conn.start.2 };
+                                    let e_node = GridNode { gx: egx, gy: egy, layer: conn.end.2 };
+                                    let w = if conn.diff_pair_leader.is_some() || conn.netclass.name == "USB_Diff" {
+                                        conn.netclass.diff_pair_width
+                                    } else {
+                                        conn.netclass.track_width
+                                    };
+
+                                    let mut best_cand: Option<(f64, Vec<GridNode>)> = None;
+                                    for var in &var_pair {
+                                        if let Some(p) = self.find_path_portfolio_variant(
+                                            &local_grid,
+                                            s_node,
+                                            e_node,
+                                            conn.net_id,
+                                            conn.netclass.clearance,
+                                            w,
+                                            conn.netclass.via_dia,
+                                            u1_center,
+                                            conn.netclass.max_coupled_length_mm,
+                                            conn.netclass.require_return_path,
+                                            var.via_mult,
+                                            var.hist_w,
+                                            var.heur_w,
+                                            var.dist_bias,
+                                            var.reverse,
+                                            var.diag_first,
+                                            stop_flag,
+                                            None,
+                                            Some(60_000),
+                                        ) {
+                                            let (vias, wl, _) = Self::evaluate_path_cost(&local_grid, &p);
+                                            let sc = (vias as f64) * 10.0 + wl;
+                                            if best_cand.as_ref().is_none_or(|(b_sc, _)| sc < *b_sc) {
+                                                best_cand = Some((sc, p));
+                                            }
+                                            if vias == 0 {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if let Some((_, p)) = best_cand {
+                                        self.commit_path_to_grid(&mut local_grid, &p, conn.net_id, w, conn.netclass.via_dia);
+                                        local_paths[c_idx] = Some(p);
+                                    }
+                                }
+
+                                let done_cnt = local_paths.iter().filter(|p| p.is_some()).count();
+                                let mut total_cost = 0.0f64;
+                                for p_opt in local_paths.iter().flatten() {
+                                    let (vias, wl, _) = Self::evaluate_path_cost(&local_grid, p_opt);
+                                    total_cost += (vias as f64) * 10.0 + wl;
+                                }
+                                Some((done_cnt, total_cost, rep_id, local_paths))
+                            })
+                            .collect();
+
+                        if let Some((best_done, _, _, winner_paths)) = replica_results.into_iter().max_by(|a, b| {
+                            a.0.cmp(&b.0)
+                                .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal))
+                                .then_with(|| b.2.cmp(&a.2))
+                        }) {
+                            if best_done > current_done {
+                                *routed_paths = winner_paths;
+                                self.rebuild_grid_state(board, grid, connections, routed_paths, escape_stubs);
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                }
+
+                let wave_grid: &RoutingGrid = &*grid;
+                let use_portfolio_phase1 = unrouted_indices.len() <= 12 || iteration >= 1;
+                let speculative_paths: Vec<(usize, Option<Vec<GridNode>>)> = if use_portfolio_phase1 {
+                    self.route_connections_portfolio(
+                        board,
+                        wave_grid,
+                        &connections,
+                        &unrouted_indices,
+                        u1_center,
+                        &stop_flag,
+                    )
+                } else {
+                    unrouted_indices
+                        .par_iter()
+                        .map(|&conn_idx| {
+                            if stop_flag.load(AtomicOrdering::Relaxed) {
+                                return (conn_idx, None);
+                            }
+                            let conn = &connections[conn_idx];
+                            let Some((sgx, sgy)) = wave_grid.world_to_grid(conn.start.0, conn.start.1) else {
+                                return (conn_idx, None);
+                            };
+                            let Some((egx, egy)) = wave_grid.world_to_grid(conn.end.0, conn.end.1) else {
+                                return (conn_idx, None);
+                            };
+                            let start_grid = GridNode {
+                                gx: sgx,
+                                gy: sgy,
+                                layer: conn.start.2,
+                            };
+                            let end_grid = GridNode {
+                                gx: egx,
+                                gy: egy,
+                                layer: conn.end.2,
+                            };
+                            let p = self
+                                .find_path_with_constraints(
+                                    wave_grid,
+                                    start_grid,
+                                    end_grid,
+                                    conn.net_id,
+                                    conn.netclass.clearance,
+                                    conn.netclass.track_width,
+                                    conn.netclass.via_dia,
+                                    u1_center,
+                                    1.0,
+                                    0.0,
+                                    conn.netclass.max_coupled_length_mm,
+                                    conn.netclass.require_return_path,
+                                    None,
+                                    &stop_flag,
+                                )
+                                .or_else(|| {
+                                    self.find_path_portfolio_variant(
+                                        wave_grid,
+                                        start_grid,
+                                        end_grid,
+                                        conn.net_id,
+                                        conn.netclass.clearance,
+                                        conn.netclass.track_width,
+                                        conn.netclass.via_dia,
+                                        u1_center,
+                                        conn.netclass.max_coupled_length_mm,
+                                        conn.netclass.require_return_path,
+                                        1.0,
+                                        1.0,
+                                        1.0,
+                                        0.0,
+                                        true,
+                                        false,
+                                        &stop_flag,
+                                        None,
+                                        None,
+                                    )
+                                });
+                            (conn_idx, p)
+                        })
+                        .collect()
+                };
+
+                // Phase 2: Conflict-Graph Independent Set Wave Partitioning & Parallel Sub-Wave Re-Routing
+                let mut _any_committed_in_wave = false;
+                let mut sorted_speculative_paths = speculative_paths;
+                sorted_speculative_paths.sort_by_key(|&(idx, _)| std::cmp::Reverse(unrouted_history[idx]));
+
+                let mut found_speculative: Vec<(usize, Vec<GridNode>)> = Vec::with_capacity(sorted_speculative_paths.len());
+                let mut need_reroute: Vec<usize> = Vec::new();
+                for (conn_idx, spec_opt) in sorted_speculative_paths {
+                    if let Some(p) = spec_opt {
+                        found_speculative.push((conn_idx, p));
+                    } else {
+                        need_reroute.push(conn_idx);
+                    }
+                }
+
+                let waves = Self::partition_into_conflict_free_waves(grid, &connections, found_speculative);
+                for (w_idx, wave) in waves.into_iter().enumerate() {
+                    if stop_flag.load(AtomicOrdering::Relaxed) {
+                        break;
+                    }
+                    let validations = self.batch_validate_paths_gpu(board, grid, &connections, &wave, u1_center);
+                    for ((conn_idx, p), (grid_ok, _gpu_drc_ok)) in wave.into_iter().zip(validations.into_iter()) {
+                        let conn = &connections[conn_idx];
+                        let w = if conn.diff_pair_leader.is_some() || conn.netclass.name == "USB_Diff" {
+                            conn.netclass.diff_pair_width
+                        } else {
+                            conn.netclass.track_width
+                        };
+                        let still_ok = grid_ok
+                            && self.is_path_conflict_free(
+                                grid,
+                                &p,
+                                conn.net_id,
+                                conn.netclass.clearance,
+                                w,
+                                conn.netclass.via_dia,
+                                u1_center,
+                                conn.netclass.require_return_path,
+                            );
+                        if still_ok {
+                            self.commit_path_to_grid(grid, &p, conn.net_id, w, conn.netclass.via_dia);
+                            routed_paths[conn_idx] = Some(p);
+                            _any_committed_in_wave = true;
+                        } else {
+                            need_reroute.push(conn_idx);
+                        }
+                    }
+                    if w_idx == 0 && _any_committed_in_wave {
+                        self.reconstruct_tracks_and_vias(board, grid, &connections, &routed_paths, &escape_stubs);
+                    }
+                }
+
+                // Parallel Sub-Wave Re-Routing for paths that conflicted with Wave 0
+                need_reroute.sort_by_key(|&idx| std::cmp::Reverse(unrouted_history[idx]));
+                let max_subwaves = 2usize;
+                for _sub in 0..max_subwaves {
+                    if need_reroute.is_empty() || stop_flag.load(AtomicOrdering::Relaxed) {
+                        break;
+                    }
+                    let sub_results = self.route_connections_portfolio(
+                        board,
+                        grid,
+                        &connections,
+                        &need_reroute,
+                        u1_center,
+                        &stop_flag,
+                    );
+                    let mut sub_found = Vec::new();
+                    let mut next_reroute = Vec::new();
+                    for (conn_idx, p_opt) in sub_results {
+                        if let Some(p) = p_opt {
+                            sub_found.push((conn_idx, p));
+                        } else {
+                            next_reroute.push(conn_idx);
+                        }
+                    }
+                    if sub_found.is_empty() {
+                        need_reroute = next_reroute;
+                        break;
+                    }
+                    let sub_waves = Self::partition_into_conflict_free_waves(grid, &connections, sub_found);
+                    for sub_wave in sub_waves {
+                        let validations = self.batch_validate_paths_gpu(board, grid, &connections, &sub_wave, u1_center);
+                        for ((conn_idx, p), (grid_ok, _)) in sub_wave.into_iter().zip(validations.into_iter()) {
+                            let conn = &connections[conn_idx];
+                            let w = if conn.diff_pair_leader.is_some() || conn.netclass.name == "USB_Diff" {
+                                conn.netclass.diff_pair_width
+                            } else {
+                                conn.netclass.track_width
+                            };
+                            if grid_ok
+                                && self.is_path_conflict_free(
+                                    grid,
+                                    &p,
+                                    conn.net_id,
+                                    conn.netclass.clearance,
+                                    w,
+                                    conn.netclass.via_dia,
+                                    u1_center,
+                                    conn.netclass.require_return_path,
+                                )
+                            {
+                                self.commit_path_to_grid(grid, &p, conn.net_id, w, conn.netclass.via_dia);
+                                routed_paths[conn_idx] = Some(p);
+                                _any_committed_in_wave = true;
+                            } else {
+                                next_reroute.push(conn_idx);
+                            }
+                        }
+                    }
+                    need_reroute = next_reroute;
+                }
+
+                // Final priority-ordered fallback for any remaining conflicted connection in this pass
+                for conn_idx in need_reroute {
+                    if stop_flag.load(AtomicOrdering::Relaxed) || routed_paths[conn_idx].is_some() {
+                        continue;
+                    }
+                    let conn = &connections[conn_idx];
+                    if let (Some((sgx, sgy)), Some((egx, egy))) = (
+                        grid.world_to_grid(conn.start.0, conn.start.1),
+                        grid.world_to_grid(conn.end.0, conn.end.1),
+                    ) {
+                        let s_node = GridNode { gx: sgx, gy: sgy, layer: conn.start.2 };
+                        let e_node = GridNode { gx: egx, gy: egy, layer: conn.end.2 };
+                        if let Some(p) = self.find_path_parallel(
+                            grid,
+                            s_node,
+                            e_node,
+                            conn.net_id,
+                            conn.netclass.clearance,
+                            conn.netclass.track_width,
+                            conn.netclass.via_dia,
+                            u1_center,
+                            conn.netclass.max_coupled_length_mm,
+                            conn.netclass.require_return_path,
+                            &stop_flag,
+                        ) {
+                            self.commit_path_to_grid(grid, &p, conn.net_id, conn.netclass.track_width, conn.netclass.via_dia);
+                            routed_paths[conn_idx] = Some(p);
+                            _any_committed_in_wave = true;
+                        }
+                    }
+                }
+
+                if _any_committed_in_wave {
+                    if let Ok(mut obs_g) = shared_obs.lock() {
+                        obs_g.clone_from(&grid.obstacle_net_ids);
+                    }
+                }
+                if let Some(ref st) = live {
+                    let done = routed_paths.iter().filter(|p| p.is_some()).count();
+                    self.reconstruct_tracks_and_vias(board, grid, &connections, &routed_paths, &escape_stubs);
+                    if let Some(ref ipc_lock) = self.ipc {
+                        if let Ok(mut client) = ipc_lock.lock() {
+                            if client.is_connected() {
+                                let _ = client.clear_tracks();
+                                let _ = client.stream_tracks_and_vias(board);
+                            }
+                        }
+                    }
+                    let remaining_ratsnest: Vec<crate::board::Segment> = connections
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, _)| routed_paths[i].is_none())
+                        .map(|(_, c)| {
+                            let p1 = board.footprints[c.start_fp].pad_absolute_position(&board.footprints[c.start_fp].pads[c.start_pad]);
+                            let p2 = board.footprints[c.end_fp].pad_absolute_position(&board.footprints[c.end_fp].pads[c.end_pad]);
+                            crate::board::Segment {
+                                p1: Point::new(p1.0, p1.1),
+                                p2: Point::new(p2.0, p2.1),
+                                net_id: c.net_id,
+                            }
+                        })
+                        .collect();
+                    if let Ok(mut g) = st.lock() {
+                        g.board.tracks = board.tracks.clone();
+                        g.board.vias = board.vias.clone();
+                        g.board.footprints = board.footprints.clone();
+                        g.ratsnest = remaining_ratsnest;
+                        g.routed_conns = done;
+                        g.routing_pass = iteration + 1;
+                        g.progress = 0.5 + 0.5 * (done as f32 / total_conns.max(1) as f32);
+                        g.status_text = format!(
+                            "Pass {}/{}: Routed {}/{} ({:.1}%)",
+                            iteration + 1,
+                            self.max_ripup_iterations,
+                            done,
+                            total_conns,
+                            (done as f64 / total_conns.max(1) as f64) * 100.0
+                        );
                     }
                 }
 
@@ -3212,6 +4271,31 @@ impl AutoRouter {
                         &stop_flag,
                     );
                     if nudged_track {
+                        if let Ok(mut obs_g) = shared_obs.lock() {
+                            obs_g.clone_from(&grid.obstacle_net_ids);
+                        }
+                    }
+                }
+
+                // Phase 2.75: Parallel Multi-Net Rip-Up Portfolio when <= 6 unrouted connections stall on pass >= 2
+                let remaining_after_nudge: Vec<usize> = (0..total_conns)
+                    .filter(|&i| routed_paths[i].is_none())
+                    .collect();
+                if !remaining_after_nudge.is_empty()
+                    && remaining_after_nudge.len() <= 6
+                    && iteration >= 2
+                    && !stop_flag.load(AtomicOrdering::Relaxed)
+                {
+                    if self.try_parallel_ripup_portfolio(
+                        board,
+                        grid,
+                        &connections,
+                        &mut routed_paths,
+                        &escape_stubs,
+                        &remaining_after_nudge,
+                        u1_center,
+                        &stop_flag,
+                    ) {
                         if let Ok(mut obs_g) = shared_obs.lock() {
                             obs_g.clone_from(&grid.obstacle_net_ids);
                         }
@@ -17875,6 +18959,254 @@ mod tests {
             .evaluate_drc_candidates(&drc_ctx.pads, &drc_ctx.tracks, &drc_ctx.vias, &cands)
             .expect("Vulkan evaluate_drc_candidates failed");
         assert_eq!(cuda_res, vk_res, "CUDA and Vulkan DRC batch results must match identically");
+    }
+
+    #[test]
+    fn test_conflict_graph_independent_set_wave_partitioning() {
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 20.0;
+        board.max_y = 20.0;
+        board.nets = vec![
+            "".to_string(),
+            "NET1".to_string(),
+            "NET2".to_string(),
+            "NET3".to_string(),
+        ];
+
+        let grid = RoutingGrid::new(&board, 0.1, None);
+        let nc = NetClass::default();
+
+        // Connection 0: NET1 horizontal along y = 3.0 (gy = 30) on layer 0
+        // Connection 1: NET2 horizontal along y = 15.0 (gy = 150) on layer 0 (disjoint from NET1)
+        // Connection 2: NET1 vertical along x = 5.0 (gx = 50) on layer 0 (same net as Connection 0 -> no conflict!)
+        // Connection 3: NET3 vertical along x = 6.0 (gx = 60) crossing y = 2.0..5.0 on layer 0 (crosses Connection 0 -> must be in Wave 1!)
+        let connections = vec![
+            RouteConnection {
+                net_id: 1,
+                net_name: "NET1".to_string(),
+                start: (2.0, 3.0, 0),
+                end: (10.0, 3.0, 0),
+                start_fp: 0,
+                start_pad: 0,
+                end_fp: 0,
+                end_pad: 0,
+                netclass: nc.clone(),
+                diff_pair_leader: None,
+            },
+            RouteConnection {
+                net_id: 2,
+                net_name: "NET2".to_string(),
+                start: (2.0, 15.0, 0),
+                end: (10.0, 15.0, 0),
+                start_fp: 0,
+                start_pad: 0,
+                end_fp: 0,
+                end_pad: 0,
+                netclass: nc.clone(),
+                diff_pair_leader: None,
+            },
+            RouteConnection {
+                net_id: 1,
+                net_name: "NET1".to_string(),
+                start: (5.0, 1.0, 0),
+                end: (5.0, 6.0, 0),
+                start_fp: 0,
+                start_pad: 0,
+                end_fp: 0,
+                end_pad: 0,
+                netclass: nc.clone(),
+                diff_pair_leader: None,
+            },
+            RouteConnection {
+                net_id: 3,
+                net_name: "NET3".to_string(),
+                start: (6.0, 1.0, 0),
+                end: (6.0, 6.0, 0),
+                start_fp: 0,
+                start_pad: 0,
+                end_fp: 0,
+                end_pad: 0,
+                netclass: nc,
+                diff_pair_leader: None,
+            },
+        ];
+
+        let path0: Vec<GridNode> = (20..=100).map(|gx| GridNode { gx, gy: 30, layer: 0 }).collect();
+        let path1: Vec<GridNode> = (20..=100).map(|gx| GridNode { gx, gy: 150, layer: 0 }).collect();
+        let path2: Vec<GridNode> = (10..=60).map(|gy| GridNode { gx: 50, gy, layer: 0 }).collect();
+        let path3: Vec<GridNode> = (10..=60).map(|gy| GridNode { gx: 60, gy, layer: 0 }).collect();
+
+        let candidates = vec![
+            (0usize, path0),
+            (1usize, path1),
+            (2usize, path2),
+            (3usize, path3),
+        ];
+
+        let waves = AutoRouter::partition_into_conflict_free_waves(&grid, &connections, candidates);
+        assert_eq!(waves.len(), 2, "Expected 2 conflict-free waves, got {:?}", waves.len());
+
+        let wave0_indices: Vec<usize> = waves[0].iter().map(|(idx, _)| *idx).collect();
+        let wave1_indices: Vec<usize> = waves[1].iter().map(|(idx, _)| *idx).collect();
+
+        // Connections 0 (NET1), 1 (disjoint NET2), and 2 (same-net NET1) must all be grouped into Wave 0
+        assert_eq!(wave0_indices, vec![0, 1, 2]);
+        // Connection 3 (NET3 crossing NET1) must be separated into Wave 1
+        assert_eq!(wave1_indices, vec![3]);
+    }
+
+    #[test]
+    fn test_parallel_portfolio_multi_trajectory_routing() {
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 20.0;
+        board.max_y = 20.0;
+        board.nets = vec![
+            "".to_string(),
+            "NET1".to_string(),
+            "NET2".to_string(),
+            "NET3".to_string(),
+        ];
+
+        let mut grid = RoutingGrid::new(&board, 0.1, VulkanEngine::new());
+        grid.obstacle_net_ids.fill(FREE_NET);
+        grid.dist_field.fill(2.0);
+
+        // Build an asymmetric deep U-pocket around start (gx=40, gy=100) opening West,
+        // while goal is at (gx=140, gy=100) to the East.
+        // Forward A* with a small expansion cap (e.g. 450 expansions) is locally trapped inside the deep pocket,
+        // whereas reverse A* (target -> source) or unconstrained portfolio expansion routes cleanly.
+        for gx in 30..=90 {
+            for l in 0..grid.num_layers {
+                let i1 = grid.idx(gx, 85, l);
+                let i2 = grid.idx(gx, 115, l);
+                grid.obstacle_net_ids[i1] = KEEPOUT_NET;
+                grid.obstacle_net_ids[i2] = KEEPOUT_NET;
+            }
+        }
+        for gy in 85..=115 {
+            for l in 0..grid.num_layers {
+                let i3 = grid.idx(90, gy, l);
+                grid.obstacle_net_ids[i3] = KEEPOUT_NET;
+            }
+        }
+
+        let router = AutoRouter::new(2);
+        let stop_flag = AtomicBool::new(false);
+        let s_node = GridNode { gx: 25, gy: 100, layer: 0 };
+        let e_node = GridNode { gx: 100, gy: 100, layer: 0 };
+
+        // 1. Verify reverse-direction portfolio variant escapes when forward A* is locally trapped
+        let fwd_trapped = router.find_path_portfolio_variant(
+            &grid,
+            s_node,
+            e_node,
+            1,
+            0.15,
+            0.15,
+            0.60,
+            None,
+            15.0,
+            false,
+            1.0,
+            1.0,
+            1.35,
+            0.0,
+            false,
+            false,
+            &stop_flag,
+            None,
+            Some(350),
+        );
+        assert!(fwd_trapped.is_none(), "Forward greedy A* with 350-expansion budget should be trapped inside U-pocket");
+
+        let rev_escaped = router.find_path_portfolio_variant(
+            &grid,
+            s_node,
+            e_node,
+            1,
+            0.15,
+            0.15,
+            0.60,
+            None,
+            15.0,
+            false,
+            1.0,
+            1.0,
+            1.35,
+            0.0,
+            true,
+            false,
+            &stop_flag,
+            None,
+            Some(2500),
+        );
+        assert!(rev_escaped.is_some(), "Reverse target->source A* must bypass U-pocket and find legal path");
+        let rev_path = rev_escaped.unwrap();
+        assert_eq!(rev_path.first().copied(), Some(s_node));
+        assert_eq!(rev_path.last().copied(), Some(e_node));
+
+        // 2. Verify full parallel portfolio multi-trajectory ensemble across multiple connections
+        let nc = NetClass::default();
+        let sw = grid.grid_to_world(s_node.gx, s_node.gy);
+        let ew = grid.grid_to_world(e_node.gx, e_node.gy);
+        let conns = vec![
+            RouteConnection {
+                net_id: 1,
+                net_name: "NET1".to_string(),
+                start: (sw.0, sw.1, 0),
+                end: (ew.0, ew.1, 0),
+                start_fp: 0,
+                start_pad: 0,
+                end_fp: 0,
+                end_pad: 0,
+                netclass: nc.clone(),
+                diff_pair_leader: None,
+            },
+            RouteConnection {
+                net_id: 2,
+                net_name: "NET2".to_string(),
+                start: (2.0, 3.0, 0),
+                end: (16.0, 3.0, 0),
+                start_fp: 0,
+                start_pad: 0,
+                end_fp: 0,
+                end_pad: 0,
+                netclass: nc,
+                diff_pair_leader: None,
+            },
+        ];
+
+        let target_indices = vec![0usize, 1usize];
+        let results = router.route_connections_portfolio(
+            &board,
+            &grid,
+            &conns,
+            &target_indices,
+            None,
+            &stop_flag,
+        );
+        assert_eq!(results.len(), 2);
+        for (c_idx, p_opt) in &results {
+            let p = p_opt.as_ref().unwrap_or_else(|| panic!("Portfolio failed to route connection {}", c_idx));
+            assert!(
+                router.is_path_conflict_free(
+                    &grid,
+                    p,
+                    conns[*c_idx].net_id,
+                    conns[*c_idx].netclass.clearance,
+                    conns[*c_idx].netclass.track_width,
+                    conns[*c_idx].netclass.via_dia,
+                    None,
+                    false,
+                ),
+                "Portfolio path for connection {} must be conflict-free",
+                c_idx
+            );
+        }
     }
 }
 
