@@ -412,6 +412,179 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+const COMPUTE_3D_ROUTING_COST_WGSL: &str = r#"
+struct GpuRouteCostParams {
+    width: u32,
+    height: u32,
+    num_layers: u32,
+    net_id: u32,
+    clearance_cells: i32,
+    present_congestion_factor: f32,
+    obstacle_clearance_weight: f32,
+    plane_layer_mask: u32,
+}
+
+@group(0) @binding(0) var<storage, read> obstacles: array<u32>;
+@group(0) @binding(1) var<storage, read> dist_field: array<f32>;
+@group(0) @binding(2) var<storage, read> history_cost: array<f32>;
+@group(0) @binding(3) var<storage, read> usage_count: array<u32>;
+@group(0) @binding(4) var<storage, read_write> cell_costs_out: array<f32>;
+@group(0) @binding(5) var<uniform> params: GpuRouteCostParams;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    let layer = gid.z;
+    let w = i32(params.width);
+    let h = i32(params.height);
+    if (x >= w || y >= h || layer >= params.num_layers) {
+        return;
+    }
+
+    let layer_stride = params.width * params.height;
+    let layer_base = layer * layer_stride;
+    let idx = layer_base + u32(y * w + x);
+
+    let center_obs = obstacles[idx];
+    let plane_blocked = ((params.plane_layer_mask >> layer) & 1u) != 0u;
+    if (plane_blocked && (params.net_id == 0u || center_obs != params.net_id)) {
+        cell_costs_out[idx] = -1.0;
+        return;
+    }
+
+    let r = max(params.clearance_cells, 0);
+    let r2 = r * r;
+    var blocked: bool = false;
+    for (var dy: i32 = -r; dy <= r; dy = dy + 1) {
+        if (blocked) {
+            break;
+        }
+        let ny = y + dy;
+        if (ny < 0 || ny >= h) {
+            continue;
+        }
+        for (var dx: i32 = -r; dx <= r; dx = dx + 1) {
+            if (dx * dx + dy * dy <= r2) {
+                let nx = x + dx;
+                if (nx < 0 || nx >= w) {
+                    continue;
+                }
+                let nidx = layer_base + u32(ny * w + nx);
+                let obs = obstacles[nidx];
+                if (obs != 0u && (params.net_id == 0u || obs != params.net_id)) {
+                    blocked = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (blocked) {
+        cell_costs_out[idx] = -1.0;
+        return;
+    }
+
+    let cong_pen = f32(usage_count[idx]) * params.present_congestion_factor;
+    let hist_pen = history_cost[idx];
+    var df_pen: f32 = 0.0;
+    if (params.obstacle_clearance_weight > 0.0) {
+        let df = max(dist_field[idx], 0.1);
+        df_pen = params.obstacle_clearance_weight / df;
+    }
+    cell_costs_out[idx] = 1.0 + cong_pen + hist_pen + df_pen;
+}
+"#;
+
+const WAVEFRONT_3D_RELAX_WGSL: &str = r#"
+struct WavefrontUniformParams {
+    width: u32,
+    height: u32,
+    num_layers: u32,
+    via_cost: f32,
+}
+
+@group(0) @binding(0) var<storage, read> cell_costs: array<f32>;
+@group(0) @binding(1) var<storage, read> wavefront_in: array<f32>;
+@group(0) @binding(2) var<storage, read_write> wavefront_out: array<f32>;
+@group(0) @binding(3) var<uniform> params: WavefrontUniformParams;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    let layer = gid.z;
+    let w = i32(params.width);
+    let h = i32(params.height);
+    let nl = params.num_layers;
+
+    if (x >= w || y >= h || layer >= nl) {
+        return;
+    }
+
+    let layer_stride = params.width * params.height;
+    let layer_base = layer * layer_stride;
+    let idx = layer_base + u32(y * w + x);
+
+    var best = wavefront_in[idx];
+    let my_cost = cell_costs[idx];
+    if (my_cost < 0.0) {
+        wavefront_out[idx] = best;
+        return;
+    }
+
+    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+        let ny = y + dy;
+        if (ny < 0 || ny >= h) {
+            continue;
+        }
+        for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
+            let nx = x + dx;
+            if (nx < 0 || nx >= w) {
+                continue;
+            }
+            let n_idx = layer_base + u32(ny * w + nx);
+            let n_wf = wavefront_in[n_idx];
+            if (n_wf >= 1.0e19) {
+                continue;
+            }
+            let is_diag = dx != 0 && dy != 0;
+            let step_len = select(1.0, 1.41421356, is_diag);
+            if (is_diag) {
+                let idx_h = layer_base + u32(y * w + nx);
+                let idx_v = layer_base + u32(ny * w + x);
+                if (cell_costs[idx_h] < 0.0 || cell_costs[idx_v] < 0.0) {
+                    continue;
+                }
+            }
+            let cand = n_wf + my_cost * step_len;
+            if (cand < best) {
+                best = cand;
+            }
+        }
+    }
+
+    for (var ol: u32 = 0u; ol < nl; ol = ol + 1u) {
+        if (ol == layer) {
+            continue;
+        }
+        let o_idx = ol * layer_stride + u32(y * w + x);
+        let o_wf = wavefront_in[o_idx];
+        if (o_wf < 1.0e19 && (cell_costs[o_idx] >= 0.0 || o_wf == 0.0)) {
+            let cand = o_wf + params.via_cost;
+            if (cand < best) {
+                best = cand;
+            }
+        }
+    }
+
+    wavefront_out[idx] = best;
+}
+"#;
+
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct GridParams {
@@ -419,6 +592,28 @@ struct GridParams {
     height: u32,
     radius: i32,
     _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuRouteCostParams {
+    pub width: u32,
+    pub height: u32,
+    pub num_layers: u32,
+    pub net_id: u32,
+    pub clearance_cells: i32,
+    pub present_congestion_factor: f32,
+    pub obstacle_clearance_weight: f32,
+    pub plane_layer_mask: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct WavefrontUniformParams {
+    width: u32,
+    height: u32,
+    num_layers: u32,
+    via_cost: f32,
 }
 
 #[repr(C)]
@@ -483,6 +678,10 @@ pub struct VulkanEngine {
     placement_bgl: wgpu::BindGroupLayout,
     sa_pipeline: wgpu::ComputePipeline,
     sa_bgl: wgpu::BindGroupLayout,
+    route_cost_pipeline: wgpu::ComputePipeline,
+    route_cost_bgl: wgpu::BindGroupLayout,
+    wavefront_pipeline: wgpu::ComputePipeline,
+    wavefront_bgl: wgpu::BindGroupLayout,
     dispatch_lock: Mutex<()>,
     pub compute_busy_ns: Arc<AtomicU64>,
     pub extra_devices: Vec<Arc<VulkanEngine>>,
@@ -837,6 +1036,158 @@ impl VulkanEngine {
             cache: None,
         });
 
+        let route_cost_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Vulkan 3D Routing Cost Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(COMPUTE_3D_ROUTING_COST_WGSL.into()),
+        });
+
+        let route_cost_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("RouteCost3D BindGroupLayout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let route_cost_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("RouteCost3D PipelineLayout"),
+            bind_group_layouts: &[&route_cost_bgl],
+            push_constant_ranges: &[],
+        });
+
+        let route_cost_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("RouteCost3D ComputePipeline"),
+            layout: Some(&route_cost_pl_layout),
+            module: &route_cost_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let wavefront_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Vulkan 3D Wavefront Relaxation Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(WAVEFRONT_3D_RELAX_WGSL.into()),
+        });
+
+        let wavefront_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Wavefront3D BindGroupLayout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let wavefront_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Wavefront3D PipelineLayout"),
+            bind_group_layouts: &[&wavefront_bgl],
+            push_constant_ranges: &[],
+        });
+
+        let wavefront_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Wavefront3D ComputePipeline"),
+            layout: Some(&wavefront_pl_layout),
+            module: &wavefront_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         let mut cuda_engine = None;
         let mut backend_kind = GpuBackendKind::Vulkan;
 
@@ -884,6 +1235,10 @@ impl VulkanEngine {
             placement_bgl,
             sa_pipeline,
             sa_bgl,
+            route_cost_pipeline,
+            route_cost_bgl,
+            wavefront_pipeline,
+            wavefront_bgl,
             dispatch_lock: Mutex::new(()),
             compute_busy_ns,
             extra_devices,
@@ -1312,6 +1667,422 @@ impl VulkanEngine {
         scores_buf.destroy();
         fp_buf.destroy();
         edges_buf.destroy();
+        param_buf.destroy();
+
+        result
+    }
+
+    pub fn compute_3d_routing_costs(
+        &self,
+        obstacles: &[u32],
+        dist_field: &[f32],
+        history_cost: &[f32],
+        usage_count: &[u32],
+        params: &GpuRouteCostParams,
+    ) -> Option<Vec<f32>> {
+        if self.backend_kind == GpuBackendKind::CudaPtx {
+            if let Some(cuda) = &self.cuda_engine {
+                if let Some(res) = cuda.compute_3d_routing_costs(obstacles, dist_field, history_cost, usage_count, params) {
+                    self.compute_busy_ns.fetch_add(cuda.compute_busy_ns.load(Ordering::Relaxed), Ordering::Relaxed);
+                    return Some(res);
+                }
+            }
+        }
+        self.compute_3d_routing_costs_vulkan_wgsl(obstacles, dist_field, history_cost, usage_count, params)
+    }
+
+    pub fn compute_3d_routing_costs_vulkan_wgsl(
+        &self,
+        obstacles: &[u32],
+        dist_field: &[f32],
+        history_cost: &[f32],
+        usage_count: &[u32],
+        params: &GpuRouteCostParams,
+    ) -> Option<Vec<f32>> {
+        let total = (params.width as usize)
+            .checked_mul(params.height as usize)?
+            .checked_mul(params.num_layers as usize)?;
+        if total == 0
+            || obstacles.len() != total
+            || dist_field.len() != total
+            || history_cost.len() != total
+            || usage_count.len() != total
+        {
+            return None;
+        }
+
+        let _guard = self.dispatch_lock.lock().ok()?;
+        let byte_size = (total * std::mem::size_of::<f32>()) as u64;
+
+        let obs_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("3D Route Cost Obstacles Buffer"),
+            contents: bytemuck::cast_slice(obstacles),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let df_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("3D Route Cost DistField Buffer"),
+            contents: bytemuck::cast_slice(dist_field),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let hist_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("3D Route Cost History Buffer"),
+            contents: bytemuck::cast_slice(history_cost),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let usage_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("3D Route Cost Usage Buffer"),
+            contents: bytemuck::cast_slice(usage_count),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("3D Route Cost Out Buffer"),
+            size: byte_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("3D Route Cost Staging Buffer"),
+            size: byte_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("GpuRouteCostParams Uniform"),
+            contents: bytemuck::bytes_of(params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("RouteCost3D BindGroup"),
+            layout: &self.route_cost_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: obs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: df_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: hist_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: usage_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: param_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("RouteCost3D CommandEncoder"),
+        });
+
+        let wg_x = (params.width + 15) / 16;
+        let wg_y = (params.height + 15) / 16;
+        let wg_z = params.num_layers;
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("RouteCost3D ComputePass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.route_cost_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
+        }
+
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging_buf, 0, byte_size);
+        let start_t = Instant::now();
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging_buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+        let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
+            let data = slice.get_mapped_range();
+            let vec: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            staging_buf.unmap();
+            Some(vec)
+        } else {
+            None
+        };
+
+        staging_buf.destroy();
+        out_buf.destroy();
+        obs_buf.destroy();
+        df_buf.destroy();
+        hist_buf.destroy();
+        usage_buf.destroy();
+        param_buf.destroy();
+
+        result
+    }
+
+    pub fn compute_3d_routing_costs_batch(
+        self: &Arc<Self>,
+        obstacles: &[u32],
+        dist_field: &[f32],
+        history_cost: &[f32],
+        usage_count: &[u32],
+        batch_params: &[GpuRouteCostParams],
+    ) -> Vec<Option<Vec<f32>>> {
+        if batch_params.is_empty() {
+            return Vec::new();
+        }
+        let engines = self.all_engines();
+        if engines.len() <= 1 || batch_params.len() == 1 {
+            if self.backend_kind == GpuBackendKind::CudaPtx {
+                if let Some(cuda) = &self.cuda_engine {
+                    return cuda.compute_3d_routing_costs_multi(obstacles, dist_field, history_cost, usage_count, batch_params);
+                }
+            }
+            return batch_params
+                .iter()
+                .map(|p| self.compute_3d_routing_costs(obstacles, dist_field, history_cost, usage_count, p))
+                .collect();
+        }
+
+        let num_engines = engines.len();
+        let mut results: Vec<Option<Vec<f32>>> = (0..batch_params.len()).map(|_| None).collect();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (eng_idx, engine) in engines.iter().enumerate() {
+                let assigned: Vec<(usize, GpuRouteCostParams)> = batch_params
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| i % num_engines == eng_idx)
+                    .map(|(i, p)| (i, *p))
+                    .collect();
+                if assigned.is_empty() {
+                    continue;
+                }
+                let eng_ref = Arc::clone(engine);
+                handles.push(scope.spawn(move || {
+                    let sub_params: Vec<GpuRouteCostParams> = assigned.iter().map(|&(_, p)| p).collect();
+                    let sub_out = if eng_ref.backend_kind == GpuBackendKind::CudaPtx {
+                        if let Some(cuda) = &eng_ref.cuda_engine {
+                            cuda.compute_3d_routing_costs_multi(obstacles, dist_field, history_cost, usage_count, &sub_params)
+                        } else {
+                            sub_params
+                                .iter()
+                                .map(|p| eng_ref.compute_3d_routing_costs(obstacles, dist_field, history_cost, usage_count, p))
+                                .collect()
+                        }
+                    } else {
+                        sub_params
+                            .iter()
+                            .map(|p| eng_ref.compute_3d_routing_costs(obstacles, dist_field, history_cost, usage_count, p))
+                            .collect()
+                    };
+                    assigned
+                        .into_iter()
+                        .map(|(orig_i, _)| orig_i)
+                        .zip(sub_out)
+                        .collect::<Vec<(usize, Option<Vec<f32>>)>>()
+                }));
+            }
+            for handle in handles {
+                if let Ok(sub_res) = handle.join() {
+                    for (orig_i, map_opt) in sub_res {
+                        results[orig_i] = map_opt;
+                    }
+                }
+            }
+        });
+        results
+    }
+
+    pub fn compute_3d_wavefront(
+        &self,
+        cell_costs: &[f32],
+        seeds: &[u32],
+        params: &GpuRouteCostParams,
+        via_cost: f32,
+        iterations: u32,
+    ) -> Option<Vec<f32>> {
+        if self.backend_kind == GpuBackendKind::CudaPtx {
+            if let Some(cuda) = &self.cuda_engine {
+                if let Some(res) = cuda.compute_3d_wavefront(cell_costs, seeds, params, via_cost, iterations) {
+                    self.compute_busy_ns.fetch_add(cuda.compute_busy_ns.load(Ordering::Relaxed), Ordering::Relaxed);
+                    return Some(res);
+                }
+            }
+        }
+        self.compute_3d_wavefront_vulkan_wgsl(cell_costs, seeds, params, via_cost, iterations)
+    }
+
+    pub fn compute_3d_wavefront_vulkan_wgsl(
+        &self,
+        cell_costs: &[f32],
+        seeds: &[u32],
+        params: &GpuRouteCostParams,
+        via_cost: f32,
+        iterations: u32,
+    ) -> Option<Vec<f32>> {
+        let total = (params.width as usize)
+            .checked_mul(params.height as usize)?
+            .checked_mul(params.num_layers as usize)?;
+        if total == 0 || cell_costs.len() != total || seeds.is_empty() {
+            return None;
+        }
+
+        let mut init_wf = vec![1.0e20f32; total];
+        for &s in seeds {
+            let idx = s as usize;
+            if idx < total {
+                init_wf[idx] = 0.0;
+            }
+        }
+        if iterations == 0 {
+            return Some(init_wf);
+        }
+
+        let _guard = self.dispatch_lock.lock().ok()?;
+        let byte_size = (total * std::mem::size_of::<f32>()) as u64;
+
+        let costs_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Wavefront3D CellCosts Buffer"),
+            contents: bytemuck::cast_slice(cell_costs),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let wf_buf_a = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Wavefront3D Buffer A"),
+            contents: bytemuck::cast_slice(&init_wf),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let wf_buf_b = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Wavefront3D Buffer B"),
+            contents: bytemuck::cast_slice(&init_wf),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Wavefront3D Staging Buffer"),
+            size: byte_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let wf_params = WavefrontUniformParams {
+            width: params.width,
+            height: params.height,
+            num_layers: params.num_layers,
+            via_cost,
+        };
+        let param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("WavefrontUniformParams Buffer"),
+            contents: bytemuck::bytes_of(&wf_params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bg_ab = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Wavefront3D BindGroup A->B"),
+            layout: &self.wavefront_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: costs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wf_buf_a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wf_buf_b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: param_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let bg_ba = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Wavefront3D BindGroup B->A"),
+            layout: &self.wavefront_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: costs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wf_buf_b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wf_buf_a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: param_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Wavefront3D CommandEncoder"),
+        });
+
+        let wg_x = (params.width + 15) / 16;
+        let wg_y = (params.height + 15) / 16;
+        let wg_z = params.num_layers;
+
+        for iter in 0..iterations {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Wavefront3D ComputePass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.wavefront_pipeline);
+            cpass.set_bind_group(0, if iter % 2 == 0 { &bg_ab } else { &bg_ba }, &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
+        }
+
+        let final_buf = if iterations % 2 == 1 { &wf_buf_b } else { &wf_buf_a };
+        encoder.copy_buffer_to_buffer(final_buf, 0, &staging_buf, 0, byte_size);
+
+        let start_t = Instant::now();
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging_buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+        let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
+            let data = slice.get_mapped_range();
+            let vec: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            staging_buf.unmap();
+            Some(vec)
+        } else {
+            None
+        };
+
+        staging_buf.destroy();
+        wf_buf_a.destroy();
+        wf_buf_b.destroy();
+        costs_buf.destroy();
         param_buf.destroy();
 
         result

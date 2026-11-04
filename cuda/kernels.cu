@@ -547,4 +547,245 @@ __global__ void gpu_sa_placer_kernel(
     chain_scores[c] = score;
 }
 
+struct GpuRouteCostParams {
+    unsigned int width;
+    unsigned int height;
+    unsigned int num_layers;
+    unsigned int net_id;
+    int clearance_cells;
+    float present_congestion_factor;
+    float obstacle_clearance_weight;
+    unsigned int plane_layer_mask;
+};
+
+// -----------------------------------------------------------------------------
+// 4. 3D Routing Cost Field Kernel (2D Shared-Memory Tiled per Layer)
+// -----------------------------------------------------------------------------
+
+__global__ void compute_3d_routing_cost_kernel(
+    const unsigned int* __restrict__ obstacles,
+    const float* __restrict__ dist_field,
+    const float* __restrict__ history_cost,
+    const unsigned int* __restrict__ usage_count,
+    float* __restrict__ cell_costs_out,
+    GpuRouteCostParams params
+) {
+    extern __shared__ unsigned char smem_raw[];
+    unsigned int* s_tile = (unsigned int*)smem_raw;
+
+    int bx = (int)(blockIdx.x * blockDim.x);
+    int by = (int)(blockIdx.y * blockDim.y);
+    int layer = (int)blockIdx.z;
+    int tx = (int)threadIdx.x;
+    int ty = (int)threadIdx.y;
+    int tid = ty * (int)blockDim.x + tx;
+    int num_threads = (int)(blockDim.x * blockDim.y);
+
+    int w = (int)params.width;
+    int h = (int)params.height;
+    int nl = (int)params.num_layers;
+    int r = params.clearance_cells > 0 ? params.clearance_cells : 0;
+
+    if (layer >= nl) {
+        return;
+    }
+
+    unsigned int layer_stride = params.width * params.height;
+    unsigned int layer_base = (unsigned int)layer * layer_stride;
+
+    int gx = bx + tx;
+    int gy = by + ty;
+
+    if (r <= 16) {
+        int tile_w = (int)blockDim.x + 2 * r;
+        int tile_h = (int)blockDim.y + 2 * r;
+        int total_smem_elems = tile_w * tile_h;
+
+        for (int i = tid; i < total_smem_elems; i += num_threads) {
+            int smem_y = i / tile_w;
+            int smem_x = i % tile_w;
+            int load_x = bx - r + smem_x;
+            int load_y = by - r + smem_y;
+            if (load_x >= 0 && load_x < w && load_y >= 0 && load_y < h) {
+                s_tile[i] = obstacles[layer_base + (unsigned int)(load_y * w + load_x)];
+            } else {
+                s_tile[i] = 0u;
+            }
+        }
+
+        __syncthreads();
+
+        if (gx >= w || gy >= h) {
+            return;
+        }
+
+        unsigned int idx = layer_base + (unsigned int)(gy * w + gx);
+        unsigned int center_obs = s_tile[(ty + r) * tile_w + (tx + r)];
+        bool plane_blocked = ((params.plane_layer_mask >> (unsigned int)layer) & 1u) != 0u;
+        if (plane_blocked && (params.net_id == 0u || center_obs != params.net_id)) {
+            cell_costs_out[idx] = -1.0f;
+            return;
+        }
+
+        bool blocked = false;
+        int r2 = r * r;
+        for (int dy = -r; dy <= r && !blocked; ++dy) {
+            int smem_row = (ty + r + dy) * tile_w;
+            for (int dx = -r; dx <= r; ++dx) {
+                if (dx * dx + dy * dy <= r2) {
+                    unsigned int obs = s_tile[smem_row + (tx + r + dx)];
+                    if (obs != 0u && (params.net_id == 0u || obs != params.net_id)) {
+                        blocked = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (blocked) {
+            cell_costs_out[idx] = -1.0f;
+            return;
+        }
+
+        float cong_pen = (float)usage_count[idx] * params.present_congestion_factor;
+        float hist_pen = history_cost[idx];
+        float df_pen = 0.0f;
+        if (params.obstacle_clearance_weight > 0.0f) {
+            float df = fmaxf(dist_field[idx], 0.1f);
+            df_pen = params.obstacle_clearance_weight / df;
+        }
+        cell_costs_out[idx] = 1.0f + cong_pen + hist_pen + df_pen;
+    } else {
+        if (gx >= w || gy >= h) {
+            return;
+        }
+        unsigned int idx = layer_base + (unsigned int)(gy * w + gx);
+        unsigned int center_obs = obstacles[idx];
+        bool plane_blocked = ((params.plane_layer_mask >> (unsigned int)layer) & 1u) != 0u;
+        if (plane_blocked && (params.net_id == 0u || center_obs != params.net_id)) {
+            cell_costs_out[idx] = -1.0f;
+            return;
+        }
+
+        bool blocked = false;
+        int r2 = r * r;
+        for (int dy = -r; dy <= r && !blocked; ++dy) {
+            int ny = gy + dy;
+            if (ny < 0 || ny >= h) {
+                continue;
+            }
+            for (int dx = -r; dx <= r; ++dx) {
+                if (dx * dx + dy * dy <= r2) {
+                    int nx = gx + dx;
+                    if (nx < 0 || nx >= w) {
+                        continue;
+                    }
+                    unsigned int obs = obstacles[layer_base + (unsigned int)(ny * w + nx)];
+                    if (obs != 0u && (params.net_id == 0u || obs != params.net_id)) {
+                        blocked = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (blocked) {
+            cell_costs_out[idx] = -1.0f;
+            return;
+        }
+
+        float cong_pen = (float)usage_count[idx] * params.present_congestion_factor;
+        float hist_pen = history_cost[idx];
+        float df_pen = 0.0f;
+        if (params.obstacle_clearance_weight > 0.0f) {
+            float df = fmaxf(dist_field[idx], 0.1f);
+            df_pen = params.obstacle_clearance_weight / df;
+        }
+        cell_costs_out[idx] = 1.0f + cong_pen + hist_pen + df_pen;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 5. Parallel 3D Wavefront Relaxation Kernel (Bellman-Ford / Lee Maze)
+// -----------------------------------------------------------------------------
+
+__global__ void wavefront_3d_relax_kernel(
+    const float* __restrict__ cell_costs,
+    const float* __restrict__ wavefront_in,
+    float* __restrict__ wavefront_out,
+    GpuRouteCostParams params,
+    float via_cost
+) {
+    int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    int layer = (int)blockIdx.z;
+    int w = (int)params.width;
+    int h = (int)params.height;
+    int nl = (int)params.num_layers;
+
+    if (x >= w || y >= h || layer >= nl) {
+        return;
+    }
+
+    unsigned int layer_stride = params.width * params.height;
+    unsigned int layer_base = (unsigned int)layer * layer_stride;
+    unsigned int idx = layer_base + (unsigned int)(y * w + x);
+
+    float best = wavefront_in[idx];
+    float my_cost = cell_costs[idx];
+    if (my_cost < 0.0f) {
+        wavefront_out[idx] = best;
+        return;
+    }
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        int ny = y + dy;
+        if (ny < 0 || ny >= h) {
+            continue;
+        }
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
+            int nx = x + dx;
+            if (nx < 0 || nx >= w) {
+                continue;
+            }
+            unsigned int n_idx = layer_base + (unsigned int)(ny * w + nx);
+            float n_wf = wavefront_in[n_idx];
+            if (n_wf >= 1.0e19f) {
+                continue;
+            }
+            float step_len = (dx != 0 && dy != 0) ? 1.41421356f : 1.0f;
+            if (dx != 0 && dy != 0) {
+                unsigned int idx_h = layer_base + (unsigned int)(y * w + nx);
+                unsigned int idx_v = layer_base + (unsigned int)(ny * w + x);
+                if (cell_costs[idx_h] < 0.0f || cell_costs[idx_v] < 0.0f) {
+                    continue;
+                }
+            }
+            float cand = n_wf + my_cost * step_len;
+            if (cand < best) {
+                best = cand;
+            }
+        }
+    }
+
+    for (int ol = 0; ol < nl; ++ol) {
+        if (ol == layer) {
+            continue;
+        }
+        unsigned int o_idx = (unsigned int)ol * layer_stride + (unsigned int)(y * w + x);
+        float o_wf = wavefront_in[o_idx];
+        if (o_wf < 1.0e19f && (cell_costs[o_idx] >= 0.0f || o_wf == 0.0f)) {
+            float cand = o_wf + via_cost;
+            if (cand < best) {
+                best = cand;
+            }
+        }
+    }
+
+    wavefront_out[idx] = best;
+}
+
 } // extern "C"

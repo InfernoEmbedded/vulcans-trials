@@ -4,7 +4,7 @@
 use crate::board::{ArcSegment, Board, Footprint, LiveTrialState, NetClass, NetTopology, Pad, Point, TrackSegment, TrialPhase, Via};
 pub use crate::board::BusBundle;
 use crate::ipc::KiCadIpcClient;
-use crate::vulkan::VulkanEngine;
+use crate::vulkan::{GpuRouteCostParams, VulkanEngine};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -51,6 +51,8 @@ pub struct RoutingGrid {
     pub obstacle_net_ids: Vec<i32>,
     pub dist_field: Vec<f32>,
     pub congestion: Vec<f32>,
+    pub usage_count: Vec<u32>,
+    pub gpu_net_cost_maps: HashMap<usize, (i32, Vec<f32>)>,
     pub nudgeable_fp: Vec<Option<usize>>,
     pub smd_pad_cells: Vec<bool>,
     pub net_clearances: Vec<f64>,
@@ -165,6 +167,8 @@ impl RoutingGrid {
             obstacle_net_ids: vec![FREE_NET; total_cells],
             dist_field: vec![999.0; total_cells],
             congestion: vec![0.0; total_cells],
+            usage_count: vec![0; total_cells],
+            gpu_net_cost_maps: HashMap::new(),
             nudgeable_fp: vec![None; total_cells],
             smd_pad_cells: vec![false; total_cells],
             net_clearances,
@@ -209,6 +213,7 @@ impl RoutingGrid {
     }
 
     pub fn rasterize_obstacles(&mut self, board: &Board) {
+        self.gpu_net_cost_maps.clear();
         let max_world_x = self.min_x + (self.width as f64) * self.res;
         let max_world_y = self.min_y + (self.height as f64) * self.res;
         if let Some(ref poly) = board.outline_polygon {
@@ -359,6 +364,7 @@ impl RoutingGrid {
         if trk.layer >= self.num_layers {
             return;
         }
+        self.gpu_net_cost_maps.clear();
         let dist = (trk.end.0 - trk.start.0).hypot(trk.end.1 - trk.start.1);
         let steps = (dist / (self.res * 0.5)).ceil() as usize;
         let r_cells = (trk.width / (2.0 * self.res)).ceil() as isize;
@@ -386,6 +392,7 @@ impl RoutingGrid {
     }
 
     pub fn commit_via(&mut self, v: &Via) {
+        self.gpu_net_cost_maps.clear();
         let vr_radius = (v.size / 2.0) + (self.res * 0.40);
         let vr_cells = (vr_radius / self.res).ceil() as isize;
         if let Some((gx, gy)) = self.world_to_grid(v.position.0, v.position.1) {
@@ -406,6 +413,120 @@ impl RoutingGrid {
                 }
             }
         }
+    }
+
+    pub fn plane_layer_mask_for_net(&self, net_id: usize) -> u32 {
+        let mut mask = 0u32;
+        for (&layer, &plane_net) in &self.plane_nets {
+            if layer < 32 && plane_net != net_id {
+                mask |= 1u32 << layer;
+            }
+        }
+        mask
+    }
+
+    /// Computes a 3D per-cell routing cost and clearance map on the GPU for `net_id`.
+    /// Cells within `clearance_cells` of any foreign obstacle are marked `-1.0f` (impassable).
+    pub fn compute_gpu_3d_routing_cost_for_net(
+        &self,
+        net_id: usize,
+        clearance_cells: i32,
+        present_congestion_factor: f32,
+        obstacle_clearance_weight: f32,
+    ) -> Option<Vec<f32>> {
+        let vk = self.vulkan.as_ref()?;
+        let obs_u32: Vec<u32> = self.obstacle_net_ids.iter().map(|&n| n as u32).collect();
+        let params = GpuRouteCostParams {
+            width: self.width as u32,
+            height: self.height as u32,
+            num_layers: self.num_layers as u32,
+            net_id: net_id as u32,
+            clearance_cells,
+            present_congestion_factor,
+            obstacle_clearance_weight,
+            plane_layer_mask: self.plane_layer_mask_for_net(net_id),
+        };
+        vk.compute_3d_routing_costs(
+            &obs_u32,
+            &self.dist_field,
+            &self.congestion,
+            &self.usage_count,
+            &params,
+        )
+    }
+
+    /// Precomputes 3D routing cost and clearance maps across all available GPUs for a batch of `(net_id, clearance_cells)`.
+    pub fn precompute_gpu_routing_costs_batch(
+        &mut self,
+        net_clearances_cells: &[(usize, i32)],
+        present_congestion_factor: f32,
+        obstacle_clearance_weight: f32,
+    ) {
+        self.gpu_net_cost_maps.clear();
+        if net_clearances_cells.is_empty() {
+            return;
+        }
+        let Some(ref vk) = self.vulkan else {
+            return;
+        };
+        let obs_u32: Vec<u32> = self.obstacle_net_ids.iter().map(|&n| n as u32).collect();
+        let params_batch: Vec<GpuRouteCostParams> = net_clearances_cells
+            .iter()
+            .map(|&(net_id, clearance_cells)| GpuRouteCostParams {
+                width: self.width as u32,
+                height: self.height as u32,
+                num_layers: self.num_layers as u32,
+                net_id: net_id as u32,
+                clearance_cells,
+                present_congestion_factor,
+                obstacle_clearance_weight,
+                plane_layer_mask: self.plane_layer_mask_for_net(net_id),
+            })
+            .collect();
+        let results = vk.compute_3d_routing_costs_batch(
+            &obs_u32,
+            &self.dist_field,
+            &self.congestion,
+            &self.usage_count,
+            &params_batch,
+        );
+        for (&(net_id, clearance_cells), res_opt) in net_clearances_cells.iter().zip(results.into_iter()) {
+            if let Some(cost_vec) = res_opt {
+                self.gpu_net_cost_maps.insert(net_id, (clearance_cells, cost_vec));
+            }
+        }
+    }
+
+    /// Computes a 3D shortest-path wavefront potential field on the GPU from target seed indices.
+    pub fn compute_gpu_3d_wavefront_for_net(
+        &self,
+        net_id: usize,
+        clearance_cells: i32,
+        seeds: &[u32],
+        via_cost: f32,
+        iterations: u32,
+    ) -> Option<Vec<f32>> {
+        let vk = self.vulkan.as_ref()?;
+        let cell_costs = if let Some((cached_r, ref map)) = self.gpu_net_cost_maps.get(&net_id) {
+            if *cached_r == clearance_cells {
+                map.clone()
+            } else {
+                self.compute_gpu_3d_routing_cost_for_net(net_id, clearance_cells, 1.5, 2.0)?
+            }
+        } else {
+            self.compute_gpu_3d_routing_cost_for_net(net_id, clearance_cells, 1.5, 2.0)?
+        };
+        let params = GpuRouteCostParams {
+            width: self.width as u32,
+            height: self.height as u32,
+            num_layers: self.num_layers as u32,
+            net_id: net_id as u32,
+            clearance_cells,
+            present_congestion_factor: 1.5,
+            obstacle_clearance_weight: 2.0,
+            plane_layer_mask: self.plane_layer_mask_for_net(net_id),
+        };
+        vk.compute_3d_wavefront(&cell_costs, seeds, &params, via_cost, iterations)
     }
 
     pub fn update_distance_fields(&mut self) {
@@ -517,6 +638,7 @@ impl RoutingGrid {
         let allow_planar = !is_dedicated_plane || self.plane_nets.get(&layer) == Some(&target_net_id);
 
         if allow_planar {
+            let gpu_cost_entry = self.gpu_net_cost_maps.get(&target_net_id);
             for (dx, dy, base_len) in planar_dirs {
             let nx = gx as isize + dx;
             let ny = gy as isize + dy;
@@ -547,37 +669,44 @@ impl RoutingGrid {
                 let search_clearance = (track_width / 2.0) + max_clearance + diag_margin;
                 let r_cells = (search_clearance / self.res).ceil() as isize;
                 let mut clearance_violation = false;
-                for cy_off in -r_cells..=r_cells {
-                    for cx_off in -r_cells..=r_cells {
-                        let cx = ngx as isize + cx_off;
-                        let cy = ngy as isize + cy_off;
-                        if cx >= 0 && cx < self.width as isize && cy >= 0 && cy < self.height as isize {
-                            let c_idx = self.idx(cx as usize, cy as usize, layer);
-                            let c_net = self.obstacle_net_ids[c_idx];
-                            if c_net != FREE_NET && c_net != target_net_id as i32 {
-                                let raw_obst_c = if c_net > 0 && (c_net as usize) < self.net_clearances.len() {
-                                    self.net_clearances[c_net as usize]
-                                } else {
-                                    req_clearance
-                                };
-                                let eff_c = if self.smd_pad_cells[c_idx] {
-                                    (req_clearance.min(raw_obst_c) - 0.015).max(0.135)
-                                } else if req_clearance <= 0.15 {
-                                    req_clearance.min(raw_obst_c).max(0.15)
-                                } else {
-                                    req_clearance.max(raw_obst_c)
-                                };
-                                let eff_clearance = (track_width / 2.0) + eff_c + diag_margin;
-                                let c_dist_sq = (cx_off * cx_off + cy_off * cy_off) as f64 * (self.res * self.res);
-                                if c_dist_sq < (eff_clearance - 1e-4).powi(2) {
-                                    clearance_violation = true;
-                                    break;
+                let gpu_certified_clear = if let Some((cached_r, cost_map)) = gpu_cost_entry {
+                    *cached_r >= r_cells as i32 && cost_map.get(n_idx).copied().unwrap_or(-1.0) > 0.0
+                } else {
+                    false
+                };
+                if !gpu_certified_clear {
+                    for cy_off in -r_cells..=r_cells {
+                        for cx_off in -r_cells..=r_cells {
+                            let cx = ngx as isize + cx_off;
+                            let cy = ngy as isize + cy_off;
+                            if cx >= 0 && cx < self.width as isize && cy >= 0 && cy < self.height as isize {
+                                let c_idx = self.idx(cx as usize, cy as usize, layer);
+                                let c_net = self.obstacle_net_ids[c_idx];
+                                if c_net != FREE_NET && c_net != target_net_id as i32 {
+                                    let raw_obst_c = if c_net > 0 && (c_net as usize) < self.net_clearances.len() {
+                                        self.net_clearances[c_net as usize]
+                                    } else {
+                                        req_clearance
+                                    };
+                                    let eff_c = if self.smd_pad_cells[c_idx] {
+                                        (req_clearance.min(raw_obst_c) - 0.015).max(0.135)
+                                    } else if req_clearance <= 0.15 {
+                                        req_clearance.min(raw_obst_c).max(0.15)
+                                    } else {
+                                        req_clearance.max(raw_obst_c)
+                                    };
+                                    let eff_clearance = (track_width / 2.0) + eff_c + diag_margin;
+                                    let c_dist_sq = (cx_off * cx_off + cy_off * cy_off) as f64 * (self.res * self.res);
+                                    if c_dist_sq < (eff_clearance - 1e-4).powi(2) {
+                                        clearance_violation = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
-                    }
-                    if clearance_violation {
-                        break;
+                        if clearance_violation {
+                            break;
+                        }
                     }
                 }
 
@@ -2838,6 +2967,23 @@ impl AutoRouter {
                 }
                 unrouted_indices.sort_by_key(|&i| std::cmp::Reverse(unrouted_history[i]));
 
+                // Offload 3D routing cost and clearance field precomputation to all GPUs before parallel A* wave
+                let mut net_clearance_map: HashMap<usize, i32> = HashMap::new();
+                let diag_margin = (grid.res * 0.7071).min(0.02);
+                for &conn_idx in &unrouted_indices {
+                    let conn = &connections[conn_idx];
+                    let max_clearance = grid.max_net_clearance.max(conn.netclass.clearance);
+                    let search_clearance = (conn.netclass.track_width / 2.0) + max_clearance + diag_margin;
+                    let r_cells = (search_clearance / grid.res).ceil() as i32;
+                    let entry = net_clearance_map.entry(conn.net_id).or_insert(r_cells);
+                    if r_cells > *entry {
+                        *entry = r_cells;
+                    }
+                }
+                let mut net_batch: Vec<(usize, i32)> = net_clearance_map.into_iter().collect();
+                net_batch.sort_unstable_by_key(|&(net_id, _)| net_id);
+                grid.precompute_gpu_routing_costs_batch(&net_batch, self.congestion_factor, 2.0);
+
                 // Phase 1: Speculative multi-core parallel A* wave across all remaining unrouted connections
                 let wave_grid: &RoutingGrid = &*grid;
                 let few_unrouted = unrouted_indices.len() <= 2;
@@ -4178,9 +4324,12 @@ impl AutoRouter {
         track_width: f64,
         via_dia: f64,
     ) {
+        grid.gpu_net_cost_maps.clear();
         let r_cells = (track_width / (2.0 * grid.res)).ceil() as isize;
         for i in 0..path.len() {
             let node = path[i];
+            let node_idx = grid.idx(node.gx, node.gy, node.layer);
+            grid.usage_count[node_idx] = grid.usage_count[node_idx].saturating_add(1);
             for dy in -r_cells..=r_cells {
                 for dx in -r_cells..=r_cells {
                     if (dx * dx + dy * dy) as f64 * (grid.res * grid.res) <= (track_width / 2.0).powi(2) + 1e-6 {
@@ -4228,6 +4377,8 @@ impl AutoRouter {
         escape_stubs: &[EscapeStub],
     ) {
         grid.obstacle_net_ids.fill(FREE_NET);
+        grid.usage_count.fill(0);
+        grid.gpu_net_cost_maps.clear();
         grid.nudgeable_fp.fill(None);
         grid.smd_pad_cells.fill(false);
         grid.rasterize_obstacles(board);
@@ -9873,7 +10024,16 @@ fn slide_and_align_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
             })
             .collect();
 
-        if incident.is_empty() {
+        let has_off_center_connection = board.tracks.iter().any(|t| {
+            t.net_id == net_id && {
+                let d_seg = dist_point_to_segment(v_pos, t.start, t.end);
+                let d_min_end = (t.start.0 - v_pos.0)
+                    .hypot(t.start.1 - v_pos.1)
+                    .min((t.end.0 - v_pos.0).hypot(t.end.1 - v_pos.1));
+                d_seg <= via_size * 0.5 + 0.05 && d_min_end >= 1e-4
+            }
+        });
+        if incident.is_empty() || has_off_center_connection {
             continue;
         }
 
@@ -17070,4 +17230,103 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_gpu_3d_routing_cost_kernel_clearance_and_congestion() {
+        let Some(vk) = VulkanEngine::new() else {
+            return;
+        };
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 2.0;
+        board.max_y = 2.0;
+        board.nets = vec!["".into(), "NET1".into(), "NET2".into()];
+
+        let mut grid = RoutingGrid::new(&board, 0.1, Some(vk));
+        grid.obstacle_net_ids.fill(FREE_NET);
+        grid.dist_field.fill(2.0);
+        grid.congestion.fill(0.0);
+        grid.usage_count.fill(0);
+
+        // Place foreign obstacle (net 2) at (10, 10, 0) and same-net obstacle (net 1) at (4, 4, 0)
+        let foreign_idx = grid.idx(10, 10, 0);
+        let same_idx = grid.idx(4, 4, 0);
+        let cong_idx = grid.idx(15, 15, 1);
+        let free_idx = grid.idx(15, 5, 1);
+        grid.obstacle_net_ids[foreign_idx] = 2;
+        grid.obstacle_net_ids[same_idx] = 1;
+        grid.congestion[cong_idx] = 3.0;
+        grid.usage_count[cong_idx] = 2;
+
+        grid.precompute_gpu_routing_costs_batch(&[(1, 2), (2, 2)], 1.5, 2.0);
+        let (cached_r, cost_net1) = grid.gpu_net_cost_maps.get(&1).expect("Net 1 cost map should be cached");
+        assert_eq!(*cached_r, 2);
+
+        // Foreign obstacle and cells within 2-cell radius must be impassable (< 0.0)
+        assert!(cost_net1[foreign_idx] < 0.0);
+        assert!(cost_net1[grid.idx(12, 10, 0)] < 0.0);
+        assert!(cost_net1[grid.idx(13, 10, 0)] > 0.0);
+
+        // Same-net obstacle must remain passable (> 0.0)
+        assert!(cost_net1[same_idx] > 0.0);
+        assert!(cost_net1[grid.idx(5, 4, 0)] > 0.0);
+
+        // Congestion and usage_count must increase cell cost
+        assert!(cost_net1[cong_idx] > cost_net1[free_idx] + 5.0);
+
+        // Verify get_neighbors with GPU cost map matches CPU-only get_neighbors
+        let neighbors_with_gpu = grid.get_neighbors(
+            GridNode { gx: 13, gy: 10, layer: 0 },
+            1,
+            0.15,
+            0.15,
+            0.60,
+            None,
+        );
+        grid.gpu_net_cost_maps.clear();
+        let neighbors_cpu_only = grid.get_neighbors(
+            GridNode { gx: 13, gy: 10, layer: 0 },
+            1,
+            0.15,
+            0.15,
+            0.60,
+            None,
+        );
+        assert_eq!(neighbors_with_gpu, neighbors_cpu_only);
+    }
+
+    #[test]
+    fn test_gpu_3d_wavefront_shortest_path_potential() {
+        let Some(vk) = VulkanEngine::new() else {
+            return;
+        };
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 1.6;
+        board.max_y = 1.6;
+        board.nets = vec!["".into(), "NET1".into(), "NET2".into()];
+
+        let mut grid = RoutingGrid::new(&board, 0.1, Some(vk));
+        grid.obstacle_net_ids.fill(FREE_NET);
+        grid.dist_field.fill(2.0);
+
+        let seed = grid.idx(2, 2, 0) as u32;
+        let wf = grid
+            .compute_gpu_3d_wavefront_for_net(1, 1, &[seed], 3.5, 32)
+            .expect("GPU 3D wavefront should succeed");
+
+        let d0 = wf[grid.idx(2, 2, 0)];
+        let d1 = wf[grid.idx(3, 2, 0)];
+        let d2 = wf[grid.idx(6, 2, 0)];
+        let d_via = wf[grid.idx(2, 2, 1)];
+        let d_via_step = wf[grid.idx(5, 2, 1)];
+
+        assert!((d0 - 0.0).abs() < 1e-5);
+        assert!(d1 > d0 && d2 > d1, "Wavefront potential must increase monotonically with distance");
+        assert!((d_via - 3.5).abs() < 1e-4, "Via transition cost must equal via_cost");
+        assert!(d_via_step > d_via, "Planar steps on adjacent layer must accumulate over via cost");
+    }
 }
+
