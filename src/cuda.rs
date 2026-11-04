@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 pub use crate::vulkan::{
@@ -16,6 +17,41 @@ pub use crate::vulkan::{
 
 pub const KERNELS_PTX: &str = include_str!("../cuda/kernels.ptx");
 pub const AMPERE_KERNELS_PTX: &str = include_str!("../cuda/ampere_kernels.ptx");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistanceFieldVariant {
+    SimtDirect,
+    SimtSharedTiled,
+    AmperePtxDirect,
+    AmperePtxTiled,
+    TensorCore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementEvalVariant {
+    SimtStandard,
+    AmperePtx,
+    TensorCore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingCost3DVariant {
+    SimtSharedTiled,
+    TensorCore,
+}
+
+#[derive(Debug, Clone)]
+pub struct KernelDispatchProfile {
+    pub device_name: String,
+    pub best_distance_field: DistanceFieldVariant,
+    pub best_placement_eval: PlacementEvalVariant,
+    pub best_routing_cost_3d: RoutingCost3DVariant,
+    pub df_timings_us: Vec<(DistanceFieldVariant, f64)>,
+    pub pe_timings_us: Vec<(PlacementEvalVariant, f64)>,
+    pub rc_timings_us: Vec<(RoutingCost3DVariant, f64)>,
+}
+
+static DISPATCH_PROFILE_CACHE: OnceLock<Mutex<HashMap<String, KernelDispatchProfile>>> = OnceLock::new();
 
 pub type CUresult = c_uint;
 pub type CUdevice = c_int;
@@ -315,15 +351,20 @@ pub struct CudaEngine {
     pub driver_info: String,
     pub optix_available: bool,
     pub optix_version: u32,
+    pub dispatch_profile: KernelDispatchProfile,
     ctx: CUcontext,
     module: CUmodule,
     ampere_module: CUmodule,
     fn_dist_field: CUfunction,
     fn_dist_field_tiled: CUfunction,
     fn_dist_field_3d_tiled: CUfunction,
+    pub fn_dist_field_tensor_core: CUfunction,
+    pub fn_dist_field_3d_tensor_core: CUfunction,
     fn_batch_placement: CUfunction,
+    pub fn_batch_placement_tensor_core: CUfunction,
     fn_gpu_sa_placer: CUfunction,
     fn_route_cost_3d: CUfunction,
+    pub fn_route_cost_3d_tensor_core: CUfunction,
     fn_wavefront_3d: CUfunction,
     fn_rt_bvh_crossings: CUfunction,
     fn_rt_bvh_drc: CUfunction,
@@ -347,6 +388,7 @@ impl std::fmt::Debug for CudaEngine {
             .field("backend_name", &self.backend_name)
             .field("optix_available", &self.optix_available)
             .field("optix_version", &self.optix_version)
+            .field("dispatch_profile", &self.dispatch_profile)
             .finish()
     }
 }
@@ -378,6 +420,11 @@ impl Drop for CudaEngine {
             }
         }
     }
+}
+
+fn median_us(mut samples: Vec<f64>) -> f64 {
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    samples[samples.len() / 2]
 }
 
 impl CudaEngine {
@@ -424,8 +471,12 @@ impl CudaEngine {
     }
 
     pub fn new_with_device(ordinal: c_int) -> Option<Arc<Self>> {
-        static CUDA_INIT_LOCK: Mutex<()> = Mutex::new(());
-        let _init_guard = CUDA_INIT_LOCK.lock().ok()?;
+        static CUDA_CTX_INIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let init_mutex = CUDA_CTX_INIT_LOCK.get_or_init(|| Mutex::new(()));
+        let _init_guard = match init_mutex.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         let api = CudaDriverApi::load()?;
         let optix_api = OptixDriverApi::load();
         unsafe {
@@ -463,7 +514,11 @@ impl CudaEngine {
             }
             let _ = (api.cuCtxSetCurrent)(ctx);
 
-            let ptx_cstr = CString::new(KERNELS_PTX).ok()?;
+            let ptx_ascii: String = KERNELS_PTX
+                .chars()
+                .map(|c| if c.is_ascii() { c } else { '-' })
+                .collect();
+            let ptx_cstr = CString::new(ptx_ascii).ok()?;
             let mut module: CUmodule = ptr::null_mut();
             if (api.cuModuleLoadData)(&mut module, ptx_cstr.as_ptr() as *const c_void) != CUDA_SUCCESS {
                 let _ = (api.cuCtxDestroy_v2)(ctx);
@@ -473,9 +528,13 @@ impl CudaEngine {
             let mut fn_dist_field: CUfunction = ptr::null_mut();
             let mut fn_dist_field_tiled: CUfunction = ptr::null_mut();
             let mut fn_dist_field_3d_tiled: CUfunction = ptr::null_mut();
+            let mut fn_dist_field_tensor_core: CUfunction = ptr::null_mut();
+            let mut fn_dist_field_3d_tensor_core: CUfunction = ptr::null_mut();
             let mut fn_batch_placement: CUfunction = ptr::null_mut();
+            let mut fn_batch_placement_tensor_core: CUfunction = ptr::null_mut();
             let mut fn_gpu_sa_placer: CUfunction = ptr::null_mut();
             let mut fn_route_cost_3d: CUfunction = ptr::null_mut();
+            let mut fn_route_cost_3d_tensor_core: CUfunction = ptr::null_mut();
             let mut fn_wavefront_3d: CUfunction = ptr::null_mut();
             let mut fn_rt_bvh_crossings: CUfunction = ptr::null_mut();
             let mut fn_rt_bvh_drc: CUfunction = ptr::null_mut();
@@ -483,9 +542,13 @@ impl CudaEngine {
             let c_df = CString::new("distance_field_kernel").unwrap();
             let c_dft = CString::new("distance_field_tiled_kernel").unwrap();
             let c_df3d = CString::new("distance_field_3d_tiled_kernel").unwrap();
+            let c_dftc = CString::new("distance_field_tensor_core_kernel").unwrap();
+            let c_df3dtc = CString::new("distance_field_3d_tensor_core_kernel").unwrap();
             let c_bp = CString::new("batch_placement_eval_kernel").unwrap();
+            let c_bptc = CString::new("batch_placement_tensor_core_kernel").unwrap();
             let c_sa = CString::new("gpu_sa_placer_kernel").unwrap();
             let c_rc3d = CString::new("compute_3d_routing_cost_kernel").unwrap();
+            let c_rc3dtc = CString::new("compute_3d_routing_cost_tensor_core_kernel").unwrap();
             let c_wf3d = CString::new("wavefront_3d_relax_kernel").unwrap();
             let c_rt_cr = CString::new("rt_bvh_segment_crossings_kernel").unwrap();
             let c_rt_drc = CString::new("rt_bvh_line_of_sight_drc_kernel").unwrap();
@@ -493,9 +556,13 @@ impl CudaEngine {
             if (api.cuModuleGetFunction)(&mut fn_dist_field, module, c_df.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_dist_field_tiled, module, c_dft.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_dist_field_3d_tiled, module, c_df3d.as_ptr()) != CUDA_SUCCESS
+                || (api.cuModuleGetFunction)(&mut fn_dist_field_tensor_core, module, c_dftc.as_ptr()) != CUDA_SUCCESS
+                || (api.cuModuleGetFunction)(&mut fn_dist_field_3d_tensor_core, module, c_df3dtc.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_batch_placement, module, c_bp.as_ptr()) != CUDA_SUCCESS
+                || (api.cuModuleGetFunction)(&mut fn_batch_placement_tensor_core, module, c_bptc.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_gpu_sa_placer, module, c_sa.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_route_cost_3d, module, c_rc3d.as_ptr()) != CUDA_SUCCESS
+                || (api.cuModuleGetFunction)(&mut fn_route_cost_3d_tensor_core, module, c_rc3dtc.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_wavefront_3d, module, c_wf3d.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_rt_bvh_crossings, module, c_rt_cr.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_rt_bvh_drc, module, c_rt_drc.as_ptr()) != CUDA_SUCCESS
@@ -510,7 +577,11 @@ impl CudaEngine {
             let mut fn_df_ampere_tiled = None;
             let mut fn_bp_ampere = None;
 
-            if let Ok(ampere_ptx_cstr) = CString::new(AMPERE_KERNELS_PTX) {
+            let ampere_ptx_ascii: String = AMPERE_KERNELS_PTX
+                .chars()
+                .map(|c| if c.is_ascii() { c } else { '-' })
+                .collect();
+            if let Ok(ampere_ptx_cstr) = CString::new(ampere_ptx_ascii) {
                 let res = (api.cuModuleLoadData)(&mut ampere_module, ampere_ptx_cstr.as_ptr() as *const c_void);
                 if res == CUDA_SUCCESS {
                     let mut f1: CUfunction = ptr::null_mut();
@@ -538,21 +609,36 @@ impl CudaEngine {
                 None => (false, 0),
             };
 
-            Some(Arc::new(Self {
-                device_name,
+            let default_profile = KernelDispatchProfile {
+                device_name: device_name.clone(),
+                best_distance_field: DistanceFieldVariant::SimtSharedTiled,
+                best_placement_eval: PlacementEvalVariant::SimtStandard,
+                best_routing_cost_3d: RoutingCost3DVariant::SimtSharedTiled,
+                df_timings_us: Vec::new(),
+                pe_timings_us: Vec::new(),
+                rc_timings_us: Vec::new(),
+            };
+
+            let mut engine = Self {
+                device_name: device_name.clone(),
                 backend_name,
                 driver_info,
                 optix_available,
                 optix_version,
+                dispatch_profile: default_profile,
                 ctx,
                 module,
                 ampere_module,
                 fn_dist_field,
                 fn_dist_field_tiled,
                 fn_dist_field_3d_tiled,
+                fn_dist_field_tensor_core,
+                fn_dist_field_3d_tensor_core,
                 fn_batch_placement,
+                fn_batch_placement_tensor_core,
                 fn_gpu_sa_placer,
                 fn_route_cost_3d,
+                fn_route_cost_3d_tensor_core,
                 fn_wavefront_3d,
                 fn_rt_bvh_crossings,
                 fn_rt_bvh_drc,
@@ -569,8 +655,251 @@ impl CudaEngine {
                     out_cap_bytes: 0,
                 }),
                 compute_busy_ns: Arc::new(AtomicU64::new(0)),
-            }))
+            };
+
+            let cache_key = format!("{}:{}", ordinal, device_name);
+            engine.calibrate_dispatch_profile(&cache_key);
+            let _ = (engine.cuda.cuCtxSetCurrent)(engine.ctx);
+            if let Ok(mut bufs) = engine.persistent_buffers.lock() {
+                if bufs.d_obs != 0 {
+                    let _ = (engine.cuda.cuMemFree_v2)(bufs.d_obs);
+                    bufs.d_obs = 0;
+                    bufs.obs_cap_bytes = 0;
+                }
+                if bufs.d_out != 0 {
+                    let _ = (engine.cuda.cuMemFree_v2)(bufs.d_out);
+                    bufs.d_out = 0;
+                    bufs.out_cap_bytes = 0;
+                }
+            }
+            engine.compute_busy_ns.store(0, Ordering::Relaxed);
+
+            Some(Arc::new(engine))
         }
+    }
+
+    fn calibrate_dispatch_profile(&mut self, cache_key: &str) {
+        let cache = DISPATCH_PROFILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut cache_guard = match cache.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(existing) = cache_guard.get(cache_key) {
+            self.dispatch_profile = existing.clone();
+            return;
+        }
+
+        // 1. Calibrate Distance Field (128x128, radius=10)
+        let df_w = 128u32;
+        let df_h = 128u32;
+        let df_r = 10i32;
+        let mut df_obs = vec![0u32; (df_w * df_h) as usize];
+        for y in (8..df_h as usize).step_by(24) {
+            for x in (8..df_w as usize).step_by(24) {
+                df_obs[y * (df_w as usize) + x] = 1;
+            }
+        }
+        let ref_df = self
+            .compute_distance_field_variant(&df_obs, df_w, df_h, df_r, DistanceFieldVariant::SimtSharedTiled)
+            .unwrap_or_default();
+
+        let df_candidates = [
+            DistanceFieldVariant::SimtDirect,
+            DistanceFieldVariant::SimtSharedTiled,
+            DistanceFieldVariant::AmperePtxDirect,
+            DistanceFieldVariant::AmperePtxTiled,
+            DistanceFieldVariant::TensorCore,
+        ];
+        let mut df_timings_us = Vec::new();
+        let mut best_df = DistanceFieldVariant::SimtSharedTiled;
+        let mut best_df_us = f64::INFINITY;
+
+        if !ref_df.is_empty() {
+            for &variant in &df_candidates {
+                if let Some(out) = self.compute_distance_field_variant(&df_obs, df_w, df_h, df_r, variant) {
+                    let valid = out.len() == ref_df.len()
+                        && out.iter().zip(&ref_df).all(|(a, b)| (a - b).abs() < 1e-3);
+                    if valid {
+                        let mut samples = Vec::with_capacity(3);
+                        for _ in 0..3 {
+                            let t0 = Instant::now();
+                            let _ = self.compute_distance_field_variant(&df_obs, df_w, df_h, df_r, variant);
+                            samples.push(t0.elapsed().as_secs_f64() * 1e6);
+                        }
+                        let med = median_us(samples);
+                        df_timings_us.push((variant, med));
+                        if med < best_df_us {
+                            best_df_us = med;
+                            best_df = variant;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Calibrate Placement Evaluation (64 candidates, 16 footprints, 24 segments)
+        let pe_nc = 64u32;
+        let pe_nf = 16u32;
+        let pe_ns = 24u32;
+        let pe_params = PlacementBatchParams {
+            num_candidates: pe_nc,
+            num_footprints: pe_nf,
+            num_segments: pe_ns,
+            _pad: 0,
+            board_min_x: 0.0,
+            board_min_y: 0.0,
+            board_max_x: 80.0,
+            board_max_y: 60.0,
+            wirelength_weight: 1.0,
+            crossing_weight: 200.0,
+            overlap_penalty: 25000.0,
+            boundary_penalty: 50000.0,
+        };
+        let mut pe_boxes = Vec::with_capacity((pe_nc * pe_nf) as usize);
+        for c in 0..pe_nc {
+            for f in 0..pe_nf {
+                let bx = ((f * 11 + c * 3) % 70) as f32 + 2.0;
+                let by = ((f * 7 + c * 5) % 50) as f32 + 2.0;
+                pe_boxes.push([bx, by, bx + 4.0, by + 3.0]);
+            }
+        }
+        let mut pe_segs = Vec::with_capacity((pe_nc * pe_ns) as usize);
+        for c in 0..pe_nc {
+            for s in 0..pe_ns {
+                let x1 = ((s * 9 + c * 2) % 65) as f32 + 3.0;
+                let y1 = ((s * 5 + c * 3) % 45) as f32 + 3.0;
+                let x2 = ((s * 13 + c * 7 + 15) % 65) as f32 + 3.0;
+                let y2 = ((s * 11 + c * 5 + 10) % 45) as f32 + 3.0;
+                pe_segs.push([x1, y1, x2, y2]);
+            }
+        }
+        let ref_pe = self
+            .evaluate_placement_variant(&pe_boxes, &pe_segs, &pe_params, PlacementEvalVariant::SimtStandard)
+            .unwrap_or_default();
+
+        let pe_candidates = [
+            PlacementEvalVariant::SimtStandard,
+            PlacementEvalVariant::AmperePtx,
+            PlacementEvalVariant::TensorCore,
+        ];
+        let mut pe_timings_us = Vec::new();
+        let mut best_pe = PlacementEvalVariant::SimtStandard;
+        let mut best_pe_us = f64::INFINITY;
+
+        if !ref_pe.is_empty() {
+            for &variant in &pe_candidates {
+                if let Some(out) = self.evaluate_placement_variant(&pe_boxes, &pe_segs, &pe_params, variant) {
+                    let valid = out.len() == ref_pe.len()
+                        && out.iter().zip(&ref_pe).all(|(a, b)| (a - b).abs() <= 1e-2 * b.abs().max(1.0));
+                    if valid {
+                        let mut samples = Vec::with_capacity(3);
+                        for _ in 0..3 {
+                            let t0 = Instant::now();
+                            let _ = self.evaluate_placement_variant(&pe_boxes, &pe_segs, &pe_params, variant);
+                            samples.push(t0.elapsed().as_secs_f64() * 1e6);
+                        }
+                        let med = median_us(samples);
+                        pe_timings_us.push((variant, med));
+                        if med < best_pe_us {
+                            best_pe_us = med;
+                            best_pe = variant;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Calibrate 3D Routing Cost (64x64x4, clearance_cells=3)
+        let rc_w = 64u32;
+        let rc_h = 64u32;
+        let rc_nl = 4u32;
+        let rc_total = (rc_w * rc_h * rc_nl) as usize;
+        let mut rc_obs = vec![0u32; rc_total];
+        let mut rc_df = vec![2.0f32; rc_total];
+        let mut rc_hist = vec![0.0f32; rc_total];
+        let mut rc_usage = vec![0u32; rc_total];
+        for i in 0..rc_total {
+            if i % 53 == 0 {
+                rc_obs[i] = ((i % 6) + 1) as u32;
+            }
+            rc_df[i] = 0.5 + ((i % 9) as f32) * 0.25;
+            rc_hist[i] = ((i % 5) as f32) * 0.2;
+            rc_usage[i] = (i % 3) as u32;
+        }
+        let rc_params = GpuRouteCostParams {
+            width: rc_w,
+            height: rc_h,
+            num_layers: rc_nl,
+            net_id: 2,
+            clearance_cells: 3,
+            present_congestion_factor: 1.25,
+            obstacle_clearance_weight: 0.3,
+            plane_layer_mask: 0b0100,
+        };
+        let ref_rc = self
+            .compute_3d_routing_costs_variant(
+                &rc_obs,
+                &rc_df,
+                &rc_hist,
+                &rc_usage,
+                &rc_params,
+                RoutingCost3DVariant::SimtSharedTiled,
+            )
+            .unwrap_or_default();
+
+        let rc_candidates = [RoutingCost3DVariant::SimtSharedTiled, RoutingCost3DVariant::TensorCore];
+        let mut rc_timings_us = Vec::new();
+        let mut best_rc = RoutingCost3DVariant::SimtSharedTiled;
+        let mut best_rc_us = f64::INFINITY;
+
+        if !ref_rc.is_empty() {
+            for &variant in &rc_candidates {
+                if let Some(out) = self.compute_3d_routing_costs_variant(
+                    &rc_obs,
+                    &rc_df,
+                    &rc_hist,
+                    &rc_usage,
+                    &rc_params,
+                    variant,
+                ) {
+                    let valid = out.len() == ref_rc.len()
+                        && out.iter().zip(&ref_rc).all(|(a, b)| (a - b).abs() < 1e-4);
+                    if valid {
+                        let mut samples = Vec::with_capacity(3);
+                        for _ in 0..3 {
+                            let t0 = Instant::now();
+                            let _ = self.compute_3d_routing_costs_variant(
+                                &rc_obs,
+                                &rc_df,
+                                &rc_hist,
+                                &rc_usage,
+                                &rc_params,
+                                variant,
+                            );
+                            samples.push(t0.elapsed().as_secs_f64() * 1e6);
+                        }
+                        let med = median_us(samples);
+                        rc_timings_us.push((variant, med));
+                        if med < best_rc_us {
+                            best_rc_us = med;
+                            best_rc = variant;
+                        }
+                    }
+                }
+            }
+        }
+
+        let profile = KernelDispatchProfile {
+            device_name: self.device_name.clone(),
+            best_distance_field: best_df,
+            best_placement_eval: best_pe,
+            best_routing_cost_3d: best_rc,
+            df_timings_us,
+            pe_timings_us,
+            rc_timings_us,
+        };
+        cache_guard.insert(cache_key.to_string(), profile.clone());
+        self.dispatch_profile = profile;
     }
 
     unsafe fn ensure_persistent_buffers(&self, in_bytes: usize, out_bytes: usize) -> Option<(CUdeviceptr, CUdeviceptr)> {
@@ -605,11 +934,78 @@ impl CudaEngine {
     }
 
     pub fn compute_distance_field(&self, obstacles: &[u32], width: u32, height: u32, radius: i32) -> Option<Vec<f32>> {
-        self.compute_distance_field_mode(obstacles, width, height, radius, true)
+        self.compute_distance_field_variant(
+            obstacles,
+            width,
+            height,
+            radius,
+            self.dispatch_profile.best_distance_field,
+        )
+        .or_else(|| self.compute_distance_field_mode(obstacles, width, height, radius, true))
+    }
+
+    pub fn compute_distance_field_variant(
+        &self,
+        obstacles: &[u32],
+        width: u32,
+        height: u32,
+        radius: i32,
+        variant: DistanceFieldVariant,
+    ) -> Option<Vec<f32>> {
+        match variant {
+            DistanceFieldVariant::SimtDirect => self.compute_distance_field_mode(obstacles, width, height, radius, false),
+            DistanceFieldVariant::SimtSharedTiled => self.compute_distance_field_mode(obstacles, width, height, radius, true),
+            DistanceFieldVariant::AmperePtxDirect => self.compute_distance_field_ampere(obstacles, width, height, radius, false),
+            DistanceFieldVariant::AmperePtxTiled => self.compute_distance_field_ampere(obstacles, width, height, radius, true),
+            DistanceFieldVariant::TensorCore => self.compute_distance_field_tensor_core(obstacles, width, height, radius),
+        }
+    }
+
+    pub fn compute_distance_field_tensor_core(
+        &self,
+        obstacles: &[u32],
+        width: u32,
+        height: u32,
+        radius: i32,
+    ) -> Option<Vec<f32>> {
+        self.launch_distance_field_kernel(self.fn_dist_field_tensor_core, obstacles, width, height, radius, true)
     }
 
     pub fn compute_distance_field_mode(
         &self,
+        obstacles: &[u32],
+        width: u32,
+        height: u32,
+        radius: i32,
+        use_shared_memory: bool,
+    ) -> Option<Vec<f32>> {
+        let kernel = if use_shared_memory {
+            self.fn_dist_field_tiled
+        } else {
+            self.fn_dist_field
+        };
+        self.launch_distance_field_kernel(kernel, obstacles, width, height, radius, use_shared_memory)
+    }
+
+    pub fn compute_distance_field_ampere(
+        &self,
+        obstacles: &[u32],
+        width: u32,
+        height: u32,
+        radius: i32,
+        tiled: bool,
+    ) -> Option<Vec<f32>> {
+        let kernel = if tiled {
+            self.fn_df_ampere_tiled?
+        } else {
+            self.fn_df_ampere?
+        };
+        self.launch_distance_field_kernel(kernel, obstacles, width, height, radius, tiled)
+    }
+
+    fn launch_distance_field_kernel(
+        &self,
+        kernel: CUfunction,
         obstacles: &[u32],
         width: u32,
         height: u32,
@@ -649,110 +1045,6 @@ impl CudaEngine {
             };
 
             let smem_bytes = if use_shared_memory {
-                let tile_w = block_x as i32 + 2 * radius;
-                let tile_h = block_y as i32 + 2 * radius;
-                (tile_w * tile_h * 4) as c_uint
-            } else {
-                0
-            };
-
-            let kernel = if use_shared_memory {
-                self.fn_dist_field_tiled
-            } else {
-                self.fn_dist_field
-            };
-
-            let mut w_arg = width;
-            let mut h_arg = height;
-            let mut r_arg = radius;
-
-            let mut args = [
-                &mut d_obs as *mut _ as *mut c_void,
-                &mut d_out as *mut _ as *mut c_void,
-                &mut w_arg as *mut _ as *mut c_void,
-                &mut h_arg as *mut _ as *mut c_void,
-                &mut r_arg as *mut _ as *mut c_void,
-            ];
-
-            for _ in 0..passes {
-                if (self.cuda.cuLaunchKernel)(
-                    kernel,
-                    grid_x,
-                    grid_y,
-                    1,
-                    block_x,
-                    block_y,
-                    1,
-                    smem_bytes,
-                    ptr::null_mut(),
-                    args.as_mut_ptr(),
-                    ptr::null_mut(),
-                ) != CUDA_SUCCESS
-                {
-                    return None;
-                }
-            }
-
-            let mut result = vec![0.0f32; total];
-            if (self.cuda.cuMemcpyDtoH_v2)(result.as_mut_ptr() as *mut c_void, d_out, out_bytes) != CUDA_SUCCESS {
-                return None;
-            }
-
-            let _ = (self.cuda.cuCtxSynchronize)();
-            let elapsed_ns = start_t.elapsed().as_nanos() as u64;
-            self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-
-            Some(result)
-        }
-    }
-
-    pub fn compute_distance_field_ampere(
-        &self,
-        obstacles: &[u32],
-        width: u32,
-        height: u32,
-        radius: i32,
-        tiled: bool,
-    ) -> Option<Vec<f32>> {
-        let kernel = if tiled {
-            self.fn_df_ampere_tiled?
-        } else {
-            self.fn_df_ampere?
-        };
-
-        let total = (width * height) as usize;
-        if obstacles.len() != total || total == 0 {
-            return None;
-        }
-
-        let _guard = self.dispatch_lock.lock().ok()?;
-        unsafe {
-            let _ = (self.cuda.cuCtxSetCurrent)(self.ctx);
-            let in_bytes = total * std::mem::size_of::<u32>();
-            let out_bytes = total * std::mem::size_of::<f32>();
-
-            let (mut d_obs, mut d_out) = self.ensure_persistent_buffers(in_bytes, out_bytes)?;
-
-            let start_t = Instant::now();
-
-            if (self.cuda.cuMemcpyHtoD_v2)(d_obs, obstacles.as_ptr() as *const c_void, in_bytes) != CUDA_SUCCESS {
-                return None;
-            }
-
-            let block_x: c_uint = 16;
-            let block_y: c_uint = 16;
-            let grid_x: c_uint = (width + block_x - 1) / block_x;
-            let grid_y: c_uint = (height + block_y - 1) / block_y;
-
-            let passes = if total >= 4096 && radius > 12 {
-                64
-            } else if total >= 4096 {
-                8
-            } else {
-                1
-            };
-
-            let smem_bytes = if tiled {
                 let tile_w = block_x as i32 + 2 * radius;
                 let tile_h = block_y as i32 + 2 * radius;
                 (tile_w * tile_h * 4) as c_uint
@@ -829,6 +1121,12 @@ impl CudaEngine {
             return None;
         }
 
+        let kernel = if self.dispatch_profile.best_distance_field == DistanceFieldVariant::TensorCore {
+            self.fn_dist_field_3d_tensor_core
+        } else {
+            self.fn_dist_field_3d_tiled
+        };
+
         let _guard = self.dispatch_lock.lock().ok()?;
         unsafe {
             let _ = (self.cuda.cuCtxSetCurrent)(self.ctx);
@@ -877,7 +1175,7 @@ impl CudaEngine {
 
             for _ in 0..passes {
                 if (self.cuda.cuLaunchKernel)(
-                    self.fn_dist_field_3d_tiled,
+                    kernel,
                     grid_x,
                     grid_y,
                     grid_z,
@@ -907,6 +1205,30 @@ impl CudaEngine {
         }
     }
 
+    pub fn evaluate_placement_batch(
+        &self,
+        boxes: &[[f32; 4]],
+        segs: &[[f32; 4]],
+        params: &PlacementBatchParams,
+    ) -> Option<Vec<f32>> {
+        self.evaluate_placement_variant(boxes, segs, params, self.dispatch_profile.best_placement_eval)
+            .or_else(|| self.evaluate_placement_variant(boxes, segs, params, PlacementEvalVariant::SimtStandard))
+    }
+
+    pub fn evaluate_placement_variant(
+        &self,
+        boxes: &[[f32; 4]],
+        segs: &[[f32; 4]],
+        params: &PlacementBatchParams,
+        variant: PlacementEvalVariant,
+    ) -> Option<Vec<f32>> {
+        let kernel = match variant {
+            PlacementEvalVariant::SimtStandard => self.fn_batch_placement,
+            PlacementEvalVariant::AmperePtx => self.fn_bp_ampere?,
+            PlacementEvalVariant::TensorCore => self.fn_batch_placement_tensor_core,
+        };
+        self.launch_placement_kernel(kernel, boxes, segs, params)
+    }
 
     pub fn evaluate_placement_ampere(
         &self,
@@ -914,7 +1236,25 @@ impl CudaEngine {
         segs: &[[f32; 4]],
         params: &PlacementBatchParams,
     ) -> Option<Vec<f32>> {
-        let kernel = self.fn_bp_ampere?;
+        self.evaluate_placement_variant(boxes, segs, params, PlacementEvalVariant::AmperePtx)
+    }
+
+    pub fn evaluate_placement_tensor_core(
+        &self,
+        boxes: &[[f32; 4]],
+        segs: &[[f32; 4]],
+        params: &PlacementBatchParams,
+    ) -> Option<Vec<f32>> {
+        self.evaluate_placement_variant(boxes, segs, params, PlacementEvalVariant::TensorCore)
+    }
+
+    fn launch_placement_kernel(
+        &self,
+        kernel: CUfunction,
+        boxes: &[[f32; 4]],
+        segs: &[[f32; 4]],
+        params: &PlacementBatchParams,
+    ) -> Option<Vec<f32>> {
         let nc = params.num_candidates as usize;
         let nf = params.num_footprints as usize;
         let ns = params.num_segments as usize;
@@ -972,107 +1312,6 @@ impl CudaEngine {
 
             if (self.cuda.cuLaunchKernel)(
                 kernel,
-                grid_x,
-                1,
-                1,
-                block_x,
-                1,
-                1,
-                0,
-                ptr::null_mut(),
-                args.as_mut_ptr(),
-                ptr::null_mut(),
-            ) != CUDA_SUCCESS
-            {
-                let _ = (self.cuda.cuMemFree_v2)(d_boxes);
-                let _ = (self.cuda.cuMemFree_v2)(d_segs);
-                let _ = (self.cuda.cuMemFree_v2)(d_out);
-                return None;
-            }
-
-            let mut result = vec![0.0f32; nc];
-            if (self.cuda.cuMemcpyDtoH_v2)(result.as_mut_ptr() as *mut c_void, d_out, out_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_boxes);
-                let _ = (self.cuda.cuMemFree_v2)(d_segs);
-                let _ = (self.cuda.cuMemFree_v2)(d_out);
-                return None;
-            }
-
-            let _ = (self.cuda.cuCtxSynchronize)();
-            let elapsed_ns = start_t.elapsed().as_nanos() as u64;
-            self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-
-            let _ = (self.cuda.cuMemFree_v2)(d_boxes);
-            let _ = (self.cuda.cuMemFree_v2)(d_segs);
-            let _ = (self.cuda.cuMemFree_v2)(d_out);
-
-            Some(result)
-        }
-    }
-
-    pub fn evaluate_placement_batch(
-        &self,
-        boxes: &[[f32; 4]],
-        segs: &[[f32; 4]],
-        params: &PlacementBatchParams,
-    ) -> Option<Vec<f32>> {
-        let nc = params.num_candidates as usize;
-        let nf = params.num_footprints as usize;
-        let ns = params.num_segments as usize;
-        if nc == 0 || nf == 0 || boxes.len() != nc * nf || segs.len() != nc * ns {
-            return None;
-        }
-
-        let _guard = self.dispatch_lock.lock().ok()?;
-        unsafe {
-            let _ = (self.cuda.cuCtxSetCurrent)(self.ctx);
-            let boxes_bytes = boxes.len() * std::mem::size_of::<[f32; 4]>();
-            let dummy_seg = [[0.0f32; 4]; 1];
-            let seg_slice: &[[f32; 4]] = if segs.is_empty() { &dummy_seg } else { segs };
-            let segs_bytes = seg_slice.len() * std::mem::size_of::<[f32; 4]>();
-            let out_bytes = nc * std::mem::size_of::<f32>();
-
-            let mut d_boxes: CUdeviceptr = 0;
-            let mut d_segs: CUdeviceptr = 0;
-            let mut d_out: CUdeviceptr = 0;
-
-            if (self.cuda.cuMemAlloc_v2)(&mut d_boxes, boxes_bytes) != CUDA_SUCCESS {
-                return None;
-            }
-            if (self.cuda.cuMemAlloc_v2)(&mut d_segs, segs_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_boxes);
-                return None;
-            }
-            if (self.cuda.cuMemAlloc_v2)(&mut d_out, out_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_boxes);
-                let _ = (self.cuda.cuMemFree_v2)(d_segs);
-                return None;
-            }
-
-            let start_t = Instant::now();
-
-            if (self.cuda.cuMemcpyHtoD_v2)(d_boxes, boxes.as_ptr() as *const c_void, boxes_bytes) != CUDA_SUCCESS
-                || (self.cuda.cuMemcpyHtoD_v2)(d_segs, seg_slice.as_ptr() as *const c_void, segs_bytes) != CUDA_SUCCESS
-            {
-                let _ = (self.cuda.cuMemFree_v2)(d_boxes);
-                let _ = (self.cuda.cuMemFree_v2)(d_segs);
-                let _ = (self.cuda.cuMemFree_v2)(d_out);
-                return None;
-            }
-
-            let block_x: c_uint = 64;
-            let grid_x: c_uint = (params.num_candidates + block_x - 1) / block_x;
-
-            let mut params_copy = *params;
-            let mut args = [
-                &mut d_boxes as *mut _ as *mut c_void,
-                &mut d_segs as *mut _ as *mut c_void,
-                &mut d_out as *mut _ as *mut c_void,
-                &mut params_copy as *mut _ as *mut c_void,
-            ];
-
-            if (self.cuda.cuLaunchKernel)(
-                self.fn_batch_placement,
                 grid_x,
                 1,
                 1,
@@ -1252,12 +1491,50 @@ impl CudaEngine {
         usage_count: &[u32],
         params: &GpuRouteCostParams,
     ) -> Option<Vec<f32>> {
-        let mut batch = self.compute_3d_routing_costs_multi(
+        self.compute_3d_routing_costs_variant(
+            obstacles,
+            dist_field,
+            history_cost,
+            usage_count,
+            params,
+            self.dispatch_profile.best_routing_cost_3d,
+        )
+    }
+
+    pub fn compute_3d_routing_costs_tensor_core(
+        &self,
+        obstacles: &[u32],
+        dist_field: &[f32],
+        history_cost: &[f32],
+        usage_count: &[u32],
+        params: &GpuRouteCostParams,
+    ) -> Option<Vec<f32>> {
+        self.compute_3d_routing_costs_variant(
+            obstacles,
+            dist_field,
+            history_cost,
+            usage_count,
+            params,
+            RoutingCost3DVariant::TensorCore,
+        )
+    }
+
+    pub fn compute_3d_routing_costs_variant(
+        &self,
+        obstacles: &[u32],
+        dist_field: &[f32],
+        history_cost: &[f32],
+        usage_count: &[u32],
+        params: &GpuRouteCostParams,
+        variant: RoutingCost3DVariant,
+    ) -> Option<Vec<f32>> {
+        let mut batch = self.compute_3d_routing_costs_multi_variant(
             obstacles,
             dist_field,
             history_cost,
             usage_count,
             std::slice::from_ref(params),
+            variant,
         );
         batch.pop().flatten()
     }
@@ -1270,6 +1547,25 @@ impl CudaEngine {
         history_cost: &[f32],
         usage_count: &[u32],
         batch_params: &[GpuRouteCostParams],
+    ) -> Vec<Option<Vec<f32>>> {
+        self.compute_3d_routing_costs_multi_variant(
+            obstacles,
+            dist_field,
+            history_cost,
+            usage_count,
+            batch_params,
+            self.dispatch_profile.best_routing_cost_3d,
+        )
+    }
+
+    pub fn compute_3d_routing_costs_multi_variant(
+        &self,
+        obstacles: &[u32],
+        dist_field: &[f32],
+        history_cost: &[f32],
+        usage_count: &[u32],
+        batch_params: &[GpuRouteCostParams],
+        variant: RoutingCost3DVariant,
     ) -> Vec<Option<Vec<f32>>> {
         if batch_params.is_empty() {
             return Vec::new();
@@ -1289,6 +1585,11 @@ impl CudaEngine {
         {
             return vec![None; batch_params.len()];
         }
+
+        let kernel = match variant {
+            RoutingCost3DVariant::SimtSharedTiled => self.fn_route_cost_3d,
+            RoutingCost3DVariant::TensorCore => self.fn_route_cost_3d_tensor_core,
+        };
 
         let _guard = match self.dispatch_lock.lock() {
             Ok(g) => g,
@@ -1379,7 +1680,7 @@ impl CudaEngine {
                 ];
 
                 if (self.cuda.cuLaunchKernel)(
-                    self.fn_route_cost_3d,
+                    kernel,
                     grid_x,
                     grid_y,
                     grid_z,
@@ -2503,6 +2804,215 @@ mod tests {
         assert_eq!(cu_crossings, cpu_crossings, "CUDA BVH crossings must match O(N^2) exact");
         assert_eq!(vk_crossings, cpu_crossings, "Vulkan BVH crossings must match O(N^2) exact");
         assert!(cpu_crossings.iter().sum::<u32>() > 100);
+    }
+
+    #[test]
+    fn test_tensor_core_kernels_exact_equivalence() {
+        let devs = CudaEngine::all_devices();
+        if devs.is_empty() {
+            return;
+        }
+
+        for cuda in &devs {
+            // 1. Distance Field Tensor Core vs SIMT Tiled (both empty and populated tiles)
+            let w = 48u32;
+            let h = 48u32;
+            let r = 10i32;
+            let mut obs = vec![0u32; (w * h) as usize];
+            obs[6 * (w as usize) + 6] = 1;
+            obs[35 * (w as usize) + 40] = 2;
+
+            let df_ref = cuda
+                .compute_distance_field_variant(&obs, w, h, r, DistanceFieldVariant::SimtSharedTiled)
+                .expect("SIMT tiled DF");
+            let df_tc = cuda
+                .compute_distance_field_tensor_core(&obs, w, h, r)
+                .expect("Tensor Core DF");
+            assert_eq!(df_ref.len(), df_tc.len());
+            for i in 0..df_ref.len() {
+                assert!(
+                    (df_ref[i] - df_tc[i]).abs() < 1e-3,
+                    "[{}] DF TensorCore mismatch at {}: ref={}, tc={}",
+                    cuda.device_name,
+                    i,
+                    df_ref[i],
+                    df_tc[i]
+                );
+            }
+
+            // 2. Batch Placement Tensor Core vs SIMT Standard
+            let pe_params = PlacementBatchParams {
+                num_candidates: 16,
+                num_footprints: 8,
+                num_segments: 12,
+                _pad: 0,
+                board_min_x: 0.0,
+                board_min_y: 0.0,
+                board_max_x: 50.0,
+                board_max_y: 40.0,
+                wirelength_weight: 1.0,
+                crossing_weight: 200.0,
+                overlap_penalty: 25000.0,
+                boundary_penalty: 50000.0,
+            };
+            let mut boxes = Vec::with_capacity(16 * 8);
+            for c in 0..16u32 {
+                for f in 0..8u32 {
+                    let bx = ((f * 9 + c * 3) % 45) as f32 - 1.0;
+                    let by = ((f * 7 + c * 5) % 35) as f32 + 1.0;
+                    boxes.push([bx, by, bx + 4.5, by + 3.5]);
+                }
+            }
+            let mut segs = Vec::with_capacity(16 * 12);
+            for c in 0..16u32 {
+                for s in 0..12u32 {
+                    let x1 = ((s * 7 + c * 2) % 40) as f32 + 2.0;
+                    let y1 = ((s * 5 + c * 3) % 30) as f32 + 2.0;
+                    let x2 = ((s * 11 + c * 7 + 12) % 40) as f32 + 2.0;
+                    let y2 = ((s * 13 + c * 5 + 8) % 30) as f32 + 2.0;
+                    segs.push([x1, y1, x2, y2]);
+                }
+            }
+
+            let pe_ref = cuda
+                .evaluate_placement_variant(&boxes, &segs, &pe_params, PlacementEvalVariant::SimtStandard)
+                .expect("SIMT Placement Eval");
+            let pe_tc = cuda
+                .evaluate_placement_tensor_core(&boxes, &segs, &pe_params)
+                .expect("Tensor Core Placement Eval");
+            assert_eq!(pe_ref.len(), pe_tc.len());
+            for i in 0..pe_ref.len() {
+                assert!(
+                    (pe_ref[i] - pe_tc[i]).abs() <= 1e-2 * pe_ref[i].abs().max(1.0),
+                    "[{}] Placement TensorCore mismatch at {}: ref={}, tc={}",
+                    cuda.device_name,
+                    i,
+                    pe_ref[i],
+                    pe_tc[i]
+                );
+            }
+
+            // 3. 3D Routing Cost Tensor Core vs SIMT Shared Tiled
+            let rw = 32u32;
+            let rh = 32u32;
+            let rnl = 4u32;
+            let rtot = (rw * rh * rnl) as usize;
+            let mut robs = vec![0u32; rtot];
+            let mut rdf = vec![1.5f32; rtot];
+            let mut rhist = vec![0.0f32; rtot];
+            let mut ruse = vec![0u32; rtot];
+            for i in 0..rtot {
+                if i % 41 == 0 {
+                    robs[i] = ((i % 5) + 1) as u32;
+                }
+                rdf[i] = 0.3 + ((i % 9) as f32) * 0.2;
+                rhist[i] = ((i % 6) as f32) * 0.3;
+                ruse[i] = (i % 4) as u32;
+            }
+            let rparams = GpuRouteCostParams {
+                width: rw,
+                height: rh,
+                num_layers: rnl,
+                net_id: 2,
+                clearance_cells: 3,
+                present_congestion_factor: 1.25,
+                obstacle_clearance_weight: 0.4,
+                plane_layer_mask: 0b0100,
+            };
+
+            let rc_ref = cuda
+                .compute_3d_routing_costs_variant(
+                    &robs,
+                    &rdf,
+                    &rhist,
+                    &ruse,
+                    &rparams,
+                    RoutingCost3DVariant::SimtSharedTiled,
+                )
+                .expect("SIMT 3D Routing Cost");
+            let rc_tc = cuda
+                .compute_3d_routing_costs_tensor_core(&robs, &rdf, &rhist, &ruse, &rparams)
+                .expect("Tensor Core 3D Routing Cost");
+            assert_eq!(rc_ref.len(), rc_tc.len());
+            for i in 0..rtot {
+                assert!(
+                    (rc_ref[i] - rc_tc[i]).abs() < 1e-4,
+                    "[{}] 3D Routing Cost TensorCore mismatch at {}: ref={}, tc={}",
+                    cuda.device_name,
+                    i,
+                    rc_ref[i],
+                    rc_tc[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_startup_kernel_benchmark_and_auto_dispatcher() {
+        let devs = CudaEngine::all_devices();
+        if devs.is_empty() {
+            return;
+        }
+
+        for dev in &devs {
+            let p = &dev.dispatch_profile;
+            println!(
+                "Auto-Dispatch Profile for {}: DF={:?} {:?}, PE={:?} {:?}, RC3D={:?} {:?}",
+                p.device_name,
+                p.best_distance_field,
+                p.df_timings_us,
+                p.best_placement_eval,
+                p.pe_timings_us,
+                p.best_routing_cost_3d,
+                p.rc_timings_us
+            );
+            assert_eq!(p.device_name, dev.device_name);
+            assert_eq!(p.df_timings_us.len(), 5, "All 5 DistanceFieldVariants must be benchmarked");
+            assert_eq!(p.pe_timings_us.len(), 3, "All 3 PlacementEvalVariants must be benchmarked");
+            assert_eq!(p.rc_timings_us.len(), 2, "Both RoutingCost3DVariants must be benchmarked");
+
+            for &(_, us) in &p.df_timings_us {
+                assert!(us > 0.0 && us.is_finite());
+            }
+            for &(_, us) in &p.pe_timings_us {
+                assert!(us > 0.0 && us.is_finite());
+            }
+            for &(_, us) in &p.rc_timings_us {
+                assert!(us > 0.0 && us.is_finite());
+            }
+
+            // Verify selected best variant matches the minimum recorded median time
+            let min_df = p
+                .df_timings_us
+                .iter()
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .unwrap();
+            assert_eq!(p.best_distance_field, min_df.0);
+
+            let min_pe = p
+                .pe_timings_us
+                .iter()
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .unwrap();
+            assert_eq!(p.best_placement_eval, min_pe.0);
+
+            let min_rc = p
+                .rc_timings_us
+                .iter()
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .unwrap();
+            assert_eq!(p.best_routing_cost_3d, min_rc.0);
+        }
+
+        // Verify process-wide cache hits immediately on subsequent initialization
+        let devs_cached = CudaEngine::all_devices();
+        assert_eq!(devs.len(), devs_cached.len());
+        for (a, b) in devs.iter().zip(devs_cached.iter()) {
+            assert_eq!(a.dispatch_profile.best_distance_field, b.dispatch_profile.best_distance_field);
+            assert_eq!(a.dispatch_profile.best_placement_eval, b.dispatch_profile.best_placement_eval);
+            assert_eq!(a.dispatch_profile.best_routing_cost_3d, b.dispatch_profile.best_routing_cost_3d);
+            assert_eq!(a.dispatch_profile.df_timings_us, b.dispatch_profile.df_timings_us);
+        }
     }
 }
 

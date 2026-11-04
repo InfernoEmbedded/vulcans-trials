@@ -1929,10 +1929,7 @@ impl VulkanEngine {
 
         if self.backend_kind == GpuBackendKind::CudaPtx {
             if let Some(cuda) = &self.cuda_engine {
-                if let Some(res) = cuda
-                    .compute_distance_field_ampere(obstacles, width, height, radius, true)
-                    .or_else(|| cuda.compute_distance_field(obstacles, width, height, radius))
-                {
+                if let Some(res) = cuda.compute_distance_field(obstacles, width, height, radius) {
                     self.compute_busy_ns.fetch_add(cuda.compute_busy_ns.load(Ordering::Relaxed), Ordering::Relaxed);
                     return Some(res);
                 }
@@ -2095,10 +2092,7 @@ impl VulkanEngine {
 
         if self.backend_kind == GpuBackendKind::CudaPtx {
             if let Some(cuda) = &self.cuda_engine {
-                if let Some(res) = cuda
-                    .evaluate_placement_ampere(boxes, segs, params)
-                    .or_else(|| cuda.evaluate_placement_batch(boxes, segs, params))
-                {
+                if let Some(res) = cuda.evaluate_placement_batch(boxes, segs, params) {
                     self.compute_busy_ns.fetch_add(cuda.compute_busy_ns.load(Ordering::Relaxed), Ordering::Relaxed);
                     return Some(res);
                 }
