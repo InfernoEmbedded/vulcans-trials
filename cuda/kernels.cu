@@ -1506,6 +1506,52 @@ __global__ void rt_bvh_segment_crossings_kernel(
     crossings_out[i] = crossings;
 }
 
+__global__ void rt_bvh_corridor_cuts_kernel(
+    const float4* __restrict__ segs,
+    const GpuBvhNode* __restrict__ bvh_nodes,
+    const float4* __restrict__ cuts,
+    unsigned int* __restrict__ cuts_out,
+    unsigned int num_cuts
+) {
+    unsigned int c_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c_idx >= num_cuts) {
+        return;
+    }
+
+    float4 cut = cuts[c_idx];
+    unsigned int crossings = 0u;
+
+    int stack[32];
+    int stack_ptr = 0;
+    stack[stack_ptr++] = 0;
+
+    while (stack_ptr > 0) {
+        int node_idx = stack[--stack_ptr];
+        GpuBvhNode node = bvh_nodes[node_idx];
+        if (node.right_or_count == 0) {
+            continue;
+        }
+        if (!ray_aabb_intersects(cut, node.min_x, node.min_y, node.max_x, node.max_y)) {
+            continue;
+        }
+        if (node.right_or_count > 0) {
+            unsigned int j = (unsigned int)node.left_or_prim;
+            if (segments_cross(cut, segs[j])) {
+                crossings += 1u;
+            }
+        } else {
+            int left_idx = node.left_or_prim;
+            int right_idx = -node.right_or_count;
+            if (stack_ptr + 2 <= 32) {
+                stack[stack_ptr++] = right_idx;
+                stack[stack_ptr++] = left_idx;
+            }
+        }
+    }
+
+    cuts_out[c_idx] = crossings;
+}
+
 __global__ void rt_bvh_line_of_sight_drc_kernel(
     const GpuBvhNode* __restrict__ bvh_nodes,
     const GpuDrcRayQuery* __restrict__ queries,
