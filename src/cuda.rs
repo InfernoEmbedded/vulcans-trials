@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::vulkan::{GpuSaParams, PlacementBatchParams};
+pub use crate::vulkan::{GpuRouteCostParams, GpuSaParams, PlacementBatchParams};
 
 pub const KERNELS_PTX: &str = include_str!("../cuda/kernels.ptx");
 pub const AMPERE_KERNELS_PTX: &str = include_str!("../cuda/ampere_kernels.ptx");
@@ -197,6 +197,8 @@ pub struct CudaEngine {
     fn_dist_field_3d_tiled: CUfunction,
     fn_batch_placement: CUfunction,
     fn_gpu_sa_placer: CUfunction,
+    fn_route_cost_3d: CUfunction,
+    fn_wavefront_3d: CUfunction,
     pub fn_df_ampere: Option<CUfunction>,
     pub fn_df_ampere_tiled: Option<CUfunction>,
     pub fn_bp_ampere: Option<CUfunction>,
@@ -339,18 +341,24 @@ impl CudaEngine {
             let mut fn_dist_field_3d_tiled: CUfunction = ptr::null_mut();
             let mut fn_batch_placement: CUfunction = ptr::null_mut();
             let mut fn_gpu_sa_placer: CUfunction = ptr::null_mut();
+            let mut fn_route_cost_3d: CUfunction = ptr::null_mut();
+            let mut fn_wavefront_3d: CUfunction = ptr::null_mut();
 
             let c_df = CString::new("distance_field_kernel").unwrap();
             let c_dft = CString::new("distance_field_tiled_kernel").unwrap();
             let c_df3d = CString::new("distance_field_3d_tiled_kernel").unwrap();
             let c_bp = CString::new("batch_placement_eval_kernel").unwrap();
             let c_sa = CString::new("gpu_sa_placer_kernel").unwrap();
+            let c_rc3d = CString::new("compute_3d_routing_cost_kernel").unwrap();
+            let c_wf3d = CString::new("wavefront_3d_relax_kernel").unwrap();
 
             if (api.cuModuleGetFunction)(&mut fn_dist_field, module, c_df.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_dist_field_tiled, module, c_dft.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_dist_field_3d_tiled, module, c_df3d.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_batch_placement, module, c_bp.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_gpu_sa_placer, module, c_sa.as_ptr()) != CUDA_SUCCESS
+                || (api.cuModuleGetFunction)(&mut fn_route_cost_3d, module, c_rc3d.as_ptr()) != CUDA_SUCCESS
+                || (api.cuModuleGetFunction)(&mut fn_wavefront_3d, module, c_wf3d.as_ptr()) != CUDA_SUCCESS
             {
                 let _ = (api.cuModuleUnload)(module);
                 let _ = (api.cuCtxDestroy_v2)(ctx);
@@ -397,6 +405,8 @@ impl CudaEngine {
                 fn_dist_field_3d_tiled,
                 fn_batch_placement,
                 fn_gpu_sa_placer,
+                fn_route_cost_3d,
+                fn_wavefront_3d,
                 fn_df_ampere,
                 fn_df_ampere_tiled,
                 fn_bp_ampere,
@@ -1083,6 +1093,367 @@ impl CudaEngine {
             Some((best_poses, final_scores))
         }
     }
+
+    pub fn compute_3d_routing_costs(
+        &self,
+        obstacles: &[u32],
+        dist_field: &[f32],
+        history_cost: &[f32],
+        usage_count: &[u32],
+        params: &GpuRouteCostParams,
+    ) -> Option<Vec<f32>> {
+        let mut batch = self.compute_3d_routing_costs_multi(
+            obstacles,
+            dist_field,
+            history_cost,
+            usage_count,
+            std::slice::from_ref(params),
+        );
+        batch.pop().flatten()
+    }
+
+    /// Evaluates one or more 3D routing cost maps on this GPU while uploading shared grid buffers only once.
+    pub fn compute_3d_routing_costs_multi(
+        &self,
+        obstacles: &[u32],
+        dist_field: &[f32],
+        history_cost: &[f32],
+        usage_count: &[u32],
+        batch_params: &[GpuRouteCostParams],
+    ) -> Vec<Option<Vec<f32>>> {
+        if batch_params.is_empty() {
+            return Vec::new();
+        }
+        let first = &batch_params[0];
+        let total = match (first.width as usize)
+            .checked_mul(first.height as usize)
+            .and_then(|v| v.checked_mul(first.num_layers as usize))
+        {
+            Some(t) if t > 0 => t,
+            _ => return vec![None; batch_params.len()],
+        };
+        if obstacles.len() != total
+            || dist_field.len() != total
+            || history_cost.len() != total
+            || usage_count.len() != total
+        {
+            return vec![None; batch_params.len()];
+        }
+
+        let _guard = match self.dispatch_lock.lock() {
+            Ok(g) => g,
+            Err(_) => return vec![None; batch_params.len()],
+        };
+
+        unsafe {
+            let _ = (self.cuda.cuCtxSetCurrent)(self.ctx);
+            let u32_bytes = total * std::mem::size_of::<u32>();
+            let f32_bytes = total * std::mem::size_of::<f32>();
+
+            let mut d_obs: CUdeviceptr = 0;
+            let mut d_df: CUdeviceptr = 0;
+            let mut d_hist: CUdeviceptr = 0;
+            let mut d_usage: CUdeviceptr = 0;
+            let mut d_out: CUdeviceptr = 0;
+
+            if (self.cuda.cuMemAlloc_v2)(&mut d_obs, u32_bytes) != CUDA_SUCCESS {
+                return vec![None; batch_params.len()];
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_df, f32_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_obs);
+                return vec![None; batch_params.len()];
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_hist, f32_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_obs);
+                let _ = (self.cuda.cuMemFree_v2)(d_df);
+                return vec![None; batch_params.len()];
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_usage, u32_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_obs);
+                let _ = (self.cuda.cuMemFree_v2)(d_df);
+                let _ = (self.cuda.cuMemFree_v2)(d_hist);
+                return vec![None; batch_params.len()];
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_out, f32_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_obs);
+                let _ = (self.cuda.cuMemFree_v2)(d_df);
+                let _ = (self.cuda.cuMemFree_v2)(d_hist);
+                let _ = (self.cuda.cuMemFree_v2)(d_usage);
+                return vec![None; batch_params.len()];
+            }
+
+            let start_t = Instant::now();
+
+            if (self.cuda.cuMemcpyHtoD_v2)(d_obs, obstacles.as_ptr() as *const c_void, u32_bytes) != CUDA_SUCCESS
+                || (self.cuda.cuMemcpyHtoD_v2)(d_df, dist_field.as_ptr() as *const c_void, f32_bytes) != CUDA_SUCCESS
+                || (self.cuda.cuMemcpyHtoD_v2)(d_hist, history_cost.as_ptr() as *const c_void, f32_bytes) != CUDA_SUCCESS
+                || (self.cuda.cuMemcpyHtoD_v2)(d_usage, usage_count.as_ptr() as *const c_void, u32_bytes) != CUDA_SUCCESS
+            {
+                let _ = (self.cuda.cuMemFree_v2)(d_obs);
+                let _ = (self.cuda.cuMemFree_v2)(d_df);
+                let _ = (self.cuda.cuMemFree_v2)(d_hist);
+                let _ = (self.cuda.cuMemFree_v2)(d_usage);
+                let _ = (self.cuda.cuMemFree_v2)(d_out);
+                return vec![None; batch_params.len()];
+            }
+
+            let block_x: c_uint = 16;
+            let block_y: c_uint = 16;
+            let grid_x: c_uint = (first.width + block_x - 1) / block_x;
+            let grid_y: c_uint = (first.height + block_y - 1) / block_y;
+            let grid_z: c_uint = first.num_layers;
+
+            let mut outputs = Vec::with_capacity(batch_params.len());
+            for p in batch_params {
+                if p.width != first.width || p.height != first.height || p.num_layers != first.num_layers {
+                    outputs.push(None);
+                    continue;
+                }
+                let r = p.clearance_cells.max(0);
+                let smem_bytes: c_uint = if r <= 16 {
+                    let tile_w = block_x as i32 + 2 * r;
+                    let tile_h = block_y as i32 + 2 * r;
+                    (tile_w * tile_h * 4) as c_uint
+                } else {
+                    0
+                };
+
+                let mut params_copy = *p;
+                let mut args = [
+                    &mut d_obs as *mut _ as *mut c_void,
+                    &mut d_df as *mut _ as *mut c_void,
+                    &mut d_hist as *mut _ as *mut c_void,
+                    &mut d_usage as *mut _ as *mut c_void,
+                    &mut d_out as *mut _ as *mut c_void,
+                    &mut params_copy as *mut _ as *mut c_void,
+                ];
+
+                if (self.cuda.cuLaunchKernel)(
+                    self.fn_route_cost_3d,
+                    grid_x,
+                    grid_y,
+                    grid_z,
+                    block_x,
+                    block_y,
+                    1,
+                    smem_bytes,
+                    ptr::null_mut(),
+                    args.as_mut_ptr(),
+                    ptr::null_mut(),
+                ) != CUDA_SUCCESS
+                {
+                    outputs.push(None);
+                    continue;
+                }
+
+                let mut res = vec![0.0f32; total];
+                if (self.cuda.cuMemcpyDtoH_v2)(res.as_mut_ptr() as *mut c_void, d_out, f32_bytes) == CUDA_SUCCESS {
+                    outputs.push(Some(res));
+                } else {
+                    outputs.push(None);
+                }
+            }
+
+            let _ = (self.cuda.cuCtxSynchronize)();
+            let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+            self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+            let _ = (self.cuda.cuMemFree_v2)(d_obs);
+            let _ = (self.cuda.cuMemFree_v2)(d_df);
+            let _ = (self.cuda.cuMemFree_v2)(d_hist);
+            let _ = (self.cuda.cuMemFree_v2)(d_usage);
+            let _ = (self.cuda.cuMemFree_v2)(d_out);
+
+            outputs
+        }
+    }
+
+    /// Evaluates a batch of 3D routing cost maps concurrently across all available CUDA GPUs.
+    pub fn compute_3d_routing_costs_batch(
+        engines: &[Arc<Self>],
+        obstacles: &[u32],
+        dist_field: &[f32],
+        history_cost: &[f32],
+        usage_count: &[u32],
+        batch_params: &[GpuRouteCostParams],
+    ) -> Vec<Option<Vec<f32>>> {
+        if engines.is_empty() || batch_params.is_empty() {
+            return vec![None; batch_params.len()];
+        }
+        if engines.len() == 1 || batch_params.len() == 1 {
+            return engines[0].compute_3d_routing_costs_multi(
+                obstacles,
+                dist_field,
+                history_cost,
+                usage_count,
+                batch_params,
+            );
+        }
+
+        let num_engines = engines.len();
+        let mut results: Vec<Option<Vec<f32>>> = (0..batch_params.len()).map(|_| None).collect();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (eng_idx, engine) in engines.iter().enumerate() {
+                let assigned: Vec<(usize, GpuRouteCostParams)> = batch_params
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| i % num_engines == eng_idx)
+                    .map(|(i, p)| (i, *p))
+                    .collect();
+                if assigned.is_empty() {
+                    continue;
+                }
+                let eng_ref = Arc::clone(engine);
+                handles.push(scope.spawn(move || {
+                    let sub_params: Vec<GpuRouteCostParams> = assigned.iter().map(|&(_, p)| p).collect();
+                    let sub_out = eng_ref.compute_3d_routing_costs_multi(
+                        obstacles,
+                        dist_field,
+                        history_cost,
+                        usage_count,
+                        &sub_params,
+                    );
+                    assigned
+                        .into_iter()
+                        .map(|(orig_i, _)| orig_i)
+                        .zip(sub_out)
+                        .collect::<Vec<(usize, Option<Vec<f32>>)>>()
+                }));
+            }
+            for handle in handles {
+                if let Ok(sub_res) = handle.join() {
+                    for (orig_i, map_opt) in sub_res {
+                        results[orig_i] = map_opt;
+                    }
+                }
+            }
+        });
+        results
+    }
+
+    pub fn compute_3d_wavefront(
+        &self,
+        cell_costs: &[f32],
+        seeds: &[u32],
+        params: &GpuRouteCostParams,
+        via_cost: f32,
+        iterations: u32,
+    ) -> Option<Vec<f32>> {
+        let total = (params.width as usize)
+            .checked_mul(params.height as usize)?
+            .checked_mul(params.num_layers as usize)?;
+        if total == 0 || cell_costs.len() != total || seeds.is_empty() {
+            return None;
+        }
+
+        let mut init_wf = vec![1.0e20f32; total];
+        for &s in seeds {
+            let idx = s as usize;
+            if idx < total {
+                init_wf[idx] = 0.0;
+            }
+        }
+        if iterations == 0 {
+            return Some(init_wf);
+        }
+
+        let _guard = self.dispatch_lock.lock().ok()?;
+        unsafe {
+            let _ = (self.cuda.cuCtxSetCurrent)(self.ctx);
+            let f32_bytes = total * std::mem::size_of::<f32>();
+
+            let mut d_costs: CUdeviceptr = 0;
+            let mut d_wf_a: CUdeviceptr = 0;
+            let mut d_wf_b: CUdeviceptr = 0;
+
+            if (self.cuda.cuMemAlloc_v2)(&mut d_costs, f32_bytes) != CUDA_SUCCESS {
+                return None;
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_wf_a, f32_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_costs);
+                return None;
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_wf_b, f32_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_costs);
+                let _ = (self.cuda.cuMemFree_v2)(d_wf_a);
+                return None;
+            }
+
+            let start_t = Instant::now();
+
+            if (self.cuda.cuMemcpyHtoD_v2)(d_costs, cell_costs.as_ptr() as *const c_void, f32_bytes) != CUDA_SUCCESS
+                || (self.cuda.cuMemcpyHtoD_v2)(d_wf_a, init_wf.as_ptr() as *const c_void, f32_bytes) != CUDA_SUCCESS
+            {
+                let _ = (self.cuda.cuMemFree_v2)(d_costs);
+                let _ = (self.cuda.cuMemFree_v2)(d_wf_a);
+                let _ = (self.cuda.cuMemFree_v2)(d_wf_b);
+                return None;
+            }
+
+            let block_x: c_uint = 16;
+            let block_y: c_uint = 16;
+            let grid_x: c_uint = (params.width + block_x - 1) / block_x;
+            let grid_y: c_uint = (params.height + block_y - 1) / block_y;
+            let grid_z: c_uint = params.num_layers;
+
+            let mut params_copy = *params;
+            let mut via_cost_arg = via_cost;
+
+            for iter in 0..iterations {
+                let (mut d_in, mut d_out) = if iter % 2 == 0 {
+                    (d_wf_a, d_wf_b)
+                } else {
+                    (d_wf_b, d_wf_a)
+                };
+                let mut args = [
+                    &mut d_costs as *mut _ as *mut c_void,
+                    &mut d_in as *mut _ as *mut c_void,
+                    &mut d_out as *mut _ as *mut c_void,
+                    &mut params_copy as *mut _ as *mut c_void,
+                    &mut via_cost_arg as *mut _ as *mut c_void,
+                ];
+                if (self.cuda.cuLaunchKernel)(
+                    self.fn_wavefront_3d,
+                    grid_x,
+                    grid_y,
+                    grid_z,
+                    block_x,
+                    block_y,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    args.as_mut_ptr(),
+                    ptr::null_mut(),
+                ) != CUDA_SUCCESS
+                {
+                    let _ = (self.cuda.cuMemFree_v2)(d_costs);
+                    let _ = (self.cuda.cuMemFree_v2)(d_wf_a);
+                    let _ = (self.cuda.cuMemFree_v2)(d_wf_b);
+                    return None;
+                }
+            }
+
+            let final_dev = if iterations % 2 == 1 { d_wf_b } else { d_wf_a };
+            let mut result = vec![0.0f32; total];
+            if (self.cuda.cuMemcpyDtoH_v2)(result.as_mut_ptr() as *mut c_void, final_dev, f32_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_costs);
+                let _ = (self.cuda.cuMemFree_v2)(d_wf_a);
+                let _ = (self.cuda.cuMemFree_v2)(d_wf_b);
+                return None;
+            }
+
+            let _ = (self.cuda.cuCtxSynchronize)();
+            let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+            self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+            let _ = (self.cuda.cuMemFree_v2)(d_costs);
+            let _ = (self.cuda.cuMemFree_v2)(d_wf_a);
+            let _ = (self.cuda.cuMemFree_v2)(d_wf_b);
+
+            Some(result)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1413,6 +1784,192 @@ mod tests {
                     diff
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_gpu_3d_routing_cost_kernel_clearance_and_congestion() {
+        let vk = crate::vulkan::VulkanEngine::new().expect("VulkanEngine must initialize");
+        let w = 16u32;
+        let h = 16u32;
+        let nl = 2u32;
+        let total = (w * h * nl) as usize;
+        let layer_stride = (w * h) as usize;
+
+        let mut obstacles = vec![0u32; total];
+        let mut dist_field = vec![2.0f32; total];
+        let mut history_cost = vec![0.0f32; total];
+        let mut usage_count = vec![0u32; total];
+
+        // Place foreign obstacle (net 5) at (6, 6, 0) and same-net obstacle (net 2) at (12, 12, 0)
+        obstacles[6 * (w as usize) + 6] = 5;
+        obstacles[12 * (w as usize) + 12] = 2;
+
+        // Add congestion and history at (2, 2, 1)
+        let idx_cong = layer_stride + 2 * (w as usize) + 2;
+        usage_count[idx_cong] = 3;
+        history_cost[idx_cong] = 4.5;
+        dist_field[idx_cong] = 0.5;
+
+        let params = GpuRouteCostParams {
+            width: w,
+            height: h,
+            num_layers: nl,
+            net_id: 2,
+            clearance_cells: 2,
+            present_congestion_factor: 1.5,
+            obstacle_clearance_weight: 0.2,
+            plane_layer_mask: 0,
+        };
+
+        let costs = vk
+            .compute_3d_routing_costs(&obstacles, &dist_field, &history_cost, &usage_count, &params)
+            .expect("3D routing cost kernel output");
+        assert_eq!(costs.len(), total);
+
+        // Cells within radius 2 of foreign obstacle (6, 6, 0) must be blocked (-1.0)
+        assert_eq!(costs[6 * (w as usize) + 6], -1.0);
+        assert_eq!(costs[6 * (w as usize) + 8], -1.0); // dx=2, dy=0 -> d^2=4 <= 4
+        assert_eq!(costs[7 * (w as usize) + 7], -1.0); // dx=1, dy=1 -> d^2=2 <= 4
+        // Cell at (6, 9, 0) has dx=0, dy=3 -> d^2=9 > 4 -> clear!
+        assert!(costs[9 * (w as usize) + 6] > 0.0);
+
+        // Same-net obstacle at (12, 12, 0) must NOT block net 2
+        assert!(costs[12 * (w as usize) + 12] > 0.0);
+        assert!(costs[12 * (w as usize) + 13] > 0.0);
+
+        // Verify exact traversal cost at (2, 2, 1): 1.0 + 3*1.5 + 4.5 + 0.2/0.5 = 10.4
+        assert!((costs[idx_cong] - 10.4).abs() < 1e-4, "got {}", costs[idx_cong]);
+    }
+
+    #[test]
+    fn test_gpu_3d_wavefront_shortest_path_potential() {
+        let vk = crate::vulkan::VulkanEngine::new().expect("VulkanEngine must initialize");
+        let w = 12u32;
+        let h = 12u32;
+        let nl = 2u32;
+        let total = (w * h * nl) as usize;
+        let stride = (w * h) as usize;
+
+        // Uniform unit cost on both layers, except a full vertical wall at x=5 on layer 0
+        let mut cell_costs = vec![1.0f32; total];
+        for y in 0..h as usize {
+            cell_costs[y * (w as usize) + 5] = -1.0;
+        }
+
+        let params = GpuRouteCostParams {
+            width: w,
+            height: h,
+            num_layers: nl,
+            net_id: 1,
+            clearance_cells: 0,
+            present_congestion_factor: 1.0,
+            obstacle_clearance_weight: 0.0,
+            plane_layer_mask: 0,
+        };
+
+        // Seed at (2, 2, 0)
+        let seed_idx = (2 * w + 2) as u32;
+        let wf = vk
+            .compute_3d_wavefront(&cell_costs, &[seed_idx], &params, 2.5, 24)
+            .expect("3D wavefront output");
+
+        // Seed itself has 0 potential
+        assert_eq!(wf[seed_idx as usize], 0.0);
+        // Orthogonal neighbor (3, 2, 0) has potential 1.0
+        assert!((wf[(2 * w + 3) as usize] - 1.0).abs() < 1e-4);
+        // Diagonal neighbor (3, 3, 0) has potential sqrt(2)
+        assert!((wf[(3 * w + 3) as usize] - 1.41421356).abs() < 1e-4);
+        // Via transition directly above seed at (2, 2, 1) has potential via_cost = 2.5
+        assert!((wf[stride + (2 * w + 2) as usize] - 2.5).abs() < 1e-4);
+        // Point (8, 2, 0) is behind the wall on layer 0, so wavefront must hop to layer 1 (+2.5),
+        // travel 6 orthogonal steps from x=2 to x=8 (+6.0), and hop back to layer 0 (+2.5) = 11.0
+        let target_behind_wall = (2 * w + 8) as usize;
+        assert!(
+            (wf[target_behind_wall] - 11.0).abs() < 1e-3,
+            "Expected 11.0 via layer transition around wall, got {}",
+            wf[target_behind_wall]
+        );
+    }
+
+    #[test]
+    fn test_cuda_vs_vulkan_3d_routing_cost_equivalence() {
+        let cuda = match CudaEngine::new() {
+            Some(c) => c,
+            None => return,
+        };
+        let vk = match crate::vulkan::VulkanEngine::new_vulkan_only() {
+            Some(v) => v,
+            None => return,
+        };
+
+        let w = 20u32;
+        let h = 18u32;
+        let nl = 4u32;
+        let total = (w * h * nl) as usize;
+        let mut obstacles = vec![0u32; total];
+        let mut dist_field = vec![1.5f32; total];
+        let mut history_cost = vec![0.0f32; total];
+        let mut usage_count = vec![0u32; total];
+
+        for i in 0..total {
+            if i % 37 == 0 {
+                obstacles[i] = ((i % 5) + 1) as u32;
+            }
+            dist_field[i] = 0.25 + ((i % 11) as f32) * 0.2;
+            history_cost[i] = ((i % 7) as f32) * 0.35;
+            usage_count[i] = (i % 4) as u32;
+        }
+
+        let params = GpuRouteCostParams {
+            width: w,
+            height: h,
+            num_layers: nl,
+            net_id: 2,
+            clearance_cells: 3,
+            present_congestion_factor: 1.25,
+            obstacle_clearance_weight: 0.4,
+            plane_layer_mask: 0b0100,
+        };
+
+        let cu_costs = cuda
+            .compute_3d_routing_costs(&obstacles, &dist_field, &history_cost, &usage_count, &params)
+            .expect("CUDA 3D routing costs");
+        let vk_costs = vk
+            .compute_3d_routing_costs_vulkan_wgsl(&obstacles, &dist_field, &history_cost, &usage_count, &params)
+            .expect("Vulkan WGSL 3D routing costs");
+
+        assert_eq!(cu_costs.len(), vk_costs.len());
+        for i in 0..total {
+            assert!(
+                (cu_costs[i] - vk_costs[i]).abs() < 1e-4,
+                "3D cost mismatch at {}: cu={}, vk={}",
+                i,
+                cu_costs[i],
+                vk_costs[i]
+            );
+        }
+
+        // Also verify 3D wavefront equivalence between CUDA PTX and Vulkan WGSL
+        let seed = (5 * w + 5) as u32;
+        let mut wf_costs = cu_costs.clone();
+        wf_costs[seed as usize] = 1.0;
+        let cu_wf = cuda
+            .compute_3d_wavefront(&wf_costs, &[seed], &params, 2.0, 12)
+            .expect("CUDA 3D wavefront");
+        let vk_wf = vk
+            .compute_3d_wavefront_vulkan_wgsl(&wf_costs, &[seed], &params, 2.0, 12)
+            .expect("Vulkan WGSL 3D wavefront");
+        assert_eq!(cu_wf.len(), vk_wf.len());
+        for i in 0..total {
+            let diff = (cu_wf[i] - vk_wf[i]).abs();
+            assert!(
+                diff < 1e-3 || (cu_wf[i] >= 1.0e19 && vk_wf[i] >= 1.0e19),
+                "3D wavefront mismatch at {}: cu={}, vk={}",
+                i,
+                cu_wf[i],
+                vk_wf[i]
+            );
         }
     }
 }
