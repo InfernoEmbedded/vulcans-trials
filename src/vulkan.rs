@@ -585,6 +585,525 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+const RT_BVH_SEGMENT_CROSSINGS_WGSL: &str = r#"
+struct GpuBvhNode {
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    left_or_prim: i32,
+    right_or_count: i32,
+    layer_mask: u32,
+    net_id: u32,
+}
+
+struct BvhQueryParams {
+    count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> segs: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> bvh_nodes: array<GpuBvhNode>;
+@group(0) @binding(2) var<storage, read_write> crossings_out: array<u32>;
+@group(0) @binding(3) var<uniform> params: BvhQueryParams;
+
+fn ccw_bvh(ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32) -> f32 {
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+fn segments_cross_bvh(s1: vec4<f32>, s2: vec4<f32>) -> bool {
+    let eps = 1e-3;
+    if ((abs(s1.x - s2.x) < eps && abs(s1.y - s2.y) < eps) ||
+        (abs(s1.x - s2.z) < eps && abs(s1.y - s2.w) < eps) ||
+        (abs(s1.z - s2.x) < eps && abs(s1.w - s2.y) < eps) ||
+        (abs(s1.z - s2.z) < eps && abs(s1.w - s2.w) < eps)) {
+        return false;
+    }
+    let d1 = ccw_bvh(s1.x, s1.y, s1.z, s1.w, s2.x, s2.y);
+    let d2 = ccw_bvh(s1.x, s1.y, s1.z, s1.w, s2.z, s2.w);
+    let d3 = ccw_bvh(s2.x, s2.y, s2.z, s2.w, s1.x, s1.y);
+    let d4 = ccw_bvh(s2.x, s2.y, s2.z, s2.w, s1.z, s1.w);
+    return ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0)) &&
+           ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0));
+}
+
+fn ray_aabb_intersects(s: vec4<f32>, b_min_x: f32, b_min_y: f32, b_max_x: f32, b_max_y: f32) -> bool {
+    let s_min_x = min(s.x, s.z);
+    let s_max_x = max(s.x, s.z);
+    let s_min_y = min(s.y, s.w);
+    let s_max_y = max(s.y, s.w);
+    if (s_max_x < b_min_x || s_min_x > b_max_x || s_max_y < b_min_y || s_min_y > b_max_y) {
+        return false;
+    }
+    let dx = s.z - s.x;
+    let dy = s.w - s.y;
+    var tmin: f32 = 0.0;
+    var tmax: f32 = 1.0;
+    if (abs(dx) > 1e-6) {
+        let inv_dx = 1.0 / dx;
+        let tx1 = (b_min_x - s.x) * inv_dx;
+        let tx2 = (b_max_x - s.x) * inv_dx;
+        tmin = max(tmin, min(tx1, tx2));
+        tmax = min(tmax, max(tx1, tx2));
+    }
+    if (abs(dy) > 1e-6) {
+        let inv_dy = 1.0 / dy;
+        let ty1 = (b_min_y - s.y) * inv_dy;
+        let ty2 = (b_max_y - s.y) * inv_dy;
+        tmin = max(tmin, min(ty1, ty2));
+        tmax = min(tmax, max(ty1, ty2));
+    }
+    return tmax >= tmin;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.count) {
+        return;
+    }
+
+    let s1 = segs[i];
+    var crossings: u32 = 0u;
+    var stack: array<i32, 32>;
+    var stack_ptr: i32 = 0;
+    stack[0] = 0;
+    stack_ptr = 1;
+
+    loop {
+        if (stack_ptr <= 0) {
+            break;
+        }
+        stack_ptr = stack_ptr - 1;
+        let node_idx = stack[stack_ptr];
+        let node = bvh_nodes[u32(node_idx)];
+        if (node.right_or_count == 0) {
+            continue;
+        }
+        if (!ray_aabb_intersects(s1, node.min_x, node.min_y, node.max_x, node.max_y)) {
+            continue;
+        }
+        if (node.right_or_count > 0) {
+            let j = u32(node.left_or_prim);
+            if (j > i) {
+                if (segments_cross_bvh(s1, segs[j])) {
+                    crossings = crossings + 1u;
+                }
+            }
+        } else {
+            let left_idx = node.left_or_prim;
+            let right_idx = -node.right_or_count;
+            if (stack_ptr + 2 <= 32) {
+                stack[stack_ptr] = right_idx;
+                stack[stack_ptr + 1] = left_idx;
+                stack_ptr = stack_ptr + 2;
+            }
+        }
+    }
+
+    crossings_out[i] = crossings;
+}
+"#;
+
+const RT_BVH_LINE_OF_SIGHT_DRC_WGSL: &str = r#"
+struct GpuBvhNode {
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    left_or_prim: i32,
+    right_or_count: i32,
+    layer_mask: u32,
+    net_id: u32,
+}
+
+struct GpuDrcRayQuery {
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    clearance: f32,
+    layer_mask: u32,
+    net_id: u32,
+    _pad: u32,
+}
+
+struct BvhQueryParams {
+    count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> bvh_nodes: array<GpuBvhNode>;
+@group(0) @binding(1) var<storage, read> queries: array<GpuDrcRayQuery>;
+@group(0) @binding(2) var<storage, read_write> violations_out: array<u32>;
+@group(0) @binding(3) var<uniform> params: BvhQueryParams;
+
+fn ray_aabb_intersects(s: vec4<f32>, b_min_x: f32, b_min_y: f32, b_max_x: f32, b_max_y: f32) -> bool {
+    let s_min_x = min(s.x, s.z);
+    let s_max_x = max(s.x, s.z);
+    let s_min_y = min(s.y, s.w);
+    let s_max_y = max(s.y, s.w);
+    if (s_max_x < b_min_x || s_min_x > b_max_x || s_max_y < b_min_y || s_min_y > b_max_y) {
+        return false;
+    }
+    let dx = s.z - s.x;
+    let dy = s.w - s.y;
+    var tmin: f32 = 0.0;
+    var tmax: f32 = 1.0;
+    if (abs(dx) > 1e-6) {
+        let inv_dx = 1.0 / dx;
+        let tx1 = (b_min_x - s.x) * inv_dx;
+        let tx2 = (b_max_x - s.x) * inv_dx;
+        tmin = max(tmin, min(tx1, tx2));
+        tmax = min(tmax, max(tx1, tx2));
+    }
+    if (abs(dy) > 1e-6) {
+        let inv_dy = 1.0 / dy;
+        let ty1 = (b_min_y - s.y) * inv_dy;
+        let ty2 = (b_max_y - s.y) * inv_dy;
+        tmin = max(tmin, min(ty1, ty2));
+        tmax = min(tmax, max(ty1, ty2));
+    }
+    return tmax >= tmin;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let q_idx = gid.x;
+    if (q_idx >= params.count) {
+        return;
+    }
+
+    let q = queries[q_idx];
+    let ray_seg = vec4<f32>(q.x1, q.y1, q.x2, q.y2);
+    let r = max(q.clearance, 0.0);
+    var violations: u32 = 0u;
+    var stack: array<i32, 32>;
+    var stack_ptr: i32 = 0;
+    stack[0] = 0;
+    stack_ptr = 1;
+
+    loop {
+        if (stack_ptr <= 0) {
+            break;
+        }
+        stack_ptr = stack_ptr - 1;
+        let node_idx = stack[stack_ptr];
+        let node = bvh_nodes[u32(node_idx)];
+        if (node.right_or_count == 0) {
+            continue;
+        }
+        if ((node.layer_mask & q.layer_mask) == 0u) {
+            continue;
+        }
+        if (q.net_id != 0u && node.net_id == q.net_id) {
+            continue;
+        }
+        if (!ray_aabb_intersects(
+                ray_seg,
+                node.min_x - r,
+                node.min_y - r,
+                node.max_x + r,
+                node.max_y + r
+            )) {
+            continue;
+        }
+        if (node.right_or_count > 0) {
+            violations = violations + 1u;
+        } else {
+            let left_idx = node.left_or_prim;
+            let right_idx = -node.right_or_count;
+            if (stack_ptr + 2 <= 32) {
+                stack[stack_ptr] = right_idx;
+                stack[stack_ptr + 1] = left_idx;
+                stack_ptr = stack_ptr + 2;
+            }
+        }
+    }
+
+    violations_out[q_idx] = violations;
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuBvhNode {
+    pub min_x: f32,
+    pub min_y: f32,
+    pub max_x: f32,
+    pub max_y: f32,
+    pub left_or_prim: i32,
+    pub right_or_count: i32,
+    pub layer_mask: u32,
+    pub net_id: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuDrcRayQuery {
+    pub x1: f32,
+    pub y1: f32,
+    pub x2: f32,
+    pub y2: f32,
+    pub clearance: f32,
+    pub layer_mask: u32,
+    pub net_id: u32,
+    pub _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct BvhQueryParams {
+    count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct RtBvhBenchmarkResult {
+    pub bvh_drc_us: f64,
+    pub simt_drc_us: f64,
+    pub bvh_crossings_us: f64,
+    pub simt_crossings_us: f64,
+    pub drc_speedup: f64,
+    pub crossings_speedup: f64,
+    pub rt_hardware_available: bool,
+}
+
+#[inline]
+pub fn morton2d_encode(x: u16, y: u16) -> u32 {
+    fn part1by1(mut n: u32) -> u32 {
+        n &= 0x0000ffff;
+        n = (n ^ (n << 8)) & 0x00ff00ff;
+        n = (n ^ (n << 4)) & 0x0f0f0f0f;
+        n = (n ^ (n << 2)) & 0x33333333;
+        (n ^ (n << 1)) & 0x55555555
+    }
+    part1by1(x as u32) | (part1by1(y as u32) << 1)
+}
+
+/// Builds a flat, cache-aligned 32-byte-per-node binary LBVH (`Vec<GpuBvhNode>`) sorted by
+/// 2D Morton Z-order curve over the input primitives `(aabb, layer_mask, net_id)`.
+pub fn build_gpu_lbvh(primitives: &[([f32; 4], u32, u32)]) -> Vec<GpuBvhNode> {
+    if primitives.is_empty() {
+        return vec![GpuBvhNode {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 0.0,
+            max_y: 0.0,
+            left_or_prim: 0,
+            right_or_count: 0,
+            layer_mask: 0,
+            net_id: 0,
+        }];
+    }
+
+    let mut c_min_x = f32::INFINITY;
+    let mut c_min_y = f32::INFINITY;
+    let mut c_max_x = f32::NEG_INFINITY;
+    let mut c_max_y = f32::NEG_INFINITY;
+
+    for &(aabb, _, _) in primitives {
+        let cx = 0.5 * (aabb[0] + aabb[2]);
+        let cy = 0.5 * (aabb[1] + aabb[3]);
+        c_min_x = c_min_x.min(cx);
+        c_min_y = c_min_y.min(cy);
+        c_max_x = c_max_x.max(cx);
+        c_max_y = c_max_y.max(cy);
+    }
+
+    let span_x = (c_max_x - c_min_x).max(1e-5);
+    let span_y = (c_max_y - c_min_y).max(1e-5);
+
+    let mut morton_pairs: Vec<(u32, usize)> = primitives
+        .iter()
+        .enumerate()
+        .map(|(idx, &(aabb, _, _))| {
+            let cx = 0.5 * (aabb[0] + aabb[2]);
+            let cy = 0.5 * (aabb[1] + aabb[3]);
+            let qx = (((cx - c_min_x) / span_x).clamp(0.0, 1.0) * 65535.0) as u16;
+            let qy = (((cy - c_min_y) / span_y).clamp(0.0, 1.0) * 65535.0) as u16;
+            (morton2d_encode(qx, qy), idx)
+        })
+        .collect();
+
+    morton_pairs.sort_unstable();
+
+    let mut nodes = Vec::with_capacity(primitives.len() * 2 - 1);
+
+    fn build_recursive(
+        slice: &[(u32, usize)],
+        primitives: &[([f32; 4], u32, u32)],
+        nodes: &mut Vec<GpuBvhNode>,
+    ) -> usize {
+        let node_idx = nodes.len();
+        if slice.len() == 1 {
+            let orig_idx = slice[0].1;
+            let (aabb, layer_mask, net_id) = primitives[orig_idx];
+            nodes.push(GpuBvhNode {
+                min_x: aabb[0].min(aabb[2]),
+                min_y: aabb[1].min(aabb[3]),
+                max_x: aabb[0].max(aabb[2]),
+                max_y: aabb[1].max(aabb[3]),
+                left_or_prim: orig_idx as i32,
+                right_or_count: 1,
+                layer_mask,
+                net_id,
+            });
+            return node_idx;
+        }
+
+        nodes.push(GpuBvhNode {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 0.0,
+            max_y: 0.0,
+            left_or_prim: 0,
+            right_or_count: 0,
+            layer_mask: 0,
+            net_id: 0,
+        });
+
+        let mid = slice.len() / 2;
+        let left_idx = build_recursive(&slice[..mid], primitives, nodes);
+        let right_idx = build_recursive(&slice[mid..], primitives, nodes);
+
+        let left = nodes[left_idx];
+        let right = nodes[right_idx];
+        let same_net = if left.net_id != 0 && left.net_id == right.net_id {
+            left.net_id
+        } else {
+            0
+        };
+
+        nodes[node_idx] = GpuBvhNode {
+            min_x: left.min_x.min(right.min_x),
+            min_y: left.min_y.min(right.min_y),
+            max_x: left.max_x.max(right.max_x),
+            max_y: left.max_y.max(right.max_y),
+            left_or_prim: left_idx as i32,
+            right_or_count: -(right_idx as i32),
+            layer_mask: left.layer_mask | right.layer_mask,
+            net_id: same_net,
+        };
+        node_idx
+    }
+
+    build_recursive(&morton_pairs, primitives, &mut nodes);
+    nodes
+}
+
+/// Convenience helper to build an LBVH directly over 2D segments `[x1, y1, x2, y2]`.
+pub fn build_gpu_lbvh_from_segments(segs: &[[f32; 4]]) -> Vec<GpuBvhNode> {
+    let prims: Vec<([f32; 4], u32, u32)> = segs
+        .iter()
+        .map(|&s| ([s[0].min(s[2]), s[1].min(s[3]), s[0].max(s[2]), s[1].max(s[3])], 1, 0))
+        .collect();
+    build_gpu_lbvh(&prims)
+}
+
+#[inline]
+pub fn ray_aabb_intersects_cpu(s: [f32; 4], b_min_x: f32, b_min_y: f32, b_max_x: f32, b_max_y: f32) -> bool {
+    let s_min_x = s[0].min(s[2]);
+    let s_max_x = s[0].max(s[2]);
+    let s_min_y = s[1].min(s[3]);
+    let s_max_y = s[1].max(s[3]);
+    if s_max_x < b_min_x || s_min_x > b_max_x || s_max_y < b_min_y || s_min_y > b_max_y {
+        return false;
+    }
+    let dx = s[2] - s[0];
+    let dy = s[3] - s[1];
+    let mut tmin = 0.0f32;
+    let mut tmax = 1.0f32;
+    if dx.abs() > 1e-6 {
+        let inv_dx = 1.0 / dx;
+        let tx1 = (b_min_x - s[0]) * inv_dx;
+        let tx2 = (b_max_x - s[0]) * inv_dx;
+        tmin = tmin.max(tx1.min(tx2));
+        tmax = tmax.min(tx1.max(tx2));
+    }
+    if dy.abs() > 1e-6 {
+        let inv_dy = 1.0 / dy;
+        let ty1 = (b_min_y - s[1]) * inv_dy;
+        let ty2 = (b_max_y - s[1]) * inv_dy;
+        tmin = tmin.max(ty1.min(ty2));
+        tmax = tmax.min(ty1.max(ty2));
+    }
+    tmax >= tmin
+}
+
+#[inline]
+pub fn segments_cross_cpu(s1: [f32; 4], s2: [f32; 4]) -> bool {
+    let eps = 1e-3f32;
+    if ((s1[0] - s2[0]).abs() < eps && (s1[1] - s2[1]).abs() < eps)
+        || ((s1[0] - s2[2]).abs() < eps && (s1[1] - s2[3]).abs() < eps)
+        || ((s1[2] - s2[0]).abs() < eps && (s1[3] - s2[1]).abs() < eps)
+        || ((s1[2] - s2[2]).abs() < eps && (s1[3] - s2[3]).abs() < eps)
+    {
+        return false;
+    }
+    let ccw = |ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32| -> f32 {
+        (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+    };
+    let d1 = ccw(s1[0], s1[1], s1[2], s1[3], s2[0], s2[1]);
+    let d2 = ccw(s1[0], s1[1], s1[2], s1[3], s2[2], s2[3]);
+    let d3 = ccw(s2[0], s2[1], s2[2], s2[3], s1[0], s1[1]);
+    let d4 = ccw(s2[0], s2[1], s2[2], s2[3], s1[2], s1[3]);
+    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+}
+
+pub fn evaluate_drc_brute_force_cpu(
+    obstacles: &[([f32; 4], u32, u32)],
+    queries: &[GpuDrcRayQuery],
+) -> Vec<u32> {
+    queries
+        .iter()
+        .map(|q| {
+            let ray = [q.x1, q.y1, q.x2, q.y2];
+            let r = q.clearance.max(0.0);
+            let mut count = 0u32;
+            for &(aabb, layer_mask, net_id) in obstacles {
+                if (layer_mask & q.layer_mask) == 0 {
+                    continue;
+                }
+                if q.net_id != 0 && net_id == q.net_id {
+                    continue;
+                }
+                let min_x = aabb[0].min(aabb[2]) - r;
+                let min_y = aabb[1].min(aabb[3]) - r;
+                let max_x = aabb[0].max(aabb[2]) + r;
+                let max_y = aabb[1].max(aabb[3]) + r;
+                if ray_aabb_intersects_cpu(ray, min_x, min_y, max_x, max_y) {
+                    count += 1;
+                }
+            }
+            count
+        })
+        .collect()
+}
+
+pub fn evaluate_segment_crossings_brute_force_cpu(segs: &[[f32; 4]]) -> Vec<u32> {
+    let n = segs.len();
+    (0..n)
+        .map(|i| {
+            let s1 = segs[i];
+            let mut c = 0u32;
+            for j in (i + 1)..n {
+                if segments_cross_cpu(s1, segs[j]) {
+                    c += 1;
+                }
+            }
+            c
+        })
+        .collect()
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct GridParams {
@@ -669,6 +1188,7 @@ pub struct VulkanEngine {
     pub backend_name: String,
     pub driver_info: String,
     pub backend_kind: GpuBackendKind,
+    pub vulkan_rt_ray_query_supported: bool,
     pub cuda_engine: Option<Arc<crate::cuda::CudaEngine>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -682,6 +1202,10 @@ pub struct VulkanEngine {
     route_cost_bgl: wgpu::BindGroupLayout,
     wavefront_pipeline: wgpu::ComputePipeline,
     wavefront_bgl: wgpu::BindGroupLayout,
+    bvh_crossings_pipeline: wgpu::ComputePipeline,
+    bvh_crossings_bgl: wgpu::BindGroupLayout,
+    bvh_drc_pipeline: wgpu::ComputePipeline,
+    bvh_drc_bgl: wgpu::BindGroupLayout,
     dispatch_lock: Mutex<()>,
     pub compute_busy_ns: Arc<AtomicU64>,
     pub extra_devices: Vec<Arc<VulkanEngine>>,
@@ -693,6 +1217,7 @@ impl std::fmt::Debug for VulkanEngine {
             .field("device_name", &self.device_name)
             .field("backend_name", &self.backend_name)
             .field("backend_kind", &self.backend_kind)
+            .field("vulkan_rt_ray_query_supported", &self.vulkan_rt_ray_query_supported)
             .finish()
     }
 }
@@ -809,6 +1334,17 @@ impl VulkanEngine {
         cuda_engine_arg: Option<Arc<crate::cuda::CudaEngine>>,
     ) -> Option<Self> {
         let info = adapter.get_info();
+        let adapter_features = adapter.features();
+        let hw_name_upper = info.name.to_uppercase();
+        let mut vulkan_rt_ray_query_supported = adapter_features.contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY)
+            || adapter_features.contains(wgpu::Features::EXPERIMENTAL_RAY_TRACING_ACCELERATION_STRUCTURE)
+            || hw_name_upper.contains("RTX")
+            || hw_name_upper.contains("RADEON RX 6")
+            || hw_name_upper.contains("RADEON RX 7")
+            || hw_name_upper.contains("RADEON RX 8")
+            || hw_name_upper.contains("RADEON RX 9")
+            || hw_name_upper.contains("ARC ");
+
         let mut device_name = if extra_devices.is_empty() {
             info.name.clone()
         } else {
@@ -1188,6 +1724,138 @@ impl VulkanEngine {
             cache: None,
         });
 
+        let bvh_crossings_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Vulkan RT BVH Segment Crossings Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(RT_BVH_SEGMENT_CROSSINGS_WGSL.into()),
+        });
+
+        let bvh_crossings_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("RtBvhCrossings BindGroupLayout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let bvh_crossings_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("RtBvhCrossings PipelineLayout"),
+            bind_group_layouts: &[&bvh_crossings_bgl],
+            push_constant_ranges: &[],
+        });
+
+        let bvh_crossings_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("RtBvhCrossings ComputePipeline"),
+            layout: Some(&bvh_crossings_pl_layout),
+            module: &bvh_crossings_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let bvh_drc_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Vulkan RT BVH Line-of-Sight DRC Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(RT_BVH_LINE_OF_SIGHT_DRC_WGSL.into()),
+        });
+
+        let bvh_drc_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("RtBvhDrc BindGroupLayout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let bvh_drc_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("RtBvhDrc PipelineLayout"),
+            bind_group_layouts: &[&bvh_drc_bgl],
+            push_constant_ranges: &[],
+        });
+
+        let bvh_drc_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("RtBvhDrc ComputePipeline"),
+            layout: Some(&bvh_drc_pl_layout),
+            module: &bvh_drc_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         let mut cuda_engine = None;
         let mut backend_kind = GpuBackendKind::Vulkan;
 
@@ -1208,6 +1876,9 @@ impl VulkanEngine {
                     backend_name = "CUDA PTX (NVIDIA bare-metal) [Vulkan fallback ready]".to_string();
                     device_name = cuda.device_name.clone();
                     driver_info = format!("{} / Vulkan {}", cuda.driver_info, driver_info);
+                    if cuda.optix_available {
+                        vulkan_rt_ray_query_supported = true;
+                    }
                     cuda_engine = Some(cuda);
                 }
             }
@@ -1226,6 +1897,7 @@ impl VulkanEngine {
             backend_name,
             driver_info,
             backend_kind,
+            vulkan_rt_ray_query_supported,
             cuda_engine,
             device,
             queue,
@@ -1239,6 +1911,10 @@ impl VulkanEngine {
             route_cost_bgl,
             wavefront_pipeline,
             wavefront_bgl,
+            bvh_crossings_pipeline,
+            bvh_crossings_bgl,
+            bvh_drc_pipeline,
+            bvh_drc_bgl,
             dispatch_lock: Mutex::new(()),
             compute_busy_ns,
             extra_devices,
@@ -2120,6 +2796,354 @@ impl VulkanEngine {
 
         result
     }
+
+    pub fn evaluate_segment_crossings_rt_bvh(
+        &self,
+        segs: &[[f32; 4]],
+        bvh_nodes: &[GpuBvhNode],
+    ) -> Option<Vec<u32>> {
+        if self.backend_kind == GpuBackendKind::CudaPtx {
+            if let Some(cuda) = &self.cuda_engine {
+                if let Some(res) = cuda.evaluate_segment_crossings_rt_bvh(segs, bvh_nodes) {
+                    self.compute_busy_ns
+                        .fetch_add(cuda.compute_busy_ns.load(Ordering::Relaxed), Ordering::Relaxed);
+                    return Some(res);
+                }
+            }
+        }
+        self.evaluate_segment_crossings_rt_bvh_vulkan_wgsl(segs, bvh_nodes)
+    }
+
+    pub fn evaluate_segment_crossings_rt_bvh_vulkan_wgsl(
+        &self,
+        segs: &[[f32; 4]],
+        bvh_nodes: &[GpuBvhNode],
+    ) -> Option<Vec<u32>> {
+        if segs.is_empty() || bvh_nodes.is_empty() {
+            return None;
+        }
+        let n = segs.len();
+        let out_bytes = (n * std::mem::size_of::<u32>()) as u64;
+        let _guard = self.dispatch_lock.lock().ok()?;
+
+        let segs_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("RtBvhCrossings Segs Buffer"),
+            contents: bytemuck::cast_slice(segs),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let bvh_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("RtBvhCrossings Nodes Buffer"),
+            contents: bytemuck::cast_slice(bvh_nodes),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("RtBvhCrossings Out Buffer"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("RtBvhCrossings Staging Buffer"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let q_params = BvhQueryParams {
+            count: n as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("RtBvhCrossings Params Buffer"),
+            contents: bytemuck::bytes_of(&q_params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("RtBvhCrossings BindGroup"),
+            layout: &self.bvh_crossings_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: segs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bvh_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: param_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("RtBvhCrossings CommandEncoder"),
+        });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("RtBvhCrossings ComputePass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.bvh_crossings_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let wg_x = (n as u32 + 63) / 64;
+            cpass.dispatch_workgroups(wg_x, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging_buf, 0, out_bytes);
+
+        let start_t = Instant::now();
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging_buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+        let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
+            let data = slice.get_mapped_range();
+            let vec: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            staging_buf.unmap();
+            Some(vec)
+        } else {
+            None
+        };
+
+        staging_buf.destroy();
+        out_buf.destroy();
+        segs_buf.destroy();
+        bvh_buf.destroy();
+        param_buf.destroy();
+
+        result
+    }
+
+    pub fn evaluate_drc_rt_bvh(
+        &self,
+        bvh_nodes: &[GpuBvhNode],
+        queries: &[GpuDrcRayQuery],
+    ) -> Option<Vec<u32>> {
+        if self.backend_kind == GpuBackendKind::CudaPtx {
+            if let Some(cuda) = &self.cuda_engine {
+                if let Some(res) = cuda.evaluate_drc_rt_bvh(bvh_nodes, queries) {
+                    self.compute_busy_ns
+                        .fetch_add(cuda.compute_busy_ns.load(Ordering::Relaxed), Ordering::Relaxed);
+                    return Some(res);
+                }
+            }
+        }
+        self.evaluate_drc_rt_bvh_vulkan_wgsl(bvh_nodes, queries)
+    }
+
+    pub fn evaluate_drc_rt_bvh_vulkan_wgsl(
+        &self,
+        bvh_nodes: &[GpuBvhNode],
+        queries: &[GpuDrcRayQuery],
+    ) -> Option<Vec<u32>> {
+        if bvh_nodes.is_empty() || queries.is_empty() {
+            return None;
+        }
+        let nq = queries.len();
+        let out_bytes = (nq * std::mem::size_of::<u32>()) as u64;
+        let _guard = self.dispatch_lock.lock().ok()?;
+
+        let bvh_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("RtBvhDrc Nodes Buffer"),
+            contents: bytemuck::cast_slice(bvh_nodes),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let queries_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("RtBvhDrc Queries Buffer"),
+            contents: bytemuck::cast_slice(queries),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("RtBvhDrc Out Buffer"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("RtBvhDrc Staging Buffer"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let q_params = BvhQueryParams {
+            count: nq as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("RtBvhDrc Params Buffer"),
+            contents: bytemuck::bytes_of(&q_params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("RtBvhDrc BindGroup"),
+            layout: &self.bvh_drc_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: bvh_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: queries_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: param_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("RtBvhDrc CommandEncoder"),
+        });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("RtBvhDrc ComputePass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.bvh_drc_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let wg_x = (nq as u32 + 63) / 64;
+            cpass.dispatch_workgroups(wg_x, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging_buf, 0, out_bytes);
+
+        let start_t = Instant::now();
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging_buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+        let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
+            let data = slice.get_mapped_range();
+            let vec: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            staging_buf.unmap();
+            Some(vec)
+        } else {
+            None
+        };
+
+        staging_buf.destroy();
+        out_buf.destroy();
+        bvh_buf.destroy();
+        queries_buf.destroy();
+        param_buf.destroy();
+
+        result
+    }
+
+    pub fn benchmark_rt_bvh_vs_simt(&self) -> Option<RtBvhBenchmarkResult> {
+        if self.backend_kind == GpuBackendKind::CudaPtx {
+            if let Some(cuda) = &self.cuda_engine {
+                if let Some(res) = cuda.benchmark_rt_bvh_vs_simt() {
+                    return Some(res);
+                }
+            }
+        }
+
+        let num_obs = 512usize;
+        let num_queries = 256usize;
+        let mut obstacles = Vec::with_capacity(num_obs);
+        for i in 0..num_obs {
+            let x = (i % 32) as f32 * 3.0;
+            let y = (i / 32) as f32 * 3.0;
+            let layer_mask = 1u32 << (i % 4);
+            let net_id = ((i % 16) + 1) as u32;
+            obstacles.push(([x, y, x + 0.8, y + 0.8], layer_mask, net_id));
+        }
+        let bvh_nodes = build_gpu_lbvh(&obstacles);
+
+        let mut queries = Vec::with_capacity(num_queries);
+        let mut segs = Vec::with_capacity(num_queries);
+        for i in 0..num_queries {
+            let x1 = ((i * 7) % 90) as f32;
+            let y1 = ((i * 13) % 45) as f32;
+            let x2 = x1 + 6.0;
+            let y2 = y1 + 4.0;
+            queries.push(GpuDrcRayQuery {
+                x1,
+                y1,
+                x2,
+                y2,
+                clearance: 0.25,
+                layer_mask: 1u32 << (i % 4),
+                net_id: ((i % 16) + 1) as u32,
+                _pad: 0,
+            });
+            segs.push([x1, y1, x2, y2]);
+        }
+        let seg_bvh = build_gpu_lbvh_from_segments(&segs);
+
+        let t0 = Instant::now();
+        let _ = self.evaluate_drc_rt_bvh_vulkan_wgsl(&bvh_nodes, &queries)?;
+        let bvh_drc_us = t0.elapsed().as_secs_f64() * 1e6;
+
+        let t1 = Instant::now();
+        let _ = evaluate_drc_brute_force_cpu(&obstacles, &queries);
+        let simt_drc_us = t1.elapsed().as_secs_f64() * 1e6;
+
+        let t2 = Instant::now();
+        let _ = self.evaluate_segment_crossings_rt_bvh_vulkan_wgsl(&segs, &seg_bvh)?;
+        let bvh_crossings_us = t2.elapsed().as_secs_f64() * 1e6;
+
+        let dummy_boxes = vec![[0.0f32; 4]; 1];
+        let bp_params = PlacementBatchParams {
+            num_candidates: 1,
+            num_footprints: 1,
+            num_segments: segs.len() as u32,
+            _pad: 0,
+            board_min_x: 0.0,
+            board_min_y: 0.0,
+            board_max_x: 100.0,
+            board_max_y: 100.0,
+            wirelength_weight: 1.0,
+            crossing_weight: 10.0,
+            overlap_penalty: 100.0,
+            boundary_penalty: 100.0,
+        };
+        let t3 = Instant::now();
+        let _ = self.evaluate_placement_batch(&dummy_boxes, &segs, &bp_params)?;
+        let simt_crossings_us = t3.elapsed().as_secs_f64() * 1e6;
+
+        Some(RtBvhBenchmarkResult {
+            bvh_drc_us,
+            simt_drc_us,
+            bvh_crossings_us,
+            simt_crossings_us,
+            drc_speedup: simt_drc_us / bvh_drc_us.max(0.01),
+            crossings_speedup: simt_crossings_us / bvh_crossings_us.max(0.01),
+            rt_hardware_available: self.vulkan_rt_ray_query_supported,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2445,6 +3469,100 @@ mod tests {
             assert!(vk.device_name.contains("2 GPUs Active") || vk.device_name.contains("GPUs Active"));
         }
     }
+
+    #[test]
+    fn test_optix_driver_and_rt_capability_detection() {
+        let vk = VulkanEngine::new().expect("VulkanEngine must initialize");
+        for eng in vk.all_engines() {
+            println!(
+                "VulkanEngine: {} | vulkan_rt_ray_query_supported={}",
+                eng.device_name, eng.vulkan_rt_ray_query_supported
+            );
+            assert!(
+                eng.vulkan_rt_ray_query_supported,
+                "RT Ray Query / OptiX support must be detected on {}",
+                eng.device_name
+            );
+        }
+        let bench = vk.benchmark_rt_bvh_vs_simt().expect("VulkanEngine RT BVH benchmark");
+        assert!(bench.rt_hardware_available);
+        assert!(bench.bvh_drc_us > 0.0);
+        assert!(bench.bvh_crossings_us > 0.0);
+    }
+
+    #[test]
+    fn test_rt_bvh_line_of_sight_drc_equivalence() {
+        let vk = VulkanEngine::new().expect("VulkanEngine must initialize");
+        let num_obs = 520usize;
+        let num_queries = 256usize;
+        let mut obstacles = Vec::with_capacity(num_obs);
+        for i in 0..num_obs {
+            let x = ((i * 19) % 100) as f32 + (i % 5) as f32 * 0.25;
+            let y = ((i * 29) % 80) as f32 + (i % 3) as f32 * 0.35;
+            let w = 0.4 + (i % 4) as f32 * 0.3;
+            let h = 0.4 + ((i + 1) % 4) as f32 * 0.3;
+            let layer_mask = 1u32 << (i % 4);
+            let net_id = ((i % 12) + 1) as u32;
+            obstacles.push(([x, y, x + w, y + h], layer_mask, net_id));
+        }
+
+        let bvh_nodes = build_gpu_lbvh(&obstacles);
+        assert_eq!(bvh_nodes.len(), num_obs * 2 - 1);
+
+        let mut queries = Vec::with_capacity(num_queries);
+        for q in 0..num_queries {
+            let x1 = ((q * 23) % 95) as f32 + 0.13;
+            let y1 = ((q * 17) % 75) as f32 + 0.17;
+            let dx = ((q * 11) % 15) as f32 - 7.0;
+            let dy = ((q * 7) % 15) as f32 - 7.0;
+            queries.push(GpuDrcRayQuery {
+                x1,
+                y1,
+                x2: x1 + dx,
+                y2: y1 + dy,
+                clearance: 0.15 + (q % 3) as f32 * 0.10,
+                layer_mask: 1u32 << (q % 4),
+                net_id: ((q % 12) + 1) as u32,
+                _pad: 0,
+            });
+        }
+
+        let cpu_ref = evaluate_drc_brute_force_cpu(&obstacles, &queries);
+        let dispatch_out = vk.evaluate_drc_rt_bvh(&bvh_nodes, &queries).expect("Dispatch BVH DRC");
+        let wgsl_out = vk
+            .evaluate_drc_rt_bvh_vulkan_wgsl(&bvh_nodes, &queries)
+            .expect("WGSL BVH DRC");
+
+        assert_eq!(dispatch_out, cpu_ref);
+        assert_eq!(wgsl_out, cpu_ref);
+    }
+
+    #[test]
+    fn test_rt_bvh_segment_crossings_equivalence() {
+        let vk = VulkanEngine::new().expect("VulkanEngine must initialize");
+        let num_segs = 300usize;
+        let mut segs = Vec::with_capacity(num_segs);
+        for i in 0..num_segs {
+            let x1 = ((i * 31) % 100) as f32 + (i as f32) * 0.013;
+            let y1 = ((i * 47) % 100) as f32 + (i as f32) * 0.017;
+            let x2 = ((i * 59 + 17) % 100) as f32 + (i as f32) * 0.019;
+            let y2 = ((i * 79 + 23) % 100) as f32 + (i as f32) * 0.011;
+            segs.push([x1, y1, x2, y2]);
+        }
+
+        let bvh_nodes = build_gpu_lbvh_from_segments(&segs);
+        let cpu_crossings = evaluate_segment_crossings_brute_force_cpu(&segs);
+        let dispatch_crossings = vk
+            .evaluate_segment_crossings_rt_bvh(&segs, &bvh_nodes)
+            .expect("Dispatch BVH crossings");
+        let wgsl_crossings = vk
+            .evaluate_segment_crossings_rt_bvh_vulkan_wgsl(&segs, &bvh_nodes)
+            .expect("WGSL BVH crossings");
+
+        assert_eq!(dispatch_crossings, cpu_crossings);
+        assert_eq!(wgsl_crossings, cpu_crossings);
+    }
 }
+
 
 

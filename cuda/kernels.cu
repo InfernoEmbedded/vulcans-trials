@@ -866,4 +866,169 @@ __global__ void wavefront_3d_relax_kernel(
     wavefront_out[idx] = best;
 }
 
+// -----------------------------------------------------------------------------
+// 6. Hardware-Friendly GPU LBVH Ray-Cast Kernels (Segment Crossings & DRC)
+// -----------------------------------------------------------------------------
+
+struct GpuBvhNode {
+    float min_x;
+    float min_y;
+    float max_x;
+    float max_y;
+    int left_or_prim;
+    int right_or_count;
+    unsigned int layer_mask;
+    unsigned int net_id;
+};
+
+struct GpuDrcRayQuery {
+    float x1;
+    float y1;
+    float x2;
+    float y2;
+    float clearance;
+    unsigned int layer_mask;
+    unsigned int net_id;
+    unsigned int _pad;
+};
+
+__device__ __forceinline__ bool ray_aabb_intersects(
+    float4 s,
+    float b_min_x,
+    float b_min_y,
+    float b_max_x,
+    float b_max_y
+) {
+    float s_min_x = fminf(s.x, s.z);
+    float s_max_x = fmaxf(s.x, s.z);
+    float s_min_y = fminf(s.y, s.w);
+    float s_max_y = fmaxf(s.y, s.w);
+    if (s_max_x < b_min_x || s_min_x > b_max_x || s_max_y < b_min_y || s_min_y > b_max_y) {
+        return false;
+    }
+    float dx = s.z - s.x;
+    float dy = s.w - s.y;
+    float tmin = 0.0f;
+    float tmax = 1.0f;
+    if (fabsf(dx) > 1e-6f) {
+        float inv_dx = 1.0f / dx;
+        float tx1 = (b_min_x - s.x) * inv_dx;
+        float tx2 = (b_max_x - s.x) * inv_dx;
+        tmin = fmaxf(tmin, fminf(tx1, tx2));
+        tmax = fminf(tmax, fmaxf(tx1, tx2));
+    }
+    if (fabsf(dy) > 1e-6f) {
+        float inv_dy = 1.0f / dy;
+        float ty1 = (b_min_y - s.y) * inv_dy;
+        float ty2 = (b_max_y - s.y) * inv_dy;
+        tmin = fmaxf(tmin, fminf(ty1, ty2));
+        tmax = fminf(tmax, fmaxf(ty1, ty2));
+    }
+    return tmax >= tmin;
+}
+
+__global__ void rt_bvh_segment_crossings_kernel(
+    const float4* __restrict__ segs,
+    const GpuBvhNode* __restrict__ bvh_nodes,
+    unsigned int* __restrict__ crossings_out,
+    unsigned int num_segments
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_segments) {
+        return;
+    }
+
+    float4 s1 = segs[i];
+    unsigned int crossings = 0u;
+
+    int stack[32];
+    int stack_ptr = 0;
+    stack[stack_ptr++] = 0;
+
+    while (stack_ptr > 0) {
+        int node_idx = stack[--stack_ptr];
+        GpuBvhNode node = bvh_nodes[node_idx];
+        if (node.right_or_count == 0) {
+            continue;
+        }
+        if (!ray_aabb_intersects(s1, node.min_x, node.min_y, node.max_x, node.max_y)) {
+            continue;
+        }
+        if (node.right_or_count > 0) {
+            unsigned int j = (unsigned int)node.left_or_prim;
+            if (j > i) {
+                if (segments_cross(s1, segs[j])) {
+                    crossings += 1u;
+                }
+            }
+        } else {
+            int left_idx = node.left_or_prim;
+            int right_idx = -node.right_or_count;
+            if (stack_ptr + 2 <= 32) {
+                stack[stack_ptr++] = right_idx;
+                stack[stack_ptr++] = left_idx;
+            }
+        }
+    }
+
+    crossings_out[i] = crossings;
+}
+
+__global__ void rt_bvh_line_of_sight_drc_kernel(
+    const GpuBvhNode* __restrict__ bvh_nodes,
+    const GpuDrcRayQuery* __restrict__ queries,
+    unsigned int* __restrict__ violations_out,
+    unsigned int num_queries
+) {
+    unsigned int q_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q_idx >= num_queries) {
+        return;
+    }
+
+    GpuDrcRayQuery q = queries[q_idx];
+    float4 ray_seg = make_float4(q.x1, q.y1, q.x2, q.y2);
+    float r = fmaxf(q.clearance, 0.0f);
+    unsigned int violations = 0u;
+
+    int stack[32];
+    int stack_ptr = 0;
+    stack[stack_ptr++] = 0;
+
+    while (stack_ptr > 0) {
+        int node_idx = stack[--stack_ptr];
+        GpuBvhNode node = bvh_nodes[node_idx];
+        if (node.right_or_count == 0) {
+            continue;
+        }
+        if ((node.layer_mask & q.layer_mask) == 0u) {
+            continue;
+        }
+        if (q.net_id != 0u && node.net_id == q.net_id) {
+            continue;
+        }
+        if (!ray_aabb_intersects(
+                ray_seg,
+                node.min_x - r,
+                node.min_y - r,
+                node.max_x + r,
+                node.max_y + r
+            )) {
+            continue;
+        }
+        if (node.right_or_count > 0) {
+            violations += 1u;
+        } else {
+            int left_idx = node.left_or_prim;
+            int right_idx = -node.right_or_count;
+            if (stack_ptr + 2 <= 32) {
+                stack[stack_ptr++] = right_idx;
+                stack[stack_ptr++] = left_idx;
+            }
+        }
+    }
+
+    violations_out[q_idx] = violations;
+}
+
 } // extern "C"
+

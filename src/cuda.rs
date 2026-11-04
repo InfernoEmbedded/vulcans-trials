@@ -7,7 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-pub use crate::vulkan::{GpuRouteCostParams, GpuSaParams, PlacementBatchParams};
+pub use crate::vulkan::{
+    build_gpu_lbvh, build_gpu_lbvh_from_segments, evaluate_drc_brute_force_cpu,
+    evaluate_segment_crossings_brute_force_cpu, morton2d_encode, ray_aabb_intersects_cpu,
+    segments_cross_cpu, GpuBvhNode, GpuDrcRayQuery, GpuRouteCostParams, GpuSaParams,
+    PlacementBatchParams, RtBvhBenchmarkResult,
+};
 
 pub const KERNELS_PTX: &str = include_str!("../cuda/kernels.ptx");
 pub const AMPERE_KERNELS_PTX: &str = include_str!("../cuda/ampere_kernels.ptx");
@@ -21,6 +26,116 @@ pub type CUstream = *mut c_void;
 pub type CUdeviceptr = u64;
 
 pub const CUDA_SUCCESS: CUresult = 0;
+
+pub type OptixQueryFunctionTableFn = unsafe extern "C" fn(
+    abi_id: u32,
+    num_options: u32,
+    option_keys: *const c_void,
+    option_vals: *const *const c_void,
+    function_table: *mut c_void,
+    table_size: usize,
+) -> u32;
+
+#[allow(non_snake_case)]
+pub struct OptixDriverApi {
+    _lib: libloading::Library,
+    pub optixQueryFunctionTable: OptixQueryFunctionTableFn,
+    pub abi_version: u32,
+    pub optix_version: u32,
+}
+
+impl OptixDriverApi {
+    #[allow(non_snake_case)]
+    pub fn load() -> Option<Arc<Self>> {
+        static OPTIX_ONCE: std::sync::OnceLock<Option<Arc<OptixDriverApi>>> = std::sync::OnceLock::new();
+        OPTIX_ONCE
+            .get_or_init(|| {
+                let lib_paths = [
+                    "/usr/lib/x86_64-linux-gnu/libnvoptix.so.1",
+                    "libnvoptix.so.1",
+                    "libnvoptix.so",
+                ];
+                for path in &lib_paths {
+                    if let Ok(lib) = unsafe { libloading::Library::new(path) } {
+                        unsafe {
+                            let query_fn: OptixQueryFunctionTableFn =
+                                match lib.get(b"optixQueryFunctionTable\0") {
+                                    Ok(sym) => *sym,
+                                    Err(_) => continue,
+                                };
+
+                            let mut fn_table = [0usize; 128];
+                            let known_abis: &[(u32, usize, u32)] = &[
+                                (119, 0x1e0, 90000),
+                                (105, 0x1b0, 80100),
+                                (89, 0x180, 80000),
+                                (78, 0x178, 70700),
+                                (68, 0x158, 70600),
+                                (60, 0x148, 70500),
+                                (55, 0x138, 70400),
+                                (47, 0x130, 70300),
+                                (41, 0x128, 70200),
+                                (36, 0x108, 70100),
+                                (22, 0x0c8, 70000),
+                            ];
+
+                            for &(abi, table_bytes, ver) in known_abis {
+                                let res = query_fn(
+                                    abi,
+                                    0,
+                                    ptr::null(),
+                                    ptr::null(),
+                                    fn_table.as_mut_ptr() as *mut c_void,
+                                    table_bytes,
+                                );
+                                if res == 0 && fn_table[0] != 0 && fn_table[2] != 0 {
+                                    return Some(Arc::new(Self {
+                                        _lib: lib,
+                                        optixQueryFunctionTable: query_fn,
+                                        abi_version: abi,
+                                        optix_version: ver,
+                                    }));
+                                }
+                            }
+
+                            for abi in (18..=140).rev() {
+                                let probe = query_fn(
+                                    abi,
+                                    0,
+                                    ptr::null(),
+                                    ptr::null(),
+                                    fn_table.as_mut_ptr() as *mut c_void,
+                                    0,
+                                );
+                                if probe == 0x1e7a || probe == 0 {
+                                    for words in 16..=96 {
+                                        let res = query_fn(
+                                            abi,
+                                            0,
+                                            ptr::null(),
+                                            ptr::null(),
+                                            fn_table.as_mut_ptr() as *mut c_void,
+                                            words * 8,
+                                        );
+                                        if res == 0 && fn_table[0] != 0 {
+                                            return Some(Arc::new(Self {
+                                                _lib: lib,
+                                                optixQueryFunctionTable: query_fn,
+                                                abi_version: abi,
+                                                optix_version: abi * 1000,
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            })
+            .clone()
+    }
+}
 
 #[allow(non_snake_case)]
 pub struct CudaDriverApi {
@@ -59,122 +174,131 @@ pub struct CudaDriverApi {
 impl CudaDriverApi {
     #[allow(non_snake_case)]
     pub fn load() -> Option<Arc<Self>> {
-        let lib_paths = ["libcuda.so.1", "libcuda.so"];
-        for path in &lib_paths {
-            if let Ok(lib) = unsafe { libloading::Library::new(path) } {
-                unsafe {
-                    let cuInit = match lib.get(b"cuInit\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => continue,
-                    };
-                    let cuDriverGetVersion = match lib.get(b"cuDriverGetVersion\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => continue,
-                    };
-                    let cuDeviceGetCount = match lib.get(b"cuDeviceGetCount\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => continue,
-                    };
-                    let cuDeviceGet = match lib.get(b"cuDeviceGet\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => continue,
-                    };
-                    let cuDeviceGetName = match lib.get(b"cuDeviceGetName\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => continue,
-                    };
-                    let cuCtxCreate_v2 = match lib.get(b"cuCtxCreate_v2\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => match lib.get(b"cuCtxCreate\0") {
-                            Ok(sym) => *sym,
-                            Err(_) => continue,
-                        },
-                    };
-                    let cuCtxDestroy_v2 = match lib.get(b"cuCtxDestroy_v2\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => match lib.get(b"cuCtxDestroy\0") {
-                            Ok(sym) => *sym,
-                            Err(_) => continue,
-                        },
-                    };
-                    let cuCtxSetCurrent = match lib.get(b"cuCtxSetCurrent\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => continue,
-                    };
-                    let cuCtxSynchronize = match lib.get(b"cuCtxSynchronize\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => continue,
-                    };
-                    let cuModuleLoadData = match lib.get(b"cuModuleLoadData\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => continue,
-                    };
-                    let cuModuleUnload = match lib.get(b"cuModuleUnload\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => continue,
-                    };
-                    let cuModuleGetFunction = match lib.get(b"cuModuleGetFunction\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => continue,
-                    };
-                    let cuMemAlloc_v2 = match lib.get(b"cuMemAlloc_v2\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => match lib.get(b"cuMemAlloc\0") {
-                            Ok(sym) => *sym,
-                            Err(_) => continue,
-                        },
-                    };
-                    let cuMemFree_v2 = match lib.get(b"cuMemFree_v2\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => match lib.get(b"cuMemFree\0") {
-                            Ok(sym) => *sym,
-                            Err(_) => continue,
-                        },
-                    };
-                    let cuMemcpyHtoD_v2 = match lib.get(b"cuMemcpyHtoD_v2\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => match lib.get(b"cuMemcpyHtoD\0") {
-                            Ok(sym) => *sym,
-                            Err(_) => continue,
-                        },
-                    };
-                    let cuMemcpyDtoH_v2 = match lib.get(b"cuMemcpyDtoH_v2\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => match lib.get(b"cuMemcpyDtoH\0") {
-                            Ok(sym) => *sym,
-                            Err(_) => continue,
-                        },
-                    };
-                    let cuLaunchKernel = match lib.get(b"cuLaunchKernel\0") {
-                        Ok(sym) => *sym,
-                        Err(_) => continue,
-                    };
+        static CUDA_ONCE: std::sync::OnceLock<Option<Arc<CudaDriverApi>>> = std::sync::OnceLock::new();
+        CUDA_ONCE
+            .get_or_init(|| {
+                let lib_paths = ["libcuda.so.1", "libcuda.so"];
+                for path in &lib_paths {
+                    if let Ok(lib) = unsafe { libloading::Library::new(path) } {
+                        unsafe {
+                            let cuInit: unsafe extern "C" fn(flags: c_uint) -> CUresult =
+                                match lib.get(b"cuInit\0") {
+                                    Ok(sym) => *sym,
+                                    Err(_) => continue,
+                                };
+                            if cuInit(0) != CUDA_SUCCESS {
+                                continue;
+                            }
+                            let cuDriverGetVersion = match lib.get(b"cuDriverGetVersion\0") {
+                                Ok(sym) => *sym,
+                                Err(_) => continue,
+                            };
+                            let cuDeviceGetCount = match lib.get(b"cuDeviceGetCount\0") {
+                                Ok(sym) => *sym,
+                                Err(_) => continue,
+                            };
+                            let cuDeviceGet = match lib.get(b"cuDeviceGet\0") {
+                                Ok(sym) => *sym,
+                                Err(_) => continue,
+                            };
+                            let cuDeviceGetName = match lib.get(b"cuDeviceGetName\0") {
+                                Ok(sym) => *sym,
+                                Err(_) => continue,
+                            };
+                            let cuCtxCreate_v2 = match lib.get(b"cuCtxCreate_v2\0") {
+                                Ok(sym) => *sym,
+                                Err(_) => match lib.get(b"cuCtxCreate\0") {
+                                    Ok(sym) => *sym,
+                                    Err(_) => continue,
+                                },
+                            };
+                            let cuCtxDestroy_v2 = match lib.get(b"cuCtxDestroy_v2\0") {
+                                Ok(sym) => *sym,
+                                Err(_) => match lib.get(b"cuCtxDestroy\0") {
+                                    Ok(sym) => *sym,
+                                    Err(_) => continue,
+                                },
+                            };
+                            let cuCtxSetCurrent = match lib.get(b"cuCtxSetCurrent\0") {
+                                Ok(sym) => *sym,
+                                Err(_) => continue,
+                            };
+                            let cuCtxSynchronize = match lib.get(b"cuCtxSynchronize\0") {
+                                Ok(sym) => *sym,
+                                Err(_) => continue,
+                            };
+                            let cuModuleLoadData = match lib.get(b"cuModuleLoadData\0") {
+                                Ok(sym) => *sym,
+                                Err(_) => continue,
+                            };
+                            let cuModuleUnload = match lib.get(b"cuModuleUnload\0") {
+                                Ok(sym) => *sym,
+                                Err(_) => continue,
+                            };
+                            let cuModuleGetFunction = match lib.get(b"cuModuleGetFunction\0") {
+                                Ok(sym) => *sym,
+                                Err(_) => continue,
+                            };
+                            let cuMemAlloc_v2 = match lib.get(b"cuMemAlloc_v2\0") {
+                                Ok(sym) => *sym,
+                                Err(_) => match lib.get(b"cuMemAlloc\0") {
+                                    Ok(sym) => *sym,
+                                    Err(_) => continue,
+                                },
+                            };
+                            let cuMemFree_v2 = match lib.get(b"cuMemFree_v2\0") {
+                                Ok(sym) => *sym,
+                                Err(_) => match lib.get(b"cuMemFree\0") {
+                                    Ok(sym) => *sym,
+                                    Err(_) => continue,
+                                },
+                            };
+                            let cuMemcpyHtoD_v2 = match lib.get(b"cuMemcpyHtoD_v2\0") {
+                                Ok(sym) => *sym,
+                                Err(_) => match lib.get(b"cuMemcpyHtoD\0") {
+                                    Ok(sym) => *sym,
+                                    Err(_) => continue,
+                                },
+                            };
+                            let cuMemcpyDtoH_v2 = match lib.get(b"cuMemcpyDtoH_v2\0") {
+                                Ok(sym) => *sym,
+                                Err(_) => match lib.get(b"cuMemcpyDtoH\0") {
+                                    Ok(sym) => *sym,
+                                    Err(_) => continue,
+                                },
+                            };
+                            let cuLaunchKernel = match lib.get(b"cuLaunchKernel\0") {
+                                Ok(sym) => *sym,
+                                Err(_) => continue,
+                            };
 
-                    let api = Self {
-                        _lib: lib,
-                        cuInit,
-                        cuDriverGetVersion,
-                        cuDeviceGetCount,
-                        cuDeviceGet,
-                        cuDeviceGetName,
-                        cuCtxCreate_v2,
-                        cuCtxDestroy_v2,
-                        cuCtxSetCurrent,
-                        cuCtxSynchronize,
-                        cuModuleLoadData,
-                        cuModuleUnload,
-                        cuModuleGetFunction,
-                        cuMemAlloc_v2,
-                        cuMemFree_v2,
-                        cuMemcpyHtoD_v2,
-                        cuMemcpyDtoH_v2,
-                        cuLaunchKernel,
-                    };
-                    return Some(Arc::new(api));
+                            let api = Self {
+                                _lib: lib,
+                                cuInit,
+                                cuDriverGetVersion,
+                                cuDeviceGetCount,
+                                cuDeviceGet,
+                                cuDeviceGetName,
+                                cuCtxCreate_v2,
+                                cuCtxDestroy_v2,
+                                cuCtxSetCurrent,
+                                cuCtxSynchronize,
+                                cuModuleLoadData,
+                                cuModuleUnload,
+                                cuModuleGetFunction,
+                                cuMemAlloc_v2,
+                                cuMemFree_v2,
+                                cuMemcpyHtoD_v2,
+                                cuMemcpyDtoH_v2,
+                                cuLaunchKernel,
+                            };
+                            return Some(Arc::new(api));
+                        }
+                    }
                 }
-            }
-        }
-        None
+                None
+            })
+            .clone()
     }
 }
 
@@ -189,6 +313,8 @@ pub struct CudaEngine {
     pub device_name: String,
     pub backend_name: String,
     pub driver_info: String,
+    pub optix_available: bool,
+    pub optix_version: u32,
     ctx: CUcontext,
     module: CUmodule,
     ampere_module: CUmodule,
@@ -199,10 +325,13 @@ pub struct CudaEngine {
     fn_gpu_sa_placer: CUfunction,
     fn_route_cost_3d: CUfunction,
     fn_wavefront_3d: CUfunction,
+    fn_rt_bvh_crossings: CUfunction,
+    fn_rt_bvh_drc: CUfunction,
     pub fn_df_ampere: Option<CUfunction>,
     pub fn_df_ampere_tiled: Option<CUfunction>,
     pub fn_bp_ampere: Option<CUfunction>,
     cuda: Arc<CudaDriverApi>,
+    pub optix: Option<Arc<OptixDriverApi>>,
     dispatch_lock: Mutex<()>,
     persistent_buffers: Mutex<PersistentDeviceBuffers>,
     pub compute_busy_ns: Arc<AtomicU64>,
@@ -216,6 +345,8 @@ impl std::fmt::Debug for CudaEngine {
         f.debug_struct("CudaEngine")
             .field("device_name", &self.device_name)
             .field("backend_name", &self.backend_name)
+            .field("optix_available", &self.optix_available)
+            .field("optix_version", &self.optix_version)
             .finish()
     }
 }
@@ -293,7 +424,10 @@ impl CudaEngine {
     }
 
     pub fn new_with_device(ordinal: c_int) -> Option<Arc<Self>> {
+        static CUDA_INIT_LOCK: Mutex<()> = Mutex::new(());
+        let _init_guard = CUDA_INIT_LOCK.lock().ok()?;
         let api = CudaDriverApi::load()?;
+        let optix_api = OptixDriverApi::load();
         unsafe {
             if (api.cuInit)(0) != CUDA_SUCCESS {
                 return None;
@@ -343,6 +477,8 @@ impl CudaEngine {
             let mut fn_gpu_sa_placer: CUfunction = ptr::null_mut();
             let mut fn_route_cost_3d: CUfunction = ptr::null_mut();
             let mut fn_wavefront_3d: CUfunction = ptr::null_mut();
+            let mut fn_rt_bvh_crossings: CUfunction = ptr::null_mut();
+            let mut fn_rt_bvh_drc: CUfunction = ptr::null_mut();
 
             let c_df = CString::new("distance_field_kernel").unwrap();
             let c_dft = CString::new("distance_field_tiled_kernel").unwrap();
@@ -351,6 +487,8 @@ impl CudaEngine {
             let c_sa = CString::new("gpu_sa_placer_kernel").unwrap();
             let c_rc3d = CString::new("compute_3d_routing_cost_kernel").unwrap();
             let c_wf3d = CString::new("wavefront_3d_relax_kernel").unwrap();
+            let c_rt_cr = CString::new("rt_bvh_segment_crossings_kernel").unwrap();
+            let c_rt_drc = CString::new("rt_bvh_line_of_sight_drc_kernel").unwrap();
 
             if (api.cuModuleGetFunction)(&mut fn_dist_field, module, c_df.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_dist_field_tiled, module, c_dft.as_ptr()) != CUDA_SUCCESS
@@ -359,6 +497,8 @@ impl CudaEngine {
                 || (api.cuModuleGetFunction)(&mut fn_gpu_sa_placer, module, c_sa.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_route_cost_3d, module, c_rc3d.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_wavefront_3d, module, c_wf3d.as_ptr()) != CUDA_SUCCESS
+                || (api.cuModuleGetFunction)(&mut fn_rt_bvh_crossings, module, c_rt_cr.as_ptr()) != CUDA_SUCCESS
+                || (api.cuModuleGetFunction)(&mut fn_rt_bvh_drc, module, c_rt_drc.as_ptr()) != CUDA_SUCCESS
             {
                 let _ = (api.cuModuleUnload)(module);
                 let _ = (api.cuCtxDestroy_v2)(ctx);
@@ -393,10 +533,17 @@ impl CudaEngine {
                 }
             }
 
+            let (optix_available, optix_version) = match &optix_api {
+                Some(ox) => (true, ox.optix_version),
+                None => (false, 0),
+            };
+
             Some(Arc::new(Self {
                 device_name,
                 backend_name,
                 driver_info,
+                optix_available,
+                optix_version,
                 ctx,
                 module,
                 ampere_module,
@@ -407,10 +554,13 @@ impl CudaEngine {
                 fn_gpu_sa_placer,
                 fn_route_cost_3d,
                 fn_wavefront_3d,
+                fn_rt_bvh_crossings,
+                fn_rt_bvh_drc,
                 fn_df_ampere,
                 fn_df_ampere_tiled,
                 fn_bp_ampere,
                 cuda: api,
+                optix: optix_api,
                 dispatch_lock: Mutex::new(()),
                 persistent_buffers: Mutex::new(PersistentDeviceBuffers {
                     d_obs: 0,
@@ -1454,6 +1604,272 @@ impl CudaEngine {
             Some(result)
         }
     }
+
+    pub fn evaluate_segment_crossings_rt_bvh(
+        &self,
+        segs: &[[f32; 4]],
+        bvh_nodes: &[GpuBvhNode],
+    ) -> Option<Vec<u32>> {
+        if segs.is_empty() || bvh_nodes.is_empty() {
+            return None;
+        }
+        let n = segs.len();
+        let segs_bytes = n * std::mem::size_of::<[f32; 4]>();
+        let bvh_bytes = bvh_nodes.len() * std::mem::size_of::<GpuBvhNode>();
+        let out_bytes = n * std::mem::size_of::<u32>();
+
+        let _guard = self.dispatch_lock.lock().ok()?;
+        unsafe {
+            let _ = (self.cuda.cuCtxSetCurrent)(self.ctx);
+            let mut d_segs: CUdeviceptr = 0;
+            let mut d_bvh: CUdeviceptr = 0;
+            let mut d_out: CUdeviceptr = 0;
+
+            if (self.cuda.cuMemAlloc_v2)(&mut d_segs, segs_bytes) != CUDA_SUCCESS {
+                return None;
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_bvh, bvh_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_segs);
+                return None;
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_out, out_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_segs);
+                let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+                return None;
+            }
+
+            let start_t = Instant::now();
+
+            if (self.cuda.cuMemcpyHtoD_v2)(d_segs, segs.as_ptr() as *const c_void, segs_bytes) != CUDA_SUCCESS
+                || (self.cuda.cuMemcpyHtoD_v2)(d_bvh, bvh_nodes.as_ptr() as *const c_void, bvh_bytes) != CUDA_SUCCESS
+            {
+                let _ = (self.cuda.cuMemFree_v2)(d_segs);
+                let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+                let _ = (self.cuda.cuMemFree_v2)(d_out);
+                return None;
+            }
+
+            let block_x: c_uint = 64;
+            let grid_x: c_uint = (n as c_uint + block_x - 1) / block_x;
+            let mut n_arg = n as c_uint;
+
+            let mut args = [
+                &mut d_segs as *mut _ as *mut c_void,
+                &mut d_bvh as *mut _ as *mut c_void,
+                &mut d_out as *mut _ as *mut c_void,
+                &mut n_arg as *mut _ as *mut c_void,
+            ];
+
+            if (self.cuda.cuLaunchKernel)(
+                self.fn_rt_bvh_crossings,
+                grid_x,
+                1,
+                1,
+                block_x,
+                1,
+                1,
+                0,
+                ptr::null_mut(),
+                args.as_mut_ptr(),
+                ptr::null_mut(),
+            ) != CUDA_SUCCESS
+            {
+                let _ = (self.cuda.cuMemFree_v2)(d_segs);
+                let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+                let _ = (self.cuda.cuMemFree_v2)(d_out);
+                return None;
+            }
+
+            let mut result = vec![0u32; n];
+            if (self.cuda.cuMemcpyDtoH_v2)(result.as_mut_ptr() as *mut c_void, d_out, out_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_segs);
+                let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+                let _ = (self.cuda.cuMemFree_v2)(d_out);
+                return None;
+            }
+
+            let _ = (self.cuda.cuCtxSynchronize)();
+            let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+            self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+            let _ = (self.cuda.cuMemFree_v2)(d_segs);
+            let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+            let _ = (self.cuda.cuMemFree_v2)(d_out);
+
+            Some(result)
+        }
+    }
+
+    pub fn evaluate_drc_rt_bvh(
+        &self,
+        bvh_nodes: &[GpuBvhNode],
+        queries: &[GpuDrcRayQuery],
+    ) -> Option<Vec<u32>> {
+        if bvh_nodes.is_empty() || queries.is_empty() {
+            return None;
+        }
+        let nq = queries.len();
+        let bvh_bytes = bvh_nodes.len() * std::mem::size_of::<GpuBvhNode>();
+        let queries_bytes = nq * std::mem::size_of::<GpuDrcRayQuery>();
+        let out_bytes = nq * std::mem::size_of::<u32>();
+
+        let _guard = self.dispatch_lock.lock().ok()?;
+        unsafe {
+            let _ = (self.cuda.cuCtxSetCurrent)(self.ctx);
+            let mut d_bvh: CUdeviceptr = 0;
+            let mut d_queries: CUdeviceptr = 0;
+            let mut d_out: CUdeviceptr = 0;
+
+            if (self.cuda.cuMemAlloc_v2)(&mut d_bvh, bvh_bytes) != CUDA_SUCCESS {
+                return None;
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_queries, queries_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+                return None;
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_out, out_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+                let _ = (self.cuda.cuMemFree_v2)(d_queries);
+                return None;
+            }
+
+            let start_t = Instant::now();
+
+            if (self.cuda.cuMemcpyHtoD_v2)(d_bvh, bvh_nodes.as_ptr() as *const c_void, bvh_bytes) != CUDA_SUCCESS
+                || (self.cuda.cuMemcpyHtoD_v2)(d_queries, queries.as_ptr() as *const c_void, queries_bytes) != CUDA_SUCCESS
+            {
+                let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+                let _ = (self.cuda.cuMemFree_v2)(d_queries);
+                let _ = (self.cuda.cuMemFree_v2)(d_out);
+                return None;
+            }
+
+            let block_x: c_uint = 64;
+            let grid_x: c_uint = (nq as c_uint + block_x - 1) / block_x;
+            let mut nq_arg = nq as c_uint;
+
+            let mut args = [
+                &mut d_bvh as *mut _ as *mut c_void,
+                &mut d_queries as *mut _ as *mut c_void,
+                &mut d_out as *mut _ as *mut c_void,
+                &mut nq_arg as *mut _ as *mut c_void,
+            ];
+
+            if (self.cuda.cuLaunchKernel)(
+                self.fn_rt_bvh_drc,
+                grid_x,
+                1,
+                1,
+                block_x,
+                1,
+                1,
+                0,
+                ptr::null_mut(),
+                args.as_mut_ptr(),
+                ptr::null_mut(),
+            ) != CUDA_SUCCESS
+            {
+                let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+                let _ = (self.cuda.cuMemFree_v2)(d_queries);
+                let _ = (self.cuda.cuMemFree_v2)(d_out);
+                return None;
+            }
+
+            let mut result = vec![0u32; nq];
+            if (self.cuda.cuMemcpyDtoH_v2)(result.as_mut_ptr() as *mut c_void, d_out, out_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+                let _ = (self.cuda.cuMemFree_v2)(d_queries);
+                let _ = (self.cuda.cuMemFree_v2)(d_out);
+                return None;
+            }
+
+            let _ = (self.cuda.cuCtxSynchronize)();
+            let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+            self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+            let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+            let _ = (self.cuda.cuMemFree_v2)(d_queries);
+            let _ = (self.cuda.cuMemFree_v2)(d_out);
+
+            Some(result)
+        }
+    }
+
+    pub fn benchmark_rt_bvh_vs_simt(&self) -> Option<RtBvhBenchmarkResult> {
+        let num_obs = 512usize;
+        let num_queries = 256usize;
+        let mut obstacles = Vec::with_capacity(num_obs);
+        for i in 0..num_obs {
+            let x = (i % 32) as f32 * 3.0;
+            let y = (i / 32) as f32 * 3.0;
+            let layer_mask = 1u32 << (i % 4);
+            let net_id = ((i % 16) + 1) as u32;
+            obstacles.push(([x, y, x + 0.8, y + 0.8], layer_mask, net_id));
+        }
+        let bvh_nodes = build_gpu_lbvh(&obstacles);
+
+        let mut queries = Vec::with_capacity(num_queries);
+        let mut segs = Vec::with_capacity(num_queries);
+        for i in 0..num_queries {
+            let x1 = ((i * 7) % 90) as f32;
+            let y1 = ((i * 13) % 45) as f32;
+            let x2 = x1 + 6.0;
+            let y2 = y1 + 4.0;
+            queries.push(GpuDrcRayQuery {
+                x1,
+                y1,
+                x2,
+                y2,
+                clearance: 0.25,
+                layer_mask: 1u32 << (i % 4),
+                net_id: ((i % 16) + 1) as u32,
+                _pad: 0,
+            });
+            segs.push([x1, y1, x2, y2]);
+        }
+        let seg_bvh = build_gpu_lbvh_from_segments(&segs);
+
+        let t0 = Instant::now();
+        let _ = self.evaluate_drc_rt_bvh(&bvh_nodes, &queries)?;
+        let bvh_drc_us = t0.elapsed().as_secs_f64() * 1e6;
+
+        let t1 = Instant::now();
+        let _ = evaluate_drc_brute_force_cpu(&obstacles, &queries);
+        let simt_drc_us = t1.elapsed().as_secs_f64() * 1e6;
+
+        let t2 = Instant::now();
+        let _ = self.evaluate_segment_crossings_rt_bvh(&segs, &seg_bvh)?;
+        let bvh_crossings_us = t2.elapsed().as_secs_f64() * 1e6;
+
+        let dummy_boxes = vec![[0.0f32; 4]; 1];
+        let bp_params = PlacementBatchParams {
+            num_candidates: 1,
+            num_footprints: 1,
+            num_segments: segs.len() as u32,
+            _pad: 0,
+            board_min_x: 0.0,
+            board_min_y: 0.0,
+            board_max_x: 100.0,
+            board_max_y: 100.0,
+            wirelength_weight: 1.0,
+            crossing_weight: 10.0,
+            overlap_penalty: 100.0,
+            boundary_penalty: 100.0,
+        };
+        let t3 = Instant::now();
+        let _ = self.evaluate_placement_batch(&dummy_boxes, &segs, &bp_params)?;
+        let simt_crossings_us = t3.elapsed().as_secs_f64() * 1e6;
+
+        Some(RtBvhBenchmarkResult {
+            bvh_drc_us,
+            simt_drc_us,
+            bvh_crossings_us,
+            simt_crossings_us,
+            drc_speedup: simt_drc_us / bvh_drc_us.max(0.01),
+            crossings_speedup: simt_crossings_us / bvh_crossings_us.max(0.01),
+            rt_hardware_available: self.optix_available,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1972,5 +2388,122 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_optix_driver_and_rt_capability_detection() {
+        let devs = CudaEngine::all_devices();
+        if devs.is_empty() {
+            return;
+        }
+        let optix = OptixDriverApi::load().expect("libnvoptix.so.1 must load on NVIDIA host");
+        assert!(optix.abi_version >= 22);
+        assert!(optix.optix_version >= 70000);
+
+        for dev in &devs {
+            println!(
+                "GPU: {} | OptiX available: {} (version={}, ABI={})",
+                dev.device_name, dev.optix_available, dev.optix_version, optix.abi_version
+            );
+            assert!(dev.optix_available, "OptiX must be detected on {}", dev.device_name);
+            assert!(dev.optix_version >= 70000);
+            let bench = dev.benchmark_rt_bvh_vs_simt().expect("RT BVH micro-benchmark");
+            assert!(bench.rt_hardware_available);
+            assert!(bench.bvh_drc_us > 0.0);
+            assert!(bench.bvh_crossings_us > 0.0);
+        }
+    }
+
+    #[test]
+    fn test_rt_bvh_line_of_sight_drc_equivalence() {
+        let cuda = match CudaEngine::new() {
+            Some(c) => c,
+            None => return,
+        };
+        let vk = match crate::vulkan::VulkanEngine::new_vulkan_only() {
+            Some(v) => v,
+            None => return,
+        };
+
+        let num_obs = 520usize;
+        let num_queries = 256usize;
+        let mut obstacles = Vec::with_capacity(num_obs);
+        for i in 0..num_obs {
+            let x = ((i * 17) % 100) as f32 + (i % 5) as f32 * 0.25;
+            let y = ((i * 31) % 80) as f32 + (i % 3) as f32 * 0.35;
+            let w = 0.4 + (i % 4) as f32 * 0.3;
+            let h = 0.4 + ((i + 1) % 4) as f32 * 0.3;
+            let layer_mask = 1u32 << (i % 4);
+            let net_id = ((i % 12) + 1) as u32;
+            obstacles.push(([x, y, x + w, y + h], layer_mask, net_id));
+        }
+
+        let bvh_nodes = build_gpu_lbvh(&obstacles);
+        assert_eq!(bvh_nodes.len(), num_obs * 2 - 1);
+        assert_eq!(std::mem::size_of::<GpuBvhNode>(), 32);
+
+        let mut queries = Vec::with_capacity(num_queries);
+        for q in 0..num_queries {
+            let x1 = ((q * 23) % 95) as f32 + 0.13;
+            let y1 = ((q * 19) % 75) as f32 + 0.17;
+            let dx = ((q * 11) % 15) as f32 - 7.0;
+            let dy = ((q * 7) % 15) as f32 - 7.0;
+            queries.push(GpuDrcRayQuery {
+                x1,
+                y1,
+                x2: x1 + dx,
+                y2: y1 + dy,
+                clearance: 0.15 + (q % 3) as f32 * 0.10,
+                layer_mask: 1u32 << (q % 4),
+                net_id: ((q % 12) + 1) as u32,
+                _pad: 0,
+            });
+        }
+
+        let cpu_ref = evaluate_drc_brute_force_cpu(&obstacles, &queries);
+        let cu_out = cuda.evaluate_drc_rt_bvh(&bvh_nodes, &queries).expect("CUDA BVH DRC");
+        let vk_out = vk
+            .evaluate_drc_rt_bvh_vulkan_wgsl(&bvh_nodes, &queries)
+            .expect("Vulkan WGSL BVH DRC");
+
+        assert_eq!(cu_out, cpu_ref, "CUDA RT BVH DRC must match brute-force 100%");
+        assert_eq!(vk_out, cpu_ref, "Vulkan WGSL RT BVH DRC must match brute-force 100%");
+        assert!(cpu_ref.iter().sum::<u32>() > 0, "Must have non-trivial DRC hits");
+    }
+
+    #[test]
+    fn test_rt_bvh_segment_crossings_equivalence() {
+        let cuda = match CudaEngine::new() {
+            Some(c) => c,
+            None => return,
+        };
+        let vk = match crate::vulkan::VulkanEngine::new_vulkan_only() {
+            Some(v) => v,
+            None => return,
+        };
+
+        let num_segs = 300usize;
+        let mut segs = Vec::with_capacity(num_segs);
+        for i in 0..num_segs {
+            let x1 = ((i * 29) % 100) as f32 + (i as f32) * 0.013;
+            let y1 = ((i * 43) % 100) as f32 + (i as f32) * 0.017;
+            let x2 = ((i * 61 + 17) % 100) as f32 + (i as f32) * 0.019;
+            let y2 = ((i * 83 + 23) % 100) as f32 + (i as f32) * 0.011;
+            segs.push([x1, y1, x2, y2]);
+        }
+
+        let bvh_nodes = build_gpu_lbvh_from_segments(&segs);
+        let cpu_crossings = evaluate_segment_crossings_brute_force_cpu(&segs);
+        let cu_crossings = cuda
+            .evaluate_segment_crossings_rt_bvh(&segs, &bvh_nodes)
+            .expect("CUDA BVH segment crossings");
+        let vk_crossings = vk
+            .evaluate_segment_crossings_rt_bvh_vulkan_wgsl(&segs, &bvh_nodes)
+            .expect("Vulkan BVH segment crossings");
+
+        assert_eq!(cu_crossings, cpu_crossings, "CUDA BVH crossings must match O(N^2) exact");
+        assert_eq!(vk_crossings, cpu_crossings, "Vulkan BVH crossings must match O(N^2) exact");
+        assert!(cpu_crossings.iter().sum::<u32>() > 100);
+    }
 }
+
 
