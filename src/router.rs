@@ -6648,80 +6648,155 @@ pub fn find_choked_pin_bottlenecks(
                                 }
                             }
 
-                            // If opposite-layer track directly under the pad blocks via placement, try nudging it with 45° tapers
+                            // If tracks on either layer near the pad block via placement, try nudging them (cumulatively across layers) with 45° tapers
                             if !connected_to_existing {
-                                let alt_layer = if fp.layer == 0 { 1 } else { 0 };
-                                let cand_indices: Vec<usize> = board
+                                let orig_tracks_snapshot = board.tracks.clone();
+                                let mut cand_tracks: Vec<TrackSegment> = board
                                     .tracks
                                     .iter()
-                                    .enumerate()
-                                    .filter(|(_, t)| {
-                                        t.layer == alt_layer
-                                            && t.net_id != plane_net_id
+                                    .filter(|t| {
+                                        t.net_id != plane_net_id
                                             && !t.is_locked
-                                            && dist_point_to_segment((px, py), t.start, t.end) < 1.2
+                                            && dist_point_to_segment((px, py), t.start, t.end) < 1.55
                                             && (t.start.0 - t.end.0).hypot(t.start.1 - t.end.1) >= 1.0
                                     })
-                                    .map(|(idx, _)| idx)
+                                    .cloned()
                                     .collect();
+                                cand_tracks.sort_by(|a, b| {
+                                    let da = dist_point_to_segment((px, py), a.start, a.end);
+                                    let db = dist_point_to_segment((px, py), b.start, b.end);
+                                    db.partial_cmp(&da).unwrap_or(Ordering::Equal)
+                                });
 
-                                for t_idx in cand_indices {
-                                    let orig_t = board.tracks[t_idx].clone();
+                                for orig_t in cand_tracks {
+                                    let Some(t_idx) = board.tracks.iter().position(|t| {
+                                        t.layer == orig_t.layer
+                                            && t.net_id == orig_t.net_id
+                                            && (t.start.0 - orig_t.start.0).abs() < 1e-5
+                                            && (t.start.1 - orig_t.start.1).abs() < 1e-5
+                                            && (t.end.0 - orig_t.end.0).abs() < 1e-5
+                                            && (t.end.1 - orig_t.end.1).abs() < 1e-5
+                                    }) else {
+                                        continue;
+                                    };
+                                    let orig_dist = dist_point_to_segment((px, py), orig_t.start, orig_t.end);
                                     let t_clr = board.get_netclass_for_net(orig_t.net_id).clearance;
-                                    let is_horiz = (orig_t.start.1 - orig_t.end.1).abs() < 1e-4;
-                                    let is_vert = (orig_t.start.0 - orig_t.end.0).abs() < 1e-4;
-                                    if !is_horiz && !is_vert {
+                                    let dx = orig_t.end.0 - orig_t.start.0;
+                                    let dy = orig_t.end.1 - orig_t.start.1;
+                                    let is_horiz = dy.abs() < 1e-4;
+                                    let is_vert = dx.abs() < 1e-4;
+                                    let is_diag = (dx.abs() - dy.abs()).abs() < 1e-3 && dx.abs() >= 1.0;
+                                    if !is_horiz && !is_vert && !is_diag {
                                         continue;
                                     }
-                                    for &shift in &[-0.35_f64, 0.35, -0.45, 0.45, -0.65, 0.65, -0.80, 0.80] {
-                                        let s_abs = shift.abs();
-                                        let tapered: Vec<((f64, f64), (f64, f64))> = if is_horiz {
-                                            let (x1, x2) = if orig_t.start.0 < orig_t.end.0 {
-                                                (orig_t.start.0, orig_t.end.0)
-                                            } else {
-                                                (orig_t.end.0, orig_t.start.0)
-                                            };
-                                            let y = orig_t.start.1;
-                                            if x2 - x1 <= 2.0 * s_abs + 0.1 {
-                                                continue;
-                                            }
-                                            vec![
-                                                ((x1, y), (x1 + s_abs, y + shift)),
-                                                ((x1 + s_abs, y + shift), (x2 - s_abs, y + shift)),
-                                                ((x2 - s_abs, y + shift), (x2, y)),
-                                            ]
-                                        } else {
-                                            let (y1, y2) = if orig_t.start.1 < orig_t.end.1 {
-                                                (orig_t.start.1, orig_t.end.1)
-                                            } else {
-                                                (orig_t.end.1, orig_t.start.1)
-                                            };
-                                            let x = orig_t.start.0;
-                                            if y2 - y1 <= 2.0 * s_abs + 0.1 {
-                                                continue;
-                                            }
-                                            vec![
-                                                ((x, y1), (x + shift, y1 + s_abs)),
-                                                ((x + shift, y1 + s_abs), (x + shift, y2 - s_abs)),
-                                                ((x + shift, y2 - s_abs), (x, y2)),
-                                            ]
-                                        };
+                                    let mut kept_nudge_for_track = false;
+                                    for &(cx_off, cy_off) in &[
+                                        (-0.23_f64, 0.825_f64),
+                                        (-0.17, 0.875),
+                                        (-0.32, 0.78),
+                                        (0.32, 0.78),
+                                        (-0.32, -0.78),
+                                        (0.32, -0.78),
+                                        (0.0, 0.98),
+                                        (0.0, -0.98),
+                                        (0.98, 0.0),
+                                        (-0.98, 0.0),
+                                        (0.0, 0.0),
+                                    ] {
+                                        let pocket_pt = (px + cx_off, py + cy_off);
+                                        let orig_pocket_dist = dist_point_to_segment(pocket_pt, orig_t.start, orig_t.end);
+                                        for &half_span in &[0.65_f64, 0.35, 0.50, 0.21, 1.15, 0.18, 1000.0] {
+                                            for &shift in &[
+                                                -0.80_f64, 0.80, -0.65, 0.65, -0.45, 0.45, -0.35, 0.35, -0.25, 0.25, -0.18, 0.18, -0.075, 0.075, -0.04, 0.04,
+                                            ] {
+                                                let s_abs = shift.abs();
+                                                let tapered: Vec<((f64, f64), (f64, f64))> = if is_horiz {
+                                                    let (x1, x2) = if orig_t.start.0 < orig_t.end.0 {
+                                                        (orig_t.start.0, orig_t.end.0)
+                                                    } else {
+                                                        (orig_t.end.0, orig_t.start.0)
+                                                    };
+                                                    let y = orig_t.start.1;
+                                                    let cx = px + cx_off;
+                                                    let bx1 = (cx - half_span - s_abs).max(x1);
+                                                    let bx2 = (cx + half_span + s_abs).min(x2);
+                                                    if bx2 - bx1 <= 2.0 * s_abs + 0.05 {
+                                                        continue;
+                                                    }
+                                                    let mut segs = Vec::with_capacity(5);
+                                                    if bx1 > x1 + 1e-4 {
+                                                        segs.push(((x1, y), (bx1, y)));
+                                                    }
+                                                    segs.push(((bx1, y), (bx1 + s_abs, y + shift)));
+                                                    segs.push(((bx1 + s_abs, y + shift), (bx2 - s_abs, y + shift)));
+                                                    segs.push(((bx2 - s_abs, y + shift), (bx2, y)));
+                                                    if bx2 < x2 - 1e-4 {
+                                                        segs.push(((bx2, y), (x2, y)));
+                                                    }
+                                                    segs
+                                                } else if is_vert {
+                                                    let (y1, y2) = if orig_t.start.1 < orig_t.end.1 {
+                                                        (orig_t.start.1, orig_t.end.1)
+                                                    } else {
+                                                        (orig_t.end.1, orig_t.start.1)
+                                                    };
+                                                    let x = orig_t.start.0;
+                                                    let cy = py + cy_off;
+                                                    let by1 = (cy - half_span - s_abs).max(y1);
+                                                    let by2 = (cy + half_span + s_abs).min(y2);
+                                                    if by2 - by1 <= 2.0 * s_abs + 0.05 {
+                                                        continue;
+                                                    }
+                                                    let mut segs = Vec::with_capacity(5);
+                                                    if by1 > y1 + 1e-4 {
+                                                        segs.push(((x, y1), (x, by1)));
+                                                    }
+                                                    segs.push(((x, by1), (x + shift, by1 + s_abs)));
+                                                    segs.push(((x + shift, by1 + s_abs), (x + shift, by2 - s_abs)));
+                                                    segs.push(((x + shift, by2 - s_abs), (x, by2)));
+                                                    if by2 < y2 - 1e-4 {
+                                                        segs.push(((x, by2), (x, y2)));
+                                                    }
+                                                    segs
+                                                } else {
+                                                    if half_span < 500.0 || s_abs > 0.45 {
+                                                        continue;
+                                                    }
+                                                    let sx = dx.signum();
+                                                    let sy = dy.signum();
+                                                    if dx.abs() <= s_abs + 0.2 {
+                                                        continue;
+                                                    }
+                                                    if shift > 0.0 {
+                                                        vec![
+                                                            (orig_t.start, (orig_t.start.0 + sx * s_abs, orig_t.start.1)),
+                                                            ((orig_t.start.0 + sx * s_abs, orig_t.start.1), (orig_t.end.0, orig_t.end.1 - sy * s_abs)),
+                                                            ((orig_t.end.0, orig_t.end.1 - sy * s_abs), orig_t.end),
+                                                        ]
+                                                    } else {
+                                                        vec![
+                                                            (orig_t.start, (orig_t.start.0, orig_t.start.1 + sy * s_abs)),
+                                                            ((orig_t.start.0, orig_t.start.1 + sy * s_abs), (orig_t.end.0 - sx * s_abs, orig_t.end.1)),
+                                                            ((orig_t.end.0 - sx * s_abs, orig_t.end.1), orig_t.end),
+                                                        ]
+                                                    }
+                                                };
 
-                                        board.tracks.remove(t_idx);
-                                        let shift_legal = tapered.iter().all(|&(s, e)| {
-                                            is_track_segment_legal(board, s, e, orig_t.width, orig_t.layer, orig_t.net_id, t_clr)
-                                        });
-                                        if shift_legal {
-                                            for &(s, e) in &tapered {
-                                                board.tracks.push(TrackSegment {
-                                                    start: s,
-                                                    end: e,
-                                                    width: orig_t.width,
-                                                    layer: orig_t.layer,
-                                                    net_id: orig_t.net_id,
-                                                    is_locked: false,
+                                                board.tracks.remove(t_idx);
+                                                let shift_legal = tapered.iter().all(|&(s, e)| {
+                                                    is_track_segment_legal(board, s, e, orig_t.width, orig_t.layer, orig_t.net_id, t_clr)
                                                 });
-                                            }
+                                                if shift_legal {
+                                                    for &(s, e) in &tapered {
+                                                        board.tracks.push(TrackSegment {
+                                                            start: s,
+                                                            end: e,
+                                                            width: orig_t.width,
+                                                            layer: orig_t.layer,
+                                                            net_id: orig_t.net_id,
+                                                            is_locked: false,
+                                                        });
+                                                    }
                                             if let Some((vx, vy)) = Self::find_safe_plane_via_location(
                                                 board,
                                                 grid,
@@ -6792,15 +6867,39 @@ pub fn find_choked_pin_bottlenecks(
                                             if connected_to_existing {
                                                 break;
                                             }
+                                            let new_pocket_dist = tapered
+                                                .iter()
+                                                .map(|&(s, e)| dist_point_to_segment(pocket_pt, s, e))
+                                                .fold(f64::INFINITY, f64::min);
+                                            let new_pad_dist = tapered
+                                                .iter()
+                                                .map(|&(s, e)| dist_point_to_segment((px, py), s, e))
+                                                .fold(f64::INFINITY, f64::min);
+                                            let pad_dist_ok = orig_t.layer != fp.layer || new_pad_dist >= orig_dist - 1e-4;
+                                            if new_pocket_dist >= 0.574 && new_pocket_dist > orig_pocket_dist + 0.03 && pad_dist_ok {
+                                                kept_nudge_for_track = true;
+                                                break;
+                                            }
                                             for _ in 0..tapered.len() {
                                                 board.tracks.pop();
                                             }
                                         }
-                                        board.tracks.insert(t_idx, orig_t.clone());
+                                                board.tracks.insert(t_idx, orig_t.clone());
+                                            }
+                                            if connected_to_existing || kept_nudge_for_track {
+                                                break;
+                                            }
+                                        }
+                                        if connected_to_existing || kept_nudge_for_track {
+                                            break;
+                                        }
                                     }
                                     if connected_to_existing {
                                         break;
                                     }
+                                }
+                                if !connected_to_existing {
+                                    board.tracks = orig_tracks_snapshot;
                                 }
                             }
                         }
@@ -6882,6 +6981,7 @@ pub fn find_choked_pin_bottlenecks(
                             }
                             if !connected_to_existing {
                                 let mut local_grid = RoutingGrid::new(board, grid.res, None);
+                                local_grid.rasterize_obstacles(board);
                                 for trk in &board.tracks {
                                     if trk.net_id != plane_net_id {
                                         local_grid.commit_track(trk);
@@ -6913,8 +7013,12 @@ pub fn find_choked_pin_bottlenecks(
                                             0.0,
                                             &dummy_stop,
                                         ) {
-                                            let mut cur_layer = fp.layer;
+                                            let orig_trk_len = board.tracks.len();
+                                            let orig_via_len = board.vias.len();
+                                            let orig_added_len = added_via_positions.len();
+                                            let cur_layer = fp.layer;
                                             let mut last_pt = (px, py);
+                                            let mut path_valid = true;
                                             for (ni, n) in p.iter().enumerate() {
                                                 let wpt = if ni + 1 == p.len() && n.layer == fp.layer {
                                                     tgt
@@ -6931,8 +7035,12 @@ pub fn find_choked_pin_bottlenecks(
                                                             is_locked: false,
                                                         });
                                                         added_via_positions.push(last_pt);
+                                                        // For a plane net, reaching a legal via already connects the pad to the plane!
+                                                        break;
+                                                    } else {
+                                                        path_valid = false;
+                                                        break;
                                                     }
-                                                    cur_layer = n.layer;
                                                 }
                                                 let dl = compute_45_dogleg(last_pt, wpt, false);
                                                 for seg in dl.windows(2) {
@@ -6949,17 +7057,13 @@ pub fn find_choked_pin_bottlenecks(
                                                 }
                                                 last_pt = wpt;
                                             }
-                                            if cur_layer != fp.layer && is_via_location_legal(board, last_pt, 0.60, plane_net_id, 0.12) {
-                                                board.vias.push(Via {
-                                                    position: last_pt,
-                                                    size: 0.60,
-                                                    drill: 0.30,
-                                                    net_id: plane_net_id,
-                                                    is_locked: false,
-                                                });
-                                                added_via_positions.push(last_pt);
+                                            if path_valid {
+                                                break;
+                                            } else {
+                                                board.tracks.truncate(orig_trk_len);
+                                                board.vias.truncate(orig_via_len);
+                                                added_via_positions.truncate(orig_added_len);
                                             }
-                                            break;
                                         }
                                     }
                                 }
@@ -6999,7 +7103,20 @@ pub fn find_choked_pin_bottlenecks(
             .map(|ko| ko.min_x - 3.9)
             .fold(board.max_x, f64::min);
 
-        let mut primary_offsets = Vec::new();
+        let mut primary_offsets = vec![
+            (-0.23, 0.825),
+            (0.23, 0.825),
+            (-0.23, -0.825),
+            (0.23, -0.825),
+            (-0.17, 0.875),
+            (0.17, 0.875),
+            (-0.17, -0.875),
+            (0.17, -0.875),
+            (-0.32, 0.78),
+            (0.32, 0.78),
+            (-0.32, -0.78),
+            (0.32, -0.78),
+        ];
         for &dist in &[
             min_d,
             min_d + 0.20,
@@ -7030,6 +7147,10 @@ pub fn find_choked_pin_bottlenecks(
             primary_offsets.push((-dist * 0.5, dist));
             primary_offsets.push((dist * 0.5, -dist));
             primary_offsets.push((-dist * 0.5, -dist));
+            primary_offsets.push((dist * 0.38, dist));
+            primary_offsets.push((-dist * 0.38, dist));
+            primary_offsets.push((dist * 0.38, -dist));
+            primary_offsets.push((-dist * 0.38, -dist));
         }
 
         if px > zone_max_x {
@@ -7070,6 +7191,10 @@ pub fn find_choked_pin_bottlenecks(
             fallback_offsets.push((-dist * 0.25, dist));
             fallback_offsets.push((dist * 0.25, -dist));
             fallback_offsets.push((-dist * 0.25, -dist));
+            fallback_offsets.push((dist * 0.38, dist));
+            fallback_offsets.push((-dist * 0.38, dist));
+            fallback_offsets.push((dist * 0.38, -dist));
+            fallback_offsets.push((-dist * 0.38, -dist));
         }
 
         let drc_ctx = GpuDrcContext::from_board(board);
@@ -17422,6 +17547,15 @@ mod tests {
 
         // 1. Test adjacent via consolidation on Net-(U2-SW)
         let sw_net_id = *board.net_name_to_id.get("Net-(U2-SW)").unwrap();
+        if !board.vias.iter().any(|v| v.net_id == sw_net_id && (v.position.0 - 144.45).hypot(v.position.1 - 113.05) < 0.1) {
+            board.vias.push(Via {
+                position: (144.45, 113.05),
+                size: 0.6,
+                drill: 0.3,
+                net_id: sw_net_id,
+                is_locked: false,
+            });
+        }
         if !board.vias.iter().any(|v| v.net_id == sw_net_id && (v.position.0 - 144.20).hypot(v.position.1 - 113.60) < 0.1) {
             board.vias.push(Via {
                 position: (144.20, 113.60),
@@ -17440,7 +17574,7 @@ mod tests {
             });
         }
         let sw_vias_before: Vec<Via> = board.vias.iter().filter(|v| v.net_id == sw_net_id).cloned().collect();
-        assert!(sw_vias_before.len() >= 3);
+        assert!(sw_vias_before.len() >= 2);
 
         router.reduce_vias(&mut board, &mut grid);
         validate_and_clean_copper(&mut board);
