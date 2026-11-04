@@ -9,11 +9,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 pub use crate::vulkan::{
-    build_gpu_lbvh, build_gpu_lbvh_from_segments, evaluate_drc_brute_force_cpu,
-    evaluate_segment_crossings_brute_force_cpu, morton2d_encode, ray_aabb_intersects_cpu,
-    segments_cross_cpu, DrcBatchParams, GpuBvhNode, GpuDrcCandidate, GpuDrcPad, GpuDrcRayQuery,
-    GpuDrcTrack, GpuDrcVia, GpuRouteCostParams, GpuSaParams, PlacementBatchParams,
-    RtBvhBenchmarkResult,
+    build_gpu_lbvh, build_gpu_lbvh_from_segments, evaluate_corridor_cuts_brute_force_cpu,
+    evaluate_corridor_cuts_lbvh_cpu, evaluate_drc_brute_force_cpu,
+    evaluate_segment_crossings_brute_force_cpu, morton2d_encode, query_lbvh_crossing_segments,
+    ray_aabb_intersects_cpu, segments_cross_cpu, DrcBatchParams, GpuBvhNode, GpuDrcCandidate,
+    GpuDrcPad, GpuDrcRayQuery, GpuDrcTrack, GpuDrcVia, GpuRouteCostParams, GpuSaParams,
+    PlacementBatchParams, RtBvhBenchmarkResult,
 };
 
 static ALL_CUDA_ENGINES: OnceLock<Vec<Arc<CudaEngine>>> = OnceLock::new();
@@ -370,6 +371,7 @@ pub struct CudaEngine {
     pub fn_route_cost_3d_tensor_core: CUfunction,
     fn_wavefront_3d: CUfunction,
     fn_rt_bvh_crossings: CUfunction,
+    fn_rt_bvh_corridor_cuts: CUfunction,
     fn_rt_bvh_drc: CUfunction,
     fn_batch_drc: CUfunction,
     pub fn_df_ampere: Option<CUfunction>,
@@ -545,6 +547,7 @@ impl CudaEngine {
             let mut fn_route_cost_3d_tensor_core: CUfunction = ptr::null_mut();
             let mut fn_wavefront_3d: CUfunction = ptr::null_mut();
             let mut fn_rt_bvh_crossings: CUfunction = ptr::null_mut();
+            let mut fn_rt_bvh_corridor_cuts: CUfunction = ptr::null_mut();
             let mut fn_rt_bvh_drc: CUfunction = ptr::null_mut();
             let mut fn_batch_drc: CUfunction = ptr::null_mut();
 
@@ -560,6 +563,7 @@ impl CudaEngine {
             let c_rc3dtc = CString::new("compute_3d_routing_cost_tensor_core_kernel").unwrap();
             let c_wf3d = CString::new("wavefront_3d_relax_kernel").unwrap();
             let c_rt_cr = CString::new("rt_bvh_segment_crossings_kernel").unwrap();
+            let c_rt_cc = CString::new("rt_bvh_corridor_cuts_kernel").unwrap();
             let c_rt_drc = CString::new("rt_bvh_line_of_sight_drc_kernel").unwrap();
             let c_drc = CString::new("batch_drc_eval_kernel").unwrap();
 
@@ -575,6 +579,7 @@ impl CudaEngine {
                 || (api.cuModuleGetFunction)(&mut fn_route_cost_3d_tensor_core, module, c_rc3dtc.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_wavefront_3d, module, c_wf3d.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_rt_bvh_crossings, module, c_rt_cr.as_ptr()) != CUDA_SUCCESS
+                || (api.cuModuleGetFunction)(&mut fn_rt_bvh_corridor_cuts, module, c_rt_cc.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_rt_bvh_drc, module, c_rt_drc.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_batch_drc, module, c_drc.as_ptr()) != CUDA_SUCCESS
             {
@@ -652,6 +657,7 @@ impl CudaEngine {
                 fn_route_cost_3d_tensor_core,
                 fn_wavefront_3d,
                 fn_rt_bvh_crossings,
+                fn_rt_bvh_corridor_cuts,
                 fn_rt_bvh_drc,
                 fn_batch_drc,
                 fn_df_ampere,
@@ -2007,6 +2013,116 @@ impl CudaEngine {
 
             let _ = (self.cuda.cuMemFree_v2)(d_segs);
             let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+            let _ = (self.cuda.cuMemFree_v2)(d_out);
+
+            Some(result)
+        }
+    }
+
+    pub fn evaluate_corridor_cuts_rt_bvh(
+        &self,
+        segs: &[[f32; 4]],
+        bvh_nodes: &[GpuBvhNode],
+        cuts: &[[f32; 4]],
+    ) -> Option<Vec<u32>> {
+        if segs.is_empty() || bvh_nodes.is_empty() || cuts.is_empty() {
+            return None;
+        }
+        let num_cuts = cuts.len();
+        let segs_bytes = segs.len() * std::mem::size_of::<[f32; 4]>();
+        let bvh_bytes = bvh_nodes.len() * std::mem::size_of::<GpuBvhNode>();
+        let cuts_bytes = num_cuts * std::mem::size_of::<[f32; 4]>();
+        let out_bytes = num_cuts * std::mem::size_of::<u32>();
+
+        let _guard = self.dispatch_lock.lock().ok()?;
+        unsafe {
+            let _ = (self.cuda.cuCtxSetCurrent)(self.ctx);
+            let mut d_segs: CUdeviceptr = 0;
+            let mut d_bvh: CUdeviceptr = 0;
+            let mut d_cuts: CUdeviceptr = 0;
+            let mut d_out: CUdeviceptr = 0;
+
+            if (self.cuda.cuMemAlloc_v2)(&mut d_segs, segs_bytes) != CUDA_SUCCESS {
+                return None;
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_bvh, bvh_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_segs);
+                return None;
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_cuts, cuts_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_segs);
+                let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+                return None;
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_out, out_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_segs);
+                let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+                let _ = (self.cuda.cuMemFree_v2)(d_cuts);
+                return None;
+            }
+
+            let start_t = Instant::now();
+
+            if (self.cuda.cuMemcpyHtoD_v2)(d_segs, segs.as_ptr() as *const c_void, segs_bytes) != CUDA_SUCCESS
+                || (self.cuda.cuMemcpyHtoD_v2)(d_bvh, bvh_nodes.as_ptr() as *const c_void, bvh_bytes) != CUDA_SUCCESS
+                || (self.cuda.cuMemcpyHtoD_v2)(d_cuts, cuts.as_ptr() as *const c_void, cuts_bytes) != CUDA_SUCCESS
+            {
+                let _ = (self.cuda.cuMemFree_v2)(d_segs);
+                let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+                let _ = (self.cuda.cuMemFree_v2)(d_cuts);
+                let _ = (self.cuda.cuMemFree_v2)(d_out);
+                return None;
+            }
+
+            let block_x: c_uint = 64;
+            let grid_x: c_uint = (num_cuts as c_uint + block_x - 1) / block_x;
+            let mut num_cuts_arg = num_cuts as c_uint;
+
+            let mut args = [
+                &mut d_segs as *mut _ as *mut c_void,
+                &mut d_bvh as *mut _ as *mut c_void,
+                &mut d_cuts as *mut _ as *mut c_void,
+                &mut d_out as *mut _ as *mut c_void,
+                &mut num_cuts_arg as *mut _ as *mut c_void,
+            ];
+
+            if (self.cuda.cuLaunchKernel)(
+                self.fn_rt_bvh_corridor_cuts,
+                grid_x,
+                1,
+                1,
+                block_x,
+                1,
+                1,
+                0,
+                ptr::null_mut(),
+                args.as_mut_ptr(),
+                ptr::null_mut(),
+            ) != CUDA_SUCCESS
+            {
+                let _ = (self.cuda.cuMemFree_v2)(d_segs);
+                let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+                let _ = (self.cuda.cuMemFree_v2)(d_cuts);
+                let _ = (self.cuda.cuMemFree_v2)(d_out);
+                return None;
+            }
+
+            let mut result = vec![0u32; num_cuts];
+            if (self.cuda.cuMemcpyDtoH_v2)(result.as_mut_ptr() as *mut c_void, d_out, out_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_segs);
+                let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+                let _ = (self.cuda.cuMemFree_v2)(d_cuts);
+                let _ = (self.cuda.cuMemFree_v2)(d_out);
+                return None;
+            }
+
+            let _ = (self.cuda.cuCtxSynchronize)();
+            let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+            self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+            let _ = (self.cuda.cuMemFree_v2)(d_segs);
+            let _ = (self.cuda.cuMemFree_v2)(d_bvh);
+            let _ = (self.cuda.cuMemFree_v2)(d_cuts);
             let _ = (self.cuda.cuMemFree_v2)(d_out);
 
             Some(result)
@@ -3464,6 +3580,52 @@ mod tests {
             .expect("Vulkan DRC batch");
         assert_eq!(cu_res.len(), 200);
         assert_eq!(cu_res, vk_res, "CUDA and Vulkan WGSL DRC batch kernels must return identical results");
+    }
+
+    #[test]
+    fn test_rt_bvh_corridor_cuts_cuda_and_vulkan_equivalence() {
+        let cuda = match CudaEngine::new() {
+            Some(c) => c,
+            None => return,
+        };
+        let vk = match crate::vulkan::VulkanEngine::new_vulkan_only() {
+            Some(v) => v,
+            None => return,
+        };
+
+        let num_segs = 320usize;
+        let num_cuts = 180usize;
+        let mut segs = Vec::with_capacity(num_segs);
+        for i in 0..num_segs {
+            let x1 = ((i * 31) % 100) as f32 + (i as f32) * 0.013;
+            let y1 = ((i * 47) % 100) as f32 + (i as f32) * 0.017;
+            let x2 = ((i * 59 + 17) % 100) as f32 + (i as f32) * 0.019;
+            let y2 = ((i * 79 + 23) % 100) as f32 + (i as f32) * 0.011;
+            segs.push([x1, y1, x2, y2]);
+        }
+
+        let mut cuts = Vec::with_capacity(num_cuts);
+        for j in 0..num_cuts {
+            let x1 = ((j * 23 + 7) % 95) as f32 + (j as f32) * 0.021;
+            let y1 = ((j * 41 + 11) % 95) as f32 + (j as f32) * 0.015;
+            let x2 = ((j * 67 + 29) % 95) as f32 + (j as f32) * 0.023;
+            let y2 = ((j * 83 + 37) % 95) as f32 + (j as f32) * 0.027;
+            cuts.push([x1, y1, x2, y2]);
+        }
+
+        let bvh_nodes = build_gpu_lbvh_from_segments(&segs);
+        let cpu_brute = evaluate_corridor_cuts_brute_force_cpu(&segs, &cuts);
+        let cpu_lbvh = evaluate_corridor_cuts_lbvh_cpu(&segs, &bvh_nodes, &cuts);
+        let cu_cuts = cuda
+            .evaluate_corridor_cuts_rt_bvh(&segs, &bvh_nodes, &cuts)
+            .expect("CUDA BVH corridor cuts");
+        let vk_cuts = vk
+            .evaluate_corridor_cuts_rt_bvh_vulkan_wgsl(&segs, &bvh_nodes, &cuts)
+            .expect("Vulkan WGSL BVH corridor cuts");
+
+        assert_eq!(cpu_lbvh, cpu_brute);
+        assert_eq!(cu_cuts, cpu_brute);
+        assert_eq!(vk_cuts, cpu_brute);
     }
 }
 

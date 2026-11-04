@@ -3,7 +3,7 @@
 
 use crate::board::{Board, LiveTrialState, Point, Polygon, Segment, TrialPhase, AABB};
 use crate::ipc::KiCadIpcClient;
-use crate::vulkan::{GpuSaParams, VulkanEngine};
+use crate::vulkan::{build_gpu_lbvh, query_lbvh_crossing_segments, GpuBvhNode, GpuSaParams, VulkanEngine};
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
@@ -88,6 +88,8 @@ pub struct PlacementState {
     pub cached_courtyards: Vec<Vec<Polygon>>,
     pub cached_bounds: Vec<AABB>,
     pub cached_pads: Vec<Vec<Point>>,
+    pub cached_connectivity_hash: u64,
+    pub cached_connectivity: Arc<(HashMap<(usize, usize), Vec<usize>>, Vec<ComponentBusLink>)>,
     pub cost: f64,
     pub crossings: usize,
     pub corridor_congestion: f64,
@@ -532,6 +534,19 @@ pub fn compute_flow_alignment_penalty_for_link(
     penalty
 }
 
+fn board_connectivity_hash(board: &Board) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    board.footprints.len().hash(&mut h);
+    for fp in &board.footprints {
+        fp.pads.len().hash(&mut h);
+        for pad in &fp.pads {
+            pad.net_id.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
 impl PlacementState {
     pub fn from_board(board: &Board, config: &PlacementConfig) -> Self {
         let n = board.footprints.len();
@@ -559,6 +574,9 @@ impl PlacementState {
             cached_pads.push(pads);
         }
 
+        let cached_connectivity_hash = board_connectivity_hash(board);
+        let cached_connectivity = Arc::new(build_board_topological_connectivity(board));
+
         let mut st = Self {
             positions,
             rotations,
@@ -566,6 +584,8 @@ impl PlacementState {
             cached_courtyards,
             cached_bounds,
             cached_pads,
+            cached_connectivity_hash,
+            cached_connectivity,
             cost: 0.0,
             crossings: 0,
             corridor_congestion: 0.0,
@@ -600,11 +620,44 @@ impl PlacementState {
     pub fn evaluate_cost(&mut self, board: &Board, config: &PlacementConfig, ties: &[PassiveTie]) {
         let segments = board.generate_ratsnest_segments(&self.cached_pads);
         let wirelength: f64 = segments.iter().map(|s| s.length()).sum();
+
+        // Build a 2D Morton LBVH over the ratsnest segments when E >= 16 so both
+        // ratsnest crossing count and topological corridor cut ray-casting run in O(log E).
+        let seg_bvh: Vec<GpuBvhNode> = if segments.len() >= 16 {
+            let mut obs = Vec::with_capacity(segments.len());
+            for seg in &segments {
+                let min_x = seg.p1.x.min(seg.p2.x) as f32;
+                let min_y = seg.p1.y.min(seg.p2.y) as f32;
+                let max_x = seg.p1.x.max(seg.p2.x) as f32;
+                let max_y = seg.p1.y.max(seg.p2.y) as f32;
+                obs.push(([min_x, min_y, max_x, max_y], 0xFFFF_FFFF, seg.net_id as u32));
+            }
+            build_gpu_lbvh(&obs)
+        } else {
+            Vec::new()
+        };
+
         let mut crossings = 0usize;
-        for i in 0..segments.len() {
-            for j in (i + 1)..segments.len() {
-                if segments[i].crosses(&segments[j]) {
-                    crossings += 1;
+        if !seg_bvh.is_empty() {
+            for (i, seg_i) in segments.iter().enumerate() {
+                let ray = [
+                    seg_i.p1.x as f32,
+                    seg_i.p1.y as f32,
+                    seg_i.p2.x as f32,
+                    seg_i.p2.y as f32,
+                ];
+                query_lbvh_crossing_segments(ray, seg_i.net_id as u32, &seg_bvh, |j| {
+                    if j > i && seg_i.crosses(&segments[j]) {
+                        crossings += 1;
+                    }
+                });
+            }
+        } else {
+            for i in 0..segments.len() {
+                for j in (i + 1)..segments.len() {
+                    if segments[i].crosses(&segments[j]) {
+                        crossings += 1;
+                    }
                 }
             }
         }
@@ -782,13 +835,19 @@ impl PlacementState {
         let mut flow_alignment_penalty_total = 0.0;
 
         if config.corridor_congestion_weight > 0.0 || config.flow_alignment_weight > 0.0 {
-            let (shared_nets, bus_links) = build_board_topological_connectivity(board);
+            let conn_hash = board_connectivity_hash(board);
+            if self.cached_connectivity_hash != conn_hash {
+                self.cached_connectivity_hash = conn_hash;
+                self.cached_connectivity = Arc::new(build_board_topological_connectivity(board));
+            }
+            let (shared_nets, bus_links) = (&self.cached_connectivity.0, &self.cached_connectivity.1);
 
             if config.corridor_congestion_weight > 0.0 && n >= 2 {
                 let num_layers = board.copper_layers().len().max(2);
                 let default_nc = board.netclasses.get("Default");
                 let track_width = default_nc.map(|nc| nc.track_width).unwrap_or(0.20).max(0.05);
                 let min_clearance = default_nc.map(|nc| nc.clearance).unwrap_or(0.20).max(0.05);
+                let mut demand_nets: Vec<usize> = Vec::with_capacity(16);
 
                 for i in 0..n {
                     for j in (i + 1)..n {
@@ -814,7 +873,7 @@ impl PlacementState {
 
                         let capacity = compute_corridor_capacity(gap_w, track_width, min_clearance, num_layers);
 
-                        let mut demand_nets: Vec<usize> = Vec::new();
+                        demand_nets.clear();
                         if let Some(shared) = shared_nets.get(&(i, j)) {
                             demand_nets.extend_from_slice(shared);
                         }
@@ -823,9 +882,23 @@ impl PlacementState {
                         let c_j = self.positions[j];
                         if c_i.distance_to(&c_j) > 1e-4 {
                             let cut_seg = Segment { p1: c_i, p2: c_j, net_id: 0 };
-                            for seg in &segments {
-                                if cut_seg.crosses(seg) {
-                                    demand_nets.push(seg.net_id);
+                            if !seg_bvh.is_empty() {
+                                let cut_ray = [
+                                    c_i.x as f32,
+                                    c_i.y as f32,
+                                    c_j.x as f32,
+                                    c_j.y as f32,
+                                ];
+                                query_lbvh_crossing_segments(cut_ray, 0, &seg_bvh, |seg_idx| {
+                                    if cut_seg.crosses(&segments[seg_idx]) {
+                                        demand_nets.push(segments[seg_idx].net_id);
+                                    }
+                                });
+                            } else {
+                                for seg in &segments {
+                                    if cut_seg.crosses(seg) {
+                                        demand_nets.push(seg.net_id);
+                                    }
                                 }
                             }
                         }
@@ -843,14 +916,16 @@ impl PlacementState {
             }
 
             if config.flow_alignment_weight > 0.0 {
-                for link in &bus_links {
+                let mut pads_a = Vec::with_capacity(8);
+                let mut pads_b = Vec::with_capacity(8);
+                for link in bus_links {
                     let comp_a = link.comp_a;
                     let comp_b = link.comp_b;
                     let pos_a = self.positions[comp_a];
                     let pos_b = self.positions[comp_b];
 
-                    let mut pads_a = Vec::with_capacity(link.shared_pads.len());
-                    let mut pads_b = Vec::with_capacity(link.shared_pads.len());
+                    pads_a.clear();
+                    pads_b.clear();
                     for &(pa_idx, pb_idx) in &link.shared_pads {
                         pads_a.push(self.cached_pads[comp_a][pa_idx]);
                         pads_b.push(self.cached_pads[comp_b][pb_idx]);
@@ -5187,6 +5262,128 @@ mod tests {
                 is_placement_legal(&board, &cand_fp, pos, rot, layer, min_spacing)
             );
         }
+    }
+
+    #[test]
+    fn test_placer_lbvh_corridor_and_crossings_exact_match() {
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 80.0;
+        board.max_y = 80.0;
+
+        let num_nets = 28usize;
+        board.nets = (0..=num_nets).map(|i| if i == 0 { "".to_string() } else { format!("SIG_{}", i) }).collect();
+
+        // Build left and right banks with inverted/crossed pad assignments (>= 16 segments)
+        let mut pads_left = Vec::new();
+        let mut pads_right = Vec::new();
+        for n in 1..=num_nets {
+            let y_left = -14.0 + (n as f64) * 1.0;
+            let y_right = 14.0 - (n as f64) * 1.0 + ((n % 5) as f64) * 0.35;
+            pads_left.push(Pad::new(&format!("{}", n), 0.0, y_left, 0.4, 0.4, n, &format!("SIG_{}", n), false));
+            pads_right.push(Pad::new(&format!("{}", n), 0.0, y_right, 0.4, 0.4, n, &format!("SIG_{}", n), false));
+        }
+
+        let j_left = make_test_fp("J1", 10.0, 40.0, true, pads_left);
+        let j_right = make_test_fp("J2", 70.0, 40.0, true, pads_right);
+
+        // Place several components in the middle creating narrow corridor cuts across the ratsnest bundle
+        let u1 = make_test_fp("U1", 38.0, 38.6, false, vec![
+            Pad::new("1", -0.5, 0.0, 0.4, 0.4, 1, "SIG_1", false),
+            Pad::new("2", 0.5, 0.0, 0.4, 0.4, 2, "SIG_2", false),
+        ]);
+        let u2 = make_test_fp("U2", 38.0, 41.4, false, vec![
+            Pad::new("1", -0.5, 0.0, 0.4, 0.4, 2, "SIG_2", false),
+            Pad::new("2", 0.5, 0.0, 0.4, 0.4, 3, "SIG_3", false),
+        ]);
+        let u3 = make_test_fp("U3", 44.0, 39.5, false, vec![
+            Pad::new("1", 0.0, -0.5, 0.4, 0.4, 4, "SIG_4", false),
+        ]);
+        let u4 = make_test_fp("U4", 44.0, 42.3, false, vec![
+            Pad::new("1", 0.0, 0.5, 0.4, 0.4, 5, "SIG_5", false),
+        ]);
+
+        board.footprints = vec![j_left, j_right, u1, u2, u3, u4];
+
+        let cfg = PlacementConfig::default();
+        let ties = build_passive_ties(&board);
+        let mut st = PlacementState::from_board(&board, &cfg);
+        st.evaluate_cost(&board, &cfg, &ties);
+
+        let segments = board.generate_ratsnest_segments(&st.cached_pads);
+        assert!(segments.len() >= 16, "Expected >= 16 ratsnest segments to exercise LBVH path");
+
+        // Compute brute-force reference crossings
+        let mut ref_crossings = 0usize;
+        for i in 0..segments.len() {
+            for j in (i + 1)..segments.len() {
+                if segments[i].crosses(&segments[j]) {
+                    ref_crossings += 1;
+                }
+            }
+        }
+        assert!(ref_crossings > 0, "Expected non-zero crossings in test setup");
+        assert_eq!(st.crossings, ref_crossings, "LBVH ratsnest crossings must exactly match brute-force crossings");
+
+        // Compute brute-force reference corridor congestion
+        let (shared_nets, _) = build_board_topological_connectivity(&board);
+        let num_layers = board.copper_layers().len().max(2);
+        let default_nc = board.netclasses.get("Default");
+        let track_width = default_nc.map(|nc| nc.track_width).unwrap_or(0.20).max(0.05);
+        let min_clearance = default_nc.map(|nc| nc.clearance).unwrap_or(0.20).max(0.05);
+        let n = board.footprints.len();
+        let mut ref_corridor_overflow = 0.0;
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let bi = &st.cached_bounds[i];
+                let bj = &st.cached_bounds[j];
+                let dx = (bi.min_x - bj.max_x).max(bj.min_x - bi.max_x).max(0.0);
+                let dy = (bi.min_y - bj.max_y).max(bj.min_y - bi.max_y).max(0.0);
+                if dx > 15.0 || dy > 15.0 || (dx * dx + dy * dy) > 225.0 {
+                    continue;
+                }
+                if st.layers[i] != st.layers[j]
+                    && board.footprints[i].is_smd_only()
+                    && board.footprints[j].is_smd_only()
+                {
+                    continue;
+                }
+                let gap_w = if !st.cached_courtyards[i].is_empty() && !st.cached_courtyards[j].is_empty() {
+                    courtyards_clearance_gap(&st.cached_courtyards[i], &st.cached_courtyards[j])
+                } else {
+                    dx.hypot(dy)
+                };
+                let capacity = compute_corridor_capacity(gap_w, track_width, min_clearance, num_layers);
+                let mut demand_nets: Vec<usize> = Vec::new();
+                if let Some(shared) = shared_nets.get(&(i, j)) {
+                    demand_nets.extend_from_slice(shared);
+                }
+                let c_i = st.positions[i];
+                let c_j = st.positions[j];
+                if c_i.distance_to(&c_j) > 1e-4 {
+                    let cut_seg = Segment { p1: c_i, p2: c_j, net_id: 0 };
+                    for seg in &segments {
+                        if cut_seg.crosses(seg) {
+                            demand_nets.push(seg.net_id);
+                        }
+                    }
+                }
+                demand_nets.sort_unstable();
+                demand_nets.dedup();
+                let demand = demand_nets.len();
+                if demand > capacity {
+                    let overflow = (demand - capacity) as f64;
+                    ref_corridor_overflow += overflow * overflow;
+                }
+            }
+        }
+        assert!(ref_corridor_overflow > 0.0, "Expected non-zero corridor congestion overflow in test setup");
+        assert_eq!(
+            st.corridor_congestion, ref_corridor_overflow,
+            "LBVH corridor congestion overflow must exactly match brute-force loop"
+        );
     }
 }
 

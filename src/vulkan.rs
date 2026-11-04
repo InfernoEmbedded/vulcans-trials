@@ -707,6 +707,127 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+const RT_BVH_CORRIDOR_CUTS_WGSL: &str = r#"
+struct GpuBvhNode {
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    left_or_prim: i32,
+    right_or_count: i32,
+    layer_mask: u32,
+    net_id: u32,
+}
+
+struct BvhQueryParams {
+    count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> segs: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> bvh_nodes: array<GpuBvhNode>;
+@group(0) @binding(2) var<storage, read> cuts: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> cuts_out: array<u32>;
+@group(0) @binding(4) var<uniform> params: BvhQueryParams;
+
+fn ccw_bvh(ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32) -> f32 {
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+fn segments_cross_bvh(s1: vec4<f32>, s2: vec4<f32>) -> bool {
+    let eps = 1e-3;
+    if ((abs(s1.x - s2.x) < eps && abs(s1.y - s2.y) < eps) ||
+        (abs(s1.x - s2.z) < eps && abs(s1.y - s2.w) < eps) ||
+        (abs(s1.z - s2.x) < eps && abs(s1.w - s2.y) < eps) ||
+        (abs(s1.z - s2.z) < eps && abs(s1.w - s2.w) < eps)) {
+        return false;
+    }
+    let d1 = ccw_bvh(s1.x, s1.y, s1.z, s1.w, s2.x, s2.y);
+    let d2 = ccw_bvh(s1.x, s1.y, s1.z, s1.w, s2.z, s2.w);
+    let d3 = ccw_bvh(s2.x, s2.y, s2.z, s2.w, s1.x, s1.y);
+    let d4 = ccw_bvh(s2.x, s2.y, s2.z, s2.w, s1.z, s1.w);
+    return ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0)) &&
+           ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0));
+}
+
+fn ray_aabb_intersects(s: vec4<f32>, b_min_x: f32, b_min_y: f32, b_max_x: f32, b_max_y: f32) -> bool {
+    let s_min_x = min(s.x, s.z);
+    let s_max_x = max(s.x, s.z);
+    let s_min_y = min(s.y, s.w);
+    let s_max_y = max(s.y, s.w);
+    if (s_max_x < b_min_x || s_min_x > b_max_x || s_max_y < b_min_y || s_min_y > b_max_y) {
+        return false;
+    }
+    let dx = s.z - s.x;
+    let dy = s.w - s.y;
+    var tmin: f32 = 0.0;
+    var tmax: f32 = 1.0;
+    if (abs(dx) > 1e-6) {
+        let inv_dx = 1.0 / dx;
+        let tx1 = (b_min_x - s.x) * inv_dx;
+        let tx2 = (b_max_x - s.x) * inv_dx;
+        tmin = max(tmin, min(tx1, tx2));
+        tmax = min(tmax, max(tx1, tx2));
+    }
+    if (abs(dy) > 1e-6) {
+        let inv_dy = 1.0 / dy;
+        let ty1 = (b_min_y - s.y) * inv_dy;
+        let ty2 = (b_max_y - s.y) * inv_dy;
+        tmin = max(tmin, min(ty1, ty2));
+        tmax = min(tmax, max(ty1, ty2));
+    }
+    return tmax >= tmin;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c_idx = gid.x;
+    if (c_idx >= params.count) {
+        return;
+    }
+
+    let cut = cuts[c_idx];
+    var crossings: u32 = 0u;
+    var stack: array<i32, 32>;
+    var stack_ptr: i32 = 0;
+    stack[0] = 0;
+    stack_ptr = 1;
+
+    loop {
+        if (stack_ptr <= 0) {
+            break;
+        }
+        stack_ptr = stack_ptr - 1;
+        let node_idx = stack[stack_ptr];
+        let node = bvh_nodes[u32(node_idx)];
+        if (node.right_or_count == 0) {
+            continue;
+        }
+        if (!ray_aabb_intersects(cut, node.min_x, node.min_y, node.max_x, node.max_y)) {
+            continue;
+        }
+        if (node.right_or_count > 0) {
+            let j = u32(node.left_or_prim);
+            if (segments_cross_bvh(cut, segs[j])) {
+                crossings = crossings + 1u;
+            }
+        } else {
+            let left_idx = node.left_or_prim;
+            let right_idx = -node.right_or_count;
+            if (stack_ptr + 2 <= 32) {
+                stack[stack_ptr] = right_idx;
+                stack[stack_ptr + 1] = left_idx;
+                stack_ptr = stack_ptr + 2;
+            }
+        }
+    }
+
+    cuts_out[c_idx] = crossings;
+}
+"#;
+
 const RT_BVH_LINE_OF_SIGHT_DRC_WGSL: &str = r#"
 struct GpuBvhNode {
     min_x: f32,
@@ -1394,6 +1515,85 @@ pub fn evaluate_segment_crossings_brute_force_cpu(segs: &[[f32; 4]]) -> Vec<u32>
         .collect()
 }
 
+#[inline]
+pub fn query_lbvh_crossing_segments<F: FnMut(usize)>(
+    ray: [f32; 4],
+    query_net_id: u32,
+    bvh_nodes: &[GpuBvhNode],
+    mut on_leaf: F,
+) {
+    if bvh_nodes.is_empty() {
+        return;
+    }
+    const PAD: f32 = 1e-3;
+    let mut stack = [0i32; 32];
+    let mut stack_ptr = 1usize;
+
+    while stack_ptr > 0 {
+        stack_ptr -= 1;
+        let node_idx = stack[stack_ptr] as usize;
+        let node = &bvh_nodes[node_idx];
+        if node.right_or_count == 0 {
+            continue;
+        }
+        if query_net_id != 0 && node.net_id == query_net_id {
+            continue;
+        }
+        if !ray_aabb_intersects_cpu(
+            ray,
+            node.min_x - PAD,
+            node.min_y - PAD,
+            node.max_x + PAD,
+            node.max_y + PAD,
+        ) {
+            continue;
+        }
+        if node.right_or_count > 0 {
+            on_leaf(node.left_or_prim as usize);
+        } else {
+            let left_idx = node.left_or_prim;
+            let right_idx = -node.right_or_count;
+            if stack_ptr + 2 <= 32 {
+                stack[stack_ptr] = right_idx;
+                stack[stack_ptr + 1] = left_idx;
+                stack_ptr += 2;
+            }
+        }
+    }
+}
+
+pub fn evaluate_corridor_cuts_brute_force_cpu(segs: &[[f32; 4]], cuts: &[[f32; 4]]) -> Vec<u32> {
+    cuts.iter()
+        .map(|&cut| {
+            let mut c = 0u32;
+            for &s in segs {
+                if segments_cross_cpu(cut, s) {
+                    c += 1;
+                }
+            }
+            c
+        })
+        .collect()
+}
+
+pub fn evaluate_corridor_cuts_lbvh_cpu(
+    segs: &[[f32; 4]],
+    bvh_nodes: &[GpuBvhNode],
+    cuts: &[[f32; 4]],
+) -> Vec<u32> {
+    cuts.iter()
+        .map(|&cut| {
+            let mut c = 0u32;
+            query_lbvh_crossing_segments(cut, 0, bvh_nodes, |j| {
+                if segments_cross_cpu(cut, segs[j]) {
+                    c += 1;
+                }
+            });
+            c
+        })
+        .collect()
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct GridParams {
@@ -1559,6 +1759,8 @@ pub struct VulkanEngine {
     wavefront_bgl: wgpu::BindGroupLayout,
     bvh_crossings_pipeline: wgpu::ComputePipeline,
     bvh_crossings_bgl: wgpu::BindGroupLayout,
+    bvh_corridor_cuts_pipeline: wgpu::ComputePipeline,
+    bvh_corridor_cuts_bgl: wgpu::BindGroupLayout,
     bvh_drc_pipeline: wgpu::ComputePipeline,
     bvh_drc_bgl: wgpu::BindGroupLayout,
     drc_pipeline: wgpu::ComputePipeline,
@@ -2147,6 +2349,82 @@ impl VulkanEngine {
             cache: None,
         });
 
+        let bvh_corridor_cuts_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Vulkan RT BVH Corridor Cuts Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(RT_BVH_CORRIDOR_CUTS_WGSL.into()),
+        });
+
+        let bvh_corridor_cuts_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("RtBvhCorridorCuts BindGroupLayout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let bvh_corridor_cuts_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("RtBvhCorridorCuts PipelineLayout"),
+            bind_group_layouts: &[&bvh_corridor_cuts_bgl],
+            push_constant_ranges: &[],
+        });
+
+        let bvh_corridor_cuts_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("RtBvhCorridorCuts ComputePipeline"),
+            layout: Some(&bvh_corridor_cuts_pl_layout),
+            module: &bvh_corridor_cuts_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         let bvh_drc_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Vulkan RT BVH Line-of-Sight DRC Compute Shader"),
             source: wgpu::ShaderSource::Wgsl(RT_BVH_LINE_OF_SIGHT_DRC_WGSL.into()),
@@ -2356,6 +2634,8 @@ impl VulkanEngine {
             wavefront_bgl,
             bvh_crossings_pipeline,
             bvh_crossings_bgl,
+            bvh_corridor_cuts_pipeline,
+            bvh_corridor_cuts_bgl,
             bvh_drc_pipeline,
             bvh_drc_bgl,
             drc_pipeline,
@@ -3368,6 +3648,153 @@ impl VulkanEngine {
         result
     }
 
+    /// Evaluate topological corridor cut ray crossings against ratsnest segments using the 2D Morton LBVH.
+    /// Automatically dispatches to CUDA PTX when `backend_kind == GpuBackendKind::CudaPtx`,
+    /// or to the Vulkan WGSL compute pipeline (`RT_BVH_CORRIDOR_CUTS_WGSL`).
+    pub fn evaluate_corridor_cuts_rt_bvh(
+        &self,
+        segs: &[[f32; 4]],
+        bvh_nodes: &[GpuBvhNode],
+        cuts: &[[f32; 4]],
+    ) -> Option<Vec<u32>> {
+        if self.backend_kind == GpuBackendKind::CudaPtx {
+            if let Some(cuda) = &self.cuda_engine {
+                if let Some(res) = cuda.evaluate_corridor_cuts_rt_bvh(segs, bvh_nodes, cuts) {
+                    self.compute_busy_ns
+                        .fetch_add(cuda.compute_busy_ns.load(Ordering::Relaxed), Ordering::Relaxed);
+                    return Some(res);
+                }
+            }
+        }
+        self.evaluate_corridor_cuts_rt_bvh_vulkan_wgsl(segs, bvh_nodes, cuts)
+    }
+
+    pub fn evaluate_corridor_cuts_rt_bvh_vulkan_wgsl(
+        &self,
+        segs: &[[f32; 4]],
+        bvh_nodes: &[GpuBvhNode],
+        cuts: &[[f32; 4]],
+    ) -> Option<Vec<u32>> {
+        if segs.is_empty() || bvh_nodes.is_empty() || cuts.is_empty() {
+            return None;
+        }
+        let num_cuts = cuts.len();
+        let out_bytes = (num_cuts * std::mem::size_of::<u32>()) as u64;
+        let _guard = self.dispatch_lock.lock().ok()?;
+
+        let segs_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("RtBvhCorridorCuts Segs Buffer"),
+            contents: bytemuck::cast_slice(segs),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let bvh_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("RtBvhCorridorCuts Nodes Buffer"),
+            contents: bytemuck::cast_slice(bvh_nodes),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let cuts_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("RtBvhCorridorCuts Cuts Buffer"),
+            contents: bytemuck::cast_slice(cuts),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("RtBvhCorridorCuts Out Buffer"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("RtBvhCorridorCuts Staging Buffer"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let q_params = BvhQueryParams {
+            count: num_cuts as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("RtBvhCorridorCuts Params Buffer"),
+            contents: bytemuck::bytes_of(&q_params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("RtBvhCorridorCuts BindGroup"),
+            layout: &self.bvh_corridor_cuts_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: segs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bvh_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: cuts_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: param_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("RtBvhCorridorCuts CommandEncoder"),
+        });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("RtBvhCorridorCuts ComputePass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.bvh_corridor_cuts_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let wg_x = (num_cuts as u32 + 63) / 64;
+            cpass.dispatch_workgroups(wg_x, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging_buf, 0, out_bytes);
+
+        let start_t = Instant::now();
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging_buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+        let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
+            let data = slice.get_mapped_range();
+            let vec: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            staging_buf.unmap();
+            Some(vec)
+        } else {
+            None
+        };
+
+        staging_buf.destroy();
+        out_buf.destroy();
+        segs_buf.destroy();
+        bvh_buf.destroy();
+        cuts_buf.destroy();
+        param_buf.destroy();
+
+        result
+    }
+
     pub fn evaluate_drc_rt_bvh(
         &self,
         bvh_nodes: &[GpuBvhNode],
@@ -4174,6 +4601,44 @@ mod tests {
 
         assert_eq!(dispatch_crossings, cpu_crossings);
         assert_eq!(wgsl_crossings, cpu_crossings);
+    }
+
+    #[test]
+    fn test_rt_bvh_corridor_cuts_cuda_and_vulkan_equivalence() {
+        let vk = VulkanEngine::new().expect("VulkanEngine must initialize");
+        let num_segs = 320usize;
+        let num_cuts = 180usize;
+        let mut segs = Vec::with_capacity(num_segs);
+        for i in 0..num_segs {
+            let x1 = ((i * 31) % 100) as f32 + (i as f32) * 0.013;
+            let y1 = ((i * 47) % 100) as f32 + (i as f32) * 0.017;
+            let x2 = ((i * 59 + 17) % 100) as f32 + (i as f32) * 0.019;
+            let y2 = ((i * 79 + 23) % 100) as f32 + (i as f32) * 0.011;
+            segs.push([x1, y1, x2, y2]);
+        }
+
+        let mut cuts = Vec::with_capacity(num_cuts);
+        for j in 0..num_cuts {
+            let x1 = ((j * 23 + 7) % 95) as f32 + (j as f32) * 0.021;
+            let y1 = ((j * 41 + 11) % 95) as f32 + (j as f32) * 0.015;
+            let x2 = ((j * 67 + 29) % 95) as f32 + (j as f32) * 0.023;
+            let y2 = ((j * 83 + 37) % 95) as f32 + (j as f32) * 0.027;
+            cuts.push([x1, y1, x2, y2]);
+        }
+
+        let bvh_nodes = build_gpu_lbvh_from_segments(&segs);
+        let cpu_brute = evaluate_corridor_cuts_brute_force_cpu(&segs, &cuts);
+        let cpu_lbvh = evaluate_corridor_cuts_lbvh_cpu(&segs, &bvh_nodes, &cuts);
+        let dispatch_cuts = vk
+            .evaluate_corridor_cuts_rt_bvh(&segs, &bvh_nodes, &cuts)
+            .expect("Dispatch BVH corridor cuts");
+        let wgsl_cuts = vk
+            .evaluate_corridor_cuts_rt_bvh_vulkan_wgsl(&segs, &bvh_nodes, &cuts)
+            .expect("WGSL BVH corridor cuts");
+
+        assert_eq!(cpu_lbvh, cpu_brute);
+        assert_eq!(dispatch_cuts, cpu_brute);
+        assert_eq!(wgsl_cuts, cpu_brute);
     }
 }
 
