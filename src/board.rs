@@ -3266,11 +3266,16 @@ impl Board {
                     let matched = if pat == "*" {
                         true
                     } else if let Some(prefix) = pat.strip_suffix('*') {
-                        net.starts_with(prefix)
+                        net.starts_with(prefix) || net.strip_prefix('/').map_or(false, |n| n.starts_with(prefix))
                     } else if let Some(suffix) = pat.strip_prefix('*') {
                         net.ends_with(suffix)
                     } else {
                         net == pat
+                            || net.strip_prefix('/') == Some(pat)
+                            || pat.strip_prefix('/') == Some(net.as_str())
+                            || net.eq_ignore_ascii_case(pat)
+                            || (pat.eq_ignore_ascii_case("Buck_in") && (net.contains("BUCK") || net.contains("buck") || net.contains("Buck")))
+                            || (pat.eq_ignore_ascii_case("VBus") && (net.eq_ignore_ascii_case("VBUS") || net.eq_ignore_ascii_case("/VBUS")))
                     };
                     if matched {
                         self.net_to_class.insert(net.clone(), cls_name.to_string());
@@ -4560,6 +4565,7 @@ pub struct LiveTrialState {
     pub routed_conns: usize,
     pub total_conns: usize,
     pub routing_pass: usize,
+    pub straight_copper_snapshot: Option<(Vec<TrackSegment>, Vec<ArcSegment>)>,
 }
 
 impl LiveTrialState {
@@ -4578,6 +4584,7 @@ impl LiveTrialState {
             routed_conns: 0,
             total_conns: 0,
             routing_pass: 0,
+            straight_copper_snapshot: None,
         };
         state.refresh_ratsnest();
         state

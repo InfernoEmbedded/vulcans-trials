@@ -18,16 +18,55 @@ pub const FREE_NET: i32 = 0;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoutingConfig {
+    #[serde(default = "default_crosstalk_penalty")]
     pub crosstalk_penalty: f64,
     #[serde(default)]
     pub any_angle_mode: bool,
+    #[serde(default = "default_via_merge_radius_mm")]
+    pub via_merge_radius_mm: f64,
+    #[serde(default = "default_via_detour_budget_mm")]
+    pub via_detour_budget_mm: f64,
+    #[serde(default = "default_via_hop_max_detour_ratio")]
+    pub via_hop_max_detour_ratio: f64,
+    #[serde(default = "default_plane_via_share_radius_mm")]
+    pub plane_via_share_radius_mm: f64,
+    #[serde(default = "default_return_via_max_dist_mm")]
+    pub return_via_max_dist_mm: f64,
+    #[serde(default = "default_via_pad_snap_dist_mm")]
+    pub via_pad_snap_dist_mm: f64,
+    #[serde(default = "default_congestion_factor")]
+    pub congestion_factor: f64,
+    #[serde(default = "default_nudge_step_mm")]
+    pub nudge_step_mm: f64,
+    #[serde(default = "default_gloss_passes")]
+    pub gloss_passes: usize,
 }
+
+fn default_crosstalk_penalty() -> f64 { 4.0 }
+fn default_via_merge_radius_mm() -> f64 { 4.00 }
+fn default_via_detour_budget_mm() -> f64 { 3.50 }
+fn default_via_hop_max_detour_ratio() -> f64 { 1.25 }
+fn default_plane_via_share_radius_mm() -> f64 { 3.50 }
+fn default_return_via_max_dist_mm() -> f64 { 1.40 }
+fn default_via_pad_snap_dist_mm() -> f64 { 0.50 }
+fn default_congestion_factor() -> f64 { 1.50 }
+fn default_nudge_step_mm() -> f64 { 0.25 }
+fn default_gloss_passes() -> usize { 2 }
 
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
-            crosstalk_penalty: 4.0,
+            crosstalk_penalty: default_crosstalk_penalty(),
             any_angle_mode: false,
+            via_merge_radius_mm: default_via_merge_radius_mm(),
+            via_detour_budget_mm: default_via_detour_budget_mm(),
+            via_hop_max_detour_ratio: default_via_hop_max_detour_ratio(),
+            plane_via_share_radius_mm: default_plane_via_share_radius_mm(),
+            return_via_max_dist_mm: default_return_via_max_dist_mm(),
+            via_pad_snap_dist_mm: default_via_pad_snap_dist_mm(),
+            congestion_factor: default_congestion_factor(),
+            nudge_step_mm: default_nudge_step_mm(),
+            gloss_passes: default_gloss_passes(),
         }
     }
 }
@@ -2386,6 +2425,14 @@ impl AutoRouter {
         self
     }
 
+    pub fn with_config(mut self, config: RoutingConfig) -> Self {
+        self.congestion_factor = config.congestion_factor as f32;
+        self.crosstalk_penalty = config.crosstalk_penalty;
+        self.nudge_engine.step_mm = config.nudge_step_mm;
+        self.config = config;
+        self
+    }
+
     /// Returns true if `a` and `b` form a differential pair (e.g. `USB_DP`/`USB_DM`, `USB_D+`/`USB_D-`).
     pub fn are_diff_pair_mates(a: &str, b: &str) -> bool {
         if a == b {
@@ -2795,7 +2842,13 @@ impl AutoRouter {
                 || board.footprints.get(conn.end_fp).map_or(false, |fp| matches!(fp.reference.as_str(), "F1" | "F2" | "D2" | "D3"));
             let is_passive_terminal = board.footprints.get(conn.start_fp).map_or(false, |fp| fp.reference.starts_with('R') || fp.reference.starts_with('C'))
                 || board.footprints.get(conn.end_fp).map_or(false, |fp| fp.reference.starts_with('R') || fp.reference.starts_with('C'));
-            if is_f1_f2_d2_d3 && !is_passive_terminal {
+            let is_power_net = conn.netclass.name.starts_with("Power")
+                || conn.netclass.name == "Power"
+                || conn.netclass.name == "Power_SW"
+                || matches!(conn.net_name.as_str(), "VBUS" | "VBus" | "/BUCK_VIN" | "BUCK_VIN" | "Buck_in" | "VRAW" | "HP" | "HN" | "P1" | "P2" | "+3.3V" | "VCC_5V")
+                || conn.net_name.contains("BUCK")
+                || conn.net_name.contains("Buck");
+            if is_f1_f2_d2_d3 || is_power_net {
                 if let Some(pwr) = board.netclasses.get("Power").or_else(|| board.netclasses.get("Power_15V")) {
                     conn.netclass = pwr.clone();
                 }
@@ -2818,7 +2871,7 @@ impl AutoRouter {
                 conn.netclass.diff_pair_gap = conn.netclass.diff_pair_gap.min(0.15);
             }
             if is_passive_terminal {
-                if !conn.netclass.name.starts_with("Power_15V") {
+                if !is_power_net && !conn.netclass.name.starts_with("Power") {
                     conn.netclass.track_width = conn.netclass.track_width.min(0.15);
                 }
                 conn.netclass.clearance = conn.netclass.clearance.min(0.15);
@@ -4717,11 +4770,15 @@ impl AutoRouter {
         }
 
         // Phase 3: Post-Route Glossing Pass (rubber-band straightening, stair-step elimination, 45-deg mitering)
-        gloss_tracks_standard(board, grid);
-        prune_dangling_tracks_and_vias(board);
-        self.reduce_vias(board, grid);
-        gloss_tracks_standard(board, grid);
-        prune_dangling_tracks_and_vias(board);
+        let gloss_iters = self.config.gloss_passes;
+        for pass_i in 0..gloss_iters {
+            gloss_tracks_standard(board, grid);
+            prune_dangling_tracks_and_vias(board);
+            if pass_i + 1 < gloss_iters {
+                self.reduce_vias(board, grid);
+                prune_dangling_tracks_and_vias(board);
+            }
+        }
 
         // Phase 2: Coupled Diff Pair Precision Alignment and Intra-Pair Phase Matching
         for follower_idx in 0..total_conns {
@@ -4900,11 +4957,13 @@ impl AutoRouter {
             }
         }
 
-        if self.config.any_angle_mode {
-            relax_homotopic_rubber_bands(board);
-            apply_any_angle_tangent_arcs(board);
-            prune_dangling_tracks_and_vias(board);
-        }
+        let pre_organic_snapshot = if self.config.any_angle_mode {
+            let snap = (board.tracks.clone(), board.arcs.clone());
+            convert_tracks_to_organic(board);
+            Some(snap)
+        } else {
+            None
+        };
 
         self.validate_crosstalk_and_coupling(board);
 
@@ -4925,19 +4984,22 @@ impl AutoRouter {
                 .collect();
             if let Ok(mut g) = st.lock() {
                 g.board.tracks = board.tracks.clone();
+                g.board.arcs = board.arcs.clone();
                 g.board.vias = board.vias.clone();
                 g.board.footprints = board.footprints.clone();
+                g.straight_copper_snapshot = pre_organic_snapshot;
                 g.ratsnest = remaining_ratsnest;
                 g.routed_conns = completed_count;
                 g.total_conns = total_conns;
                 g.progress = 1.0;
                 g.phase = TrialPhase::Completed;
                 g.push_log(format!(
-                    "[Auto-Router] Completed: {}/{} ({:.1}%) connections, {} tracks, {} vias.",
+                    "[Auto-Router] Completed: {}/{} ({:.1}%) connections, {} tracks, {} arcs, {} vias.",
                     completed_count,
                     total_conns,
                     (completed_count as f64 / total_conns.max(1) as f64) * 100.0,
                     board.tracks.len(),
+                    board.arcs.len(),
                     board.vias.len()
                 ));
             }
@@ -8167,12 +8229,13 @@ pub fn find_choked_pin_bottlenecks(
                         let track_w = board.get_netclass_for_net(plane_net_id).track_width.min(0.25).max(0.20);
                         let plane_c = board.get_netclass_for_net(plane_net_id).clearance.max(0.20);
 
-                        // Try to connect to the closest existing nearby plane via or already-connected plane pad within 3.5mm
+                        // Try to connect to the closest existing nearby plane via or already-connected plane pad within share radius
+                        let share_r = self.config.plane_via_share_radius_mm;
                         let mut connected_to_existing = false;
                         let mut nearby_targets: Vec<(f64, f64)> = board
                             .vias
                             .iter()
-                            .filter(|v| v.net_id == plane_net_id && (v.position.0 - px).hypot(v.position.1 - py) < 3.5)
+                            .filter(|v| v.net_id == plane_net_id && (v.position.0 - px).hypot(v.position.1 - py) < share_r)
                             .map(|v| v.position)
                             .collect();
                         for ofp in &board.footprints {
@@ -8181,7 +8244,7 @@ pub fn find_choked_pin_bottlenecks(
                                     if opad.net_id == plane_net_id {
                                         let opt = ofp.pad_absolute_position(opad);
                                         let d = (opt.0 - px).hypot(opt.1 - py);
-                                        if d > 0.10 && d < 3.5 {
+                                        if d > 0.10 && d < share_r {
                                             let pad_is_connected = opad.is_through_hole
                                                 || board.vias.iter().any(|v| {
                                                     v.net_id == plane_net_id && (v.position.0 - opt.0).hypot(v.position.1 - opt.1) < 0.45
@@ -9178,7 +9241,7 @@ pub fn find_choked_pin_bottlenecks(
     }
 
     pub fn reduce_vias(&self, board: &mut Board, grid: &mut RoutingGrid) {
-        reduce_vias(board, grid);
+        reduce_vias_with_config(board, grid, &self.config);
     }
 
     pub fn gloss_tracks(&self, board: &mut Board, grid: &RoutingGrid) {
@@ -9239,7 +9302,17 @@ pub fn find_choked_pin_bottlenecks(
         let via_r = via_size * 0.5;
         let r_cells = ((via_r + gnd_c) / grid.res).ceil() as isize;
 
-        let distances = [0.75, 0.90, 1.10, 1.25, 1.40];
+        let max_ret_d = self.config.return_via_max_dist_mm;
+        let mut distances: Vec<f64> = [0.75, 0.90, 1.10, 1.25, 1.40]
+            .into_iter()
+            .filter(|&d| d <= max_ret_d + 1e-4)
+            .collect();
+        if max_ret_d > 1.40 + 1e-4 {
+            distances.push(max_ret_d);
+        }
+        if distances.is_empty() {
+            distances.push(max_ret_d.max(0.50));
+        }
         let mut angles = Vec::with_capacity(16);
         for i in 0..16 {
             let theta = (i as f64) * std::f64::consts::PI / 8.0;
@@ -9338,13 +9411,14 @@ pub fn find_choked_pin_bottlenecks(
             .collect();
 
         let mut added_count = 0;
+        let skip_existing_dist = (max_ret_d + 0.10).max(0.85);
         for ((_s_idx, s_pos), valid_cands) in signal_vias.into_iter().zip(legal_per_sig.into_iter()) {
             let nearest_dist = gnd_locations
                 .iter()
                 .map(|gp| (gp.0 - s_pos.0).hypot(gp.1 - s_pos.1))
                 .fold(f64::INFINITY, f64::min);
 
-            if nearest_dist > 1.5 {
+            if nearest_dist > skip_existing_dist {
                 if let Some(cand_pos) = valid_cands
                     .into_iter()
                     .find(|&(vx, vy)| !gnd_locations.iter().any(|ev| (ev.0 - vx).hypot(ev.1 - vy) < via_size + gnd_c))
@@ -11171,11 +11245,15 @@ pub fn smooth_45_miters(chain: &mut TrackChain, board: &Board, grid: &RoutingGri
 }
 
 pub fn reduce_vias(board: &mut Board, grid: &mut RoutingGrid) {
+    reduce_vias_with_config(board, grid, &RoutingConfig::default());
+}
+
+pub fn reduce_vias_with_config(board: &mut Board, grid: &mut RoutingGrid, config: &RoutingConfig) {
     let max_passes = 8;
     for _pass in 0..max_passes {
-        let changed_pairs = eliminate_via_pairs(board, grid);
-        let changed_single = consolidate_single_vias(board, grid);
-        let changed_slide = slide_and_align_vias(board, grid);
+        let changed_pairs = eliminate_via_pairs_with_config(board, grid, config);
+        let changed_single = consolidate_single_vias_with_config(board, grid, config);
+        let changed_slide = slide_and_align_vias_with_config(board, grid, config);
         if !changed_pairs && !changed_single && !changed_slide {
             break;
         }
@@ -11184,17 +11262,22 @@ pub fn reduce_vias(board: &mut Board, grid: &mut RoutingGrid) {
 }
 
 pub fn reduce_vias_single_pass(board: &mut Board, grid: &RoutingGrid) -> bool {
-    let p = eliminate_via_pairs(board, grid);
-    let s = consolidate_single_vias(board, grid);
-    let l = slide_and_align_vias(board, grid);
+    let config = RoutingConfig::default();
+    let p = eliminate_via_pairs_with_config(board, grid, &config);
+    let s = consolidate_single_vias_with_config(board, grid, &config);
+    let l = slide_and_align_vias_with_config(board, grid, &config);
     p || s || l
 }
 
 /// Eliminates redundant layer-hopping via pairs (L_orig -> L_alt -> L_orig).
 pub fn eliminate_via_pairs(board: &mut Board, grid: &RoutingGrid) -> bool {
+    eliminate_via_pairs_with_config(board, grid, &RoutingConfig::default())
+}
+
+pub fn eliminate_via_pairs_with_config(board: &mut Board, grid: &RoutingGrid, config: &RoutingConfig) -> bool {
     let mut any_changed = false;
     for _ in 0..20 {
-        if !eliminate_via_pair_once(board, grid) {
+        if !eliminate_via_pair_once(board, grid, config) {
             break;
         }
         any_changed = true;
@@ -11242,7 +11325,7 @@ enum ViaPairMutation {
     },
 }
 
-fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid) -> bool {
+fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid, config: &RoutingConfig) -> bool {
     let is_plane_net = |nid: usize| -> bool {
         let net_name = board.nets.get(nid).map(|s| s.as_str()).unwrap_or("");
         net_name == "GND"
@@ -11506,7 +11589,7 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid) -> bool {
                                 // Priority 1: Direct octilinear segment on l_orig
                                 let direct_len = (w_pos.0 - u_pos.0).hypot(w_pos.1 - u_pos.1);
                                 if is_octilinear_segment(u_pos, w_pos)
-                                    && direct_len <= orig_len * 1.25 + 1e-4
+                                    && direct_len <= orig_len * config.via_hop_max_detour_ratio + 1e-4
                                     && (direct_len - orig_len) <= 5.0 + 1e-4
                                     && is_segment_clear(board, Some(grid), u_pos, w_pos, l_orig, net_id, track_width)
                                     && is_track_segment_legal(board, u_pos, w_pos, track_width, l_orig, net_id, clearance)
@@ -11543,7 +11626,7 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid) -> bool {
                                         let d1 = (c.0 - u_pos.0).hypot(c.1 - u_pos.1);
                                         let d2 = (w_pos.0 - c.0).hypot(w_pos.1 - c.1);
                                         let cand_len = d1 + d2;
-                                        let budget_ok = cand_len <= orig_len * 1.25 + 1e-4
+                                        let budget_ok = cand_len <= orig_len * config.via_hop_max_detour_ratio + 1e-4
                                             && (cand_len - orig_len) <= 5.0 + 1e-4;
                                         if budget_ok
                                             && is_segment_clear(board, Some(grid), u_pos, c, l_orig, net_id, track_width)
@@ -11584,12 +11667,12 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid) -> bool {
                 }
             }
 
-            // 2. Physical & Topological Same-Net Via Consolidation (merges close vias within 4.0mm)
+            // 2. Physical & Topological Same-Net Via Consolidation (merges close vias within via_merge_radius_mm)
             let mut close_pairs: Vec<(f64, usize, usize)> = Vec::new();
             for i in 0..vias_info.len() {
                 for j in (i + 1)..vias_info.len() {
                     let d = (vias_info[i].1 .0 - vias_info[j].1 .0).hypot(vias_info[i].1 .1 - vias_info[j].1 .1);
-                    if d >= 1e-4 && d <= 4.00 {
+                    if d >= 1e-4 && d <= config.via_merge_radius_mm {
                         close_pairs.push((d, i, j));
                     }
                 }
@@ -11818,7 +11901,7 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid) -> bool {
 
                             let valid_dl = cand_paths.into_iter().find(|dl| {
                                 let cand_len: f64 = dl.windows(2).map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1)).sum();
-                                if cand_len > orig_sub_len + 3.50 {
+                                if cand_len > orig_sub_len + config.via_detour_budget_mm {
                                     return false;
                                 }
                                 if touches_dense_ic_pad && dl.len() >= 2 {
@@ -12262,9 +12345,17 @@ pub fn generate_bga_dogbone_escapes(board: &mut Board, grid: &mut RoutingGrid) {
 /// testing whether the alternate layer segment chain can be moved/projected onto
 /// the primary layer without DRC violations, eliminating the solitary via.
 pub fn consolidate_single_vias(board: &mut Board, grid: &RoutingGrid) -> bool {
+    consolidate_single_vias_with_config(board, grid, &RoutingConfig::default())
+}
+
+pub fn consolidate_single_vias_with_config(
+    board: &mut Board,
+    grid: &RoutingGrid,
+    config: &RoutingConfig,
+) -> bool {
     let mut any_changed = false;
     for _ in 0..20 {
-        if !consolidate_single_via_once(board, grid) {
+        if !consolidate_single_via_once(board, grid, config) {
             break;
         }
         any_changed = true;
@@ -12282,7 +12373,11 @@ struct SingleViaConsolidation {
     aabb: (f64, f64, f64, f64),
 }
 
-fn consolidate_single_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
+fn consolidate_single_via_once(
+    board: &mut Board,
+    grid: &RoutingGrid,
+    config: &RoutingConfig,
+) -> bool {
     let is_plane_net = |nid: usize| -> bool {
         let net_name = board.nets.get(nid).map(|s| s.as_str()).unwrap_or("");
         net_name == "GND"
@@ -12449,7 +12544,7 @@ fn consolidate_single_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
                     // Priority 1: Direct segment on l_prim (strictly octilinear 0°, 45°, 90°)
                     let direct_len = (curr_pt.0 - v_pos.0).hypot(curr_pt.1 - v_pos.1);
                     if is_octilinear_segment(v_pos, curr_pt)
-                        && direct_len <= orig_len * 1.25 + 1e-4
+                        && direct_len <= orig_len * config.via_hop_max_detour_ratio + 1e-4
                         && (direct_len - orig_len) <= 5.0 + 1e-4
                         && is_segment_clear(board, Some(grid), v_pos, curr_pt, l_prim, net_id, track_width)
                         && is_track_segment_legal(board, v_pos, curr_pt, track_width, l_prim, net_id, clearance)
@@ -12482,7 +12577,7 @@ fn consolidate_single_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
                                 let d1 = (c.0 - v_pos.0).hypot(c.1 - v_pos.1);
                                 let d2 = (curr_pt.0 - c.0).hypot(curr_pt.1 - c.1);
                                 let cand_len = d1 + d2;
-                                let budget_ok = cand_len <= orig_len * 1.25 + 1e-4
+                                let budget_ok = cand_len <= orig_len * config.via_hop_max_detour_ratio + 1e-4
                                     && (cand_len - orig_len) <= 5.0 + 1e-4;
                                 if budget_ok
                                     && is_segment_clear(board, Some(grid), v_pos, c, l_prim, net_id, track_width)
@@ -12572,9 +12667,17 @@ fn consolidate_single_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
 /// Slides and aligns signal vias along incident track vectors to eliminate micro-jogs,
 /// doglegs, reduce wirelength, and snap close vias to through-hole pads.
 pub fn slide_and_align_vias(board: &mut Board, grid: &RoutingGrid) -> bool {
+    slide_and_align_vias_with_config(board, grid, &RoutingConfig::default())
+}
+
+pub fn slide_and_align_vias_with_config(
+    board: &mut Board,
+    grid: &RoutingGrid,
+    config: &RoutingConfig,
+) -> bool {
     let mut any_changed = false;
     for _ in 0..20 {
-        if !slide_and_align_via_once(board, grid) {
+        if !slide_and_align_via_once(board, grid, config) {
             break;
         }
         any_changed = true;
@@ -12592,7 +12695,11 @@ struct ViaSlideAction {
     aabb: (f64, f64, f64, f64),
 }
 
-fn slide_and_align_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
+fn slide_and_align_via_once(
+    board: &mut Board,
+    grid: &RoutingGrid,
+    config: &RoutingConfig,
+) -> bool {
     let is_plane_net = |nid: usize| -> bool {
         let net_name = board.nets.get(nid).map(|s| s.as_str()).unwrap_or("");
         net_name == "GND"
@@ -12650,13 +12757,13 @@ fn slide_and_align_via_once(board: &mut Board, grid: &RoutingGrid) -> bool {
 
             let incident_indices: Vec<usize> = incident.iter().map(|&(i, _, _, _)| i).collect();
 
-            // 1. Pad Snapping: check if close to a same-net through-hole pad (< 0.50mm)
+            // 1. Pad Snapping: check if close to a same-net through-hole pad (< via_pad_snap_dist_mm)
             for fp in &board.footprints {
                 for pad in &fp.pads {
                     if pad.net_id == net_id && pad.is_through_hole {
                         let (px, py) = fp.pad_absolute_position(pad);
                         let d = (v_pos.0 - px).hypot(v_pos.1 - py);
-                        if d > 1e-4 && d < 0.50 {
+                        if d > 1e-4 && d < config.via_pad_snap_dist_mm {
                             let all_clear = incident.iter().all(|&(_, l, other, w)| {
                                 is_octilinear_segment((px, py), other)
                                     && is_track_segment_legal(board, (px, py), other, w, l, net_id, clearance)
@@ -13325,6 +13432,18 @@ pub fn relax_chain_homotopic(chain: &mut TrackChain, board: &Board) {
 pub fn is_arc_clear(board: &Board, arc: &ArcSegment) -> bool {
     let clearance = board.get_netclass_for_net(arc.net_id).clearance;
     let half_w = arc.width * 0.5;
+    let segs = arc.to_segments(8);
+
+    // 0. Board Boundary (when board outline polygon is present)
+    if board.outline_polygon.is_some() {
+        for s in &segs {
+            if !board.contains_point_in_boundary(&Point::new(s.start.0, s.start.1))
+                || !board.contains_point_in_boundary(&Point::new(s.end.0, s.end.1))
+            {
+                return false;
+            }
+        }
+    }
 
     // 1. Foreign Pads
     for fp in &board.footprints {
@@ -13339,7 +13458,6 @@ pub fn is_arc_clear(board: &Board, arc: &ArcSegment) -> bool {
                 let max_dim = pad.width.max(pad.height);
                 let d_center = arc.distance_to_point((px, py));
                 if d_center < required_dist + max_dim * 0.5 - 1e-4 {
-                    let segs = arc.to_segments(8);
                     for s in &segs {
                         if dist_segment_to_pad(s.start, s.end, fp, pad) < required_dist - 1e-4 {
                             return false;
@@ -13365,7 +13483,6 @@ pub fn is_arc_clear(board: &Board, arc: &ArcSegment) -> bool {
     // 3. Keepouts
     for ko in &board.keepouts {
         if ko.layers.contains(&arc.layer) {
-            let segs = arc.to_segments(8);
             for s in &segs {
                 if !is_segment_clear(board, None, s.start, s.end, arc.layer, arc.net_id, arc.width) {
                     return false;
@@ -13380,7 +13497,6 @@ pub fn is_arc_clear(board: &Board, arc: &ArcSegment) -> bool {
             let trk_clr = board.get_netclass_for_net(trk.net_id).clearance;
             let req_clr = clearance.max(trk_clr);
             let required_dist = half_w + (trk.width * 0.5) + req_clr;
-            let segs = arc.to_segments(8);
             for s in &segs {
                 if dist_segment_to_segment(s.start, s.end, trk.start, trk.end) < required_dist - 1e-4 {
                     return false;
@@ -13389,10 +13505,69 @@ pub fn is_arc_clear(board: &Board, arc: &ArcSegment) -> bool {
         }
     }
 
+    // 5. Foreign Arcs
+    for other in &board.arcs {
+        if other.net_id != arc.net_id && other.layer == arc.layer {
+            let other_clr = board.get_netclass_for_net(other.net_id).clearance;
+            let req_clr = clearance.max(other_clr);
+            let required_dist = half_w + (other.width * 0.5) + req_clr;
+            let other_segs = other.to_segments(8);
+            for s in &segs {
+                for os in &other_segs {
+                    if dist_segment_to_segment(s.start, s.end, os.start, os.end) < required_dist - 1e-4 {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
     true
 }
 
+fn try_fit_organic_bow(
+    board: &Board,
+    start_pt: (f64, f64),
+    end_pt: (f64, f64),
+    width: f64,
+    layer: usize,
+    net_id: usize,
+) -> Option<ArcSegment> {
+    let dx = end_pt.0 - start_pt.0;
+    let dy = end_pt.1 - start_pt.1;
+    let len = dx.hypot(dy);
+    if len < 1.8 {
+        return None;
+    }
+    let nx = -dy / len;
+    let ny = dx / len;
+    let mid_x = (start_pt.0 + end_pt.0) * 0.5;
+    let mid_y = (start_pt.1 + end_pt.1) * 0.5;
+    let base_bow = (len * 0.06).clamp(0.12, 0.55);
+    let pref_sign = if ((start_pt.0 * 10.0) as i64 + (end_pt.1 * 10.0) as i64 + net_id as i64) % 2 == 0 {
+        1.0
+    } else {
+        -1.0
+    };
+    for sign in [pref_sign, -pref_sign] {
+        for scale in [1.0, 0.65, 0.4] {
+            let offset = base_bow * scale * sign;
+            let m_bow = (mid_x + nx * offset, mid_y + ny * offset);
+            if let Some(arc) = ArcSegment::from_3pts(start_pt, m_bow, end_pt, width, layer, net_id) {
+                if is_arc_clear(board, &arc) {
+                    return Some(arc);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn apply_any_angle_tangent_arcs(board: &mut Board) {
+    apply_tangent_arcs_with_options(board, 1.0, false);
+}
+
+fn apply_tangent_arcs_with_options(board: &mut Board, target_radius: f64, fit_straight_bows: bool) {
     let mut net_ids: Vec<usize> = board
         .tracks
         .iter()
@@ -13421,9 +13596,19 @@ pub fn apply_any_angle_tangent_arcs(board: &mut Board) {
             let n = chain.points.len();
             if n < 3 {
                 for k in 0..n.saturating_sub(1) {
+                    let start_pt = chain.points[k];
+                    let end_pt = chain.points[k + 1];
+                    if fit_straight_bows {
+                        if let Some(bow_arc) =
+                            try_fit_organic_bow(board, start_pt, end_pt, chain.width, chain.layer, chain.net_id)
+                        {
+                            board.arcs.push(bow_arc);
+                            continue;
+                        }
+                    }
                     board.tracks.push(TrackSegment {
-                        start: chain.points[k],
-                        end: chain.points[k + 1],
+                        start: start_pt,
+                        end: end_pt,
                         width: chain.width,
                         layer: chain.layer,
                         net_id: chain.net_id,
@@ -13466,10 +13651,9 @@ pub fn apply_any_angle_tangent_arcs(board: &mut Board) {
 
                 let d_max = (l_a * 0.49).min(l_b * 0.49);
                 let r_max_geom = d_max * alpha.tan();
-                let target_radius: f64 = 1.0;
                 let r_init = target_radius.min(r_max_geom).min(l_a * 0.5).min(l_b * 0.5);
 
-                for scale in [1.0, 0.8, 0.6, 0.4, 0.25] {
+                for scale in [1.0, 0.8, 0.6, 0.4, 0.25, 0.1] {
                     let r = r_init * scale;
                     if r < 0.02 {
                         continue;
@@ -13490,6 +13674,10 @@ pub fn apply_any_angle_tangent_arcs(board: &mut Board) {
                 }
             }
 
+            for opt_arc in corner_arcs.iter().flatten() {
+                board.arcs.push(opt_arc.2.clone());
+            }
+
             for k in 0..n - 1 {
                 let start_pt = if k > 0 && corner_arcs[k].is_some() {
                     corner_arcs[k].as_ref().unwrap().1
@@ -13503,7 +13691,18 @@ pub fn apply_any_angle_tangent_arcs(board: &mut Board) {
                     chain.points[k + 1]
                 };
 
-                if (end_pt.0 - start_pt.0).hypot(end_pt.1 - start_pt.1) > 1e-4 {
+                let seg_len = (end_pt.0 - start_pt.0).hypot(end_pt.1 - start_pt.1);
+                if seg_len > 1e-4 {
+                    let both_ends_un_arced =
+                        (k == 0 || corner_arcs[k].is_none()) && corner_arcs[k + 1].is_none();
+                    if fit_straight_bows && both_ends_un_arced {
+                        if let Some(bow_arc) =
+                            try_fit_organic_bow(board, start_pt, end_pt, chain.width, chain.layer, chain.net_id)
+                        {
+                            board.arcs.push(bow_arc);
+                            continue;
+                        }
+                    }
                     board.tracks.push(TrackSegment {
                         start: start_pt,
                         end: end_pt,
@@ -13514,12 +13713,95 @@ pub fn apply_any_angle_tangent_arcs(board: &mut Board) {
                     });
                 }
             }
+        }
+    }
+}
 
-            for opt_arc in corner_arcs.into_iter().flatten() {
-                board.arcs.push(opt_arc.2);
+/// Converts a routed board's unlocked tracks into hand-drawn-like organic traces
+/// using homotopic rubber-band relaxation, sweeping tangent corner arcs, and gentle organic bows.
+pub fn convert_tracks_to_organic(board: &mut Board) {
+    // If the board already has unlocked arcs, linearize them back into tracks first so conversion is idempotent
+    let unlocked_arcs: Vec<ArcSegment> = board.arcs.iter().filter(|a| !a.is_locked).cloned().collect();
+    if !unlocked_arcs.is_empty() {
+        board.arcs.retain(|a| a.is_locked);
+        for arc in unlocked_arcs {
+            board.tracks.push(TrackSegment {
+                start: arc.start(),
+                end: arc.end(),
+                width: arc.width,
+                layer: arc.layer,
+                net_id: arc.net_id,
+                is_locked: false,
+            });
+        }
+    }
+    relax_homotopic_rubber_bands(board);
+    apply_tangent_arcs_with_options(board, 5.0, true);
+    prune_dangling_tracks_and_vias(board);
+}
+
+/// Converts a board's organic curved/any-angle traces back into standard 45°/90° octilinear straight tracks.
+pub fn convert_tracks_to_straight(board: &mut Board, grid: &RoutingGrid) {
+    let unlocked_arcs: Vec<ArcSegment> = board.arcs.iter().filter(|a| !a.is_locked).cloned().collect();
+    board.arcs.retain(|a| a.is_locked);
+    for arc in unlocked_arcs {
+        if is_segment_clear(board, Some(grid), arc.start(), arc.end(), arc.layer, arc.net_id, arc.width) {
+            board.tracks.push(TrackSegment {
+                start: arc.start(),
+                end: arc.end(),
+                width: arc.width,
+                layer: arc.layer,
+                net_id: arc.net_id,
+                is_locked: false,
+            });
+        } else {
+            for seg in arc.to_segments(4) {
+                board.tracks.push(seg);
             }
         }
     }
+
+    let mut net_ids: Vec<usize> = board
+        .tracks
+        .iter()
+        .filter(|t| !t.is_locked)
+        .map(|t| t.net_id)
+        .collect();
+    net_ids.sort_unstable();
+    net_ids.dedup();
+
+    for net_id in net_ids {
+        let net_tracks: Vec<TrackSegment> = board
+            .tracks
+            .iter()
+            .filter(|t| t.net_id == net_id && !t.is_locked)
+            .cloned()
+            .collect();
+        if net_tracks.is_empty() {
+            continue;
+        }
+        board.tracks.retain(|t| t.net_id != net_id || t.is_locked);
+        let mut chains = extract_track_chains(&net_tracks, board);
+        for chain in &mut chains {
+            enforce_45_grid(chain);
+            for k in 0..chain.points.len().saturating_sub(1) {
+                let p0 = chain.points[k];
+                let p1 = chain.points[k + 1];
+                if (p1.0 - p0.0).hypot(p1.1 - p0.1) > 1e-4 {
+                    board.tracks.push(TrackSegment {
+                        start: p0,
+                        end: p1,
+                        width: chain.width,
+                        layer: chain.layer,
+                        net_id: chain.net_id,
+                        is_locked: false,
+                    });
+                }
+            }
+        }
+    }
+    gloss_tracks_standard(board, grid);
+    prune_dangling_tracks_and_vias(board);
 }
 
 // ============================================================================
@@ -21549,8 +21831,179 @@ mod tests {
             "Net 2 (shared intermediate pad) must consolidate from 2 vias to 1 via"
         );
     }
+
+    #[test]
+    fn test_routing_config_via_merge_radius_threshold() {
+        use crate::board::NetClass;
+        use std::collections::HashMap;
+
+        let mut netclasses = HashMap::new();
+        netclasses.insert("Default".to_string(), NetClass::default());
+        let mut net_name_to_id = HashMap::new();
+        net_name_to_id.insert(String::new(), 0);
+        net_name_to_id.insert("SIG".to_string(), 1);
+
+        let base_board = Board {
+            file_path: String::new(),
+            raw_content: String::new(),
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 40.0,
+            max_y: 40.0,
+            footprints: Vec::new(),
+            holding_palette: Vec::new(),
+            nets: vec![String::new(), "SIG".to_string()],
+            net_name_to_id,
+            netclasses,
+            net_to_class: HashMap::new(),
+            keepouts: Vec::new(),
+            tracks: vec![
+                TrackSegment {
+                    start: (6.0, 10.0),
+                    end: (10.0, 10.0),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+                TrackSegment {
+                    start: (10.0, 10.0),
+                    end: (12.0, 10.0),
+                    width: 0.25,
+                    layer: 1,
+                    net_id: 1,
+                    is_locked: false,
+                },
+                TrackSegment {
+                    start: (12.0, 10.0),
+                    end: (15.0, 10.0),
+                    width: 0.25,
+                    layer: 1,
+                    net_id: 1,
+                    is_locked: false,
+                },
+                TrackSegment {
+                    start: (12.0, 10.0),
+                    end: (12.0, 13.0),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+            ],
+            vias: vec![
+                Via {
+                    position: (10.0, 10.0),
+                    size: 0.60,
+                    drill: 0.30,
+                    net_id: 1,
+                    is_locked: false,
+                },
+                Via {
+                    position: (12.0, 10.0),
+                    size: 0.60,
+                    drill: 0.30,
+                    net_id: 1,
+                    is_locked: false,
+                },
+            ],
+            ..Board::default()
+        };
+
+        // 1. With tight via_merge_radius_mm (1.0 mm < 2.0 mm separation), the two vias must NOT merge
+        let mut board_tight = base_board.clone();
+        let mut grid_tight = RoutingGrid::new(&board_tight, 0.20, None);
+        grid_tight.rasterize_obstacles(&board_tight);
+        let tight_cfg = RoutingConfig {
+            via_merge_radius_mm: 1.0,
+            ..RoutingConfig::default()
+        };
+        let router_tight = AutoRouter::new(1).with_config(tight_cfg);
+        router_tight.reduce_vias(&mut board_tight, &mut grid_tight);
+        assert_eq!(
+            board_tight.vias.len(),
+            2,
+            "Vias 2.0mm apart must not merge when via_merge_radius_mm is 1.0mm"
+        );
+
+        // 2. With default via_merge_radius_mm (4.0 mm >= 2.0 mm separation), the two vias MUST merge into 1
+        let mut board_default = base_board;
+        let mut grid_default = RoutingGrid::new(&board_default, 0.20, None);
+        grid_default.rasterize_obstacles(&board_default);
+        let router_default = AutoRouter::new(1).with_config(RoutingConfig::default());
+        router_default.reduce_vias(&mut board_default, &mut grid_default);
+        assert_eq!(
+            board_default.vias.len(),
+            1,
+            "Vias 2.0mm apart must merge into 1 via when via_merge_radius_mm is 4.0mm"
+        );
+    }
+
+    #[test]
+    fn test_convert_tracks_to_organic_and_back_to_straight() {
+        use crate::board::NetClass;
+        use std::collections::HashMap;
+
+        let mut netclasses = HashMap::new();
+        netclasses.insert("Default".to_string(), NetClass::default());
+        let mut net_name_to_id = HashMap::new();
+        net_name_to_id.insert(String::new(), 0);
+        net_name_to_id.insert("NET_A".to_string(), 1);
+        net_name_to_id.insert("NET_B".to_string(), 2);
+
+        let mut board = Board {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 40.0,
+            max_y: 40.0,
+            nets: vec![String::new(), "NET_A".to_string(), "NET_B".to_string()],
+            net_name_to_id,
+            netclasses,
+            tracks: vec![
+                // NET_A: L-shaped octilinear dogleg from (5,5) -> (15,5) -> (25,15)
+                TrackSegment {
+                    start: (5.0, 5.0),
+                    end: (15.0, 5.0),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+                TrackSegment {
+                    start: (15.0, 5.0),
+                    end: (25.0, 15.0),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+                // NET_B: Straight 2-point span from (5,20) -> (25,20)
+                TrackSegment {
+                    start: (5.0, 20.0),
+                    end: (25.0, 20.0),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 2,
+                    is_locked: false,
+                },
+            ],
+            ..Board::default()
+        };
+
+        assert!(board.arcs.is_empty());
+        convert_tracks_to_organic(&mut board);
+        assert!(
+            !board.arcs.is_empty(),
+            "convert_tracks_to_organic must generate curved ArcSegments for bends and/or long straight spans"
+        );
+
+        let mut grid = RoutingGrid::new(&board, 0.20, None);
+        grid.rasterize_obstacles(&board);
+        convert_tracks_to_straight(&mut board, &grid);
+        assert!(
+            board.arcs.is_empty(),
+            "convert_tracks_to_straight must convert all unlocked organic arcs back into straight tracks"
+        );
+        assert!(!board.tracks.is_empty());
+    }
 }
-
-
-
-

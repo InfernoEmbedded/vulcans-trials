@@ -49,6 +49,11 @@ pub enum IpcMessage {
     ClearTracks,
     /// Atomically flush pending canvas mutations and trigger 60 FPS viewport repaint.
     CommitBatch,
+    /// Pull and synchronize the saved board (.kicad_pcb and .ses) into KiCad.
+    PullBoard {
+        pcb_path: String,
+        ses_path: String,
+    },
 }
 
 pub type IpcCommand = IpcMessage;
@@ -166,14 +171,27 @@ impl KiCadIpcClient {
 
     /// Attempts to connect to a custom path if given, or automatically discovers an active KiCad 10 IPC socket.
     pub fn connect_or_discover(custom_path: Option<&str>) -> Option<Self> {
+        Self::connect_or_discover_inner(custom_path, false)
+    }
+
+    /// Quietly attempts to connect to a custom path or discover an active KiCad 10 IPC socket without logging to stderr on retry failure.
+    pub fn connect_or_discover_quiet(custom_path: Option<&str>) -> Option<Self> {
+        Self::connect_or_discover_inner(custom_path, true)
+    }
+
+    fn connect_or_discover_inner(custom_path: Option<&str>, quiet: bool) -> Option<Self> {
         if let Some(cp) = custom_path {
             let norm = Self::normalize_socket_path(cp);
             if !norm.as_os_str().is_empty() {
                 match Self::connect(&norm) {
                     Ok(client) => return Some(client),
                     Err(e) => {
-                        eprintln!("[KiCad-IPC] Failed to connect to specified socket '{}': {}", norm.display(), e);
-                        return None;
+                        if !quiet {
+                            eprintln!("[KiCad-IPC] Failed to connect to specified socket '{}': {}", norm.display(), e);
+                        }
+                        if norm != Path::new("/tmp/kicad/api.sock") {
+                            return None;
+                        }
                     }
                 }
             }
@@ -182,11 +200,15 @@ impl KiCadIpcClient {
         if let Some(discovered) = Self::discover_socket_path() {
             match Self::connect(&discovered) {
                 Ok(client) => {
-                    println!("[KiCad-IPC] Connected to active KiCad 10 socket at {}", discovered.display());
+                    if !quiet {
+                        println!("[KiCad-IPC] Connected to active KiCad 10 socket at {}", discovered.display());
+                    }
                     Some(client)
                 }
                 Err(e) => {
-                    eprintln!("[KiCad-IPC] Failed to connect to discovered socket '{}': {}", discovered.display(), e);
+                    if !quiet {
+                        eprintln!("[KiCad-IPC] Failed to connect to discovered socket '{}': {}", discovered.display(), e);
+                    }
                     None
                 }
             }
@@ -287,11 +309,15 @@ impl KiCadIpcClient {
                 let json = serde_json::to_string(msg).map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, e)
                 })?;
-                stream.write_all(json.as_bytes())?;
-                stream.write_all(b"\n")?;
+                if let Err(e) = stream.write_all(json.as_bytes()).and_then(|_| stream.write_all(b"\n")) {
+                    self.is_connected = false;
+                    self.stream = None;
+                    return Err(e);
+                }
                 self.total_messages_sent += 1;
                 Ok(())
             } else {
+                self.is_connected = false;
                 Err(std::io::Error::new(
                     std::io::ErrorKind::NotConnected,
                     "KiCad IPC stream not connected",
@@ -437,6 +463,14 @@ impl KiCadIpcClient {
             count += 1;
         }
 
+        for arc in &board.arcs {
+            let layer_name = board.layer_name(arc.layer);
+            for seg in arc.to_segments(12) {
+                self.queue_add_track(seg.start, seg.end, seg.width, layer_name, seg.net_id);
+                count += 1;
+            }
+        }
+
         for via in &board.vias {
             self.queue_add_via(via.position, via.size, via.drill, via.net_id);
             count += 1;
@@ -444,6 +478,65 @@ impl KiCadIpcClient {
 
         self.commit_batch()?;
         Ok(count)
+    }
+
+    /// Pulls the full saved board (footprints, tracks, arcs, vias, and PullBoard notification)
+    /// into KiCad over the active IPC socket, bypassing throttle intervals.
+    pub fn pull_board_into_kicad(
+        &mut self,
+        board: &Board,
+        pcb_path: &Path,
+        ses_path: &Path,
+    ) -> std::io::Result<usize> {
+        if !self.is_connected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "KiCad IPC stream not connected",
+            ));
+        }
+
+        self.clear_tracks()?;
+
+        for fp in &board.footprints {
+            self.queue_move_footprint(&fp.reference, fp.x, fp.y, fp.rotation);
+        }
+
+        for trk in &board.tracks {
+            let layer_name = board.layer_name(trk.layer);
+            self.queue_add_track(trk.start, trk.end, trk.width, layer_name, trk.net_id);
+        }
+
+        for arc in &board.arcs {
+            let layer_name = board.layer_name(arc.layer);
+            for seg in arc.to_segments(12) {
+                self.queue_add_track(seg.start, seg.end, seg.width, layer_name, seg.net_id);
+            }
+        }
+
+        for via in &board.vias {
+            self.queue_add_via(via.position, via.size, via.drill, via.net_id);
+        }
+
+        let committed = self.commit_batch()?;
+
+        let pull_msg = IpcMessage::PullBoard {
+            pcb_path: pcb_path.to_string_lossy().to_string(),
+            ses_path: ses_path.to_string_lossy().to_string(),
+        };
+        self.send_raw_message(&pull_msg)?;
+
+        #[cfg(unix)]
+        {
+            if let Some(ref mut stream) = self.stream {
+                if let Err(e) = stream.flush() {
+                    self.is_connected = false;
+                    self.stream = None;
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(committed)
     }
 
     /// Flushes all queued moves, tracks, and vias, then issues CommitBatch and flushes socket writer.
@@ -491,7 +584,11 @@ impl KiCadIpcClient {
         #[cfg(unix)]
         {
             if let Some(ref mut stream) = self.stream {
-                stream.flush()?;
+                if let Err(e) = stream.flush() {
+                    self.is_connected = false;
+                    self.stream = None;
+                    return Err(e);
+                }
             }
         }
 
@@ -779,5 +876,72 @@ mod tests {
         let line = server_thread.join().expect("Server thread join failed");
         let _ = fs::remove_file(&sock_path);
         assert!(line.contains("Handshake"));
+    }
+
+    #[test]
+    fn test_pull_board_into_kicad_sends_footprint_tracks_and_pull_board() {
+        let sock_path = format!("/tmp/kicad_ipc_pull_board_test_{}.sock", std::process::id());
+        let _ = fs::remove_file(&sock_path);
+
+        let listener = UnixListener::bind(&sock_path).expect("Failed to bind test unix socket");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("Accept failed");
+            let reader = BufReader::new(stream);
+            let mut messages = Vec::new();
+            for line in reader.lines().flatten() {
+                if !line.trim().is_empty() {
+                    let msg: IpcMessage = serde_json::from_str(&line).expect("Valid JSON");
+                    let is_pull = matches!(msg, IpcMessage::PullBoard { .. });
+                    messages.push(msg);
+                    if is_pull {
+                        break;
+                    }
+                }
+            }
+            messages
+        });
+
+        let mut client =
+            KiCadIpcClient::connect_or_discover_quiet(Some(&sock_path)).expect("Connect failed");
+        let mut board = crate::board::Board::default();
+        board.tracks.push(crate::board::TrackSegment {
+            start: (1.0, 2.0),
+            end: (5.0, 6.0),
+            width: 0.25,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+        board.vias.push(crate::board::Via {
+            position: (5.0, 6.0),
+            size: 0.60,
+            drill: 0.30,
+            net_id: 1,
+            is_locked: false,
+        });
+
+        let synced = client
+            .pull_board_into_kicad(
+                &board,
+                Path::new("/tmp/test_pull_out.kicad_pcb"),
+                Path::new("/tmp/test_pull_out.ses"),
+            )
+            .expect("pull_board_into_kicad must succeed");
+        assert_eq!(synced, 2);
+
+        let received = server_thread.join().expect("Server thread join failed");
+        let _ = fs::remove_file(&sock_path);
+
+        assert!(received.iter().any(|m| matches!(m, IpcMessage::ClearTracks)));
+        assert!(received.iter().any(|m| matches!(m, IpcMessage::AddTrack { .. })));
+        assert!(received.iter().any(|m| matches!(m, IpcMessage::AddVia { .. })));
+        assert!(received.iter().any(|m| matches!(m, IpcMessage::CommitBatch)));
+        assert_eq!(
+            received.last(),
+            Some(&IpcMessage::PullBoard {
+                pcb_path: "/tmp/test_pull_out.kicad_pcb".to_string(),
+                ses_path: "/tmp/test_pull_out.ses".to_string(),
+            })
+        );
     }
 }

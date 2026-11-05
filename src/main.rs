@@ -281,6 +281,18 @@ fn run_headless_trial(
     board.save_pcb(out_path)?;
     let ses_path = out_path.with_extension("ses");
     board.save_ses(&ses_path)?;
+    if let Some(ref ipc_arc) = ipc {
+        if let Ok(mut client) = ipc_arc.lock() {
+            if client.is_connected() {
+                if let Ok(synced) = client.pull_board_into_kicad(board, out_path, &ses_path) {
+                    println!(
+                        "[KiCad-IPC] Pulled updated board into KiCad ({} items synced)",
+                        synced
+                    );
+                }
+            }
+        }
+    }
     println!("Saved output to {} and {}", out_path.display(), ses_path.display());
     Ok(())
 }

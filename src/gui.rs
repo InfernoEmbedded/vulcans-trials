@@ -4,7 +4,7 @@
 use crate::board::{Board, LiveTrialState, Point, Polygon, TrackSegment, TrialPhase, Via};
 use crate::ipc::KiCadIpcClient;
 use crate::placer::{run_auto_placer, PlacementConfig};
-use crate::router::{AutoRouter, RoutingGrid};
+use crate::router::{AutoRouter, RoutingConfig, RoutingGrid};
 use crate::vulkan::{SystemTelemetry, VulkanEngine};
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 // KiCad default colour theme (KiCad 8/9/10 "default"; pcbnew builtin scheme).
 pub const COL_F_CU: Color32 = Color32::from_rgb(0xC8, 0x34, 0x34);
@@ -157,7 +158,7 @@ pub struct AppPreferences {
     #[serde(default)]
     pub any_angle_mode: bool,
 
-    // Aggressive placement exploration & weights
+    // Advanced autoplacer exploration & weights
     #[serde(default = "default_max_jump_radius")]
     pub max_jump_radius_mm: f64,
     #[serde(default = "default_pair_swap_prob")]
@@ -170,6 +171,28 @@ pub struct AppPreferences {
     pub escape_margin_mult: f64,
     #[serde(default = "default_crossing_weight")]
     pub crossing_weight: f64,
+
+    // Advanced autorouter thresholds & distances
+    #[serde(default = "default_via_merge_radius")]
+    pub via_merge_radius_mm: f64,
+    #[serde(default = "default_via_detour_budget")]
+    pub via_detour_budget_mm: f64,
+    #[serde(default = "default_via_hop_max_detour_ratio")]
+    pub via_hop_max_detour_ratio: f64,
+    #[serde(default = "default_plane_via_share_radius")]
+    pub plane_via_share_radius_mm: f64,
+    #[serde(default = "default_return_via_max_dist")]
+    pub return_via_max_dist_mm: f64,
+    #[serde(default = "default_via_pad_snap_dist")]
+    pub via_pad_snap_dist_mm: f64,
+    #[serde(default = "default_congestion_factor")]
+    pub congestion_factor: f64,
+    #[serde(default = "default_crosstalk_penalty")]
+    pub crosstalk_penalty: f64,
+    #[serde(default = "default_nudge_step")]
+    pub nudge_step_mm: f64,
+    #[serde(default = "default_gloss_passes")]
+    pub gloss_passes: usize,
 
     // Layer visibility & display toggles
     #[serde(default = "default_true")]
@@ -192,7 +215,7 @@ pub struct AppPreferences {
     pub show_holding_palette: bool,
 
     // KiCad IPC Live Sync
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub kicad_ipc_enabled: bool,
     #[serde(default)]
     pub kicad_ipc_socket_path: String,
@@ -221,6 +244,16 @@ fn default_centroid_pull_prob() -> f64 { 0.20 }
 fn default_temp_scale() -> f64 { 1.0 }
 fn default_escape_margin_mult() -> f64 { 1.0 }
 fn default_crossing_weight() -> f64 { 200.0 }
+fn default_via_merge_radius() -> f64 { 4.00 }
+fn default_via_detour_budget() -> f64 { 3.50 }
+fn default_via_hop_max_detour_ratio() -> f64 { 1.25 }
+fn default_plane_via_share_radius() -> f64 { 3.50 }
+fn default_return_via_max_dist() -> f64 { 1.40 }
+fn default_via_pad_snap_dist() -> f64 { 0.50 }
+fn default_congestion_factor() -> f64 { 1.50 }
+fn default_crosstalk_penalty() -> f64 { 4.0 }
+fn default_nudge_step() -> f64 { 0.25 }
+fn default_gloss_passes() -> usize { 2 }
 fn default_true() -> bool { true }
 fn default_bundle_dim() -> f64 { 0.25 }
 
@@ -241,6 +274,16 @@ impl Default for AppPreferences {
             temp_scale: default_temp_scale(),
             escape_margin_mult: default_escape_margin_mult(),
             crossing_weight: default_crossing_weight(),
+            via_merge_radius_mm: default_via_merge_radius(),
+            via_detour_budget_mm: default_via_detour_budget(),
+            via_hop_max_detour_ratio: default_via_hop_max_detour_ratio(),
+            plane_via_share_radius_mm: default_plane_via_share_radius(),
+            return_via_max_dist_mm: default_return_via_max_dist(),
+            via_pad_snap_dist_mm: default_via_pad_snap_dist(),
+            congestion_factor: default_congestion_factor(),
+            crosstalk_penalty: default_crosstalk_penalty(),
+            nudge_step_mm: default_nudge_step(),
+            gloss_passes: default_gloss_passes(),
             show_courtyards: true,
             show_ratsnest: true,
             show_f_cu: true,
@@ -250,7 +293,7 @@ impl Default for AppPreferences {
             show_vias: true,
             show_refs: true,
             show_holding_palette: true,
-            kicad_ipc_enabled: false,
+            kicad_ipc_enabled: true,
             kicad_ipc_socket_path: String::new(),
             bundle_track_width: default_bundle_dim(),
             bundle_track_spacing: default_bundle_dim(),
@@ -357,13 +400,25 @@ pub struct VulcansTrialsApp {
     pub allow_component_nudge: bool,
     pub any_angle_mode: bool,
 
-    // Aggressive placement exploration & weights
+    // Advanced autoplacer exploration & weights
     pub max_jump_radius_mm: f64,
     pub pair_swap_prob: f64,
     pub centroid_pull_prob: f64,
     pub temp_scale: f64,
     pub escape_margin_mult: f64,
     pub crossing_weight: f64,
+
+    // Advanced autorouter thresholds & distances
+    pub via_merge_radius_mm: f64,
+    pub via_detour_budget_mm: f64,
+    pub via_hop_max_detour_ratio: f64,
+    pub plane_via_share_radius_mm: f64,
+    pub return_via_max_dist_mm: f64,
+    pub via_pad_snap_dist_mm: f64,
+    pub congestion_factor: f64,
+    pub crosstalk_penalty: f64,
+    pub nudge_step_mm: f64,
+    pub gloss_passes: usize,
 
     // Canvas viewport controls
     pub pan_offset: Vec2,
@@ -392,6 +447,8 @@ pub struct VulcansTrialsApp {
     pub ipc: Option<Arc<Mutex<KiCadIpcClient>>>,
     pub kicad_ipc_enabled: bool,
     pub kicad_ipc_socket_path: String,
+    pub last_ipc_retry: Instant,
+    pub ipc_retry_interval: Duration,
 
     // Persistence
     pub preferences_path: Option<PathBuf>,
@@ -442,6 +499,16 @@ impl VulcansTrialsApp {
             temp_scale: 1.0,
             escape_margin_mult: 1.0,
             crossing_weight: 200.0,
+            via_merge_radius_mm: 4.00,
+            via_detour_budget_mm: 3.50,
+            via_hop_max_detour_ratio: 1.25,
+            plane_via_share_radius_mm: 3.50,
+            return_via_max_dist_mm: 1.40,
+            via_pad_snap_dist_mm: 0.50,
+            congestion_factor: 1.50,
+            crosstalk_penalty: 4.0,
+            nudge_step_mm: 0.25,
+            gloss_passes: 2,
             pan_offset: Vec2::ZERO,
             zoom: 1.0,
             show_courtyards: true,
@@ -466,10 +533,12 @@ impl VulcansTrialsApp {
             bundle_track_width: 0.25,
             bundle_track_spacing: 0.25,
             ipc: None,
-            kicad_ipc_enabled: false,
+            kicad_ipc_enabled: true,
             kicad_ipc_socket_path: KiCadIpcClient::discover_socket_path()
                 .map(|p| format!("ipc://{}", p.display()))
                 .unwrap_or_else(|| "ipc:///tmp/kicad/api.sock".to_string()),
+            last_ipc_retry: Instant::now(),
+            ipc_retry_interval: Duration::from_secs(2),
             preferences_path: None,
             last_saved_prefs: AppPreferences::default(),
         };
@@ -478,19 +547,10 @@ impl VulcansTrialsApp {
         if !is_running_under_cargo_test() {
             let saved_prefs = AppPreferences::load();
             app.apply_preferences(&saved_prefs);
+            // Always auto-enable IPC on launch so the socket connects automatically or retries periodically
+            app.kicad_ipc_enabled = true;
             app.last_saved_prefs = app.to_preferences();
-        }
-
-        // If IPC live sync was saved as enabled and no client connected yet, attempt reconnection
-        if app.kicad_ipc_enabled && app.ipc.is_none() {
-            let custom = if app.kicad_ipc_socket_path.trim().is_empty() {
-                None
-            } else {
-                Some(app.kicad_ipc_socket_path.trim())
-            };
-            if let Some(client) = KiCadIpcClient::connect_or_discover(custom) {
-                app.ipc = Some(Arc::new(Mutex::new(client)));
-            }
+            app.try_connect_ipc(true);
         }
 
         app
@@ -523,6 +583,17 @@ impl VulcansTrialsApp {
         self.temp_scale = prefs.temp_scale;
         self.escape_margin_mult = prefs.escape_margin_mult;
         self.crossing_weight = prefs.crossing_weight;
+
+        self.via_merge_radius_mm = prefs.via_merge_radius_mm;
+        self.via_detour_budget_mm = prefs.via_detour_budget_mm;
+        self.via_hop_max_detour_ratio = prefs.via_hop_max_detour_ratio;
+        self.plane_via_share_radius_mm = prefs.plane_via_share_radius_mm;
+        self.return_via_max_dist_mm = prefs.return_via_max_dist_mm;
+        self.via_pad_snap_dist_mm = prefs.via_pad_snap_dist_mm;
+        self.congestion_factor = prefs.congestion_factor;
+        self.crosstalk_penalty = prefs.crosstalk_penalty;
+        self.nudge_step_mm = prefs.nudge_step_mm;
+        self.gloss_passes = prefs.gloss_passes;
 
         self.show_courtyards = prefs.show_courtyards;
         self.show_ratsnest = prefs.show_ratsnest;
@@ -561,6 +632,17 @@ impl VulcansTrialsApp {
             temp_scale: self.temp_scale,
             escape_margin_mult: self.escape_margin_mult,
             crossing_weight: self.crossing_weight,
+
+            via_merge_radius_mm: self.via_merge_radius_mm,
+            via_detour_budget_mm: self.via_detour_budget_mm,
+            via_hop_max_detour_ratio: self.via_hop_max_detour_ratio,
+            plane_via_share_radius_mm: self.plane_via_share_radius_mm,
+            return_via_max_dist_mm: self.return_via_max_dist_mm,
+            via_pad_snap_dist_mm: self.via_pad_snap_dist_mm,
+            congestion_factor: self.congestion_factor,
+            crosstalk_penalty: self.crosstalk_penalty,
+            nudge_step_mm: self.nudge_step_mm,
+            gloss_passes: self.gloss_passes,
 
             show_courtyards: self.show_courtyards,
             show_ratsnest: self.show_ratsnest,
@@ -603,10 +685,100 @@ impl VulcansTrialsApp {
                     self.kicad_ipc_socket_path = format!("ipc://{}", path.display());
                 }
             }
+            self.ipc = ipc;
         }
-        self.ipc = ipc;
         self.last_saved_prefs = self.to_preferences();
         self
+    }
+
+    /// Returns true if an active, connected KiCad IPC client is currently attached.
+    pub fn is_ipc_connected(&self) -> bool {
+        self.ipc
+            .as_ref()
+            .is_some_and(|c| c.lock().is_ok_and(|g| g.is_connected()))
+    }
+
+    /// Attempts to connect (or reconnect) to the KiCad IPC socket.
+    pub fn try_connect_ipc(&mut self, quiet: bool) -> bool {
+        let custom = if self.kicad_ipc_socket_path.trim().is_empty() {
+            None
+        } else {
+            Some(self.kicad_ipc_socket_path.trim())
+        };
+        let maybe_client = if quiet {
+            KiCadIpcClient::connect_or_discover_quiet(custom)
+        } else {
+            KiCadIpcClient::connect_or_discover(custom)
+        };
+        self.last_ipc_retry = Instant::now();
+        if let Some(client) = maybe_client {
+            let sock_str = client
+                .socket_path()
+                .map(|sp| format!("ipc://{}", sp.display()))
+                .unwrap_or_else(|| self.kicad_ipc_socket_path.clone());
+            if self.kicad_ipc_socket_path.trim().is_empty() {
+                self.kicad_ipc_socket_path = sock_str.clone();
+            }
+            self.ipc = Some(Arc::new(Mutex::new(client)));
+            if let Ok(mut g) = self.live.lock() {
+                g.push_log(format!("[KiCad-IPC] Connected to {}", sock_str));
+            }
+            true
+        } else {
+            self.ipc = None;
+            false
+        }
+    }
+
+    /// Periodically retries connecting to the KiCad IPC socket when `kicad_ipc_enabled` is true and disconnected.
+    pub fn poll_ipc_auto_reconnect(&mut self) -> bool {
+        if !self.kicad_ipc_enabled {
+            return false;
+        }
+        if self.is_ipc_connected() {
+            return true;
+        }
+        if self.last_ipc_retry.elapsed() >= self.ipc_retry_interval {
+            return self.try_connect_ipc(true);
+        }
+        false
+    }
+
+    /// Saves the board to `.kicad_pcb` and `.ses`, and if the KiCad IPC socket is connected,
+    /// pulls the updated board into KiCad.
+    pub fn save_output_and_pull_to_kicad(&mut self) -> bool {
+        let pcb_path = PathBuf::from(&self.output_path);
+        let ses_path = pcb_path.with_extension("ses");
+        let board_clone = {
+            let mut g = self.live.lock().unwrap();
+            if let Err(e) = g.board.save_pcb(&pcb_path) {
+                g.push_log(format!("[Error] {}", e));
+                return false;
+            }
+            let _ = g.board.save_ses(&ses_path);
+            g.push_log(format!("[Saved] {}", self.output_path));
+            g.board.clone()
+        };
+
+        if self.kicad_ipc_enabled && !self.is_ipc_connected() {
+            self.try_connect_ipc(true);
+        }
+
+        if let Some(ref ipc_arc) = self.ipc {
+            let pull_res = ipc_arc
+                .lock()
+                .ok()
+                .map(|mut ipc| ipc.pull_board_into_kicad(&board_clone, &pcb_path, &ses_path));
+            if let Some(Ok(synced)) = pull_res {
+                if let Ok(mut g) = self.live.lock() {
+                    g.push_log(format!(
+                        "[KiCad-IPC] Pulled updated board into KiCad ({} items synced)",
+                        synced
+                    ));
+                }
+            }
+        }
+        true
     }
 
     pub fn is_layer_visible(&self, layer_name: &str) -> bool {
@@ -663,6 +835,19 @@ impl VulcansTrialsApp {
         let t_scale = self.temp_scale;
         let esc_mult = self.escape_margin_mult;
         let cross_w = self.crossing_weight;
+        let routing_cfg = RoutingConfig {
+            crosstalk_penalty: self.crosstalk_penalty,
+            any_angle_mode: any_angle,
+            via_merge_radius_mm: self.via_merge_radius_mm,
+            via_detour_budget_mm: self.via_detour_budget_mm,
+            via_hop_max_detour_ratio: self.via_hop_max_detour_ratio,
+            plane_via_share_radius_mm: self.plane_via_share_radius_mm,
+            return_via_max_dist_mm: self.return_via_max_dist_mm,
+            via_pad_snap_dist_mm: self.via_pad_snap_dist_mm,
+            congestion_factor: self.congestion_factor,
+            nudge_step_mm: self.nudge_step_mm,
+            gloss_passes: self.gloss_passes,
+        };
         let out_path = self.output_path.clone();
         let ipc_client = if self.kicad_ipc_enabled { self.ipc.clone() } else { None };
 
@@ -709,10 +894,11 @@ impl VulcansTrialsApp {
             }
 
             if do_route && !stop_flag.load(Ordering::Relaxed) {
-                let mut grid = RoutingGrid::new(&working_board, grid_res, vulkan).with_inner_layer_penalty(inner_plane_pen);
+                let mut grid = RoutingGrid::new(&working_board, grid_res, vulkan)
+                    .with_inner_layer_penalty(inner_plane_pen);
                 let mut router = AutoRouter::new(max_passes)
                     .with_allow_component_nudge(allow_comp_nudge)
-                    .with_any_angle_mode(any_angle)
+                    .with_config(routing_cfg)
                     .with_ipc(ipc_client.clone());
                 router.inner_layer_penalty = inner_plane_pen;
                 router.route_all(
@@ -1842,8 +2028,60 @@ impl VulcansTrialsApp {
         self.bundle_guide_points.push(snapped_pt);
     }
 
+    /// Post-route swap between straight octilinear (45°/90°) tracks and hand-drawn-like organic curved tracks.
+    pub fn swap_organic_tracks(&mut self, enable_organic: bool) -> bool {
+        let mut g = self.live.lock().unwrap();
+        if g.board.tracks.is_empty() && g.board.arcs.is_empty() {
+            return false;
+        }
+        self.any_angle_mode = enable_organic;
+        if enable_organic {
+            if g.straight_copper_snapshot.is_none() {
+                g.straight_copper_snapshot = Some((g.board.tracks.clone(), g.board.arcs.clone()));
+            }
+            crate::router::convert_tracks_to_organic(&mut g.board);
+            let num_tracks = g.board.tracks.len();
+            let num_arcs = g.board.arcs.len();
+            g.refresh_ratsnest();
+            g.push_log(format!(
+                "[Organic] Swapped to hand-drawn organic tracks: {} straight segments, {} curved arcs",
+                num_tracks, num_arcs
+            ));
+        } else {
+            if let Some((saved_tracks, saved_arcs)) = g.straight_copper_snapshot.take() {
+                g.board.tracks = saved_tracks;
+                g.board.arcs = saved_arcs;
+            } else {
+                let grid_res = if self.grid_res_mm > 0.001 { self.grid_res_mm } else { 0.10 };
+                let grid = RoutingGrid::new(&g.board, grid_res, self.vulkan.clone());
+                crate::router::convert_tracks_to_straight(&mut g.board, &grid);
+            }
+            let num_tracks = g.board.tracks.len();
+            let num_arcs = g.board.arcs.len();
+            g.refresh_ratsnest();
+            g.push_log(format!(
+                "[Organic] Swapped back to straight 45° tracks: {} segments, {} arcs",
+                num_tracks, num_arcs
+            ));
+        }
+        let board_clone = g.board.clone();
+        drop(g);
+        if self.kicad_ipc_enabled {
+            if let Some(ref ipc_arc) = self.ipc {
+                if let Ok(mut ipc) = ipc_arc.lock() {
+                    let _ = ipc.stream_tracks_and_vias(&board_clone);
+                }
+            }
+        }
+        true
+    }
+
     pub fn render_ui(&mut self, ctx: &egui::Context) {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
+
+        if !is_running_under_cargo_test() || self.ipc_retry_interval < Duration::from_secs(1) {
+            self.poll_ipc_auto_reconnect();
+        }
 
         let telem = self.telemetry.state.lock().unwrap().clone();
         let snap = self.live.lock().unwrap().clone();
@@ -2028,18 +2266,28 @@ impl VulcansTrialsApp {
                     }
                 });
 
+                let has_copper = !snap.board.tracks.is_empty() || !snap.board.arcs.is_empty();
+                let is_currently_organic = !snap.board.arcs.is_empty();
+                let swap_label = if is_currently_organic {
+                    "📐 Swap to Straight Tracks (45°)"
+                } else {
+                    "🌿 Swap to Organic Tracks"
+                };
+                if ui
+                    .add_enabled(!is_running && has_copper, egui::Button::new(swap_label))
+                    .on_hover_text(
+                        "Post-route swap between straight octilinear (45°/90°) tracks and smooth, hand-drawn organic curved tracks",
+                    )
+                    .clicked()
+                {
+                    self.swap_organic_tracks(!is_currently_organic);
+                }
+
                 if ui
                     .add_enabled(!is_running, egui::Button::new("💾 Save Output (.kicad_pcb + .ses)"))
                     .clicked()
                 {
-                    let mut g = self.live.lock().unwrap();
-                    if let Err(e) = g.board.save_pcb(Path::new(&self.output_path)) {
-                        g.push_log(format!("[Error] {}", e));
-                    } else {
-                        let ses = Path::new(&self.output_path).with_extension("ses");
-                        let _ = g.board.save_ses(&ses);
-                        g.push_log(format!("[Saved] {}", self.output_path));
-                    }
+                    self.save_output_and_pull_to_kicad();
                 }
 
                 ui.separator();
@@ -2060,98 +2308,12 @@ impl VulcansTrialsApp {
                     !is_running,
                     egui::Slider::new(&mut self.max_ripup_passes, 1..=30).text("Max Rip-up Passes"),
                 );
-                ui.add_enabled(
-                    !is_running,
-                    egui::Slider::new(&mut self.inner_plane_penalty, 1.0..=30.0).text("Inner Plane Penalty"),
-                );
-                ui.add_enabled(
-                    !is_running,
-                    egui::Checkbox::new(&mut self.allow_layer_flip, "Allow SMD Side Flip (F.Cu ↔ B.Cu)"),
-                );
-                ui.add_enabled(
-                    !is_running,
-                    egui::Checkbox::new(&mut self.allow_component_nudge, "Allow Router to Nudge Unlocked Passives"),
-                );
-                ui.add_enabled(
-                    !is_running,
-                    egui::Checkbox::new(&mut self.any_angle_mode, "Any-Angle Mode (TopoR Arcs)"),
-                );
 
-                ui.separator();
-                ui.heading("KiCad 10 IPC Live Sync");
-                if ui.checkbox(&mut self.kicad_ipc_enabled, "KiCad IPC Live Sync").changed() {
-                    if self.kicad_ipc_enabled && self.ipc.is_none() {
-                        let custom = if self.kicad_ipc_socket_path.trim().is_empty() {
-                            None
-                        } else {
-                            Some(self.kicad_ipc_socket_path.trim())
-                        };
-                        if let Some(client) = KiCadIpcClient::connect_or_discover(custom) {
-                            if self.kicad_ipc_socket_path.trim().is_empty() {
-                                if let Some(sp) = client.socket_path() {
-                                    self.kicad_ipc_socket_path = format!("ipc://{}", sp.display());
-                                }
-                            }
-                            self.ipc = Some(Arc::new(Mutex::new(client)));
-                        }
-                    } else if !self.kicad_ipc_enabled {
-                        self.ipc = None;
-                    }
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label("Socket:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.kicad_ipc_socket_path)
-                            .hint_text("ipc:///tmp/kicad/api.sock")
-                            .desired_width(160.0),
+                ui.collapsing("Advanced Autoplacer", |ui| {
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Checkbox::new(&mut self.allow_layer_flip, "Allow SMD Side Flip (F.Cu ↔ B.Cu)"),
                     );
-                    if ui.button("Connect").clicked() {
-                        let custom = if self.kicad_ipc_socket_path.trim().is_empty() {
-                            None
-                        } else {
-                            Some(self.kicad_ipc_socket_path.trim())
-                        };
-                        if let Some(client) = KiCadIpcClient::connect_or_discover(custom) {
-                            if self.kicad_ipc_socket_path.trim().is_empty() {
-                                if let Some(sp) = client.socket_path() {
-                                    self.kicad_ipc_socket_path = format!("ipc://{}", sp.display());
-                                }
-                            }
-                            self.ipc = Some(Arc::new(Mutex::new(client)));
-                            self.kicad_ipc_enabled = true;
-                        } else {
-                            self.ipc = None;
-                        }
-                    }
-                });
-
-                let (status_text, status_col) = match self.ipc.as_ref() {
-                    Some(client_lock) => {
-                        if let Ok(c) = client_lock.lock() {
-                            if c.is_connected() {
-                                ("Connected", Color32::from_rgb(0, 220, 100))
-                            } else {
-                                ("Disconnected", Color32::from_rgb(220, 80, 80))
-                            }
-                        } else {
-                            ("Locked", Color32::GRAY)
-                        }
-                    }
-                    None => {
-                        if self.kicad_ipc_enabled {
-                            ("Connecting / Not Found", Color32::from_rgb(220, 150, 40))
-                        } else {
-                            ("Offline", Color32::GRAY)
-                        }
-                    }
-                };
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Status:").strong());
-                    ui.label(egui::RichText::new(status_text).color(status_col));
-                });
-
-                ui.collapsing("Aggressive Placement & Exploration", |ui| {
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.max_jump_radius_mm, 2.0..=50.0)
@@ -2187,6 +2349,133 @@ impl VulcansTrialsApp {
                         egui::Slider::new(&mut self.crossing_weight, 50.0..=600.0)
                             .text("Crossing Penalty Weight"),
                     );
+                });
+
+                ui.collapsing("Advanced Autorouter", |ui| {
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.via_merge_radius_mm, 0.50..=8.00)
+                            .text("Via Merge Radius (mm)")
+                            .suffix(" mm"),
+                    );
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.via_detour_budget_mm, 0.50..=8.00)
+                            .text("Via Merge Detour Budget (mm)")
+                            .suffix(" mm"),
+                    );
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.via_hop_max_detour_ratio, 1.00..=2.00)
+                            .text("Via Hop Max Detour Ratio")
+                            .suffix("x"),
+                    );
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.plane_via_share_radius_mm, 0.50..=8.00)
+                            .text("Plane Via Share Radius (mm)")
+                            .suffix(" mm"),
+                    );
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.return_via_max_dist_mm, 0.50..=3.50)
+                            .text("Return Via Max Radius (mm)")
+                            .suffix(" mm"),
+                    );
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.via_pad_snap_dist_mm, 0.00..=1.50)
+                            .text("Via-to-Pad Snap Dist (mm)")
+                            .suffix(" mm"),
+                    );
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.inner_plane_penalty, 1.0..=30.0)
+                            .text("Inner Plane Penalty"),
+                    );
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.congestion_factor, 0.50..=5.00)
+                            .text("Congestion Penalty Factor"),
+                    );
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.crosstalk_penalty, 0.0..=20.0)
+                            .text("Crosstalk Penalty Weight"),
+                    );
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.nudge_step_mm, 0.05..=1.00)
+                            .text("Shove / Nudge Step (mm)")
+                            .suffix(" mm"),
+                    );
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Slider::new(&mut self.gloss_passes, 1..=6)
+                            .text("Glossing Passes"),
+                    );
+                    ui.add_enabled(
+                        !is_running,
+                        egui::Checkbox::new(&mut self.allow_component_nudge, "Allow Router to Nudge Unlocked Passives"),
+                    );
+                    if ui
+                        .add_enabled(
+                            !is_running,
+                            egui::Checkbox::new(&mut self.any_angle_mode, "Any-Angle / Organic Mode (TopoR Arcs)"),
+                        )
+                        .changed()
+                        && has_copper
+                    {
+                        self.swap_organic_tracks(self.any_angle_mode);
+                    }
+                });
+
+                ui.separator();
+                ui.heading("KiCad 10 IPC Live Sync");
+                if ui.checkbox(&mut self.kicad_ipc_enabled, "KiCad IPC Live Sync").changed() {
+                    if self.kicad_ipc_enabled && !self.is_ipc_connected() {
+                        self.try_connect_ipc(false);
+                    } else if !self.kicad_ipc_enabled {
+                        self.ipc = None;
+                    }
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label("Socket:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.kicad_ipc_socket_path)
+                            .hint_text("ipc:///tmp/kicad/api.sock")
+                            .desired_width(160.0),
+                    );
+                    if ui.button("Connect").clicked() {
+                        self.kicad_ipc_enabled = true;
+                        self.try_connect_ipc(false);
+                    }
+                });
+
+                let (status_text, status_col) = match self.ipc.as_ref() {
+                    Some(client_lock) => {
+                        if let Ok(c) = client_lock.lock() {
+                            if c.is_connected() {
+                                ("Connected", Color32::from_rgb(0, 220, 100))
+                            } else {
+                                ("Disconnected (Auto-Retrying...)", Color32::from_rgb(220, 80, 80))
+                            }
+                        } else {
+                            ("Locked", Color32::GRAY)
+                        }
+                    }
+                    None => {
+                        if self.kicad_ipc_enabled {
+                            ("Auto-Retrying...", Color32::from_rgb(220, 150, 40))
+                        } else {
+                            ("Offline", Color32::GRAY)
+                        }
+                    }
+                };
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Status:").strong());
+                    ui.label(egui::RichText::new(status_text).color(status_col));
                 });
 
                 ui.separator();
@@ -4826,6 +5115,263 @@ mod tests {
 
         let _ = fs::remove_file(&in_path);
     }
+
+    #[test]
+    fn test_advanced_autoplacer_and_autorouter_panels_and_preferences() {
+        let temp_pref_path = format!(
+            "/tmp/vulcans_trials_adv_panels_pref_test_{}.json",
+            std::process::id()
+        );
+        let _ = fs::remove_file(&temp_pref_path);
+
+        let board = Board::default();
+        let mut app = VulcansTrialsApp::new(
+            "in.kicad_pcb".to_string(),
+            "out.kicad_pcb".to_string(),
+            board,
+            None,
+        )
+        .with_preferences_path(PathBuf::from(&temp_pref_path));
+
+        // Verify default advanced autorouter and autoplacer fields
+        assert!((app.via_merge_radius_mm - 4.00).abs() < 1e-6);
+        assert!((app.via_detour_budget_mm - 3.50).abs() < 1e-6);
+        assert!((app.via_hop_max_detour_ratio - 1.25).abs() < 1e-6);
+        assert!((app.plane_via_share_radius_mm - 3.50).abs() < 1e-6);
+        assert!((app.return_via_max_dist_mm - 1.40).abs() < 1e-6);
+        assert!((app.via_pad_snap_dist_mm - 0.50).abs() < 1e-6);
+        assert!((app.congestion_factor - 1.50).abs() < 1e-6);
+        assert!((app.crosstalk_penalty - 4.0).abs() < 1e-6);
+        assert!((app.nudge_step_mm - 0.25).abs() < 1e-6);
+        assert_eq!(app.gloss_passes, 2);
+
+        // Mutate both Advanced Autoplacer and Advanced Autorouter settings
+        app.max_jump_radius_mm = 32.0;
+        app.via_merge_radius_mm = 5.50;
+        app.via_detour_budget_mm = 4.25;
+        app.via_hop_max_detour_ratio = 1.45;
+        app.plane_via_share_radius_mm = 4.75;
+        app.return_via_max_dist_mm = 1.85;
+        app.via_pad_snap_dist_mm = 0.70;
+        app.congestion_factor = 2.25;
+        app.crosstalk_penalty = 7.5;
+        app.nudge_step_mm = 0.35;
+        app.gloss_passes = 3;
+
+        let ctx = egui::Context::default();
+        // Expand both collapsible panels in egui memory so their inner widgets render and are exercised
+        let id_placer = egui::Id::new("vulcan_controls_panel").with("Advanced Autoplacer");
+        let id_router = egui::Id::new("vulcan_controls_panel").with("Advanced Autorouter");
+        egui::collapsing_header::CollapsingState::load_with_default_open(&ctx, id_placer, true)
+            .store(&ctx);
+        egui::collapsing_header::CollapsingState::load_with_default_open(&ctx, id_router, true)
+            .store(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.render_ui(ctx);
+        });
+
+        // Verify auto-save persisted all advanced settings to disk
+        let reloaded = AppPreferences::load_from_path(Path::new(&temp_pref_path))
+            .expect("Must reload preferences from disk");
+        assert!((reloaded.max_jump_radius_mm - 32.0).abs() < 1e-6);
+        assert!((reloaded.via_merge_radius_mm - 5.50).abs() < 1e-6);
+        assert!((reloaded.via_detour_budget_mm - 4.25).abs() < 1e-6);
+        assert!((reloaded.via_hop_max_detour_ratio - 1.45).abs() < 1e-6);
+        assert!((reloaded.plane_via_share_radius_mm - 4.75).abs() < 1e-6);
+        assert!((reloaded.return_via_max_dist_mm - 1.85).abs() < 1e-6);
+        assert!((reloaded.via_pad_snap_dist_mm - 0.70).abs() < 1e-6);
+        assert!((reloaded.congestion_factor - 2.25).abs() < 1e-6);
+        assert!((reloaded.crosstalk_penalty - 7.5).abs() < 1e-6);
+        assert!((reloaded.nudge_step_mm - 0.35).abs() < 1e-6);
+        assert_eq!(reloaded.gloss_passes, 3);
+
+        let _ = fs::remove_file(&temp_pref_path);
+    }
+
+    #[test]
+    fn test_swap_organic_tracks_reversible() {
+        let temp_pref_path = format!(
+            "/tmp/vulcans_trials_swap_organic_pref_test_{}.json",
+            std::process::id()
+        );
+        let _ = fs::remove_file(&temp_pref_path);
+
+        let mut net_name_to_id = std::collections::HashMap::new();
+        net_name_to_id.insert(String::new(), 0);
+        net_name_to_id.insert("NET1".to_string(), 1);
+        let mut netclasses = std::collections::HashMap::new();
+        netclasses.insert("Default".to_string(), crate::board::NetClass::default());
+
+        let board = Board {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 40.0,
+            max_y: 40.0,
+            nets: vec![String::new(), "NET1".to_string()],
+            net_name_to_id,
+            netclasses,
+            tracks: vec![
+                TrackSegment {
+                    start: (5.0, 5.0),
+                    end: (15.0, 5.0),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+                TrackSegment {
+                    start: (15.0, 5.0),
+                    end: (25.0, 15.0),
+                    width: 0.25,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+            ],
+            ..Board::default()
+        };
+
+        let mut app = VulcansTrialsApp::new(
+            "in.kicad_pcb".to_string(),
+            "out.kicad_pcb".to_string(),
+            board,
+            None,
+        )
+        .with_preferences_path(PathBuf::from(&temp_pref_path));
+
+        // 1. Swap straight -> organic
+        assert!(app.swap_organic_tracks(true));
+        assert!(app.any_angle_mode);
+        {
+            let g = app.live.lock().unwrap();
+            assert!(
+                !g.board.arcs.is_empty(),
+                "Swapping to organic tracks must produce curved ArcSegments"
+            );
+            assert!(g.straight_copper_snapshot.is_some());
+        }
+
+        // 2. Swap organic -> straight
+        assert!(app.swap_organic_tracks(false));
+        assert!(!app.any_angle_mode);
+        {
+            let g = app.live.lock().unwrap();
+            assert!(
+                g.board.arcs.is_empty(),
+                "Swapping back to straight tracks must restore 0 arcs"
+            );
+            assert_eq!(
+                g.board.tracks.len(),
+                2,
+                "Swapping back to straight tracks must restore the original 2 straight track segments"
+            );
+        }
+
+        let _ = fs::remove_file(&temp_pref_path);
+    }
+
+    #[test]
+    fn test_ipc_auto_retry_and_pull_on_save() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let temp_pref_path = format!(
+            "/tmp/vulcans_trials_ipc_retry_pref_test_{}.json",
+            std::process::id()
+        );
+        let sock_path = format!(
+            "/tmp/vulcans_trials_ipc_retry_sock_{}.sock",
+            std::process::id()
+        );
+        let out_pcb_path = format!(
+            "/tmp/vulcans_trials_ipc_pull_out_{}.kicad_pcb",
+            std::process::id()
+        );
+        let out_ses_path = format!(
+            "/tmp/vulcans_trials_ipc_pull_out_{}.ses",
+            std::process::id()
+        );
+        let _ = fs::remove_file(&temp_pref_path);
+        let _ = fs::remove_file(&sock_path);
+        let _ = fs::remove_file(&out_pcb_path);
+        let _ = fs::remove_file(&out_ses_path);
+
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 20.0;
+        board.max_y = 20.0;
+        board.tracks.push(TrackSegment {
+            start: (2.0, 2.0),
+            end: (10.0, 2.0),
+            width: 0.25,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+
+        let mut app = VulcansTrialsApp::new(
+            out_pcb_path.clone(),
+            out_pcb_path.clone(),
+            board,
+            None,
+        )
+        .with_preferences_path(PathBuf::from(&temp_pref_path));
+
+        // 1. Default launch state has IPC enabled and points to custom socket (not listening yet)
+        assert!(app.kicad_ipc_enabled, "IPC must be enabled by default on launch");
+        app.kicad_ipc_socket_path = format!("ipc://{}", sock_path);
+        app.ipc = None;
+        app.ipc_retry_interval = Duration::from_millis(1);
+        app.last_ipc_retry = Instant::now() - Duration::from_secs(5);
+
+        // Socket is not bound yet -> poll_ipc_auto_reconnect returns false
+        assert!(!app.poll_ipc_auto_reconnect());
+        assert!(!app.is_ipc_connected());
+
+        // 2. Now start the Unix socket server and verify periodic retry connects automatically
+        let listener = UnixListener::bind(&sock_path).expect("Failed to bind test unix socket");
+        let server_thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("Accept failed");
+            let reader = BufReader::new(stream);
+            let mut messages = Vec::new();
+            for line in reader.lines().flatten() {
+                if !line.trim().is_empty() {
+                    let msg: crate::ipc::IpcMessage =
+                        serde_json::from_str(&line).expect("Valid JSON");
+                    let is_pull = matches!(msg, crate::ipc::IpcMessage::PullBoard { .. });
+                    messages.push(msg);
+                    if is_pull {
+                        break;
+                    }
+                }
+            }
+            messages
+        });
+
+        app.last_ipc_retry = Instant::now() - Duration::from_secs(5);
+        assert!(
+            app.poll_ipc_auto_reconnect(),
+            "poll_ipc_auto_reconnect must automatically connect once socket becomes available"
+        );
+        assert!(app.is_ipc_connected());
+
+        // 3. Save the board and verify it pulls the updated board into KiCad over IPC
+        assert!(app.save_output_and_pull_to_kicad());
+        assert!(Path::new(&out_pcb_path).exists());
+        assert!(Path::new(&out_ses_path).exists());
+
+        let received = server_thread.join().expect("Server thread join failed");
+        assert!(
+            received
+                .iter()
+                .any(|m| matches!(m, crate::ipc::IpcMessage::PullBoard { .. })),
+            "Saving the board while IPC is connected must send PullBoard to KiCad"
+        );
+
+        let _ = fs::remove_file(&temp_pref_path);
+        let _ = fs::remove_file(&sock_path);
+        let _ = fs::remove_file(&out_pcb_path);
+        let _ = fs::remove_file(&out_ses_path);
+    }
 }
-
-
