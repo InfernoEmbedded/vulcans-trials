@@ -2842,6 +2842,97 @@ impl Board {
         segments
     }
 
+    /// Filters out ratsnest airwire segments whose endpoints are already electrically
+    /// connected by same-net copper (`tracks` and/or organic `arcs`).
+    pub fn filter_unrouted_ratsnest(&self, ratsnest: &[Segment]) -> Vec<Segment> {
+        if ratsnest.is_empty() || (self.tracks.is_empty() && self.arcs.is_empty()) {
+            return ratsnest.to_vec();
+        }
+
+        let mut net_chords: HashMap<usize, Vec<(Point, Point)>> = HashMap::new();
+        for t in &self.tracks {
+            if t.net_id > 0 {
+                net_chords.entry(t.net_id).or_default().push((
+                    Point::new(t.start.0, t.start.1),
+                    Point::new(t.end.0, t.end.1),
+                ));
+            }
+        }
+        for a in &self.arcs {
+            if a.net_id > 0 {
+                let (sx, sy) = a.start();
+                let (mx, my) = a.mid();
+                let (ex, ey) = a.end();
+                let s = Point::new(sx, sy);
+                let m = Point::new(mx, my);
+                let e = Point::new(ex, ey);
+                let entry = net_chords.entry(a.net_id).or_default();
+                entry.push((s, m));
+                entry.push((m, e));
+            }
+        }
+
+        fn find_root(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+
+        let mut net_uf: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (&net_id, chords) in &net_chords {
+            let m = chords.len();
+            let mut parent: Vec<usize> = (0..m).collect();
+            for i in 0..m {
+                let (a1, b1) = chords[i];
+                for j in (i + 1)..m {
+                    let (a2, b2) = chords[j];
+                    if a1.distance_to_segment(&a2, &b2) <= 0.35
+                        || b1.distance_to_segment(&a2, &b2) <= 0.35
+                        || a2.distance_to_segment(&a1, &b1) <= 0.35
+                        || b2.distance_to_segment(&a1, &b1) <= 0.35
+                    {
+                        let ri = find_root(&mut parent, i);
+                        let rj = find_root(&mut parent, j);
+                        if ri != rj {
+                            parent[ri] = rj;
+                        }
+                    }
+                }
+            }
+            for i in 0..m {
+                let _ = find_root(&mut parent, i);
+            }
+            net_uf.insert(net_id, parent);
+        }
+
+        ratsnest
+            .iter()
+            .filter(|seg| {
+                let Some(chords) = net_chords.get(&seg.net_id) else {
+                    return true;
+                };
+                let Some(roots) = net_uf.get(&seg.net_id) else {
+                    return true;
+                };
+                let pad_touch_tol = 0.85;
+                let mut p1_roots = Vec::new();
+                let mut p2_roots = Vec::new();
+                for (idx, &(a, b)) in chords.iter().enumerate() {
+                    if seg.p1.distance_to_segment(&a, &b) <= pad_touch_tol {
+                        p1_roots.push(roots[idx]);
+                    }
+                    if seg.p2.distance_to_segment(&a, &b) <= pad_touch_tol {
+                        p2_roots.push(roots[idx]);
+                    }
+                }
+                !p1_roots.iter().any(|r1| p2_roots.contains(r1))
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn to_kicad_pcb(&self) -> Result<String, String> {
         let is_kicad10_named_nets = self.raw_content.contains("(version 2026")
             || self.raw_content.contains("(generator_version \"10.")

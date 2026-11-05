@@ -1872,6 +1872,7 @@ impl VulcansTrialsApp {
             let added_vias = route.vias_placed.len();
             g.board.vias.extend(route.vias_placed);
             g.refresh_ratsnest();
+            g.ratsnest = g.board.filter_unrouted_ratsnest(&g.ratsnest);
             g.push_log(format!(
                 "[Route] Committed route for net '{}': {} tracks, {} vias",
                 route.net_name, added_tracks, added_vias
@@ -1988,6 +1989,7 @@ impl VulcansTrialsApp {
         if ok {
             let total_tracks = g.board.tracks.len();
             g.refresh_ratsnest();
+            g.ratsnest = g.board.filter_unrouted_ratsnest(&g.ratsnest);
             g.push_log(format!(
                 "[BusBundle] Committed bundle '{}' ({} nets, {} guide waypoints). Total tracks: {}",
                 bundle.name, bundle.net_ids.len(), bundle.guide_points.len(), total_tracks
@@ -2042,7 +2044,7 @@ impl VulcansTrialsApp {
             crate::router::convert_tracks_to_organic(&mut g.board);
             let num_tracks = g.board.tracks.len();
             let num_arcs = g.board.arcs.len();
-            g.refresh_ratsnest();
+            g.ratsnest = g.board.filter_unrouted_ratsnest(&g.ratsnest);
             g.push_log(format!(
                 "[Organic] Swapped to hand-drawn organic tracks: {} straight segments, {} curved arcs",
                 num_tracks, num_arcs
@@ -2058,7 +2060,7 @@ impl VulcansTrialsApp {
             }
             let num_tracks = g.board.tracks.len();
             let num_arcs = g.board.arcs.len();
-            g.refresh_ratsnest();
+            g.ratsnest = g.board.filter_unrouted_ratsnest(&g.ratsnest);
             g.push_log(format!(
                 "[Organic] Swapped back to straight 45° tracks: {} segments, {} arcs",
                 num_tracks, num_arcs
@@ -5194,52 +5196,51 @@ mod tests {
             "/tmp/vulcans_trials_swap_organic_pref_test_{}.json",
             std::process::id()
         );
+        let temp_pcb_path = format!(
+            "/tmp/vulcans_trials_swap_organic_pcb_test_{}.kicad_pcb",
+            std::process::id()
+        );
         let _ = fs::remove_file(&temp_pref_path);
+        let _ = fs::remove_file(&temp_pcb_path);
 
-        let mut net_name_to_id = std::collections::HashMap::new();
-        net_name_to_id.insert(String::new(), 0);
-        net_name_to_id.insert("NET1".to_string(), 1);
-        let mut netclasses = std::collections::HashMap::new();
-        netclasses.insert("Default".to_string(), crate::board::NetClass::default());
-
-        let board = Board {
-            min_x: 0.0,
-            min_y: 0.0,
-            max_x: 40.0,
-            max_y: 40.0,
-            nets: vec![String::new(), "NET1".to_string()],
-            net_name_to_id,
-            netclasses,
-            tracks: vec![
-                TrackSegment {
-                    start: (5.0, 5.0),
-                    end: (15.0, 5.0),
-                    width: 0.25,
-                    layer: 0,
-                    net_id: 1,
-                    is_locked: false,
-                },
-                TrackSegment {
-                    start: (15.0, 5.0),
-                    end: (25.0, 15.0),
-                    width: 0.25,
-                    layer: 0,
-                    net_id: 1,
-                    is_locked: false,
-                },
-            ],
-            ..Board::default()
-        };
+        let content = r#"(kicad_pcb
+          (net 0 "") (net 1 "NET1")
+          (gr_rect (start 0.0 0.0) (end 40.0 40.0) (layer "Edge.Cuts"))
+          (footprint "R" (at 5.0 5.0) (property "Reference" "R1")
+            (pad "1" smd rect (at 0 0) (size 0.8 0.8) (layers "F.Cu") (net 1 "NET1")))
+          (footprint "R" (at 25.0 15.0) (property "Reference" "R2")
+            (pad "1" smd rect (at 0 0) (size 0.8 0.8) (layers "F.Cu") (net 1 "NET1")))
+        )"#;
+        fs::write(&temp_pcb_path, content).unwrap();
+        let mut board = Board::load(&temp_pcb_path, &HashSet::new()).unwrap();
+        board.tracks = vec![
+            TrackSegment {
+                start: (5.0, 5.0),
+                end: (15.0, 5.0),
+                width: 0.25,
+                layer: 0,
+                net_id: 1,
+                is_locked: false,
+            },
+            TrackSegment {
+                start: (15.0, 5.0),
+                end: (25.0, 15.0),
+                width: 0.25,
+                layer: 0,
+                net_id: 1,
+                is_locked: false,
+            },
+        ];
 
         let mut app = VulcansTrialsApp::new(
-            "in.kicad_pcb".to_string(),
-            "out.kicad_pcb".to_string(),
+            temp_pcb_path.clone(),
+            temp_pcb_path.clone(),
             board,
             None,
         )
         .with_preferences_path(PathBuf::from(&temp_pref_path));
 
-        // 1. Swap straight -> organic
+        // 1. Swap straight -> organic: pads are routed so airwires must NOT redraw
         assert!(app.swap_organic_tracks(true));
         assert!(app.any_angle_mode);
         {
@@ -5249,9 +5250,13 @@ mod tests {
                 "Swapping to organic tracks must produce curved ArcSegments"
             );
             assert!(g.straight_copper_snapshot.is_some());
+            assert!(
+                g.ratsnest.is_empty(),
+                "Swapping to organic tracks must not redraw airwires for already-routed pads"
+            );
         }
 
-        // 2. Swap organic -> straight
+        // 2. Swap organic -> straight: airwires must remain empty
         assert!(app.swap_organic_tracks(false));
         assert!(!app.any_angle_mode);
         {
@@ -5265,9 +5270,14 @@ mod tests {
                 2,
                 "Swapping back to straight tracks must restore the original 2 straight track segments"
             );
+            assert!(
+                g.ratsnest.is_empty(),
+                "Swapping back to straight tracks must not redraw airwires for already-routed pads"
+            );
         }
 
         let _ = fs::remove_file(&temp_pref_path);
+        let _ = fs::remove_file(&temp_pcb_path);
     }
 
     #[test]

@@ -2661,7 +2661,30 @@ impl AutoRouter {
         let e_layer = efp.layer;
         let net_id = conn.net_id;
 
-        let tracks: Vec<&TrackSegment> = board.tracks.iter().filter(|t| t.net_id == net_id).collect();
+        let mut tracks: Vec<TrackSegment> = board
+            .tracks
+            .iter()
+            .filter(|t| t.net_id == net_id)
+            .cloned()
+            .collect();
+        for a in board.arcs.iter().filter(|a| a.net_id == net_id) {
+            tracks.push(TrackSegment {
+                start: a.start(),
+                end: a.mid(),
+                width: a.width,
+                layer: a.layer,
+                net_id: a.net_id,
+                is_locked: a.is_locked,
+            });
+            tracks.push(TrackSegment {
+                start: a.mid(),
+                end: a.end(),
+                width: a.width,
+                layer: a.layer,
+                net_id: a.net_id,
+                is_locked: a.is_locked,
+            });
+        }
         let vias: Vec<&Via> = board.vias.iter().filter(|v| v.net_id == net_id).collect();
         let n_t = tracks.len();
         let n_v = vias.len();
@@ -2671,9 +2694,9 @@ impl AutoRouter {
         const EPS: f64 = 0.05;
         let mut adj = vec![Vec::new(); n_t + n_v];
         for i in 0..n_t {
-            let ti = tracks[i];
+            let ti = &tracks[i];
             for j in (i + 1)..n_t {
-                let tj = tracks[j];
+                let tj = &tracks[j];
                 if ti.layer == tj.layer {
                     let c = (ti.start.0 - tj.start.0).hypot(ti.start.1 - tj.start.1) < EPS
                         || (ti.start.0 - tj.end.0).hypot(ti.start.1 - tj.end.1) < EPS
@@ -2705,7 +2728,7 @@ impl AutoRouter {
         let mut queue = VecDeque::new();
         let mut visited = vec![false; n_t + n_v];
         for i in 0..n_t {
-            let ti = tracks[i];
+            let ti = &tracks[i];
             if s_th || ti.layer == s_layer {
                 if (ti.start.0 - s_pos.0).hypot(ti.start.1 - s_pos.1) < 0.12
                     || (ti.end.0 - s_pos.0).hypot(ti.end.1 - s_pos.1) < 0.12
@@ -2719,7 +2742,7 @@ impl AutoRouter {
         }
         while let Some(u) = queue.pop_front() {
             if u < n_t {
-                let ti = tracks[u];
+                let ti = &tracks[u];
                 if e_th || ti.layer == e_layer {
                     if (ti.start.0 - e_pos.0).hypot(ti.start.1 - e_pos.1) < 0.12
                         || (ti.end.0 - e_pos.0).hypot(ti.end.1 - e_pos.1) < 0.12
@@ -13532,18 +13555,23 @@ fn try_fit_organic_bow(
     width: f64,
     layer: usize,
     net_id: usize,
-) -> Option<ArcSegment> {
+) -> Option<(TrackSegment, ArcSegment, TrackSegment)> {
     let dx = end_pt.0 - start_pt.0;
     let dy = end_pt.1 - start_pt.1;
     let len = dx.hypot(dy);
+    const STUB_MM: f64 = 0.20;
     if len < 1.8 {
         return None;
     }
-    let nx = -dy / len;
-    let ny = dx / len;
-    let mid_x = (start_pt.0 + end_pt.0) * 0.5;
-    let mid_y = (start_pt.1 + end_pt.1) * 0.5;
-    let base_bow = (len * 0.06).clamp(0.12, 0.55);
+    let ux = dx / len;
+    let uy = dy / len;
+    let nx = -uy;
+    let ny = ux;
+    let arc_start = (start_pt.0 + ux * STUB_MM, start_pt.1 + uy * STUB_MM);
+    let arc_end = (end_pt.0 - ux * STUB_MM, end_pt.1 - uy * STUB_MM);
+    let mid_x = (arc_start.0 + arc_end.0) * 0.5;
+    let mid_y = (arc_start.1 + arc_end.1) * 0.5;
+    let base_bow = ((len - 2.0 * STUB_MM) * 0.06).clamp(0.12, 0.55);
     let pref_sign = if ((start_pt.0 * 10.0) as i64 + (end_pt.1 * 10.0) as i64 + net_id as i64) % 2 == 0 {
         1.0
     } else {
@@ -13553,9 +13581,25 @@ fn try_fit_organic_bow(
         for scale in [1.0, 0.65, 0.4] {
             let offset = base_bow * scale * sign;
             let m_bow = (mid_x + nx * offset, mid_y + ny * offset);
-            if let Some(arc) = ArcSegment::from_3pts(start_pt, m_bow, end_pt, width, layer, net_id) {
+            if let Some(arc) = ArcSegment::from_3pts(arc_start, m_bow, arc_end, width, layer, net_id) {
                 if is_arc_clear(board, &arc) {
-                    return Some(arc);
+                    let s1 = TrackSegment {
+                        start: start_pt,
+                        end: arc.start(),
+                        width,
+                        layer,
+                        net_id,
+                        is_locked: false,
+                    };
+                    let s2 = TrackSegment {
+                        start: arc.end(),
+                        end: end_pt,
+                        width,
+                        layer,
+                        net_id,
+                        is_locked: false,
+                    };
+                    return Some((s1, arc, s2));
                 }
             }
         }
@@ -13599,10 +13643,12 @@ fn apply_tangent_arcs_with_options(board: &mut Board, target_radius: f64, fit_st
                     let start_pt = chain.points[k];
                     let end_pt = chain.points[k + 1];
                     if fit_straight_bows {
-                        if let Some(bow_arc) =
+                        if let Some((s1, bow_arc, s2)) =
                             try_fit_organic_bow(board, start_pt, end_pt, chain.width, chain.layer, chain.net_id)
                         {
+                            board.tracks.push(s1);
                             board.arcs.push(bow_arc);
+                            board.tracks.push(s2);
                             continue;
                         }
                     }
@@ -13696,10 +13742,12 @@ fn apply_tangent_arcs_with_options(board: &mut Board, target_radius: f64, fit_st
                     let both_ends_un_arced =
                         (k == 0 || corner_arcs[k].is_none()) && corner_arcs[k + 1].is_none();
                     if fit_straight_bows && both_ends_un_arced {
-                        if let Some(bow_arc) =
+                        if let Some((s1, bow_arc, s2)) =
                             try_fit_organic_bow(board, start_pt, end_pt, chain.width, chain.layer, chain.net_id)
                         {
+                            board.tracks.push(s1);
                             board.arcs.push(bow_arc);
+                            board.tracks.push(s2);
                             continue;
                         }
                     }
@@ -15468,6 +15516,82 @@ pub fn validate_and_clean_copper(board: &mut Board) {
             board.raw_content.push_str("\n)\n");
         }
     }
+
+    // KiCad 10 SHAPE_ARC::Collide(SHAPE_RECT, 0) quirk: shallow arcs terminating directly on a
+    // rectangular pad center without a straight segment stub can fail pad-to-arc connectivity.
+    if !board.arcs.is_empty() && !board.footprints.is_empty() {
+        let mut pad_centers: Vec<((f64, f64), usize, usize, bool)> = Vec::new();
+        for fp in &board.footprints {
+            for pad in &fp.pads {
+                if pad.net_id > 0 {
+                    pad_centers.push((
+                        fp.pad_absolute_position(pad),
+                        pad.net_id,
+                        fp.layer,
+                        pad.is_through_hole,
+                    ));
+                }
+            }
+        }
+        let mut stub_tracks = Vec::new();
+        for arc in &mut board.arcs {
+            if arc.radius <= 0.1 || (arc.end_angle_rad - arc.start_angle_rad).abs() * arc.radius <= 0.60 {
+                continue;
+            }
+            let sign = if arc.end_angle_rad >= arc.start_angle_rad { 1.0 } else { -1.0 };
+            let delta = 0.20 / arc.radius;
+            let as_pt = arc.start();
+            let start_on_pad = pad_centers.iter().any(|&(p, nid, lyr, th)| {
+                nid == arc.net_id && (th || lyr == arc.layer) && (as_pt.0 - p.0).hypot(as_pt.1 - p.1) < 0.05
+            });
+            if start_on_pad {
+                let has_track = board.tracks.iter().any(|t| {
+                    t.net_id == arc.net_id
+                        && t.layer == arc.layer
+                        && ((t.start.0 - as_pt.0).hypot(t.start.1 - as_pt.1) < 0.02
+                            || (t.end.0 - as_pt.0).hypot(t.end.1 - as_pt.1) < 0.02)
+                });
+                if !has_track {
+                    arc.start_angle_rad += sign * delta;
+                    let new_start = arc.start();
+                    stub_tracks.push(TrackSegment {
+                        start: as_pt,
+                        end: new_start,
+                        width: arc.width,
+                        layer: arc.layer,
+                        net_id: arc.net_id,
+                        is_locked: arc.is_locked,
+                    });
+                }
+            }
+            let ae_pt = arc.end();
+            let end_on_pad = pad_centers.iter().any(|&(p, nid, lyr, th)| {
+                nid == arc.net_id && (th || lyr == arc.layer) && (ae_pt.0 - p.0).hypot(ae_pt.1 - p.1) < 0.05
+            });
+            if end_on_pad && (arc.end_angle_rad - arc.start_angle_rad).abs() * arc.radius > 0.40 {
+                let has_track = board.tracks.iter().any(|t| {
+                    t.net_id == arc.net_id
+                        && t.layer == arc.layer
+                        && ((t.start.0 - ae_pt.0).hypot(t.start.1 - ae_pt.1) < 0.02
+                            || (t.end.0 - ae_pt.0).hypot(t.end.1 - ae_pt.1) < 0.02)
+                });
+                if !has_track {
+                    arc.end_angle_rad -= sign * delta;
+                    let new_end = arc.end();
+                    stub_tracks.push(TrackSegment {
+                        start: new_end,
+                        end: ae_pt,
+                        width: arc.width,
+                        layer: arc.layer,
+                        net_id: arc.net_id,
+                        is_locked: arc.is_locked,
+                    });
+                }
+            }
+        }
+        board.tracks.extend(stub_tracks);
+    }
+
     let mut changed = true;
     let mut iteration = 0;
     while changed && iteration < 10 {
@@ -20438,23 +20562,30 @@ mod tests {
             );
         }
 
-        // 2. Test C7 south pad (Pad 2, GND) stitching
+        // 2. Test C7 GND pad stitching
         let gnd_net_id = *board.net_name_to_id.get("GND").unwrap();
         router.add_plane_stitching_vias(&mut board, &grid);
         prune_dangling_tracks_and_vias(&mut board);
 
         let c7 = board.footprints.iter().find(|fp| fp.reference == "C7").unwrap();
-        let c7_pad2 = c7.pads.iter().find(|p| p.number == "2").unwrap();
-        let (c7_px, c7_py) = c7.pad_absolute_position(c7_pad2);
+        let c7_gnd_pad = c7.pads.iter().find(|p| p.net_id == gnd_net_id).unwrap();
+        let (c7_px, c7_py) = c7.pad_absolute_position(c7_gnd_pad);
         let c7_connected = board.tracks.iter().any(|t| {
             t.net_id == gnd_net_id
                 && t.layer == c7.layer
                 && ((t.start.0 - c7_px).hypot(t.start.1 - c7_py) < 0.08
                     || (t.end.0 - c7_px).hypot(t.end.1 - c7_py) < 0.08)
+        }) || board.arcs.iter().any(|a| {
+            let s = a.start();
+            let e = a.end();
+            a.net_id == gnd_net_id
+                && a.layer == c7.layer
+                && ((s.0 - c7_px).hypot(s.1 - c7_py) < 0.08
+                    || (e.0 - c7_px).hypot(e.1 - c7_py) < 0.08)
         });
         assert!(
             c7_connected,
-            "South pad (Pad 2, GND) of C7 at ({:.4}, {:.4}) must have a connected GND stitching track",
+            "GND pad of C7 at ({:.4}, {:.4}) must have a connected GND stitching track or arc",
             c7_px,
             c7_py
         );
