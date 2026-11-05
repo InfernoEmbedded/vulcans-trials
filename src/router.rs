@@ -4980,6 +4980,8 @@ impl AutoRouter {
             }
         }
 
+        widen_tracks_and_arcs_to_netclass(board);
+
         let pre_organic_snapshot = if self.config.any_angle_mode {
             let snap = (board.tracks.clone(), board.arcs.clone());
             convert_tracks_to_organic(board);
@@ -13273,6 +13275,28 @@ pub fn collect_obstacles_for_net(board: &Board, layer: usize, net_id: usize, tra
     obstacles
 }
 
+pub fn subdivide_long_segments(points: &mut Vec<(f64, f64)>, max_seg_len: f64) {
+    if points.len() < 2 || max_seg_len <= 0.1 {
+        return;
+    }
+    let mut out = Vec::with_capacity(points.len() * 2);
+    out.push(points[0]);
+    for w in points.windows(2) {
+        let p0 = w[0];
+        let p1 = w[1];
+        let len = (p1.0 - p0.0).hypot(p1.1 - p0.1);
+        if len > max_seg_len && out.len() < 28 {
+            let steps = ((len / max_seg_len).ceil() as usize).clamp(2, 6);
+            for s in 1..steps {
+                let t = s as f64 / steps as f64;
+                out.push((p0.0 + t * (p1.0 - p0.0), p0.1 + t * (p1.1 - p0.1)));
+            }
+        }
+        out.push(p1);
+    }
+    *points = out;
+}
+
 pub fn relax_homotopic_rubber_bands(board: &mut Board) {
     let mut net_ids: Vec<usize> = board
         .tracks
@@ -13283,37 +13307,63 @@ pub fn relax_homotopic_rubber_bands(board: &mut Board) {
     net_ids.sort_unstable();
     net_ids.dedup();
 
-    for net_id in net_ids {
-        let net_tracks: Vec<TrackSegment> = board
-            .tracks
-            .iter()
-            .filter(|t| t.net_id == net_id && !t.is_locked)
-            .cloned()
-            .collect();
-        if net_tracks.is_empty() {
-            continue;
-        }
+    for outer_pass in 0..2 {
+        let iter_nets: Vec<usize> = if outer_pass % 2 == 0 {
+            net_ids.clone()
+        } else {
+            net_ids.iter().copied().rev().collect()
+        };
+        for net_id in iter_nets {
+            let net_tracks: Vec<TrackSegment> = board
+                .tracks
+                .iter()
+                .filter(|t| t.net_id == net_id && !t.is_locked)
+                .cloned()
+                .collect();
+            if net_tracks.is_empty() {
+                continue;
+            }
 
-        board.tracks.retain(|t| t.net_id != net_id || t.is_locked);
+            board.tracks.retain(|t| t.net_id != net_id || t.is_locked);
 
-        let mut chains = extract_track_chains(&net_tracks, board);
-        for chain in &mut chains {
-            relax_chain_homotopic(chain, board);
-        }
+            let nc_w = board.get_netclass_for_net(net_id).track_width;
+            let mut chains = extract_track_chains(&net_tracks, board);
+            for chain in &mut chains {
+                for pass in 0..2 {
+                    if pass == 1 {
+                        relax_chain_homotopic(chain, board);
+                    }
+                    if nc_w > chain.width + 1e-3 && chain.points.len() >= 2 {
+                        for &cand_w in &[nc_w, 0.50, 0.45, 0.40, 0.35, 0.30, 0.25, 0.20] {
+                            if cand_w <= chain.width + 1e-3 || cand_w > nc_w + 1e-3 {
+                                continue;
+                            }
+                            let all_ok = chain.points.windows(2).all(|w| {
+                                is_segment_clear(board, None, w[0], w[1], chain.layer, chain.net_id, cand_w)
+                            });
+                            if all_ok {
+                                chain.width = cand_w;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
 
-        for chain in chains {
-            for k in 0..chain.points.len().saturating_sub(1) {
-                let p1 = chain.points[k];
-                let p2 = chain.points[k + 1];
-                if (p1.0 - p2.0).hypot(p1.1 - p2.1) > 1e-5 {
-                    board.tracks.push(TrackSegment {
-                        start: p1,
-                        end: p2,
-                        width: chain.width,
-                        layer: chain.layer,
-                        net_id: chain.net_id,
-                        is_locked: false,
-                    });
+            for chain in chains {
+                for k in 0..chain.points.len().saturating_sub(1) {
+                    let p1 = chain.points[k];
+                    let p2 = chain.points[k + 1];
+                    if (p1.0 - p2.0).hypot(p1.1 - p2.1) > 1e-5 {
+                        board.tracks.push(TrackSegment {
+                            start: p1,
+                            end: p2,
+                            width: chain.width,
+                            layer: chain.layer,
+                            net_id: chain.net_id,
+                            is_locked: false,
+                        });
+                    }
                 }
             }
         }
@@ -13325,11 +13375,15 @@ pub fn relax_chain_homotopic(chain: &mut TrackChain, board: &Board) {
         return;
     }
 
-    let obstacles = collect_obstacles_for_net(board, chain.layer, chain.net_id, chain.width);
+    let nc_w = board.get_netclass_for_net(chain.net_id).track_width.max(chain.width);
+    let obstacles = collect_obstacles_for_net(board, chain.layer, chain.net_id, nc_w);
 
     // Iterative rubber-band string pulling passes
-    for _pass in 0..6 {
+    for pass in 0..5 {
         merge_collinear_points(&mut chain.points);
+        if pass == 0 {
+            subdivide_long_segments(&mut chain.points, 3.0);
+        }
         if chain.points.len() < 3 {
             break;
         }
@@ -13450,17 +13504,78 @@ pub fn relax_chain_homotopic(chain: &mut TrackChain, board: &Board) {
     }
 
     merge_collinear_points(&mut chain.points);
+
+    // 5. Netclass Channel Centering for wide power nets
+    if nc_w > 0.25 && nc_w > chain.width + 1e-3 {
+        for k in 1..chain.points.len().saturating_sub(1) {
+            let p_prev = chain.points[k - 1];
+            let p_curr = chain.points[k];
+            let p_next = chain.points[k + 1];
+            if is_segment_clear(board, None, p_prev, p_curr, chain.layer, chain.net_id, nc_w)
+                && is_segment_clear(board, None, p_curr, p_next, chain.layer, chain.net_id, nc_w)
+            {
+                continue;
+            }
+            let dx = p_next.0 - p_prev.0;
+            let dy = p_next.1 - p_prev.1;
+            let dlen = dx.hypot(dy);
+            if dlen <= 1e-4 {
+                continue;
+            }
+            let nx = -dy / dlen;
+            let ny = dx / dlen;
+            for &target_w in &[nc_w, 0.50, 0.45, 0.40, 0.35, 0.30] {
+                if target_w <= chain.width + 1e-3 || target_w > nc_w + 1e-3 {
+                    continue;
+                }
+                if is_segment_clear(board, None, p_prev, p_curr, chain.layer, chain.net_id, target_w)
+                    && is_segment_clear(board, None, p_curr, p_next, chain.layer, chain.net_id, target_w)
+                {
+                    break;
+                }
+                let mut moved = false;
+                for step in [0.08, -0.08, 0.16, -0.16, 0.24, -0.24, 0.32, -0.32, 0.42, -0.42] {
+                    let cand = (p_curr.0 + nx * step, p_curr.1 + ny * step);
+                    let tri1 = [p_prev, p_curr, cand];
+                    let tri2 = [p_curr, p_next, cand];
+                    if obstacles.iter().all(|o| !point_in_polygon(o.center, &tri1) && !point_in_polygon(o.center, &tri2))
+                        && is_segment_clear(board, None, p_prev, cand, chain.layer, chain.net_id, target_w)
+                        && is_segment_clear(board, None, cand, p_next, chain.layer, chain.net_id, target_w)
+                    {
+                        chain.points[k] = cand;
+                        moved = true;
+                        break;
+                    }
+                }
+                if moved {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 pub fn is_arc_clear(board: &Board, arc: &ArcSegment) -> bool {
     let clearance = board.get_netclass_for_net(arc.net_id).clearance;
-    let half_w = arc.width * 0.5;
-    let segs = arc.to_segments(8);
+    // Include 0.025 mm chord-sagitta safety margin so outward circular arc bulge never violates clearance
+    let half_w = arc.width * 0.5 + 0.025;
+    let n_segs = ((arc.length() / 0.6).ceil() as usize).clamp(8, 28);
+    let segs = arc.to_segments(n_segs);
 
     // 0. Board Boundary (when board outline polygon is present)
-    if board.outline_polygon.is_some() {
+    if let Some(ref poly) = board.outline_polygon {
+        let b = poly.aabb();
+        let edge_clr = board.get_netclass_for_net(arc.net_id).board_edge_clearance + half_w;
         for s in &segs {
-            if !board.contains_point_in_boundary(&Point::new(s.start.0, s.start.1))
+            if s.start.0 < b.min_x + edge_clr
+                || s.start.0 > b.max_x - edge_clr
+                || s.start.1 < b.min_y + edge_clr
+                || s.start.1 > b.max_y - edge_clr
+                || s.end.0 < b.min_x + edge_clr
+                || s.end.0 > b.max_x - edge_clr
+                || s.end.1 < b.min_y + edge_clr
+                || s.end.1 > b.max_y - edge_clr
+                || !board.contains_point_in_boundary(&Point::new(s.start.0, s.start.1))
                 || !board.contains_point_in_boundary(&Point::new(s.end.0, s.end.1))
             {
                 return false;
@@ -13534,7 +13649,7 @@ pub fn is_arc_clear(board: &Board, arc: &ArcSegment) -> bool {
             let other_clr = board.get_netclass_for_net(other.net_id).clearance;
             let req_clr = clearance.max(other_clr);
             let required_dist = half_w + (other.width * 0.5) + req_clr;
-            let other_segs = other.to_segments(8);
+            let other_segs = other.to_segments(12);
             for s in &segs {
                 for os in &other_segs {
                     if dist_segment_to_segment(s.start, s.end, os.start, os.end) < required_dist - 1e-4 {
@@ -13548,63 +13663,324 @@ pub fn is_arc_clear(board: &Board, arc: &ArcSegment) -> bool {
     true
 }
 
-fn try_fit_organic_bow(
+fn try_fit_sweeping_chain_arc(
     board: &Board,
-    start_pt: (f64, f64),
-    end_pt: (f64, f64),
+    points: &[(f64, f64)],
     width: f64,
     layer: usize,
     net_id: usize,
+    obstacles: &[ObstacleInfo],
 ) -> Option<(TrackSegment, ArcSegment, TrackSegment)> {
-    let dx = end_pt.0 - start_pt.0;
-    let dy = end_pt.1 - start_pt.1;
-    let len = dx.hypot(dy);
-    const STUB_MM: f64 = 0.20;
-    if len < 1.8 {
+    let n = points.len();
+    if !(3..=4).contains(&n) {
         return None;
     }
-    let ux = dx / len;
-    let uy = dy / len;
-    let nx = -uy;
-    let ny = ux;
-    let arc_start = (start_pt.0 + ux * STUB_MM, start_pt.1 + uy * STUB_MM);
-    let arc_end = (end_pt.0 - ux * STUB_MM, end_pt.1 - uy * STUB_MM);
+    const STUB_MM: f64 = 0.20;
+    let p_first = points[0];
+    let p_second = points[1];
+    let p_penult = points[n - 2];
+    let p_last = points[n - 1];
+
+    let l_first = (p_second.0 - p_first.0).hypot(p_second.1 - p_first.1);
+    let l_last = (p_last.0 - p_penult.0).hypot(p_last.1 - p_penult.1);
+    if l_first < STUB_MM + 0.1 || l_last < STUB_MM + 0.1 {
+        return None;
+    }
+
+    let u_first = ((p_second.0 - p_first.0) / l_first, (p_second.1 - p_first.1) / l_first);
+    let u_last = ((p_penult.0 - p_last.0) / l_last, (p_penult.1 - p_last.1) / l_last);
+    let arc_start = (p_first.0 + u_first.0 * STUB_MM, p_first.1 + u_first.1 * STUB_MM);
+    let arc_end = (p_last.0 + u_last.0 * STUB_MM, p_last.1 + u_last.1 * STUB_MM);
+
+    let chord_len = (arc_end.0 - arc_start.0).hypot(arc_end.1 - arc_start.1);
+    if chord_len < 1.0 {
+        return None;
+    }
+
+    let apex = if n == 3 {
+        points[1]
+    } else {
+        ((points[1].0 + points[2].0) * 0.5, (points[1].1 + points[2].1) * 0.5)
+    };
+    let chord_mid = ((arc_start.0 + arc_end.0) * 0.5, (arc_start.1 + arc_end.1) * 0.5);
+    let dev = (apex.0 - chord_mid.0).hypot(apex.1 - chord_mid.1);
+    if dev < 0.05 || dev > chord_len * 0.85 {
+        return None;
+    }
+
+    for w in [0.50, 0.38, 0.62, 0.26, 0.75, 0.16] {
+        let m_cand = (
+            chord_mid.0 + w * (apex.0 - chord_mid.0),
+            chord_mid.1 + w * (apex.1 - chord_mid.1),
+        );
+        if let Some(arc) = ArcSegment::from_3pts(arc_start, m_cand, arc_end, width, layer, net_id) {
+            let sweep = (arc.end_angle_rad - arc.start_angle_rad).abs();
+            if sweep > 2.4 || arc.radius < 0.50 {
+                continue;
+            }
+            let mut loop_poly = points.to_vec();
+            let mut arc_pts: Vec<(f64, f64)> = arc.to_segments(12).into_iter().map(|s| s.end).collect();
+            arc_pts.reverse();
+            loop_poly.extend(arc_pts);
+            let homotopy_ok = obstacles.iter().all(|obs| !point_in_polygon(obs.center, &loop_poly));
+            if homotopy_ok && is_arc_clear(board, &arc) {
+                let s1 = TrackSegment {
+                    start: p_first,
+                    end: arc.start(),
+                    width,
+                    layer,
+                    net_id,
+                    is_locked: false,
+                };
+                let s2 = TrackSegment {
+                    start: arc.end(),
+                    end: p_last,
+                    width,
+                    layer,
+                    net_id,
+                    is_locked: false,
+                };
+                return Some((s1, arc, s2));
+            }
+        }
+    }
+    None
+}
+
+/// Fits a G1-continuous asymmetric bi-arc at corner `p_curr` when one leg is much longer than the other,
+/// replacing both the corner and a large span of the long leg with two tangent circular arcs.
+fn try_fit_asymmetric_corner_biarc(
+    board: &Board,
+    p_curr: (f64, f64),
+    u1: (f64, f64),
+    u2: (f64, f64),
+    avail_a: f64,
+    avail_b: f64,
+    width: f64,
+    layer: usize,
+    net_id: usize,
+) -> Option<((f64, f64), (f64, f64), Vec<ArcSegment>, f64)> {
+    let a_is_short = avail_a < avail_b;
+    let short_avail = avail_a.min(avail_b);
+    let long_avail = avail_a.max(avail_b);
+    if short_avail < 0.35 || long_avail < short_avail * 1.6 || long_avail < 2.5 {
+        return None;
+    }
+
+    let d_short = (short_avail * 0.90).min(3.5);
+    let (u_short, u_long) = if a_is_short { (u1, u2) } else { (u2, u1) };
+
+    for long_frac in [0.85, 0.65, 0.48, 0.35] {
+        let d_long = (long_avail * long_frac).min(d_short * 4.5).max(d_short * 1.5);
+        if d_long <= d_short * 1.3 || d_long > long_avail {
+            continue;
+        }
+        let t_short = (p_curr.0 + d_short * u_short.0, p_curr.1 + d_short * u_short.1);
+        let t_long = (p_curr.0 + d_long * u_long.0, p_curr.1 + d_long * u_long.1);
+
+        let s1 = d_short * 0.55;
+        let q1 = (
+            p_curr.0 + (d_short - s1) * u_short.0,
+            p_curr.1 + (d_short - s1) * u_short.1,
+        );
+        let w = (t_long.0 - q1.0, t_long.1 - q1.1);
+        let w_len2 = w.0 * w.0 + w.1 * w.1;
+        let w_dot_ulong = w.0 * u_long.0 + w.1 * u_long.1;
+        let denom = 2.0 * (s1 + w_dot_ulong);
+        if denom <= 1e-5 {
+            continue;
+        }
+        let s2 = (w_len2 - s1 * s1) / denom;
+        if s2 <= 0.1 || s2 >= d_long - 0.05 {
+            continue;
+        }
+        let q2 = (t_long.0 - s2 * u_long.0, t_long.1 - s2 * u_long.1);
+        let join = (
+            (s2 * q1.0 + s1 * q2.0) / (s1 + s2),
+            (s2 * q1.1 + s1 * q2.1) / (s1 + s2),
+        );
+
+        let c1 = ((t_short.0 + join.0) * 0.5, (t_short.1 + join.1) * 0.5);
+        let hc1 = (join.0 - t_short.0).hypot(join.1 - t_short.1) * 0.5;
+        let m1 = (
+            (s1 * c1.0 + hc1 * q1.0) / (s1 + hc1),
+            (s1 * c1.1 + hc1 * q1.1) / (s1 + hc1),
+        );
+
+        let c2 = ((join.0 + t_long.0) * 0.5, (join.1 + t_long.1) * 0.5);
+        let hc2 = (t_long.0 - join.0).hypot(t_long.1 - join.1) * 0.5;
+        let m2 = (
+            (s2 * c2.0 + hc2 * q2.0) / (s2 + hc2),
+            (s2 * c2.1 + hc2 * q2.1) / (s2 + hc2),
+        );
+
+        let (arc1_opt, arc2_opt, t_in, t_out, used_b) = if a_is_short {
+            (
+                ArcSegment::from_3pts(t_short, m1, join, width, layer, net_id),
+                ArcSegment::from_3pts(join, m2, t_long, width, layer, net_id),
+                t_short,
+                t_long,
+                d_long,
+            )
+        } else {
+            (
+                ArcSegment::from_3pts(t_long, m2, join, width, layer, net_id),
+                ArcSegment::from_3pts(join, m1, t_short, width, layer, net_id),
+                t_long,
+                t_short,
+                d_short,
+            )
+        };
+
+        if let (Some(a1), Some(a2)) = (arc1_opt, arc2_opt) {
+            if a1.radius >= 0.35 && a2.radius >= 0.35 && is_arc_clear(board, &a1) && is_arc_clear(board, &a2) {
+                return Some((t_in, t_out, vec![a1, a2], used_b));
+            }
+        }
+    }
+    None
+}
+
+fn try_fit_single_bow_arc(
+    board: &Board,
+    arc_start: (f64, f64),
+    arc_end: (f64, f64),
+    width: f64,
+    layer: usize,
+    net_id: usize,
+    pref_sign: f64,
+) -> Option<ArcSegment> {
+    let dx = arc_end.0 - arc_start.0;
+    let dy = arc_end.1 - arc_start.1;
+    let len = dx.hypot(dy);
+    if len < 0.75 {
+        return None;
+    }
+    let nx = -dy / len;
+    let ny = dx / len;
     let mid_x = (arc_start.0 + arc_end.0) * 0.5;
     let mid_y = (arc_start.1 + arc_end.1) * 0.5;
-    let base_bow = ((len - 2.0 * STUB_MM) * 0.06).clamp(0.12, 0.55);
-    let pref_sign = if ((start_pt.0 * 10.0) as i64 + (end_pt.1 * 10.0) as i64 + net_id as i64) % 2 == 0 {
-        1.0
-    } else {
-        -1.0
-    };
+    let base_bow = (len * 0.08).clamp(0.10, 0.90);
     for sign in [pref_sign, -pref_sign] {
-        for scale in [1.0, 0.65, 0.4] {
+        for scale in [1.0, 0.7, 0.45, 0.28, 0.16, 0.09, 0.05] {
             let offset = base_bow * scale * sign;
             let m_bow = (mid_x + nx * offset, mid_y + ny * offset);
             if let Some(arc) = ArcSegment::from_3pts(arc_start, m_bow, arc_end, width, layer, net_id) {
                 if is_arc_clear(board, &arc) {
-                    let s1 = TrackSegment {
-                        start: start_pt,
-                        end: arc.start(),
-                        width,
-                        layer,
-                        net_id,
-                        is_locked: false,
-                    };
-                    let s2 = TrackSegment {
-                        start: arc.end(),
-                        end: end_pt,
-                        width,
-                        layer,
-                        net_id,
-                        is_locked: false,
-                    };
-                    return Some((s1, arc, s2));
+                    return Some(arc);
                 }
             }
         }
     }
     None
+}
+
+fn emit_organic_bow_span(
+    board: &mut Board,
+    start_pt: (f64, f64),
+    end_pt: (f64, f64),
+    width: f64,
+    layer: usize,
+    net_id: usize,
+    need_start_stub: bool,
+    need_end_stub: bool,
+    pref_sign: f64,
+) -> bool {
+    let dx = end_pt.0 - start_pt.0;
+    let dy = end_pt.1 - start_pt.1;
+    let len = dx.hypot(dy);
+    const STUB_MM: f64 = 0.20;
+    let stub_s = if need_start_stub { STUB_MM } else { 0.0 };
+    let stub_e = if need_end_stub { STUB_MM } else { 0.0 };
+    if len < stub_s + stub_e + 0.75 {
+        return false;
+    }
+    let ux = dx / len;
+    let uy = dy / len;
+    let arc_start = (start_pt.0 + ux * stub_s, start_pt.1 + uy * stub_s);
+    let arc_end = (end_pt.0 - ux * stub_e, end_pt.1 - uy * stub_e);
+    let arc_len = len - stub_s - stub_e;
+
+    let nc_w = board.get_netclass_for_net(net_id).track_width;
+    let mut cand_widths = Vec::with_capacity(9);
+    if nc_w > width + 1e-3 {
+        for &cw in &[nc_w, 0.50, 0.45, 0.40, 0.35, 0.30, 0.25, 0.20] {
+            if cw > width + 1e-3
+                && cw <= nc_w + 1e-3
+                && is_segment_clear(board, None, start_pt, end_pt, layer, net_id, cw)
+            {
+                cand_widths.push(cw);
+            }
+        }
+    }
+    cand_widths.push(width);
+
+    for span_w in cand_widths {
+        // 1. Try single sweeping bow arc across the entire span
+        if let Some(arc) = try_fit_single_bow_arc(board, arc_start, arc_end, span_w, layer, net_id, pref_sign) {
+            if need_start_stub {
+                board.tracks.push(TrackSegment {
+                    start: start_pt,
+                    end: arc.start(),
+                    width: span_w,
+                    layer,
+                    net_id,
+                    is_locked: false,
+                });
+            }
+            let end_anchor = arc.end();
+            board.arcs.push(arc);
+            if need_end_stub {
+                board.tracks.push(TrackSegment {
+                    start: end_anchor,
+                    end: end_pt,
+                    width: span_w,
+                    layer,
+                    net_id,
+                    is_locked: false,
+                });
+            }
+            return true;
+        }
+
+        // 2. Try G1-continuous 2-arc S-curve (+h on first half, -h on second half)
+        if arc_len >= 2.2 {
+            let mid_pt = ((arc_start.0 + arc_end.0) * 0.5, (arc_start.1 + arc_end.1) * 0.5);
+            for sign in [pref_sign, -pref_sign] {
+                if let (Some(a1), Some(a2)) = (
+                    try_fit_single_bow_arc(board, arc_start, mid_pt, span_w, layer, net_id, sign),
+                    try_fit_single_bow_arc(board, mid_pt, arc_end, span_w, layer, net_id, -sign),
+                ) {
+                    if need_start_stub {
+                        board.tracks.push(TrackSegment {
+                            start: start_pt,
+                            end: a1.start(),
+                            width: span_w,
+                            layer,
+                            net_id,
+                            is_locked: false,
+                        });
+                    }
+                    let end_anchor = a2.end();
+                    board.arcs.push(a1);
+                    board.arcs.push(a2);
+                    if need_end_stub {
+                        board.tracks.push(TrackSegment {
+                            start: end_anchor,
+                            end: end_pt,
+                            width: span_w,
+                            layer,
+                            net_id,
+                            is_locked: false,
+                        });
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 pub fn apply_any_angle_tangent_arcs(board: &mut Board) {
@@ -13642,15 +14018,25 @@ fn apply_tangent_arcs_with_options(board: &mut Board, target_radius: f64, fit_st
                 for k in 0..n.saturating_sub(1) {
                     let start_pt = chain.points[k];
                     let end_pt = chain.points[k + 1];
-                    if fit_straight_bows {
-                        if let Some((s1, bow_arc, s2)) =
-                            try_fit_organic_bow(board, start_pt, end_pt, chain.width, chain.layer, chain.net_id)
-                        {
-                            board.tracks.push(s1);
-                            board.arcs.push(bow_arc);
-                            board.tracks.push(s2);
-                            continue;
-                        }
+                    let pref_sign = if ((start_pt.0 * 10.0) as i64 + (end_pt.1 * 10.0) as i64 + chain.net_id as i64) % 2 == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    if fit_straight_bows
+                        && emit_organic_bow_span(
+                            board,
+                            start_pt,
+                            end_pt,
+                            chain.width,
+                            chain.layer,
+                            chain.net_id,
+                            true,
+                            true,
+                            pref_sign,
+                        )
+                    {
+                        continue;
                     }
                     board.tracks.push(TrackSegment {
                         start: start_pt,
@@ -13664,7 +14050,29 @@ fn apply_tangent_arcs_with_options(board: &mut Board, target_radius: f64, fit_st
                 continue;
             }
 
-            let mut corner_arcs: Vec<Option<((f64, f64), (f64, f64), ArcSegment)>> = vec![None; n];
+            // In organic mode, first attempt to bridge 3- or 4-point chains with a single sweeping curve
+            if fit_straight_bows && (3..=4).contains(&n) {
+                let obstacles = collect_obstacles_for_net(board, chain.layer, chain.net_id, chain.width);
+                if let Some((s1, sweep_arc, s2)) = try_fit_sweeping_chain_arc(
+                    board,
+                    &chain.points,
+                    chain.width,
+                    chain.layer,
+                    chain.net_id,
+                    &obstacles,
+                ) {
+                    board.tracks.push(s1);
+                    board.arcs.push(sweep_arc);
+                    board.tracks.push(s2);
+                    continue;
+                }
+            }
+
+            let mut corner_arcs: Vec<Option<((f64, f64), (f64, f64), Vec<ArcSegment>)>> = vec![None; n];
+            let mut used_on_seg = vec![0.0f64; n];
+            if fit_straight_bows {
+                used_on_seg[0] = 0.20;
+            }
 
             for i in 1..n - 1 {
                 let p_prev = chain.points[i - 1];
@@ -13687,6 +14095,33 @@ fn apply_tangent_arcs_with_options(board: &mut Board, target_radius: f64, fit_st
                     continue;
                 }
 
+                let avail_a = (l_a - used_on_seg[i - 1] - 0.05).max(0.0);
+                let avail_b = if i == n - 2 {
+                    (l_b - 0.20).max(0.0)
+                } else if fit_straight_bows {
+                    l_b * 0.78
+                } else {
+                    l_b * 0.49
+                };
+
+                if fit_straight_bows {
+                    if let Some((t_in, t_out, bi_arcs, used_b)) = try_fit_asymmetric_corner_biarc(
+                        board,
+                        p_curr,
+                        u1,
+                        u2,
+                        avail_a,
+                        avail_b,
+                        chain.width,
+                        chain.layer,
+                        chain.net_id,
+                    ) {
+                        corner_arcs[i] = Some((t_in, t_out, bi_arcs));
+                        used_on_seg[i] = used_b;
+                        continue;
+                    }
+                }
+
                 let alpha = theta * 0.5;
                 let b_sum = (u1.0 + u2.0, u1.1 + u2.1);
                 let b_len = b_sum.0.hypot(b_sum.1);
@@ -13695,11 +14130,15 @@ fn apply_tangent_arcs_with_options(board: &mut Board, target_radius: f64, fit_st
                 }
                 let b = (b_sum.0 / b_len, b_sum.1 / b_len);
 
-                let d_max = (l_a * 0.49).min(l_b * 0.49);
+                let d_max = if fit_straight_bows {
+                    avail_a.min(avail_b)
+                } else {
+                    (l_a * 0.49).min(l_b * 0.49)
+                };
                 let r_max_geom = d_max * alpha.tan();
-                let r_init = target_radius.min(r_max_geom).min(l_a * 0.5).min(l_b * 0.5);
+                let r_init = target_radius.min(r_max_geom);
 
-                for scale in [1.0, 0.8, 0.6, 0.4, 0.25, 0.1] {
+                for scale in [1.0, 0.85, 0.7, 0.55, 0.4, 0.3, 0.2, 0.12, 0.06] {
                     let r = r_init * scale;
                     if r < 0.02 {
                         continue;
@@ -13713,7 +14152,8 @@ fn apply_tangent_arcs_with_options(board: &mut Board, target_radius: f64, fit_st
 
                     if let Some(arc) = ArcSegment::from_3pts(t1, m_arc, t2, chain.width, chain.layer, chain.net_id) {
                         if is_arc_clear(board, &arc) {
-                            corner_arcs[i] = Some((t1, t2, arc));
+                            corner_arcs[i] = Some((t1, t2, vec![arc]));
+                            used_on_seg[i] = d;
                             break;
                         }
                     }
@@ -13721,7 +14161,9 @@ fn apply_tangent_arcs_with_options(board: &mut Board, target_radius: f64, fit_st
             }
 
             for opt_arc in corner_arcs.iter().flatten() {
-                board.arcs.push(opt_arc.2.clone());
+                for a in &opt_arc.2 {
+                    board.arcs.push(a.clone());
+                }
             }
 
             for k in 0..n - 1 {
@@ -13739,15 +14181,46 @@ fn apply_tangent_arcs_with_options(board: &mut Board, target_radius: f64, fit_st
 
                 let seg_len = (end_pt.0 - start_pt.0).hypot(end_pt.1 - start_pt.1);
                 if seg_len > 1e-4 {
-                    let both_ends_un_arced =
-                        (k == 0 || corner_arcs[k].is_none()) && corner_arcs[k + 1].is_none();
-                    if fit_straight_bows && both_ends_un_arced {
-                        if let Some((s1, bow_arc, s2)) =
-                            try_fit_organic_bow(board, start_pt, end_pt, chain.width, chain.layer, chain.net_id)
-                        {
-                            board.tracks.push(s1);
-                            board.arcs.push(bow_arc);
-                            board.tracks.push(s2);
+                    if fit_straight_bows {
+                        let need_start_stub = k == 0 && corner_arcs[0].is_none();
+                        let need_end_stub = k + 1 == n - 1 && corner_arcs[k + 1].is_none();
+                        let dx = end_pt.0 - start_pt.0;
+                        let dy = end_pt.1 - start_pt.1;
+                        let mut pref_sign = if ((start_pt.0 * 10.0) as i64 + (end_pt.1 * 10.0) as i64 + chain.net_id as i64) % 2 == 0 {
+                            1.0
+                        } else {
+                            -1.0
+                        };
+                        if k + 2 < n {
+                            let next_v = (
+                                chain.points[k + 2].0 - chain.points[k + 1].0,
+                                chain.points[k + 2].1 - chain.points[k + 1].1,
+                            );
+                            let cross = dx * next_v.1 - dy * next_v.0;
+                            if cross.abs() > 1e-3 {
+                                pref_sign = if cross > 0.0 { -1.0 } else { 1.0 };
+                            }
+                        } else if k > 0 {
+                            let prev_v = (
+                                chain.points[k].0 - chain.points[k - 1].0,
+                                chain.points[k].1 - chain.points[k - 1].1,
+                            );
+                            let cross = prev_v.0 * dy - prev_v.1 * dx;
+                            if cross.abs() > 1e-3 {
+                                pref_sign = if cross > 0.0 { -1.0 } else { 1.0 };
+                            }
+                        }
+                        if emit_organic_bow_span(
+                            board,
+                            start_pt,
+                            end_pt,
+                            chain.width,
+                            chain.layer,
+                            chain.net_id,
+                            need_start_stub,
+                            need_end_stub,
+                            pref_sign,
+                        ) {
                             continue;
                         }
                     }
@@ -13768,24 +14241,150 @@ fn apply_tangent_arcs_with_options(board: &mut Board, target_radius: f64, fit_st
 /// Converts a routed board's unlocked tracks into hand-drawn-like organic traces
 /// using homotopic rubber-band relaxation, sweeping tangent corner arcs, and gentle organic bows.
 pub fn convert_tracks_to_organic(board: &mut Board) {
-    // If the board already has unlocked arcs, linearize them back into tracks first so conversion is idempotent
+    // If the board already has unlocked arcs, reconstruct their sharp tangent corners or chords first so conversion is idempotent
     let unlocked_arcs: Vec<ArcSegment> = board.arcs.iter().filter(|a| !a.is_locked).cloned().collect();
     if !unlocked_arcs.is_empty() {
         board.arcs.retain(|a| a.is_locked);
         for arc in unlocked_arcs {
-            board.tracks.push(TrackSegment {
-                start: arc.start(),
-                end: arc.end(),
-                width: arc.width,
-                layer: arc.layer,
-                net_id: arc.net_id,
-                is_locked: false,
-            });
+            let as_pt = arc.start();
+            let ae_pt = arc.end();
+            let mid = arc.mid();
+            let dx = mid.0 - arc.center.0;
+            let dy = mid.1 - arc.center.1;
+            let d_len = dx.hypot(dy);
+            let half_sweep = (arc.end_angle_rad - arc.start_angle_rad).abs() * 0.5;
+            let mut reconstructed_corner = false;
+            if d_len > 1e-6 && (0.08..1.35).contains(&half_sweep) && arc.radius < 6.0 {
+                let h = arc.radius / half_sweep.cos();
+                let p_corner = (
+                    arc.center.0 + (dx / d_len) * h,
+                    arc.center.1 + (dy / d_len) * h,
+                );
+                let has_collinear_adj = board.tracks.iter().any(|t| {
+                    t.net_id == arc.net_id && t.layer == arc.layer && {
+                        let d_s = (t.end.0 - as_pt.0).hypot(t.end.1 - as_pt.1);
+                        let d_e = (t.start.0 - as_pt.0).hypot(t.start.1 - as_pt.1);
+                        if d_s < 0.02 {
+                            let v_t = (as_pt.0 - t.start.0, as_pt.1 - t.start.1);
+                            let v_c = (p_corner.0 - as_pt.0, p_corner.1 - as_pt.1);
+                            let lt = v_t.0.hypot(v_t.1);
+                            let lc = v_c.0.hypot(v_c.1);
+                            lt > 0.25 && lc > 1e-4 && (v_t.0 * v_c.0 + v_t.1 * v_c.1) / (lt * lc) > 0.995
+                        } else if d_e < 0.02 {
+                            let v_t = (as_pt.0 - t.end.0, as_pt.1 - t.end.1);
+                            let v_c = (p_corner.0 - as_pt.0, p_corner.1 - as_pt.1);
+                            let lt = v_t.0.hypot(v_t.1);
+                            let lc = v_c.0.hypot(v_c.1);
+                            lt > 0.25 && lc > 1e-4 && (v_t.0 * v_c.0 + v_t.1 * v_c.1) / (lt * lc) > 0.995
+                        } else {
+                            false
+                        }
+                    }
+                });
+                if has_collinear_adj
+                    && is_segment_clear(board, None, as_pt, p_corner, arc.layer, arc.net_id, arc.width)
+                    && is_segment_clear(board, None, p_corner, ae_pt, arc.layer, arc.net_id, arc.width)
+                {
+                    board.tracks.push(TrackSegment {
+                        start: as_pt,
+                        end: p_corner,
+                        width: arc.width,
+                        layer: arc.layer,
+                        net_id: arc.net_id,
+                        is_locked: false,
+                    });
+                    board.tracks.push(TrackSegment {
+                        start: p_corner,
+                        end: ae_pt,
+                        width: arc.width,
+                        layer: arc.layer,
+                        net_id: arc.net_id,
+                        is_locked: false,
+                    });
+                    reconstructed_corner = true;
+                }
+            }
+            if !reconstructed_corner {
+                if is_segment_clear(board, None, as_pt, ae_pt, arc.layer, arc.net_id, arc.width) {
+                    board.tracks.push(TrackSegment {
+                        start: as_pt,
+                        end: ae_pt,
+                        width: arc.width,
+                        layer: arc.layer,
+                        net_id: arc.net_id,
+                        is_locked: false,
+                    });
+                } else {
+                    for seg in arc.to_segments(4) {
+                        board.tracks.push(seg);
+                    }
+                }
+            }
         }
     }
     relax_homotopic_rubber_bands(board);
-    apply_tangent_arcs_with_options(board, 5.0, true);
+    apply_tangent_arcs_with_options(board, 25.0, true);
+    widen_tracks_and_arcs_to_netclass(board);
     prune_dangling_tracks_and_vias(board);
+}
+
+fn widen_tracks_and_arcs_to_netclass(board: &mut Board) {
+    for i in 0..board.arcs.len() {
+        if board.arcs[i].is_locked {
+            continue;
+        }
+        let net_id = board.arcs[i].net_id;
+        let cur_w = board.arcs[i].width;
+        let nc_w = board.get_netclass_for_net(net_id).track_width;
+        if nc_w <= cur_w + 1e-3 {
+            continue;
+        }
+        for &cand_w in &[nc_w, 0.50, 0.45, 0.40, 0.35, 0.30, 0.25, 0.20] {
+            if cand_w <= cur_w + 1e-3 || cand_w > nc_w + 1e-3 {
+                continue;
+            }
+            let mut cand_arc = board.arcs[i].clone();
+            cand_arc.width = cand_w;
+            if is_arc_clear(board, &cand_arc) {
+                board.arcs[i].width = cand_w;
+                break;
+            }
+        }
+    }
+
+    for i in 0..board.tracks.len() {
+        if board.tracks[i].is_locked {
+            continue;
+        }
+        let trk = board.tracks[i].clone();
+        let nc_w = board.get_netclass_for_net(trk.net_id).track_width;
+        if nc_w <= trk.width + 1e-3 {
+            continue;
+        }
+        let net_clr = board.get_netclass_for_net(trk.net_id).clearance;
+        for &cand_w in &[nc_w, 0.50, 0.45, 0.40, 0.35, 0.30, 0.25, 0.20] {
+            if cand_w <= trk.width + 1e-3 || cand_w > nc_w + 1e-3 {
+                continue;
+            }
+            if !is_segment_clear(board, None, trk.start, trk.end, trk.layer, trk.net_id, cand_w) {
+                continue;
+            }
+            let arcs_ok = board.arcs.iter().all(|a| {
+                if a.net_id == trk.net_id || a.layer != trk.layer {
+                    return true;
+                }
+                let a_clr = board.get_netclass_for_net(a.net_id).clearance;
+                let req = cand_w * 0.5 + a.width * 0.5 + net_clr.max(a_clr) + 0.025;
+                a.to_segments(8)
+                    .iter()
+                    .all(|asg| dist_segment_to_segment(trk.start, trk.end, asg.start, asg.end) >= req - 1e-4)
+            });
+            if arcs_ok {
+                board.tracks[i].width = cand_w;
+                break;
+            }
+        }
+    }
 }
 
 /// Converts a board's organic curved/any-angle traces back into standard 45°/90° octilinear straight tracks.
@@ -13849,6 +14448,7 @@ pub fn convert_tracks_to_straight(board: &mut Board, grid: &RoutingGrid) {
         }
     }
     gloss_tracks_standard(board, grid);
+    widen_tracks_and_arcs_to_netclass(board);
     prune_dangling_tracks_and_vias(board);
 }
 
@@ -22127,6 +22727,18 @@ mod tests {
             !board.arcs.is_empty(),
             "convert_tracks_to_organic must generate curved ArcSegments for bends and/or long straight spans"
         );
+        let curved_len: f64 = board.arcs.iter().map(|a| a.length()).sum();
+        let straight_len: f64 = board
+            .tracks
+            .iter()
+            .map(|t| (t.end.0 - t.start.0).hypot(t.end.1 - t.start.1))
+            .sum();
+        assert!(
+            curved_len > straight_len * 3.0,
+            "Organic conversion must turn long runs and bends into predominantly smooth curves (curved={:.2}mm vs straight={:.2}mm)",
+            curved_len,
+            straight_len
+        );
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
         grid.rasterize_obstacles(&board);
@@ -22136,5 +22748,90 @@ mod tests {
             "convert_tracks_to_straight must convert all unlocked organic arcs back into straight tracks"
         );
         assert!(!board.tracks.is_empty());
+    }
+
+    #[test]
+    fn test_power_netclass_width_preserved_on_wide_usb_c_pads_and_organic_widening() {
+        use crate::board::NetClass;
+        use std::collections::HashMap;
+
+        let mut netclasses = HashMap::new();
+        netclasses.insert("Default".to_string(), NetClass::default());
+        netclasses.insert(
+            "Power".to_string(),
+            NetClass {
+                name: "Power".to_string(),
+                track_width: 0.60,
+                clearance: 0.25,
+                via_dia: 0.80,
+                via_drill: 0.40,
+                ..NetClass::default()
+            },
+        );
+        let mut net_to_class = HashMap::new();
+        net_to_class.insert("VBUS".to_string(), "Power".to_string());
+        let mut net_name_to_id = HashMap::new();
+        net_name_to_id.insert(String::new(), 0);
+        net_name_to_id.insert("VBUS".to_string(), 1);
+        net_name_to_id.insert("USB_DP".to_string(), 2);
+
+        // J2 with a wide 0.60x1.45 VBUS blade (A4 at 7.55, 6.0) and narrow 0.30x1.45 signal pin (A6 at 9.75, 14.0)
+        let pad_vbus = Pad::new("A4", -2.45, -4.0, 0.60, 1.45, 1, "VBUS", false);
+        let pad_dp = Pad::new("A6", -0.25, 4.0, 0.30, 1.45, 2, "USB_DP", false);
+        let fp_j2 = make_fp("J2", 10.0, 10.0, false, vec![pad_vbus, pad_dp]);
+        let pad_d2 = Pad::new("2", 0.0, 0.0, 0.90, 1.20, 1, "VBUS", false);
+        let fp_d2 = make_fp("D2", 28.0, 10.0, false, vec![pad_d2]);
+
+        let mut board = Board {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 40.0,
+            max_y: 40.0,
+            footprints: vec![fp_j2, fp_d2],
+            nets: vec![String::new(), "VBUS".to_string(), "USB_DP".to_string()],
+            net_name_to_id,
+            netclasses,
+            net_to_class,
+            tracks: vec![
+                TrackSegment {
+                    start: (7.55, 6.0),
+                    end: (20.0, 6.0),
+                    width: 0.15,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+                TrackSegment {
+                    start: (20.0, 6.0),
+                    end: (28.0, 10.0),
+                    width: 0.15,
+                    layer: 0,
+                    net_id: 1,
+                    is_locked: false,
+                },
+            ],
+            ..Board::default()
+        };
+
+        let mut straight_board = board.clone();
+        widen_tracks_and_arcs_to_netclass(&mut straight_board);
+        assert!(
+            straight_board.tracks.iter().all(|t| t.net_id != 1 || (t.width - 0.60).abs() < 1e-3),
+            "VBUS straight tracks in open space must widen from 0.15mm fine-pitch neckdown to 0.60mm Power netclass width"
+        );
+
+        convert_tracks_to_organic(&mut board);
+        assert!(
+            !board.arcs.is_empty(),
+            "convert_tracks_to_organic must emit curved ArcSegments for VBUS"
+        );
+        assert!(
+            board.arcs.iter().all(|a| a.net_id != 1 || (a.width - 0.60).abs() < 1e-3),
+            "VBUS organic arcs in open space must widen to 0.60mm Power netclass width"
+        );
+        assert!(
+            board.tracks.iter().all(|t| t.net_id != 1 || (t.width - 0.60).abs() < 1e-3),
+            "VBUS organic pad stubs in open space must widen to 0.60mm Power netclass width"
+        );
     }
 }
