@@ -167,30 +167,7 @@ impl RoutingGrid {
         let mut net_clearances = vec![0.20; board.nets.len()];
         let mut max_net_clearance = 0.25_f64;
         for i in 0..board.nets.len() {
-            let mut c = board.get_netclass_for_net(i).clearance;
-            let touches_fine_pitch = board.footprints.iter().any(|fp| {
-                let smd_pads: Vec<&Pad> = fp.pads.iter().filter(|p| !p.is_through_hole).collect();
-                if smd_pads.len() >= 4 {
-                    let mut min_pitch = f64::INFINITY;
-                    for p1_i in 0..smd_pads.len() {
-                        let (x1, y1) = fp.pad_absolute_position(smd_pads[p1_i]);
-                        for p2_i in (p1_i + 1)..smd_pads.len() {
-                            let (x2, y2) = fp.pad_absolute_position(smd_pads[p2_i]);
-                            let d = (x1 - x2).hypot(y1 - y2);
-                            if d > 0.05 && d < min_pitch {
-                                min_pitch = d;
-                            }
-                        }
-                    }
-                    if min_pitch <= 0.85 {
-                        return fp.pads.iter().any(|p| p.net_id == i);
-                    }
-                }
-                false
-            });
-            if touches_fine_pitch {
-                c = c.min(0.15);
-            }
+            let c = board.get_netclass_for_net(i).clearance;
             net_clearances[i] = c;
             max_net_clearance = max_net_clearance.max(c);
         }
@@ -2871,7 +2848,7 @@ impl AutoRouter {
                 || matches!(conn.net_name.as_str(), "VBUS" | "VBus" | "/BUCK_VIN" | "BUCK_VIN" | "Buck_in" | "VRAW" | "HP" | "HN" | "P1" | "P2" | "+3.3V" | "VCC_5V")
                 || conn.net_name.contains("BUCK")
                 || conn.net_name.contains("Buck");
-            if is_f1_f2_d2_d3 || is_power_net {
+            if conn.netclass.name == "Default" && (is_f1_f2_d2_d3 || is_power_net) {
                 if let Some(pwr) = board.netclasses.get("Power").or_else(|| board.netclasses.get("Power_15V")) {
                     conn.netclass = pwr.clone();
                 }
@@ -2894,10 +2871,9 @@ impl AutoRouter {
                 conn.netclass.diff_pair_gap = conn.netclass.diff_pair_gap.min(0.15);
             }
             if is_passive_terminal {
-                if !is_power_net && !conn.netclass.name.starts_with("Power") {
+                if !is_power_net && !conn.netclass.name.starts_with("Power") && conn.netclass.name != "P1P2_Bus" {
                     conn.netclass.track_width = conn.netclass.track_width.min(0.15);
                 }
-                conn.netclass.clearance = conn.netclass.clearance.min(0.15);
                 conn.netclass.via_dia = conn.netclass.via_dia.min(0.60);
             }
         }
@@ -4981,10 +4957,14 @@ impl AutoRouter {
         }
 
         widen_tracks_and_arcs_to_netclass(board);
+        self.add_plane_stitching_vias(board, grid);
+        prune_dangling_tracks_and_vias(board);
 
         let pre_organic_snapshot = if self.config.any_angle_mode {
             let snap = (board.tracks.clone(), board.arcs.clone());
             convert_tracks_to_organic(board);
+            self.add_plane_stitching_vias(board, grid);
+            prune_dangling_tracks_and_vias(board);
             Some(snap)
         } else {
             None
@@ -8411,6 +8391,33 @@ pub fn find_choked_pin_bottlenecks(
                             // If tracks on either layer near the pad block via placement, try nudging them (cumulatively across layers) with 45° tapers
                             if !connected_to_existing {
                                 let orig_tracks_snapshot = board.tracks.clone();
+                                let orig_arcs_snapshot = board.arcs.clone();
+                                let mut ai = 0;
+                                while ai < board.arcs.len() {
+                                    let arc = &board.arcs[ai];
+                                    if arc.net_id != plane_net_id
+                                        && !arc.is_locked
+                                        && arc.to_segments(8).iter().any(|s| dist_point_to_segment((px, py), s.start, s.end) < 2.10)
+                                    {
+                                        let removed = board.arcs.remove(ai);
+                                        for s in removed.to_segments(4) {
+                                            board.tracks.push(s);
+                                        }
+                                    } else {
+                                        ai += 1;
+                                    }
+                                }
+                                for ti in 0..board.tracks.len() {
+                                    let trk = board.tracks[ti].clone();
+                                    if trk.net_id != plane_net_id
+                                        && !trk.is_locked
+                                        && trk.width > 0.25
+                                        && dist_point_to_segment((px, py), trk.start, trk.end) < 2.10
+                                    {
+                                        let min_w = board.get_netclass_for_net(trk.net_id).min_track_width.max(0.15).min(0.20);
+                                        board.tracks[ti].width = trk.width.min(min_w);
+                                    }
+                                }
                                 let mut cand_tracks: Vec<TrackSegment> = board
                                     .tracks
                                     .iter()
@@ -8704,12 +8711,12 @@ pub fn find_choked_pin_bottlenecks(
                                                     }
                                                     segs
                                                 } else {
-                                                    if half_span < 500.0 || s_abs > 0.45 {
+                                                    if half_span < 500.0 || s_abs > 0.75 {
                                                         continue;
                                                     }
                                                     let sx = dx.signum();
                                                     let sy = dy.signum();
-                                                    if dx.abs() <= s_abs + 0.2 {
+                                                    if dx.abs() <= s_abs + 0.15 {
                                                         continue;
                                                     }
                                                     if shift > 0.0 {
@@ -8728,15 +8735,22 @@ pub fn find_choked_pin_bottlenecks(
                                                 };
 
                                                 board.tracks.remove(t_idx);
-                                                let shift_legal = tapered.iter().all(|&(s, e)| {
-                                                    is_track_segment_legal(board, s, e, orig_t.width, orig_t.layer, orig_t.net_id, t_clr)
-                                                });
-                                                if shift_legal {
+                                                let min_t_w = board.get_netclass_for_net(orig_t.net_id).min_track_width.max(0.15).min(orig_t.width);
+                                                let chosen_t_w = [orig_t.width, 0.30, 0.25, 0.20, min_t_w]
+                                                    .into_iter()
+                                                    .filter(|&w| w <= orig_t.width + 1e-4 && w >= min_t_w - 1e-4)
+                                                    .find(|&w| {
+                                                        tapered.iter().all(|&(s, e)| {
+                                                            is_track_segment_legal(board, s, e, w, orig_t.layer, orig_t.net_id, t_clr)
+                                                        })
+                                                    });
+                                                if let Some(use_t_w) = chosen_t_w {
+                                                    let eff_t_w = use_t_w.min(0.25).max(min_t_w);
                                                     for &(s, e) in &tapered {
                                                         board.tracks.push(TrackSegment {
                                                             start: s,
                                                             end: e,
-                                                            width: orig_t.width,
+                                                            width: eff_t_w,
                                                             layer: orig_t.layer,
                                                             net_id: orig_t.net_id,
                                                             is_locked: false,
@@ -8821,7 +8835,10 @@ pub fn find_choked_pin_bottlenecks(
                                                 .map(|&(s, e)| dist_point_to_segment((px, py), s, e))
                                                 .fold(f64::INFINITY, f64::min);
                                             let pad_dist_ok = orig_t.layer != fp.layer || new_pad_dist >= orig_dist - 1e-4;
-                                            if new_pocket_dist >= 0.574 && new_pocket_dist > orig_pocket_dist + 0.03 && pad_dist_ok {
+                                            let req_pocket_dist = 0.30 + eff_t_w * 0.5 + t_clr - 1e-3;
+                                            let old_clr_margin = orig_pocket_dist - orig_t.width * 0.5;
+                                            let new_clr_margin = new_pocket_dist - eff_t_w * 0.5;
+                                            if new_pocket_dist >= req_pocket_dist && new_clr_margin > old_clr_margin + 0.03 && pad_dist_ok {
                                                 kept_nudge_for_track = true;
                                                 break;
                                             }
@@ -8846,12 +8863,43 @@ pub fn find_choked_pin_bottlenecks(
                                 }
                                 if !connected_to_existing {
                                     board.tracks = orig_tracks_snapshot;
+                                    board.arcs = orig_arcs_snapshot;
                                 }
                             }
                         }
 
                         // Fallback: connect to another connected pad, via, or track endpoint of the same plane net
                         if !connected_to_existing {
+                            let orig_tracks_fb = board.tracks.clone();
+                            let orig_arcs_fb = board.arcs.clone();
+                            let mut ai = 0;
+                            while ai < board.arcs.len() {
+                                let arc = &board.arcs[ai];
+                                if arc.net_id != plane_net_id
+                                    && !arc.is_locked
+                                    && arc.to_segments(8).iter().any(|s| dist_point_to_segment((px, py), s.start, s.end) < 2.20)
+                                {
+                                    let removed = board.arcs.remove(ai);
+                                    for mut s in removed.to_segments(4) {
+                                        let min_w = board.get_netclass_for_net(s.net_id).min_track_width.max(0.15).min(0.20);
+                                        s.width = s.width.min(min_w);
+                                        board.tracks.push(s);
+                                    }
+                                } else {
+                                    ai += 1;
+                                }
+                            }
+                            for ti in 0..board.tracks.len() {
+                                let trk = board.tracks[ti].clone();
+                                if trk.net_id != plane_net_id
+                                    && !trk.is_locked
+                                    && trk.width > 0.20
+                                    && dist_point_to_segment((px, py), trk.start, trk.end) < 2.20
+                                {
+                                    let min_w = board.get_netclass_for_net(trk.net_id).min_track_width.max(0.15).min(0.20);
+                                    board.tracks[ti].width = trk.width.min(min_w);
+                                }
+                            }
                             let mut targets: Vec<(f64, f64)> = board
                                 .tracks
                                 .iter()
@@ -8921,16 +8969,199 @@ pub fn find_choked_pin_bottlenecks(
                                         break;
                                     }
                                 }
+                                if !connected_to_existing {
+                                    for &tgt in &targets {
+                                        if (tgt.0 - px).hypot(tgt.1 - py) > 6.0 {
+                                            break;
+                                        }
+                                        for &wx_off in &[-1.35_f64, -1.15, -0.95, -0.75, -0.55, 0.55, 0.75, 0.95, 1.15, 1.35] {
+                                            for &wy_off in &[-1.35_f64, -1.05, -0.75, -0.45, 0.0, 0.45, 0.75, 1.05, 1.35] {
+                                                let wpt = (px + wx_off, py + wy_off);
+                                                for df1 in [false, true] {
+                                                    let dl1 = compute_45_dogleg((px, py), wpt, df1);
+                                                    if !dl1.windows(2).all(|w| {
+                                                        (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) <= 1e-4
+                                                            || is_track_segment_legal(board, w[0], w[1], try_w, fp.layer, plane_net_id, try_c)
+                                                    }) {
+                                                        continue;
+                                                    }
+                                                    for df2 in [false, true] {
+                                                        let dl2 = compute_45_dogleg(wpt, tgt, df2);
+                                                        if dl2.windows(2).all(|w| {
+                                                            (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) <= 1e-4
+                                                                || is_track_segment_legal(board, w[0], w[1], try_w, fp.layer, plane_net_id, try_c)
+                                                        }) {
+                                                            for w in dl1.windows(2).chain(dl2.windows(2)) {
+                                                                if (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) > 1e-4 {
+                                                                    board.tracks.push(TrackSegment {
+                                                                        start: w[0],
+                                                                        end: w[1],
+                                                                        width: try_w,
+                                                                        layer: fp.layer,
+                                                                        net_id: plane_net_id,
+                                                                        is_locked: false,
+                                                                    });
+                                                                }
+                                                            }
+                                                            connected_to_existing = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                    if connected_to_existing {
+                                                        break;
+                                                    }
+                                                }
+                                                if connected_to_existing {
+                                                    break;
+                                                }
+                                            }
+                                            if connected_to_existing {
+                                                break;
+                                            }
+                                        }
+                                        if connected_to_existing {
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !connected_to_existing {
+                                    // Try nudging any single foreign track chain on fp.layer that blocks a dogleg to tgt
+                                    for &tgt in targets.iter().take(4) {
+                                        if (tgt.0 - px).hypot(tgt.1 - py) > 5.0 {
+                                            break;
+                                        }
+                                        for diag_first in [false, true] {
+                                            let dogleg = compute_45_dogleg((px, py), tgt, diag_first);
+                                            let mut blocking_nets: Vec<usize> = board
+                                                .tracks
+                                                .iter()
+                                                .filter(|t| {
+                                                    t.layer == fp.layer
+                                                        && t.net_id != plane_net_id
+                                                        && !t.is_locked
+                                                        && dogleg.windows(2).any(|w| {
+                                                            let tc = try_c.max(board.get_netclass_for_net(t.net_id).clearance).max(0.12);
+                                                            dist_segment_to_segment(w[0], w[1], t.start, t.end) < try_w * 0.5 + t.width * 0.5 + tc
+                                                        })
+                                                })
+                                                .map(|t| t.net_id)
+                                                .collect();
+                                            blocking_nets.sort_unstable();
+                                            blocking_nets.dedup();
+                                            if blocking_nets.len() != 1 {
+                                                continue;
+                                            }
+                                            let blk_net = blocking_nets[0];
+                                            let blk_clr = board.get_netclass_for_net(blk_net).clearance;
+                                            let blk_min_w = board.get_netclass_for_net(blk_net).min_track_width.max(0.15);
+                                            let snap_tracks = board.tracks.clone();
+                                            for &(sx, sy) in &[
+                                                (-0.35_f64, 0.35_f64), (-0.45, 0.45), (-0.55, 0.55), (-0.65, 0.65),
+                                                (0.35, -0.35), (0.45, -0.45), (0.55, -0.55), (0.65, -0.65),
+                                                (0.0, 0.45), (0.0, 0.65), (0.0, -0.45), (0.0, -0.65),
+                                                (-0.45, 0.0), (-0.65, 0.0), (0.45, 0.0), (0.65, 0.0),
+                                            ] {
+                                                board.tracks = snap_tracks.clone();
+                                                let mut moved_any = false;
+                                                let mut move_vts = Vec::new();
+                                                for t in &board.tracks {
+                                                    if t.layer == fp.layer && t.net_id == blk_net && !t.is_locked {
+                                                        for &pt in &[t.start, t.end] {
+                                                            if (pt.0 - px).hypot(pt.1 - py) < 2.2 {
+                                                                let anchored = board.vias.iter().any(|v| v.net_id == blk_net && (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05)
+                                                                    || board.footprints.iter().any(|ofp| ofp.pads.iter().any(|op| op.net_id == blk_net && {
+                                                                        let opp = ofp.pad_absolute_position(op);
+                                                                        (opp.0 - pt.0).hypot(opp.1 - pt.1) < 0.05
+                                                                    }));
+                                                                if !anchored && !move_vts.iter().any(|&(vx, vy): &(f64, f64)| (vx - pt.0).hypot(vy - pt.1) < 1e-3) {
+                                                                    move_vts.push(pt);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if move_vts.is_empty() {
+                                                    break;
+                                                }
+                                                let mut mod_idxs = Vec::new();
+                                                for (ti, t) in board.tracks.iter_mut().enumerate() {
+                                                    if t.layer == fp.layer && t.net_id == blk_net && !t.is_locked {
+                                                        let mut chg = false;
+                                                        if move_vts.iter().any(|&(vx, vy)| (vx - t.start.0).hypot(vy - t.start.1) < 1e-3) {
+                                                            t.start = (t.start.0 + sx, t.start.1 + sy);
+                                                            chg = true;
+                                                        }
+                                                        if move_vts.iter().any(|&(vx, vy)| (vx - t.end.0).hypot(vy - t.end.1) < 1e-3) {
+                                                            t.end = (t.end.0 + sx, t.end.1 + sy);
+                                                            chg = true;
+                                                        }
+                                                        if chg {
+                                                            t.width = t.width.min(blk_min_w);
+                                                            mod_idxs.push(ti);
+                                                            moved_any = true;
+                                                        }
+                                                    }
+                                                }
+                                                if !moved_any {
+                                                    continue;
+                                                }
+                                                let mod_tracks: Vec<TrackSegment> = mod_idxs.iter().map(|&i| board.tracks[i].clone()).collect();
+                                                for &i in mod_idxs.iter().rev() {
+                                                    board.tracks.remove(i);
+                                                }
+                                                let blk_ok = mod_tracks.iter().all(|mt| {
+                                                    is_track_segment_legal(board, mt.start, mt.end, mt.width, mt.layer, mt.net_id, blk_clr)
+                                                });
+                                                for mt in mod_tracks {
+                                                    board.tracks.push(mt);
+                                                }
+                                                if blk_ok && dogleg.windows(2).all(|w| {
+                                                    (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) <= 1e-4
+                                                        || is_track_segment_legal(board, w[0], w[1], try_w, fp.layer, plane_net_id, try_c)
+                                                }) {
+                                                    for w in dogleg.windows(2) {
+                                                        if (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) > 1e-4 {
+                                                            board.tracks.push(TrackSegment {
+                                                                start: w[0],
+                                                                end: w[1],
+                                                                width: try_w,
+                                                                layer: fp.layer,
+                                                                net_id: plane_net_id,
+                                                                is_locked: false,
+                                                            });
+                                                        }
+                                                    }
+                                                    connected_to_existing = true;
+                                                    break;
+                                                }
+                                            }
+                                            if !connected_to_existing {
+                                                board.tracks = snap_tracks;
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        if connected_to_existing {
+                                            break;
+                                        }
+                                    }
+                                }
                                 if connected_to_existing {
                                     break;
                                 }
                             }
                             if !connected_to_existing {
                                 let mut local_grid = RoutingGrid::new(board, grid.res, None);
+                                for c in &mut local_grid.net_clearances {
+                                    *c = c.min(0.15);
+                                }
+                                local_grid.max_net_clearance = 0.15;
                                 local_grid.rasterize_obstacles(board);
                                 for trk in &board.tracks {
                                     if trk.net_id != plane_net_id {
-                                        local_grid.commit_track(trk);
+                                        let mut thin = trk.clone();
+                                        thin.width = thin.width.min(0.15);
+                                        local_grid.commit_track(&thin);
                                     }
                                 }
                                 for v in &board.vias {
@@ -8939,7 +9170,7 @@ pub fn find_choked_pin_bottlenecks(
                                     }
                                 }
                                 let dummy_stop = AtomicBool::new(false);
-                                for &tgt in targets.iter().take(6) {
+                                for &tgt in targets.iter().take(8) {
                                     if let (Some((sgx, sgy)), Some((egx, egy))) = (
                                         local_grid.world_to_grid(px, py),
                                         local_grid.world_to_grid(tgt.0, tgt.1),
@@ -8952,7 +9183,7 @@ pub fn find_choked_pin_bottlenecks(
                                             e_node,
                                             plane_net_id,
                                             0.15,
-                                            0.15,
+                                            0.12,
                                             0.60,
                                             None,
                                             1.0,
@@ -9007,6 +9238,7 @@ pub fn find_choked_pin_bottlenecks(
                                                 last_pt = wpt;
                                             }
                                             if path_valid {
+                                                connected_to_existing = true;
                                                 break;
                                             } else {
                                                 board.tracks.truncate(orig_trk_len);
@@ -9016,6 +9248,10 @@ pub fn find_choked_pin_bottlenecks(
                                         }
                                     }
                                 }
+                            }
+                            if !connected_to_existing {
+                                board.tracks = orig_tracks_fb;
+                                board.arcs = orig_arcs_fb;
                             }
                         }
                     }
@@ -9126,6 +9362,13 @@ pub fn find_choked_pin_bottlenecks(
         }
 
         let mut fallback_offsets = primary_offsets.clone();
+        for &dx in &[-0.95_f64, -0.85, -0.75, -0.65, -0.55, -0.45, -0.35, -0.25, -0.15, 0.0, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95] {
+            for &dy in &[0.65_f64, 0.72, 0.78, 0.825, 0.88, 0.95, 1.05, -0.65, -0.72, -0.78, -0.825, -0.88, -0.95, -1.05, 0.0, 0.35, -0.35, 0.50, -0.50] {
+                if dx.hypot(dy) >= min_d_narrow - 0.05 {
+                    fallback_offsets.push((dx, dy));
+                }
+            }
+        }
         for &dist in &[
             min_d,
             min_d + 0.15,
@@ -10533,12 +10776,23 @@ pub fn is_segment_clear(
     }
 
     // 3. Foreign Pads
+    let min_hole_clr = board.get_netclass_for_net(net_id).min_hole_clearance;
     for fp in &board.footprints {
         let pad_layer = fp.layer;
         for pad in &fp.pads {
             if pad.net_id != net_id {
                 if pad.is_through_hole || pad_layer == layer {
                     let (px, py) = fp.pad_absolute_position(pad);
+                    if pad.is_through_hole {
+                        if let Some(drill) = pad.drill {
+                            if drill > 0.0
+                                && dist_to_segment(px, py, p1.0, p1.1, p2.0, p2.1)
+                                    < half_w + drill * 0.5 + min_hole_clr - 1e-4
+                            {
+                                return false;
+                            }
+                        }
+                    }
                     let pad_clr = board.get_netclass_for_net(pad.net_id).clearance;
                     let req_clr = clearance.max(pad_clr);
                     let required_dist = half_w + req_clr;
@@ -10573,7 +10827,7 @@ pub fn is_segment_clear(
             let via_rad = via.size * 0.5;
             let via_clr = board.get_netclass_for_net(via.net_id).clearance;
             let req_clr = clearance.max(via_clr);
-            let required_dist = half_w + via_rad + req_clr;
+            let required_dist = half_w + (via_rad + req_clr).max(via.drill * 0.5 + min_hole_clr);
             if dist_to_segment(via.position.0, via.position.1, p1.0, p1.1, p2.0, p2.1) < required_dist - 1e-4 {
                 return false;
             }
@@ -13584,11 +13838,19 @@ pub fn is_arc_clear(board: &Board, arc: &ArcSegment) -> bool {
     }
 
     // 1. Foreign Pads
+    let min_hole_clr = board.get_netclass_for_net(arc.net_id).min_hole_clearance;
     for fp in &board.footprints {
         let pad_layer = fp.layer;
         for pad in &fp.pads {
             if pad.net_id != arc.net_id && (pad.is_through_hole || pad_layer == arc.layer) {
                 let (px, py) = fp.pad_absolute_position(pad);
+                if pad.is_through_hole {
+                    if let Some(drill) = pad.drill {
+                        if drill > 0.0 && arc.distance_to_point((px, py)) < half_w + drill * 0.5 + min_hole_clr - 1e-4 {
+                            return false;
+                        }
+                    }
+                }
                 let pad_clr = board.get_netclass_for_net(pad.net_id).clearance;
                 let req_clr = clearance.max(pad_clr);
                 let required_dist = half_w + req_clr;
@@ -13611,7 +13873,7 @@ pub fn is_arc_clear(board: &Board, arc: &ArcSegment) -> bool {
         if via.net_id != arc.net_id {
             let via_clr = board.get_netclass_for_net(via.net_id).clearance;
             let req_clr = clearance.max(via_clr);
-            let required_dist = half_w + via.size * 0.5 + req_clr;
+            let required_dist = half_w + (via.size * 0.5 + req_clr).max(via.drill * 0.5 + min_hole_clr);
             if arc.distance_to_point(via.position) < required_dist - 1e-4 {
                 return false;
             }
@@ -14329,6 +14591,196 @@ pub fn convert_tracks_to_organic(board: &mut Board) {
 }
 
 fn widen_tracks_and_arcs_to_netclass(board: &mut Board) {
+    // 1. Neck down any track or arc whose current width violates netclass or hole clearance
+    for i in 0..board.arcs.len() {
+        if board.arcs[i].is_locked {
+            continue;
+        }
+        let arc = board.arcs[i].clone();
+        let min_w = board.get_netclass_for_net(arc.net_id).min_track_width.max(0.15);
+        if arc.width > min_w + 1e-3 && !is_arc_clear(board, &arc) {
+            for &cand_w in &[0.40, 0.35, 0.30, 0.25, 0.20, 0.18, min_w] {
+                if cand_w >= arc.width - 1e-3 || cand_w < min_w - 1e-3 {
+                    continue;
+                }
+                let mut cand_arc = arc.clone();
+                cand_arc.width = cand_w;
+                if is_arc_clear(board, &cand_arc) {
+                    board.arcs[i].width = cand_w;
+                    break;
+                }
+            }
+            if !is_arc_clear(board, &board.arcs[i].clone()) {
+                board.arcs[i].width = min_w;
+            }
+        }
+    }
+
+    for i in 0..board.tracks.len() {
+        if board.tracks[i].is_locked {
+            continue;
+        }
+        let trk = board.tracks[i].clone();
+        let min_w = board.get_netclass_for_net(trk.net_id).min_track_width.max(0.15);
+        if trk.width > min_w + 1e-3
+            && !is_segment_clear(board, None, trk.start, trk.end, trk.layer, trk.net_id, trk.width)
+        {
+            let mut healed = false;
+            for &cand_w in &[0.40, 0.35, 0.30, 0.25, 0.20, 0.18, min_w] {
+                if cand_w >= trk.width - 1e-3 || cand_w < min_w - 1e-3 {
+                    continue;
+                }
+                if is_segment_clear(board, None, trk.start, trk.end, trk.layer, trk.net_id, cand_w) {
+                    board.tracks[i].width = cand_w;
+                    healed = true;
+                    break;
+                }
+            }
+            if !healed {
+                board.tracks[i].width = min_w;
+            }
+        }
+    }
+
+    // 2. Micro-nudge any via that slightly violates hole_to_hole, hole_clearance, or copper clearance
+    let dirs_16: [(f64, f64); 16] = [
+        (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
+        (0.7071, 0.7071), (-0.7071, 0.7071), (0.7071, -0.7071), (-0.7071, -0.7071),
+        (0.9239, 0.3827), (-0.9239, 0.3827), (0.9239, -0.3827), (-0.9239, -0.3827),
+        (0.3827, 0.9239), (-0.3827, 0.9239), (0.3827, -0.9239), (-0.3827, -0.9239),
+    ];
+    for vi in 0..board.vias.len() {
+        if board.vias[vi].is_locked {
+            continue;
+        }
+        let v = board.vias[vi].clone();
+        let v_clr = board.get_netclass_for_net(v.net_id).clearance;
+        if is_via_location_legal_ignoring(board, v.position, v.size, v.net_id, v_clr, Some(v.position)) {
+            continue;
+        }
+        'via_nudge: for &r in &[0.02, 0.04, 0.06, 0.08, 0.10, 0.14, 0.18, 0.22, 0.28] {
+            for &(dx, dy) in &dirs_16 {
+                let cand = (v.position.0 + dx * r, v.position.1 + dy * r);
+                if !is_via_location_legal_ignoring(board, cand, v.size, v.net_id, v_clr, Some(v.position)) {
+                    continue;
+                }
+                let tracks_ok = board.tracks.iter().all(|t| {
+                    if t.net_id != v.net_id {
+                        return true;
+                    }
+                    let s_on = (t.start.0 - v.position.0).hypot(t.start.1 - v.position.1) < 1e-3;
+                    let e_on = (t.end.0 - v.position.0).hypot(t.end.1 - v.position.1) < 1e-3;
+                    if !s_on && !e_on {
+                        return true;
+                    }
+                    let ns = if s_on { cand } else { t.start };
+                    let ne = if e_on { cand } else { t.end };
+                    is_track_segment_legal(board, ns, ne, t.width, t.layer, t.net_id, v_clr)
+                });
+                let arcs_ok = !board.arcs.iter().any(|a| {
+                    a.net_id == v.net_id && {
+                        let as_pt = a.start();
+                        let ae_pt = a.end();
+                        (as_pt.0 - v.position.0).hypot(as_pt.1 - v.position.1) < 1e-2
+                            || (ae_pt.0 - v.position.0).hypot(ae_pt.1 - v.position.1) < 1e-2
+                    }
+                });
+                if tracks_ok && arcs_ok {
+                    for t in &mut board.tracks {
+                        if t.net_id == v.net_id {
+                            if (t.start.0 - v.position.0).hypot(t.start.1 - v.position.1) < 1e-3 {
+                                t.start = cand;
+                            }
+                            if (t.end.0 - v.position.0).hypot(t.end.1 - v.position.1) < 1e-3 {
+                                t.end = cand;
+                            }
+                        }
+                    }
+                    board.vias[vi].position = cand;
+                    break 'via_nudge;
+                }
+            }
+        }
+    }
+
+    // 3. Micro-nudge any shared interior track vertex whose incident segment slightly violates clearance
+    let is_anchored = |pt: (f64, f64), layer: usize, net_id: usize, b: &Board| -> bool {
+        b.vias.iter().any(|v| v.net_id == net_id && (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05)
+            || b.footprints.iter().any(|fp| {
+                fp.pads.iter().any(|p| {
+                    p.net_id == net_id
+                        && (p.is_through_hole || fp.layer == layer)
+                        && {
+                            let (px, py) = fp.pad_absolute_position(p);
+                            (px - pt.0).hypot(py - pt.1) < 0.05
+                        }
+                })
+            })
+            || b.arcs.iter().any(|a| {
+                a.net_id == net_id && a.layer == layer && {
+                    let s = a.start();
+                    let e = a.end();
+                    (s.0 - pt.0).hypot(s.1 - pt.1) < 0.02 || (e.0 - pt.0).hypot(e.1 - pt.1) < 0.02
+                }
+            })
+    };
+    let n_trks = board.tracks.len();
+    for i in 0..n_trks {
+        if board.tracks[i].is_locked {
+            continue;
+        }
+        let ti = board.tracks[i].clone();
+        if is_segment_clear(board, None, ti.start, ti.end, ti.layer, ti.net_id, ti.width) {
+            continue;
+        }
+        for &end_is_end in &[false, true] {
+            let v_pt = if end_is_end { ti.end } else { ti.start };
+            if is_anchored(v_pt, ti.layer, ti.net_id, board) {
+                continue;
+            }
+            let incident: Vec<(usize, bool)> = (0..n_trks)
+                .filter_map(|k| {
+                    let tk = &board.tracks[k];
+                    if tk.net_id != ti.net_id || tk.layer != ti.layer || tk.is_locked {
+                        return None;
+                    }
+                    if (tk.start.0 - v_pt.0).hypot(tk.start.1 - v_pt.1) < 1e-3 {
+                        Some((k, false))
+                    } else if (tk.end.0 - v_pt.0).hypot(tk.end.1 - v_pt.1) < 1e-3 {
+                        Some((k, true))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if incident.is_empty() || incident.len() > 3 {
+                continue;
+            }
+            'vtx_nudge: for &r in &[0.015, 0.03, 0.05, 0.08, 0.12, 0.16, 0.22] {
+                for &(dx, dy) in &dirs_16 {
+                    let cand = (v_pt.0 + dx * r, v_pt.1 + dy * r);
+                    let all_clear = incident.iter().all(|&(k, is_e)| {
+                        let tk = &board.tracks[k];
+                        let ns = if is_e { tk.start } else { cand };
+                        let ne = if is_e { cand } else { tk.end };
+                        is_segment_clear(board, None, ns, ne, tk.layer, tk.net_id, tk.width)
+                    });
+                    if all_clear {
+                        for &(k, is_e) in &incident {
+                            if is_e {
+                                board.tracks[k].end = cand;
+                            } else {
+                                board.tracks[k].start = cand;
+                            }
+                        }
+                        break 'vtx_nudge;
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Widen tracks and arcs back up to netclass target width where clearance permits
     for i in 0..board.arcs.len() {
         if board.arcs[i].is_locked {
             continue;
@@ -14721,6 +15173,17 @@ pub fn is_via_location_legal_ignoring(
         }
     }
 
+    let nc = board.get_netclass_for_net(net_id);
+    let min_hole_clr = if clearance < 0.15 { 0.0 } else { nc.min_hole_clearance };
+    let min_hole_to_hole = nc.min_hole_to_hole.max(0.25);
+    let via_drill = if via_dia <= 0.35 {
+        0.15
+    } else if via_dia <= 0.48 {
+        0.20
+    } else {
+        nc.via_drill.max(0.30)
+    };
+
     // 3. Footprint pads (foreign pads on all layers, including net 0; and same-net SMD pads)
     for fp in &board.footprints {
         for pad in &fp.pads {
@@ -14733,7 +15196,12 @@ pub fn is_via_location_legal_ignoring(
                     0.12
                 };
                 let pad_c = clearance.max(board.get_netclass_for_net(pad.net_id).clearance).max(min_c);
-                if d < via_r + pad_c - 1e-4 {
+                let req_r = if fp.is_bga() {
+                    via_r + pad_c
+                } else {
+                    (via_r + pad_c).max(via_drill * 0.5 + min_hole_clr)
+                };
+                if d < req_r - 1e-4 {
                     return false;
                 }
             } else if !pad.is_through_hole {
@@ -14752,7 +15220,8 @@ pub fn is_via_location_legal_ignoring(
         if trk.net_id != net_id {
             let trk_c = clearance.max(board.get_netclass_for_net(trk.net_id).clearance).max(min_c);
             let d = dist_point_to_segment(pos, trk.start, trk.end);
-            if d < via_r + trk.width * 0.5 + trk_c - 1e-4 {
+            let req_r = (via_r + trk_c).max(via_drill * 0.5 + min_hole_clr);
+            if d < req_r + trk.width * 0.5 - 1e-4 {
                 return false;
             }
         }
@@ -14771,14 +15240,16 @@ pub fn is_via_location_legal_ignoring(
         if v.net_id != net_id {
             let v_c = clearance.max(board.get_netclass_for_net(v.net_id).clearance).max(min_c);
             let d = (pos.0 - v.position.0).hypot(pos.1 - v.position.1);
-            if d < via_r + v.size * 0.5 + v_c - 1e-4 {
+            let req_d = (via_r + v.size * 0.5 + v_c)
+                .max(via_drill * 0.5 + v.size * 0.5 + min_hole_clr)
+                .max(via_r + v.drill * 0.5 + min_hole_clr);
+            if d < req_d - 1e-4 {
                 return false;
             }
         }
     }
 
     // 6. Hole-to-hole drill clearance against all through-hole pads (including same net)
-    let via_drill = if via_dia <= 0.35 { 0.15 } else { 0.30 };
     for fp in &board.footprints {
         for pad in &fp.pads {
             if pad.is_through_hole {
@@ -14786,8 +15257,11 @@ pub fn is_via_location_legal_ignoring(
                     if drill > 0.0 {
                         let (px, py) = fp.pad_absolute_position(pad);
                         let d = (pos.0 - px).hypot(pos.1 - py);
-                        let min_hole_dist = (via_drill * 0.5) + (drill * 0.5) + 0.25;
+                        let min_hole_dist = (via_drill * 0.5) + (drill * 0.5) + min_hole_to_hole;
                         if d < min_hole_dist - 1e-4 {
+                            return false;
+                        }
+                        if pad.net_id != net_id && d < via_r + (drill * 0.5) + min_hole_clr - 1e-4 {
                             return false;
                         }
                     }
@@ -14810,10 +15284,23 @@ pub fn is_via_location_legal_ignoring(
         let min_hole_dist = if via_dia <= 0.35 && v.drill <= 0.18 {
             (via_drill * 0.5) + (v.drill * 0.5) + 0.10
         } else {
-            (via_drill * 0.5) + (v.drill * 0.5) + 0.25
+            (via_drill * 0.5) + (v.drill * 0.5) + min_hole_to_hole
         };
         if d < min_hole_dist - 1e-4 {
             return false;
+        }
+    }
+
+    // 8. Foreign arcs on all copper layers
+    for arc in &board.arcs {
+        if arc.net_id != net_id {
+            let arc_c = clearance.max(board.get_netclass_for_net(arc.net_id).clearance).max(min_c);
+            let req_r = (via_r + arc_c).max(via_drill * 0.5 + min_hole_clr) + arc.width * 0.5;
+            for seg in arc.to_segments(8) {
+                if dist_point_to_segment(pos, seg.start, seg.end) < req_r - 1e-4 {
+                    return false;
+                }
+            }
         }
     }
 
@@ -14844,6 +15331,7 @@ pub fn is_track_segment_legal(
     clearance: f64,
 ) -> bool {
     let half_w = width * 0.5;
+    let min_hole_clr = board.get_netclass_for_net(net_id).min_hole_clearance;
 
     // 1. Board boundary & edge cuts clearance
     let edge_clr = board.get_netclass_for_net(net_id).board_edge_clearance;
@@ -14904,6 +15392,18 @@ pub fn is_track_segment_legal(
         for pad in &fp.pads {
             if pad.net_id != net_id {
                 if pad.is_through_hole || fp.layer == layer {
+                    if pad.is_through_hole {
+                        if let Some(drill) = pad.drill {
+                            if drill > 0.0 {
+                                let (px, py) = fp.pad_absolute_position(pad);
+                                if dist_point_to_segment((px, py), start, end)
+                                    < half_w + drill * 0.5 + min_hole_clr - 1e-4
+                                {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
                     let pad_c = clearance.max(board.get_netclass_for_net(pad.net_id).clearance).max(0.12);
                     let d = dist_segment_to_pad(start, end, fp, pad);
                     let req_d = half_w + pad_c;
@@ -14944,8 +15444,22 @@ pub fn is_track_segment_legal(
         if v.net_id != net_id {
             let v_c = clearance.max(board.get_netclass_for_net(v.net_id).clearance).max(0.12);
             let d = dist_point_to_segment(v.position, start, end);
-            if d < half_w + v.size * 0.5 + v_c - 1e-4 {
+            let req_v_r = (v.size * 0.5 + v_c).max(v.drill * 0.5 + min_hole_clr);
+            if d < half_w + req_v_r - 1e-4 {
                 return false;
+            }
+        }
+    }
+
+    // 6. Foreign arcs on same layer
+    for arc in &board.arcs {
+        if arc.net_id != net_id && arc.layer == layer {
+            let arc_c = clearance.max(board.get_netclass_for_net(arc.net_id).clearance).max(0.12);
+            let req = half_w + arc.width * 0.5 + arc_c - 1e-4;
+            for seg in arc.to_segments(8) {
+                if dist_segment_to_segment(start, end, seg.start, seg.end) < req {
+                    return false;
+                }
             }
         }
     }
@@ -16386,6 +16900,7 @@ pub fn validate_and_clean_copper(board: &mut Board) {
                 continue;
             }
 
+            let min_h2h = board.get_netclass_for_net(v1.net_id).min_hole_to_hole.max(0.25);
             for fp in &board.footprints {
                 for pad in &fp.pads {
                     if pad.is_through_hole {
@@ -16415,7 +16930,8 @@ pub fn validate_and_clean_copper(board: &mut Board) {
                     continue;
                 }
                 let v2 = &board.vias[j];
-                let min_hole_dist = (v1.drill * 0.5) + (v2.drill * 0.5) + 0.20;
+                let h2h_thresh = if v1.net_id == v2.net_id { min_h2h } else { 0.20 };
+                let min_hole_dist = (v1.drill * 0.5) + (v2.drill * 0.5) + h2h_thresh;
                 let d = (v1.position.0 - v2.position.0).hypot(v1.position.1 - v2.position.1);
                 if d < min_hole_dist - 1e-4 {
                     if v1.net_id == v2.net_id && i < j {
@@ -22834,4 +23350,84 @@ mod tests {
             "VBUS organic pad stubs in open space must widen to 0.60mm Power netclass width"
         );
     }
+
+    #[test]
+    fn test_drc_hole_clearance_and_neckdown_healing() {
+        let mut netclasses = HashMap::new();
+        let mut def_nc = NetClass::default();
+        def_nc.min_hole_clearance = 0.25;
+        def_nc.min_hole_to_hole = 0.25;
+        def_nc.min_track_width = 0.15;
+        netclasses.insert("Default".to_string(), def_nc);
+
+        let mut pwr_nc = NetClass {
+            name: "Power".to_string(),
+            clearance: 0.25,
+            track_width: 0.50,
+            via_dia: 0.60,
+            via_drill: 0.30,
+            ..NetClass::default()
+        };
+        pwr_nc.min_hole_clearance = 0.25;
+        pwr_nc.min_hole_to_hole = 0.25;
+        pwr_nc.min_track_width = 0.15;
+        netclasses.insert("Power".to_string(), pwr_nc);
+
+        let mut net_to_class = HashMap::new();
+        net_to_class.insert("VBUS".to_string(), "Power".to_string());
+        net_to_class.insert("SIG".to_string(), "Default".to_string());
+
+        let mut board = Board {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 30.0,
+            max_y: 30.0,
+            nets: vec![String::new(), "VBUS".to_string(), "SIG".to_string()],
+            netclasses,
+            net_to_class,
+            vias: vec![Via {
+                position: (10.0, 10.0),
+                size: 0.45, // small annular ring so hole_clearance (0.15 + 0.25 = 0.40) dominates over copper radius (0.225 + 0.20 = 0.425) when min_hole_clearance is raised
+                drill: 0.30,
+                net_id: 2,
+                is_locked: true,
+            }],
+            tracks: vec![TrackSegment {
+                // At y = 10.62, dist = 0.62mm.
+                // With width = 0.50 (half_w = 0.25) and via_r = 0.225 + req_clr = 0.25 -> req = 0.725mm (violation!).
+                // If necked down to width = 0.15 (half_w = 0.075), req = 0.075 + 0.225 + 0.25 = 0.55mm <= 0.62mm (legal!).
+                start: (5.0, 10.62),
+                end: (15.0, 10.62),
+                width: 0.50,
+                layer: 0,
+                net_id: 1,
+                is_locked: false,
+            }],
+            ..Board::default()
+        };
+
+        assert!(
+            !is_segment_clear(&board, None, (5.0, 10.62), (15.0, 10.62), 0, 1, 0.50),
+            "0.50mm Power track at 0.62mm from foreign via must fail clearance check"
+        );
+        widen_tracks_and_arcs_to_netclass(&mut board);
+        assert!(
+            board.tracks[0].width < 0.30 && board.tracks[0].width >= 0.15,
+            "Tight 0.50mm track must neck down to satisfy netclass clearance without being deleted (got {})",
+            board.tracks[0].width
+        );
+        assert!(
+            is_segment_clear(
+                &board,
+                None,
+                board.tracks[0].start,
+                board.tracks[0].end,
+                0,
+                1,
+                board.tracks[0].width
+            ),
+            "Necked-down track must pass is_segment_clear"
+        );
+    }
 }
+

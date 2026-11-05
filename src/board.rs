@@ -594,6 +594,40 @@ impl Default for DfmConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DesignRules {
+    pub min_clearance: f64,
+    pub min_track_width: f64,
+    pub min_via_diameter: f64,
+    pub min_via_drill: f64,
+    pub min_via_annular_width: f64,
+    pub min_through_hole_diameter: f64,
+    pub min_hole_clearance: f64,
+    pub min_hole_to_hole: f64,
+    pub min_copper_edge_clearance: f64,
+    pub zone_min_clearance: f64,
+    pub zone_min_thickness: f64,
+}
+
+impl Default for DesignRules {
+    fn default() -> Self {
+        Self {
+            min_clearance: 0.0,
+            min_track_width: 0.127,
+            min_via_diameter: 0.50,
+            min_via_drill: 0.20,
+            min_via_annular_width: 0.10,
+            min_through_hole_diameter: 0.20,
+            min_hole_clearance: 0.25,
+            min_hole_to_hole: 0.25,
+            min_copper_edge_clearance: 0.30,
+            zone_min_clearance: 0.50,
+            zone_min_thickness: 0.25,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NetClass {
@@ -620,6 +654,24 @@ pub struct NetClass {
     pub max_coupled_length_mm: f64,
     #[serde(default)]
     pub require_return_path: bool,
+    #[serde(default = "default_min_track_width")]
+    pub min_track_width: f64,
+    #[serde(default = "default_min_via_diameter")]
+    pub min_via_diameter: f64,
+    #[serde(default = "default_min_via_drill")]
+    pub min_via_drill: f64,
+    #[serde(default = "default_min_via_annular_width")]
+    pub min_via_annular_width: f64,
+    #[serde(default = "default_min_through_hole_diameter")]
+    pub min_through_hole_diameter: f64,
+    #[serde(default = "default_min_hole_clearance")]
+    pub min_hole_clearance: f64,
+    #[serde(default = "default_min_hole_to_hole")]
+    pub min_hole_to_hole: f64,
+    #[serde(default = "default_zone_min_clearance")]
+    pub zone_min_clearance: f64,
+    #[serde(default = "default_zone_min_thickness")]
+    pub zone_min_thickness: f64,
 }
 
 fn default_diff_pair_dim() -> f64 {
@@ -646,6 +698,42 @@ fn default_max_coupled_length_mm() -> f64 {
     15.0
 }
 
+fn default_min_track_width() -> f64 {
+    0.127
+}
+
+fn default_min_via_diameter() -> f64 {
+    0.50
+}
+
+fn default_min_via_drill() -> f64 {
+    0.20
+}
+
+fn default_min_via_annular_width() -> f64 {
+    0.10
+}
+
+fn default_min_through_hole_diameter() -> f64 {
+    0.20
+}
+
+fn default_min_hole_clearance() -> f64 {
+    0.25
+}
+
+fn default_min_hole_to_hole() -> f64 {
+    0.25
+}
+
+fn default_zone_min_clearance() -> f64 {
+    0.50
+}
+
+fn default_zone_min_thickness() -> f64 {
+    0.25
+}
+
 impl Default for NetClass {
     fn default() -> Self {
         Self {
@@ -663,11 +751,42 @@ impl Default for NetClass {
             board_edge_clearance: 0.35,
             max_coupled_length_mm: 15.0,
             require_return_path: false,
+            min_track_width: 0.127,
+            min_via_diameter: 0.50,
+            min_via_drill: 0.20,
+            min_via_annular_width: 0.10,
+            min_through_hole_diameter: 0.20,
+            min_hole_clearance: 0.25,
+            min_hole_to_hole: 0.25,
+            zone_min_clearance: 0.50,
+            zone_min_thickness: 0.25,
         }
     }
 }
 
 impl NetClass {
+    pub fn apply_design_rules(&mut self, rules: &DesignRules) {
+        self.min_track_width = rules.min_track_width;
+        self.min_via_diameter = rules.min_via_diameter;
+        self.min_via_drill = rules.min_via_drill;
+        self.min_via_annular_width = rules.min_via_annular_width;
+        self.min_through_hole_diameter = rules.min_through_hole_diameter;
+        self.min_hole_clearance = rules.min_hole_clearance;
+        self.min_hole_to_hole = rules.min_hole_to_hole;
+        self.zone_min_clearance = rules.zone_min_clearance;
+        self.zone_min_thickness = rules.zone_min_thickness;
+        self.clearance = self.clearance.max(rules.min_clearance);
+        self.track_width = self.track_width.max(rules.min_track_width);
+        self.via_drill = self
+            .via_drill
+            .max(rules.min_via_drill)
+            .max(rules.min_through_hole_diameter);
+        self.via_dia = self
+            .via_dia
+            .max(rules.min_via_diameter)
+            .max(self.via_drill + 2.0 * rules.min_via_annular_width);
+    }
+
     pub fn is_high_speed_name(name: &str) -> bool {
         let upper = name.to_uppercase();
         upper.contains("DIFF")
@@ -2068,13 +2187,19 @@ impl Board {
         };
 
         if !path.is_empty() {
-            // Auto-load project netclasses if sibling .kicad_pro exists
+            // Auto-load project netclasses and design rules if sibling .kicad_pro exists
             let pro_path = Path::new(path).with_extension("kicad_pro");
             if pro_path.exists() {
                 board.load_project_netclasses(&pro_path);
                 // The project defines its own classes; drop built-in fallbacks left with no nets.
                 let used: HashSet<&String> = board.net_to_class.values().collect();
                 board.netclasses.retain(|name, _| name == "Default" || used.contains(name));
+            }
+
+            // Auto-load custom DRC rules if sibling .kicad_dru exists
+            let dru_path = Path::new(path).with_extension("kicad_dru");
+            if dru_path.exists() {
+                board.load_design_rules_dru(&dru_path);
             }
 
             // Auto-load schematic functional clusters if sibling .kicad_sch exists
@@ -2273,6 +2398,29 @@ impl Board {
             .map(|nc| nc.board_edge_clearance)
             .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap_or(0.35)
+    }
+
+    /// Board-level physical DRC constraints imported from `.kicad_pro` and `.kicad_dru`.
+    pub fn design_rules(&self) -> DesignRules {
+        let nc = self.get_netclass_for_net(0);
+        DesignRules {
+            min_clearance: self
+                .netclasses
+                .values()
+                .map(|c| c.clearance)
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(0.0),
+            min_track_width: nc.min_track_width,
+            min_via_diameter: nc.min_via_diameter,
+            min_via_drill: nc.min_via_drill,
+            min_via_annular_width: nc.min_via_annular_width,
+            min_through_hole_diameter: nc.min_through_hole_diameter,
+            min_hole_clearance: nc.min_hole_clearance,
+            min_hole_to_hole: nc.min_hole_to_hole,
+            min_copper_edge_clearance: self.board_edge_clearance(),
+            zone_min_clearance: nc.zone_min_clearance,
+            zone_min_thickness: nc.zone_min_thickness,
+        }
     }
 
     /// Verifies if a point is strictly inside the physical board boundary and outline contour.
@@ -3126,7 +3274,8 @@ impl Board {
                     v.position.0, v.position.1, v.size, v.drill, net_expr, locked_str
                 ));
             }
-            if !content.contains("(net_class ") {
+            let has_pro = !self.file_path.is_empty() && Path::new(&self.file_path).with_extension("kicad_pro").exists();
+            if !content.contains("(net_class ") && !is_kicad10_named_nets && !has_pro {
                 let mut sorted_cnames: Vec<&String> = self.netclasses.keys().collect();
                 sorted_cnames.sort();
                 for name in sorted_cnames {
@@ -3328,7 +3477,28 @@ impl Board {
 
     pub fn load_project_netclasses(&mut self, pro_path: &Path) {
         let Ok(content) = fs::read_to_string(pro_path) else { return };
-        self.parse_netclasses_from_pro_or_pcb(&content);
+        self.apply_project_netclasses_str(&content);
+    }
+
+    pub fn apply_project_netclasses_str(&mut self, content: &str) {
+        let classes = parse_netclasses_from_pro_or_pcb(content);
+        if !classes.is_empty() {
+            // Reset heuristic netclass assignments so nets not explicitly assigned in .kicad_pro
+            // fall back to "Default" instead of retaining built-in heuristic classes (e.g. "HBS_Bus").
+            for cls in self.net_to_class.values_mut() {
+                *cls = "Default".to_string();
+            }
+            self.netclasses
+                .retain(|name, _| name == "Default" || classes.contains_key(name));
+            for (name, nc) in classes {
+                self.netclasses.insert(name, nc);
+            }
+        }
+        if let Some(rules) = parse_design_rules_from_pro_or_dru(&content) {
+            for nc in self.netclasses.values_mut() {
+                nc.apply_design_rules(&rules);
+            }
+        }
         let Ok(root) = serde_json::from_str::<serde_json::Value>(&content) else { return };
         let Some(net_settings) = root.get("net_settings") else { return };
 
@@ -3373,6 +3543,20 @@ impl Board {
                     }
                 }
             }
+        }
+    }
+
+    pub fn load_design_rules_dru(&mut self, dru_path: &Path) {
+        let Ok(content) = fs::read_to_string(dru_path) else { return };
+        self.apply_design_rules_dru_str(&content);
+    }
+
+    pub fn apply_design_rules_dru_str(&mut self, content: &str) {
+        let mut base_rules = self.design_rules();
+        apply_dru_rules_to_board(content, &mut base_rules, &mut self.netclasses);
+        for nc in self.netclasses.values_mut() {
+            nc.apply_design_rules(&base_rules);
+            nc.board_edge_clearance = nc.board_edge_clearance.max(base_rules.min_copper_edge_clearance);
         }
     }
 
@@ -3974,11 +4158,199 @@ fn chain_lines_into_polygons(mut lines: Vec<(Point, Point)>) -> Vec<Polygon> {
     polys
 }
 
+fn parse_dru_dimension_mm(raw: &str) -> Option<f64> {
+    let s = raw.trim().trim_matches('"').trim();
+    if let Some(num_s) = s.strip_suffix("mm") {
+        num_s.trim().parse::<f64>().ok()
+    } else if let Some(num_s) = s.strip_suffix("um") {
+        num_s.trim().parse::<f64>().ok().map(|v| v * 0.001)
+    } else if let Some(num_s) = s.strip_suffix("mil") {
+        num_s.trim().parse::<f64>().ok().map(|v| v * 0.0254)
+    } else {
+        s.parse::<f64>().ok()
+    }
+}
+
+pub fn apply_dru_rules_to_board(
+    content: &str,
+    rules: &mut DesignRules,
+    netclasses: &mut HashMap<String, NetClass>,
+) {
+    let bytes = content.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == b'(' {
+            let word = next_token(content, i + 1);
+            if word == "rule" {
+                if let Some(end) = find_closing_paren(bytes, i) {
+                    let block = &content[i..end];
+                    let condition = if let Some(c_pos) = block.find("(condition ") {
+                        let after = &block[c_pos + 11..];
+                        if let Some(q1) = after.find('"') {
+                            after[q1 + 1..].find('"').map(|q2| &after[q1 + 1..q1 + 1 + q2])
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Ignore pad-specific exemption rules when computing global track/via routing rules
+                    let is_pad_exemption = condition
+                        .map(|c| c.contains("Pad") || c.contains("pad") || c.contains("Footprint"))
+                        .unwrap_or(false);
+                    if !is_pad_exemption {
+                        let b_bytes = block.as_bytes();
+                        let mut j = 0;
+                        while j < b_bytes.len() {
+                            if b_bytes[j] == b'(' && block[j..].starts_with("(constraint ") {
+                                if let Some(c_end) = find_closing_paren(b_bytes, j) {
+                                    let c_block = &block[j..c_end];
+                                    let c_type = next_token(c_block, "(constraint ".len());
+                                    let min_val = if let Some(m_pos) = c_block.find("(min ") {
+                                        let rest = &c_block[m_pos + 5..];
+                                        rest.find(')').and_then(|m_end| parse_dru_dimension_mm(&rest[..m_end]))
+                                    } else if let Some(o_pos) = c_block.find("(opt ") {
+                                        let rest = &c_block[o_pos + 5..];
+                                        rest.find(')').and_then(|o_end| parse_dru_dimension_mm(&rest[..o_end]))
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(val) = min_val {
+                                        if let Some(cond_str) = condition {
+                                            for (cls_name, nc) in netclasses.iter_mut() {
+                                                if cond_str.contains(&format!("'{}'", cls_name))
+                                                    || cond_str.contains(&format!("\"{}\"", cls_name))
+                                                {
+                                                    match c_type {
+                                                        "clearance" => nc.clearance = nc.clearance.max(val),
+                                                        "track_width" => nc.track_width = nc.track_width.max(val),
+                                                        "via_diameter" => nc.via_dia = nc.via_dia.max(val),
+                                                        "hole_size" | "via_drill" => nc.via_drill = nc.via_drill.max(val),
+                                                        "edge_clearance" | "copper_edge_clearance" => {
+                                                            nc.board_edge_clearance = nc.board_edge_clearance.max(val)
+                                                        }
+                                                        "hole_clearance" => {
+                                                            nc.min_hole_clearance = nc.min_hole_clearance.max(val)
+                                                        }
+                                                        "hole_to_hole" => {
+                                                            nc.min_hole_to_hole = nc.min_hole_to_hole.max(val)
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            match c_type {
+                                                "clearance" => rules.min_clearance = rules.min_clearance.max(val),
+                                                "track_width" => rules.min_track_width = rules.min_track_width.max(val),
+                                                "via_diameter" => {
+                                                    rules.min_via_diameter = rules.min_via_diameter.max(val)
+                                                }
+                                                "hole_size" | "via_drill" => {
+                                                    rules.min_via_drill = rules.min_via_drill.max(val)
+                                                }
+                                                "annular_width" => {
+                                                    rules.min_via_annular_width = rules.min_via_annular_width.max(val)
+                                                }
+                                                "hole_clearance" => {
+                                                    rules.min_hole_clearance = rules.min_hole_clearance.max(val)
+                                                }
+                                                "hole_to_hole" => {
+                                                    rules.min_hole_to_hole = rules.min_hole_to_hole.max(val)
+                                                }
+                                                "edge_clearance" | "copper_edge_clearance" => {
+                                                    rules.min_copper_edge_clearance =
+                                                        rules.min_copper_edge_clearance.max(val)
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    j = c_end;
+                                    continue;
+                                }
+                            }
+                            j += 1;
+                        }
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+pub fn parse_design_rules_from_pro_or_dru(content: &str) -> Option<DesignRules> {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with('{') {
+        let root = serde_json::from_str::<serde_json::Value>(content).ok()?;
+        let design_settings = root.get("board").and_then(|b| b.get("design_settings")).or_else(|| root.get("design_settings"))?;
+        let mut rules = DesignRules::default();
+        let mut found_any = false;
+        if let Some(r_obj) = design_settings.get("rules") {
+            found_any = true;
+            if let Some(v) = r_obj.get("min_clearance").and_then(|v| v.as_f64()) {
+                rules.min_clearance = v;
+            }
+            if let Some(v) = r_obj.get("min_track_width").and_then(|v| v.as_f64()) {
+                rules.min_track_width = v;
+            }
+            if let Some(v) = r_obj.get("min_via_diameter").and_then(|v| v.as_f64()) {
+                rules.min_via_diameter = v;
+            }
+            if let Some(v) = r_obj.get("min_via_drill").and_then(|v| v.as_f64()) {
+                rules.min_via_drill = v;
+            }
+            if let Some(v) = r_obj.get("min_via_annular_width").and_then(|v| v.as_f64()) {
+                rules.min_via_annular_width = v;
+            }
+            if let Some(v) = r_obj.get("min_through_hole_diameter").and_then(|v| v.as_f64()) {
+                rules.min_through_hole_diameter = v;
+            }
+            if let Some(v) = r_obj.get("min_hole_clearance").and_then(|v| v.as_f64()) {
+                rules.min_hole_clearance = v;
+            }
+            if let Some(v) = r_obj.get("min_hole_to_hole").and_then(|v| v.as_f64()) {
+                rules.min_hole_to_hole = v;
+            }
+            if let Some(v) = r_obj.get("min_copper_edge_clearance").and_then(|v| v.as_f64()) {
+                rules.min_copper_edge_clearance = v;
+            }
+        }
+        if let Some(z_obj) = design_settings.get("defaults").and_then(|d| d.get("zones")) {
+            found_any = true;
+            if let Some(v) = z_obj.get("min_clearance").and_then(|v| v.as_f64()) {
+                rules.zone_min_clearance = v;
+            }
+            if let Some(v) = z_obj.get("min_thickness").and_then(|v| v.as_f64()) {
+                rules.zone_min_thickness = v;
+            }
+        }
+        if found_any {
+            Some(rules)
+        } else {
+            None
+        }
+    } else if trimmed.contains("(rule ") || trimmed.contains("(constraint ") {
+        let mut rules = DesignRules::default();
+        let mut dummy = HashMap::new();
+        apply_dru_rules_to_board(content, &mut rules, &mut dummy);
+        Some(rules)
+    } else {
+        None
+    }
+}
+
 pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetClass> {
     let mut netclasses = HashMap::new();
     let trimmed = content.trim_start();
     if trimmed.starts_with('{') {
         if let Ok(root) = serde_json::from_str::<serde_json::Value>(content) {
+            let pro_rules = parse_design_rules_from_pro_or_dru(content);
             let root_preset = root
                 .get("fab_preset")
                 .or_else(|| root.get("preset"))
@@ -4034,7 +4406,10 @@ pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetCla
                         .get("teardrop_width_ratio")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(0.8);
-                    let default_edge_clr = cls_preset.map(|p| p.board_edge_clearance()).unwrap_or(0.35);
+                    let default_edge_clr = cls_preset
+                        .map(|p| p.board_edge_clearance())
+                        .or_else(|| pro_rules.map(|r| r.min_copper_edge_clearance))
+                        .unwrap_or(0.35);
                     let board_edge_clearance = cls
                         .get("board_edge_clearance")
                         .and_then(|v| v.as_f64())
@@ -4055,7 +4430,11 @@ pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetCla
                         board_edge_clearance,
                         max_coupled_length_mm,
                         require_return_path,
+                        ..NetClass::default()
                     };
+                    if let Some(ref rules) = pro_rules {
+                        nc.apply_design_rules(rules);
+                    }
                     if let Some(p) = cls_preset {
                         p.apply_to_netclass(&mut nc);
                         if let Some(explicit_bec) = cls.get("board_edge_clearance").and_then(|v| v.as_f64()) {
@@ -4173,6 +4552,7 @@ pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetCla
                                 board_edge_clearance,
                                 max_coupled_length_mm,
                                 require_return_path,
+                                ..NetClass::default()
                             };
                             if let Some(p) = cls_preset {
                                 p.apply_to_netclass(&mut nc);
@@ -6485,4 +6865,99 @@ mod tests {
         assert!((reloaded.footprints[0].pads[0].rotation - 0.0).abs() < 1e-4);
         assert!((reloaded.footprints[0].pads[1].rotation - 90.0).abs() < 1e-4);
     }
+
+    #[test]
+    fn test_parse_design_rules_from_kicad_pro_and_dru() {
+        let pro_json = r#"{
+  "board": {
+    "design_settings": {
+      "defaults": {
+        "zones": {
+          "min_clearance": 0.5,
+          "min_thickness": 0.25
+        }
+      },
+      "rules": {
+        "min_clearance": 0.18,
+        "min_copper_edge_clearance": 0.45,
+        "min_hole_clearance": 0.28,
+        "min_hole_to_hole": 0.30,
+        "min_through_hole_diameter": 0.35,
+        "min_track_width": 0.16,
+        "min_via_annular_width": 0.14,
+        "min_via_diameter": 0.55
+      }
+    }
+  },
+  "net_settings": {
+    "classes": [
+      {
+        "name": "Default",
+        "clearance": 0.2,
+        "track_width": 0.25,
+        "via_diameter": 0.6,
+        "via_drill": 0.3
+      },
+      {
+        "name": "P1P2_Bus",
+        "clearance": 0.3,
+        "track_width": 0.5,
+        "via_diameter": 0.6,
+        "via_drill": 0.3
+      }
+    ],
+    "netclass_assignments": {
+      "P1": "P1P2_Bus"
+    }
+  }
+}"#;
+        let rules = parse_design_rules_from_pro_or_dru(pro_json).expect("Expected DesignRules");
+        assert!((rules.min_clearance - 0.18).abs() < 1e-6);
+        assert!((rules.min_copper_edge_clearance - 0.45).abs() < 1e-6);
+        assert!((rules.min_hole_clearance - 0.28).abs() < 1e-6);
+        assert!((rules.min_hole_to_hole - 0.30).abs() < 1e-6);
+        assert!((rules.min_through_hole_diameter - 0.35).abs() < 1e-6);
+        assert!((rules.min_track_width - 0.16).abs() < 1e-6);
+        assert!((rules.min_via_annular_width - 0.14).abs() < 1e-6);
+        assert!((rules.min_via_diameter - 0.55).abs() < 1e-6);
+        assert!((rules.zone_min_clearance - 0.50).abs() < 1e-6);
+        assert!((rules.zone_min_thickness - 0.25).abs() < 1e-6);
+
+        let pcb = r#"(kicad_pcb
+  (version 20260206)
+  (generator "pcbnew")
+  (generator_version "10.0")
+  (net 0 "")
+  (net 1 "P1")
+  (net 2 "Net-(D4-A)")
+)"#;
+        let mut board = Board::from_kicad_pcb(pcb).expect("Failed to parse PCB");
+        board.apply_project_netclasses_str(pro_json);
+        assert!(!board.netclasses.contains_key("HBS_Bus"), "Fallback HBS_Bus must not pollute .kicad_pro netclasses");
+        assert_eq!(board.get_netclass_for_net(1).name, "P1P2_Bus");
+        assert!((board.get_netclass_for_net(1).clearance - 0.30).abs() < 1e-6);
+        assert_eq!(board.get_netclass_for_net(2).name, "Default");
+        assert!((board.board_edge_clearance() - 0.45).abs() < 1e-6);
+        assert!((board.design_rules().min_hole_clearance - 0.28).abs() < 1e-6);
+        assert!((board.design_rules().min_hole_to_hole - 0.30).abs() < 1e-6);
+
+        let dru = r#"(version 1)
+(rule "Custom Hole To Hole"
+  (constraint hole_to_hole (min 0.35mm))
+  (constraint hole_clearance (min 0.32mm))
+  (constraint edge_clearance (min 0.50mm))
+)
+(rule "High Voltage Bus"
+  (condition "A.NetClass == 'P1P2_Bus'")
+  (constraint clearance (min 0.40mm))
+  (constraint track_width (min 0.60mm))
+)"#;
+        board.apply_design_rules_dru_str(dru);
+        assert!((board.design_rules().min_hole_to_hole - 0.35).abs() < 1e-6);
+        assert!((board.design_rules().min_hole_clearance - 0.32).abs() < 1e-6);
+        assert!((board.board_edge_clearance() - 0.50).abs() < 1e-6);
+        assert!((board.get_netclass_for_net(1).clearance - 0.40).abs() < 1e-6);
+        assert!((board.get_netclass_for_net(1).track_width - 0.60).abs() < 1e-6);
+    }
 }
+
