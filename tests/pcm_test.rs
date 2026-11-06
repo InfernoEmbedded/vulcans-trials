@@ -289,3 +289,41 @@ fn test_build_multi_platform_kicad_packages_script() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_app_icons_exist_for_all_os_and_window_managers() {
+    let root = get_workspace_root();
+    let assets = root.join("assets");
+    assert!(assets.exists(), "assets directory must exist");
+
+    // 1. Windows icon (.ico)
+    let ico = assets.join("icon.ico");
+    assert!(ico.exists(), "assets/icon.ico must exist");
+    assert!(fs::metadata(&ico).unwrap().len() > 10000, "assets/icon.ico must contain multi-res mipmaps");
+
+    // 2. macOS Apple Icon Image (.icns) and Info.plist
+    let icns = assets.join("icon.icns");
+    assert!(icns.exists(), "assets/icon.icns must exist");
+    assert!(fs::metadata(&icns).unwrap().len() > 50000, "assets/icon.icns must contain retina icon data");
+
+    let plist = assets.join("Info.plist");
+    assert!(plist.exists(), "assets/Info.plist must exist");
+    let plist_text = fs::read_to_string(&plist).unwrap();
+    assert!(plist_text.contains("<string>com.infernoembedded.vulcans-trials</string>"));
+    assert!(plist_text.contains("<string>icon.icns</string>"));
+
+    // 3. Linux XDG Desktop Entry and Hicolor theme hierarchy
+    let desktop = assets.join("vulcans-trials.desktop");
+    assert!(desktop.exists(), "assets/vulcans-trials.desktop must exist");
+    let desktop_text = fs::read_to_string(&desktop).unwrap();
+    assert!(desktop_text.contains("Icon=vulcans-trials"));
+    assert!(desktop_text.contains("StartupWMClass=com.infernoembedded.vulcans-trials"));
+
+    let hicolor = assets.join("icons").join("hicolor");
+    for size in [16, 24, 32, 48, 64, 128, 256, 512] {
+        let png = hicolor.join(format!("{}x{}", size, size)).join("apps").join("vulcans-trials.png");
+        assert!(png.exists(), "Missing XDG icon at {}", png.display());
+    }
+    let svg = hicolor.join("scalable").join("apps").join("vulcans-trials.svg");
+    assert!(svg.exists(), "Missing scalable SVG at {}", svg.display());
+}
+

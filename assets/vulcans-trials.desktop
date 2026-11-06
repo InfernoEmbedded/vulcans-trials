@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Vulcan's Trials
+GenericName=PCB Auto-Placer and Auto-Router
+Comment=Vulkan GPU & Multi-Core CPU Auto-Placer and Auto-Router for KiCad
+Exec=vulcans-trials %f
+Icon=vulcans-trials
+Terminal=false
+Categories=Development;Engineering;Electronics;
+MimeType=application/x-kicad-pcb;
+StartupWMClass=com.infernoembedded.vulcans-trials
+Keywords=kicad;pcb;autorouter;autoplacer;vulkan;eda;routing;placement;

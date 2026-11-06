@@ -432,10 +432,19 @@ fn main() {
         return;
     }
 
+    pub const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon_256x256.png");
+
+    let icon_data = eframe::icon_data::from_png_bytes(APP_ICON_PNG).ok();
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_title(format!("Vulcan's Trials v{} — InfernoEmbedded Auto-Placer & Auto-Router (GPLv3)", env!("CARGO_PKG_VERSION")))
+        .with_app_id("com.infernoembedded.vulcans-trials")
+        .with_inner_size([1360.0, 840.0]);
+    if let Some(icon) = icon_data {
+        viewport = viewport.with_icon(icon);
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title(format!("Vulcan's Trials v{} — InfernoEmbedded Auto-Placer & Auto-Router (GPLv3)", env!("CARGO_PKG_VERSION")))
-            .with_inner_size([1360.0, 840.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -455,6 +464,16 @@ fn main() {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn test_app_window_icon_loads_valid_png() {
+        const APP_ICON_BYTES: &[u8] = include_bytes!("../assets/icon_256x256.png");
+        let icon = eframe::icon_data::from_png_bytes(APP_ICON_BYTES)
+            .expect("App window icon PNG must decode successfully");
+        assert_eq!(icon.width, 256);
+        assert_eq!(icon.height, 256);
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
 
     #[test]
     fn test_cli_args_parsing_and_locked_refs() {
