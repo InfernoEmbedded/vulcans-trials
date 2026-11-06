@@ -63,6 +63,7 @@ pub type IpcCommand = IpcMessage;
 pub struct KiCadIpcClient {
     #[cfg(unix)]
     stream: Option<UnixStream>,
+    nng: Option<NngKiCadClient>,
     socket_path: Option<PathBuf>,
     is_connected: bool,
 
@@ -89,6 +90,7 @@ impl std::fmt::Debug for KiCadIpcClient {
         f.debug_struct("KiCadIpcClient")
             .field("socket_path", &self.socket_path)
             .field("is_connected", &self.is_connected)
+            .field("is_nng", &self.nng.is_some())
             .field("throttle_interval", &self.throttle_interval)
             .field("pending_moves", &self.pending_moves.len())
             .field("pending_tracks", &self.pending_tracks.len())
@@ -99,12 +101,28 @@ impl std::fmt::Debug for KiCadIpcClient {
     }
 }
 
+/// Returns true if `path` refers to a native KiCad 9/10 NNG IPC socket (such as `/tmp/kicad/api.sock`)
+/// rather than a mock line-delimited JSON `UnixListener` test socket (`/tmp/kicad_ipc_test_*.sock`).
+pub fn is_native_kicad_nng_socket_path(path: &Path) -> bool {
+    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let parent_name = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    fname == "api.sock"
+        || parent_name == "kicad"
+        || fname.contains("_nng_")
+        || fname == "kicad.sock"
+}
+
 impl KiCadIpcClient {
     /// Creates a new unconnected IPC client instance with default 60 FPS (16ms) throttling.
     pub fn new() -> Self {
         Self {
             #[cfg(unix)]
             stream: None,
+            nng: None,
             socket_path: None,
             is_connected: false,
             throttle_interval: Duration::from_millis(16),
@@ -132,9 +150,29 @@ impl KiCadIpcClient {
     }
 
     /// Connects to a specific Unix domain socket path and performs initial handshake.
-    /// Supports direct filesystem paths as well as `ipc:///path/to/socket` URI syntax.
+    /// Uses native NNG Req0 + Protobuf (`kiapi.*`) for KiCad 9/10 sockets (`/tmp/kicad/api.sock`),
+    /// and line-delimited JSON over `UnixStream` for mock test sockets.
     pub fn connect<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let p = Self::normalize_socket_path(&path.as_ref().to_string_lossy());
+        if is_native_kicad_nng_socket_path(&p) {
+            let nng = NngKiCadClient::connect(&p)?;
+            return Ok(Self {
+                #[cfg(unix)]
+                stream: None,
+                nng: Some(nng),
+                socket_path: Some(p),
+                is_connected: true,
+                throttle_interval: Duration::from_millis(16),
+                last_flush_time: Instant::now(),
+                pending_moves: HashMap::new(),
+                last_sent_moves: HashMap::new(),
+                pending_tracks: Vec::new(),
+                pending_vias: Vec::new(),
+                total_messages_sent: 1,
+                total_batches_committed: 0,
+            });
+        }
+
         #[cfg(unix)]
         {
             let stream = UnixStream::connect(&p)?;
@@ -143,6 +181,7 @@ impl KiCadIpcClient {
 
             let mut client = Self {
                 stream: Some(stream),
+                nng: None,
                 socket_path: Some(p),
                 is_connected: true,
                 throttle_interval: Duration::from_millis(16),
@@ -187,7 +226,11 @@ impl KiCadIpcClient {
                     Ok(client) => return Some(client),
                     Err(e) => {
                         if !quiet {
-                            eprintln!("[KiCad-IPC] Failed to connect to specified socket '{}': {}", norm.display(), e);
+                            eprintln!(
+                                "[KiCad-IPC] Failed to connect to specified socket '{}': {}",
+                                norm.display(),
+                                e
+                            );
                         }
                         if norm != Path::new("/tmp/kicad/api.sock") {
                             return None;
@@ -201,13 +244,20 @@ impl KiCadIpcClient {
             match Self::connect(&discovered) {
                 Ok(client) => {
                     if !quiet {
-                        println!("[KiCad-IPC] Connected to active KiCad 10 socket at {}", discovered.display());
+                        println!(
+                            "[KiCad-IPC] Connected to active KiCad 10 socket at {}",
+                            discovered.display()
+                        );
                     }
                     Some(client)
                 }
                 Err(e) => {
                     if !quiet {
-                        eprintln!("[KiCad-IPC] Failed to connect to discovered socket '{}': {}", discovered.display(), e);
+                        eprintln!(
+                            "[KiCad-IPC] Failed to connect to discovered socket '{}': {}",
+                            discovered.display(),
+                            e
+                        );
                     }
                     None
                 }
@@ -219,14 +269,17 @@ impl KiCadIpcClient {
 
     /// Discovers active KiCad 10 IPC Unix socket paths on Linux/macOS.
     /// Checks:
-    /// 1. $KICAD_IPC_PATH or $KICAD_IPC_SOCKET env vars (supports ipc:// prefix)
+    /// 1. $KICAD_IPC_PATH, $KICAD_IPC_SOCKET, or $KICAD_API_SOCKET env vars (supports ipc:// prefix)
     /// 2. Well-known KiCad 9/10 socket paths (/tmp/kicad/api.sock, /tmp/kicad.sock)
     /// 3. $XDG_RUNTIME_DIR/kicad/
     /// 4. /tmp/kicad/
     /// 5. /tmp/
     pub fn discover_socket_path() -> Option<PathBuf> {
         // 1. Environment variable override
-        if let Ok(env_path) = env::var("KICAD_IPC_PATH").or_else(|_| env::var("KICAD_IPC_SOCKET")) {
+        if let Ok(env_path) = env::var("KICAD_IPC_PATH")
+            .or_else(|_| env::var("KICAD_IPC_SOCKET"))
+            .or_else(|_| env::var("KICAD_API_SOCKET"))
+        {
             let p = Self::normalize_socket_path(&env_path);
             if p.exists() {
                 return Some(p);
@@ -294,6 +347,11 @@ impl KiCadIpcClient {
 
     /// Sends the initial Handshake message.
     pub fn send_handshake(&mut self) -> std::io::Result<()> {
+        if let Some(ref mut nng) = self.nng {
+            nng.ping()?;
+            self.total_messages_sent += 1;
+            return Ok(());
+        }
         let msg = IpcMessage::Handshake {
             client: "Vulcan's Trials".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -303,6 +361,10 @@ impl KiCadIpcClient {
 
     /// Directly serializes and writes an IPC message as a single line JSON over the socket.
     fn send_raw_message(&mut self, msg: &IpcMessage) -> std::io::Result<()> {
+        if self.nng.is_some() {
+            self.total_messages_sent += 1;
+            return Ok(());
+        }
         #[cfg(unix)]
         {
             if let Some(ref mut stream) = self.stream {
@@ -370,6 +432,9 @@ impl KiCadIpcClient {
     /// Sends ClearTracks command to clear autorouted copper before rerouting.
     pub fn clear_tracks(&mut self) -> std::io::Result<()> {
         if !self.is_connected {
+            return Ok(());
+        }
+        if self.nng.is_some() {
             return Ok(());
         }
         self.send_raw_message(&IpcMessage::ClearTracks)
@@ -480,7 +545,7 @@ impl KiCadIpcClient {
         Ok(count)
     }
 
-    /// Pulls the full saved board (footprints, tracks, arcs, vias, and PullBoard notification)
+    /// Pulls the full saved board (footprints, tracks, arcs, vias, and zone refills)
     /// into KiCad over the active IPC socket, bypassing throttle intervals.
     pub fn pull_board_into_kicad(
         &mut self,
@@ -493,6 +558,25 @@ impl KiCadIpcClient {
                 std::io::ErrorKind::NotConnected,
                 "KiCad IPC stream not connected",
             ));
+        }
+
+        if let Some(ref mut nng) = self.nng {
+            self.pending_moves.clear();
+            self.pending_tracks.clear();
+            self.pending_vias.clear();
+            match nng.push_board_state(board, pcb_path) {
+                Ok(synced) => {
+                    self.total_messages_sent += synced;
+                    self.total_batches_committed += 1;
+                    self.last_flush_time = Instant::now();
+                    return Ok(synced);
+                }
+                Err(e) => {
+                    self.is_connected = false;
+                    self.nng = None;
+                    return Err(e);
+                }
+            }
         }
 
         self.clear_tracks()?;
@@ -553,6 +637,18 @@ impl KiCadIpcClient {
             return Ok(total_queued);
         }
 
+        if self.nng.is_some() {
+            for (ref_des, coords) in self.pending_moves.drain() {
+                self.last_sent_moves.insert(ref_des, coords);
+            }
+            self.pending_tracks.clear();
+            self.pending_vias.clear();
+            self.total_messages_sent += total_queued;
+            self.total_batches_committed += 1;
+            self.last_flush_time = Instant::now();
+            return Ok(total_queued);
+        }
+
         // 1. Flush footprint moves
         let moves: Vec<(String, (f64, f64, f64))> = self.pending_moves.drain().collect();
         for (ref_des, (x, y, rot)) in moves {
@@ -596,6 +692,1441 @@ impl KiCadIpcClient {
         self.total_batches_committed += 1;
         Ok(total_queued)
     }
+}
+
+/// Convenience helper that connects (or discovers `/tmp/kicad/api.sock`) and pushes `board` into KiCad.
+pub fn push_saved_board_to_kicad(
+    client_slot: &mut Option<KiCadIpcClient>,
+    custom_socket_path: Option<&str>,
+    board: &Board,
+    pcb_path: &Path,
+    ses_path: &Path,
+) -> Result<usize, String> {
+    let needs_reconnect = client_slot.as_ref().map_or(true, |c| !c.is_connected());
+    if needs_reconnect {
+        *client_slot = KiCadIpcClient::connect_or_discover_quiet(custom_socket_path);
+    }
+    if let Some(ref mut client) = client_slot {
+        match client.pull_board_into_kicad(board, pcb_path, ses_path) {
+            Ok(n) => return Ok(n),
+            Err(_) => {
+                *client_slot = KiCadIpcClient::connect_or_discover_quiet(custom_socket_path);
+                if let Some(ref mut retry_client) = client_slot {
+                    return retry_client
+                        .pull_board_into_kicad(board, pcb_path, ses_path)
+                        .map_err(|e| e.to_string());
+                }
+            }
+        }
+    }
+    Err("No active KiCad IPC socket found".to_string())
+}
+
+// ============================================================================
+// Native KiCad 10 NNG (`libnng.so.1`) + Protobuf (`kiapi.*`) IPC Implementation
+// ============================================================================
+
+const NNG_OPT_RECVTIMEO: &[u8] = b"recv-timeout\0";
+const NNG_OPT_SENDTIMEO: &[u8] = b"send-timeout\0";
+const NNG_FLAG_ALLOC: i32 = 1;
+
+const BL_F_CU: i32 = 3;
+const BL_IN1_CU: i32 = 4;
+const BL_B_CU: i32 = 34;
+
+const KOT_PCB_FOOTPRINT: i32 = 1;
+const KOT_PCB_TRACE: i32 = 11;
+const KOT_PCB_VIA: i32 = 12;
+const KOT_PCB_ARC: i32 = 13;
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct NngSocket {
+    id: u32,
+}
+
+type FnNngReq0Open = unsafe extern "C" fn(*mut NngSocket) -> i32;
+type FnNngRep0Open = unsafe extern "C" fn(*mut NngSocket) -> i32;
+type FnNngClose = unsafe extern "C" fn(NngSocket) -> i32;
+type FnNngDial = unsafe extern "C" fn(NngSocket, *const std::os::raw::c_char, *mut usize, i32) -> i32;
+type FnNngListen = unsafe extern "C" fn(NngSocket, *const std::os::raw::c_char, *mut usize, i32) -> i32;
+type FnNngSend = unsafe extern "C" fn(NngSocket, *const u8, usize, i32) -> i32;
+type FnNngRecv = unsafe extern "C" fn(NngSocket, *mut *mut u8, *mut usize, i32) -> i32;
+type FnNngFree = unsafe extern "C" fn(*mut u8, usize);
+type FnNngSocketSetMs = unsafe extern "C" fn(NngSocket, *const std::os::raw::c_char, i32) -> i32;
+
+#[allow(dead_code)]
+struct NngLib {
+    _lib: libloading::Library,
+    req0_open: FnNngReq0Open,
+    rep0_open: Option<FnNngRep0Open>,
+    close: FnNngClose,
+    dial: FnNngDial,
+    listen: Option<FnNngListen>,
+    send: FnNngSend,
+    recv: FnNngRecv,
+    free: FnNngFree,
+    set_ms: Option<FnNngSocketSetMs>,
+}
+
+impl NngLib {
+    fn load() -> std::io::Result<&'static Self> {
+        static INSTANCE: std::sync::OnceLock<Result<NngLib, String>> = std::sync::OnceLock::new();
+        let res = INSTANCE.get_or_init(Self::load_once);
+        match res {
+            Ok(lib) => Ok(lib),
+            Err(msg) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                msg.clone(),
+            )),
+        }
+    }
+
+    fn load_once() -> Result<Self, String> {
+        let candidates = [
+            "libnng.so.1",
+            "/usr/lib/x86_64-linux-gnu/libnng.so.1",
+            "/usr/lib64/libnng.so.1",
+            "/usr/lib/libnng.so.1",
+            "libnng.so",
+        ];
+        let mut last_err = None;
+        for name in &candidates {
+            unsafe {
+                match libloading::Library::new(name) {
+                    Ok(lib) => {
+                        let req0_open = *lib
+                            .get::<FnNngReq0Open>(b"nng_req0_open\0")
+                            .map_err(|e| e.to_string())?;
+                        let rep0_open = lib.get::<FnNngRep0Open>(b"nng_rep0_open\0").ok().map(|s| *s);
+                        let close = *lib
+                            .get::<FnNngClose>(b"nng_close\0")
+                            .map_err(|e| e.to_string())?;
+                        let dial = *lib
+                            .get::<FnNngDial>(b"nng_dial\0")
+                            .map_err(|e| e.to_string())?;
+                        let listen = lib.get::<FnNngListen>(b"nng_listen\0").ok().map(|s| *s);
+                        let send = *lib
+                            .get::<FnNngSend>(b"nng_send\0")
+                            .map_err(|e| e.to_string())?;
+                        let recv = *lib
+                            .get::<FnNngRecv>(b"nng_recv\0")
+                            .map_err(|e| e.to_string())?;
+                        let free = *lib
+                            .get::<FnNngFree>(b"nng_free\0")
+                            .map_err(|e| e.to_string())?;
+                        let set_ms = lib
+                            .get::<FnNngSocketSetMs>(b"nng_socket_set_ms\0")
+                            .or_else(|_| lib.get::<FnNngSocketSetMs>(b"nng_setopt_ms\0"))
+                            .ok()
+                            .map(|s| *s);
+                        return Ok(Self {
+                            _lib: lib,
+                            req0_open,
+                            rep0_open,
+                            close,
+                            dial,
+                            listen,
+                            send,
+                            recv,
+                            free,
+                            set_ms,
+                        });
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+        }
+        Err(format!("Failed to load libnng.so.1: {:?}", last_err))
+    }
+}
+
+struct NngKiCadClient {
+    lib: &'static NngLib,
+    sock: NngSocket,
+    token: String,
+    client_name: String,
+}
+
+impl Drop for NngKiCadClient {
+    fn drop(&mut self) {
+        if self.sock.id != 0 {
+            unsafe {
+                let _ = (self.lib.close)(self.sock);
+            }
+            self.sock.id = 0;
+        }
+    }
+}
+
+impl NngKiCadClient {
+    fn connect(socket_path: &Path) -> std::io::Result<Self> {
+        let lib = NngLib::load()?;
+        let mut sock = NngSocket::default();
+        unsafe {
+            let rv = (lib.req0_open)(&mut sock);
+            if rv != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("nng_req0_open failed with code {}", rv),
+                ));
+            }
+            if let Some(set_ms) = lib.set_ms {
+                let _ = set_ms(sock, NNG_OPT_RECVTIMEO.as_ptr() as *const _, 10_000);
+                let _ = set_ms(sock, NNG_OPT_SENDTIMEO.as_ptr() as *const _, 10_000);
+            }
+            let uri = format!("ipc://{}\0", socket_path.to_string_lossy());
+            let rv = (lib.dial)(sock, uri.as_ptr() as *const _, std::ptr::null_mut(), 0);
+            if rv != 0 {
+                let _ = (lib.close)(sock);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("nng_dial({}) failed with code {}", socket_path.display(), rv),
+                ));
+            }
+        }
+
+        let mut client = Self {
+            lib,
+            sock,
+            token: String::new(),
+            client_name: format!("vulcans-trials-{}", std::process::id()),
+        };
+        client.ping()?;
+        Ok(client)
+    }
+
+    fn send_command(&mut self, type_url: &str, payload: &[u8]) -> std::io::Result<(String, Vec<u8>)> {
+        let mut header = Vec::new();
+        if !self.token.is_empty() {
+            proto_encode_str(1, &self.token, &mut header);
+        }
+        proto_encode_str(2, &self.client_name, &mut header);
+
+        let any_msg = proto_encode_any(type_url, payload);
+        let mut req = Vec::new();
+        proto_encode_bytes(1, &header, &mut req);
+        proto_encode_bytes(2, &any_msg, &mut req);
+
+        let resp_bytes = unsafe {
+            let rv = (self.lib.send)(self.sock, req.as_ptr(), req.len(), 0);
+            if rv != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    format!("nng_send({}) failed with code {}", type_url, rv),
+                ));
+            }
+            let mut buf_ptr: *mut u8 = std::ptr::null_mut();
+            let mut buf_len: usize = 0;
+            let rv = (self.lib.recv)(self.sock, &mut buf_ptr, &mut buf_len, NNG_FLAG_ALLOC);
+            if rv != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("nng_recv({}) failed with code {}", type_url, rv),
+                ));
+            }
+            let slice = if buf_ptr.is_null() || buf_len == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(buf_ptr, buf_len).to_vec()
+            };
+            if !buf_ptr.is_null() {
+                (self.lib.free)(buf_ptr, buf_len);
+            }
+            slice
+        };
+
+        // Parse ApiResponse: header (1), status (2), message (3)
+        let mut resp_token = String::new();
+        let mut status_code: u64 = 0;
+        let mut error_msg = String::new();
+        let mut msg_type_url = String::new();
+        let mut msg_val = Vec::new();
+
+        proto_walk(&resp_bytes, |tag, wt, val| {
+            match (tag, wt) {
+                (1, 2) => {
+                    proto_walk(val, |htag, hwt, hval| {
+                        if htag == 1 && hwt == 2 {
+                            if let Ok(s) = std::str::from_utf8(hval) {
+                                resp_token = s.to_string();
+                            }
+                        }
+                    });
+                }
+                (2, 2) => {
+                    proto_walk(val, |stag, swt, sval| match (stag, swt) {
+                        (1, 0) => status_code = proto_bytes_to_varint(sval),
+                        (2, 2) => {
+                            if let Ok(s) = std::str::from_utf8(sval) {
+                                error_msg = s.to_string();
+                            }
+                        }
+                        _ => {}
+                    });
+                }
+                (3, 2) => {
+                    let (turl, inner) = proto_decode_any(val);
+                    msg_type_url = turl;
+                    msg_val = inner;
+                }
+                _ => {}
+            }
+        });
+
+        if !resp_token.is_empty() {
+            self.token = resp_token;
+        }
+        // AS_OK = 1
+        if status_code != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "KiCad IPC error on {} (status={}): {}",
+                    type_url, status_code, error_msg
+                ),
+            ));
+        }
+
+        Ok((msg_type_url, msg_val))
+    }
+
+    fn ping(&mut self) -> std::io::Result<()> {
+        let _ = self.send_command("type.googleapis.com/kiapi.common.commands.Ping", &[])?;
+        Ok(())
+    }
+
+    fn get_open_pcb_document(&mut self, board: &Board, pcb_path: &Path) -> std::io::Result<Vec<u8>> {
+        let mut req = Vec::new();
+        // DOCTYPE_PCB = 3
+        proto_encode_varint_field(1, 3, &mut req);
+        let (_, resp) = self.send_command(
+            "type.googleapis.com/kiapi.common.commands.GetOpenDocuments",
+            &req,
+        )?;
+        let mut docs: Vec<Vec<u8>> = Vec::new();
+        proto_walk(&resp, |tag, wt, val| {
+            if tag == 1 && wt == 2 {
+                docs.push(val.to_vec());
+            }
+        });
+        if docs.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No PCB document is currently open in KiCad",
+            ));
+        }
+
+        let clean_stem = |p: &Path| -> String {
+            let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            fname
+                .strip_suffix("_vulcan.kicad_pcb")
+                .or_else(|| fname.strip_suffix("_routed.kicad_pcb"))
+                .or_else(|| fname.strip_suffix("_out.kicad_pcb"))
+                .or_else(|| fname.strip_suffix(".kicad_pcb"))
+                .unwrap_or(fname)
+                .to_string()
+        };
+
+        let out_stem = clean_stem(pcb_path);
+        let src_stem = clean_stem(Path::new(&board.file_path));
+
+        for doc in &docs {
+            let mut board_filename = String::new();
+            proto_walk(doc, |tag, wt, val| {
+                if tag == 4 && wt == 2 {
+                    if let Ok(s) = std::str::from_utf8(val) {
+                        board_filename = s.to_string();
+                    }
+                }
+            });
+            let doc_stem = clean_stem(Path::new(&board_filename));
+            if !doc_stem.is_empty()
+                && ((out_stem == doc_stem || doc_stem.starts_with(&out_stem) || out_stem.starts_with(&doc_stem))
+                    || (!src_stem.is_empty()
+                        && (src_stem == doc_stem
+                            || doc_stem.starts_with(&src_stem)
+                            || src_stem.starts_with(&doc_stem))))
+            {
+                return Ok(doc.clone());
+            }
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "Open PCB in KiCad does not match saved board '{}' (source '{}')",
+                pcb_path.display(),
+                board.file_path
+            ),
+        ))
+    }
+
+    fn get_nets_map(&mut self, doc_spec: &[u8]) -> std::io::Result<HashMap<String, i32>> {
+        let mut req = Vec::new();
+        proto_encode_bytes(1, doc_spec, &mut req);
+        let (_, resp) = self.send_command(
+            "type.googleapis.com/kiapi.board.commands.GetNets",
+            &req,
+        )?;
+        let mut map = HashMap::new();
+        proto_walk(&resp, |tag, wt, val| {
+            if tag == 1 && wt == 2 {
+                let mut code: i32 = 0;
+                let mut name = String::new();
+                proto_walk(val, |ntag, nwt, nval| match (ntag, nwt) {
+                    (1, 2) => {
+                        proto_walk(nval, |ctag, cwt, cval| {
+                            if ctag == 1 && cwt == 0 {
+                                code = proto_bytes_to_varint(cval) as i32;
+                            }
+                        });
+                    }
+                    (2, 2) => {
+                        if let Ok(s) = std::str::from_utf8(nval) {
+                            name = s.to_string();
+                        }
+                    }
+                    _ => {}
+                });
+                map.insert(name, code);
+            }
+        });
+        Ok(map)
+    }
+
+    fn push_board_state(&mut self, board: &Board, pcb_path: &Path) -> std::io::Result<usize> {
+        let doc_spec = self.get_open_pcb_document(board, pcb_path)?;
+        let kicad_nets = self.get_nets_map(&doc_spec).unwrap_or_default();
+
+        let mut item_header = Vec::new();
+        proto_encode_bytes(1, &doc_spec, &mut item_header);
+
+        // Fetch existing footprints, tracks, vias, and arcs on the board
+        let mut get_items_req = Vec::new();
+        proto_encode_bytes(1, &item_header, &mut get_items_req);
+        for kot in [KOT_PCB_FOOTPRINT, KOT_PCB_TRACE, KOT_PCB_VIA, KOT_PCB_ARC] {
+            proto_encode_varint_field(2, kot as u64, &mut get_items_req);
+        }
+        let (_, get_items_resp) = self.send_command(
+            "type.googleapis.com/kiapi.common.commands.GetItems",
+            &get_items_req,
+        )?;
+
+        let mut live_footprints: HashMap<String, (Vec<u8>, Vec<u8>, i64, i64, f64, i32)> =
+            HashMap::new();
+        let mut old_copper_ids: Vec<Vec<u8>> = Vec::new();
+
+        proto_walk(&get_items_resp, |tag, wt, val| {
+            if tag == 3 && wt == 2 {
+                let (type_url, item_bytes) = proto_decode_any(val);
+                if type_url.ends_with(".FootprintInstance") {
+                    if let Some((ref_des, kiid_bytes, x_nm, y_nm, deg, layer)) =
+                        parse_footprint_instance_summary(&item_bytes)
+                    {
+                        live_footprints.insert(
+                            ref_des,
+                            (item_bytes, kiid_bytes, x_nm, y_nm, deg, layer),
+                        );
+                    }
+                } else if type_url.ends_with(".Track")
+                    || type_url.ends_with(".Arc")
+                    || type_url.ends_with(".Via")
+                {
+                    if let Some(kiid_bytes) = extract_item_kiid(&item_bytes) {
+                        old_copper_ids.push(kiid_bytes);
+                    }
+                }
+            }
+        });
+
+        // Begin atomic KiCad undo/redo commit session
+        let (_, begin_resp) = self.send_command(
+            "type.googleapis.com/kiapi.common.commands.BeginCommit",
+            &[],
+        )?;
+        let mut commit_id = Vec::new();
+        proto_walk(&begin_resp, |tag, wt, val| {
+            if tag == 1 && wt == 2 {
+                commit_id = val.to_vec();
+            }
+        });
+
+        let sync_result = (|| -> std::io::Result<usize> {
+            let mut total_synced = 0usize;
+
+            // 1. Update footprints (flip layer if needed, then transform coordinates & pad nets)
+            let mut updated_fp_anys: Vec<Vec<u8>> = Vec::new();
+            for fp in &board.footprints {
+                let Some((mut raw_fp, kiid_bytes, mut old_x, mut old_y, mut old_deg, old_layer)) =
+                    live_footprints.remove(&fp.reference)
+                else {
+                    continue;
+                };
+
+                let target_layer = if fp.layer == 1 { BL_B_CU } else { BL_F_CU };
+                if old_layer != 0 && old_layer != target_layer {
+                    let mut flip_req = Vec::new();
+                    proto_encode_bytes(1, &item_header, &mut flip_req);
+                    proto_encode_bytes(2, &kiid_bytes, &mut flip_req);
+                    // BFD_TOP_BOTTOM = 2
+                    proto_encode_varint_field(3, 2, &mut flip_req);
+                    if self
+                        .send_command(
+                            "type.googleapis.com/kiapi.board.commands.FlipItems",
+                            &flip_req,
+                        )
+                        .is_ok()
+                    {
+                        let mut get_by_id = Vec::new();
+                        proto_encode_bytes(1, &item_header, &mut get_by_id);
+                        proto_encode_bytes(2, &kiid_bytes, &mut get_by_id);
+                        if let Ok((_, by_id_resp)) = self.send_command(
+                            "type.googleapis.com/kiapi.common.commands.GetItemsById",
+                            &get_by_id,
+                        ) {
+                            proto_walk(&by_id_resp, |t, w, v| {
+                                if t == 3 && w == 2 {
+                                    let (turl, ibytes) = proto_decode_any(v);
+                                    if turl.ends_with(".FootprintInstance") {
+                                        if let Some((_, _, nx, ny, ndeg, _)) =
+                                            parse_footprint_instance_summary(&ibytes)
+                                        {
+                                            raw_fp = ibytes;
+                                            old_x = nx;
+                                            old_y = ny;
+                                            old_deg = ndeg;
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+
+                let new_x = mm_to_nm(fp.x);
+                let new_y = mm_to_nm(fp.y);
+                let new_deg = normalize_angle_deg(fp.rotation);
+                let moved = (new_x - old_x).abs() > 50
+                    || (new_y - old_y).abs() > 50
+                    || normalize_angle_deg(new_deg - old_deg).abs() > 1e-3
+                    || old_layer != target_layer;
+
+                // Build pad net map for this footprint ( in case pin/gate swap modified pad nets )
+                let mut pad_nets: HashMap<String, (i32, String)> = HashMap::new();
+                for pad in &fp.pads {
+                    if !pad.number.is_empty() && !pad.net_name.is_empty() {
+                        let code = kicad_nets
+                            .get(&pad.net_name)
+                            .copied()
+                            .unwrap_or(pad.net_id as i32);
+                        pad_nets.insert(pad.number.clone(), (code, pad.net_name.clone()));
+                    }
+                }
+
+                if moved || !board.pin_swap_history.is_empty() {
+                    let transformed = transform_footprint_instance_proto(
+                        &raw_fp,
+                        old_x,
+                        old_y,
+                        old_deg,
+                        new_x,
+                        new_y,
+                        new_deg,
+                        fp.is_locked,
+                        &pad_nets,
+                    );
+                    updated_fp_anys.push(proto_encode_any(
+                        "type.googleapis.com/kiapi.board.types.FootprintInstance",
+                        &transformed,
+                    ));
+                    total_synced += 1;
+                }
+            }
+
+            if !updated_fp_anys.is_empty() {
+                let mut update_req = Vec::new();
+                proto_encode_bytes(1, &item_header, &mut update_req);
+                for any_fp in &updated_fp_anys {
+                    proto_encode_bytes(2, any_fp, &mut update_req);
+                }
+                let _ = self.send_command(
+                    "type.googleapis.com/kiapi.common.commands.UpdateItems",
+                    &update_req,
+                )?;
+            }
+
+            // 2. Delete old tracks, arcs, and vias before creating the saved set
+            if !old_copper_ids.is_empty() {
+                let mut del_req = Vec::new();
+                proto_encode_bytes(1, &item_header, &mut del_req);
+                for id_bytes in &old_copper_ids {
+                    proto_encode_bytes(2, id_bytes, &mut del_req);
+                }
+                let _ = self.send_command(
+                    "type.googleapis.com/kiapi.common.commands.DeleteItems",
+                    &del_req,
+                )?;
+            }
+
+            // Helper to resolve board net_id -> (KiCad NetCode, NetName)
+            let resolve_net = |net_id: usize| -> (i32, String) {
+                let net_name = board
+                    .nets
+                    .get(net_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let code = kicad_nets
+                    .get(&net_name)
+                    .copied()
+                    .unwrap_or(net_id as i32);
+                (code, net_name)
+            };
+
+            // 3. Build and create all tracks, arcs, and vias in KiCad
+            let mut new_items: Vec<Vec<u8>> =
+                Vec::with_capacity(board.tracks.len() + board.arcs.len() + board.vias.len());
+
+            for trk in &board.tracks {
+                let (net_code, net_name) = resolve_net(trk.net_id);
+                let layer_enum = board_layer_to_kiapi(board.layer_name(trk.layer));
+                let trk_bytes = build_track_proto(
+                    trk.start,
+                    trk.end,
+                    trk.width,
+                    layer_enum,
+                    net_code,
+                    &net_name,
+                    trk.is_locked,
+                );
+                new_items.push(proto_encode_any(
+                    "type.googleapis.com/kiapi.board.types.Track",
+                    &trk_bytes,
+                ));
+                total_synced += 1;
+            }
+
+            for arc in &board.arcs {
+                let (net_code, net_name) = resolve_net(arc.net_id);
+                let layer_enum = board_layer_to_kiapi(board.layer_name(arc.layer));
+                let arc_bytes = build_arc_proto(
+                    arc.start(),
+                    arc.mid(),
+                    arc.end(),
+                    arc.width,
+                    layer_enum,
+                    net_code,
+                    &net_name,
+                    arc.is_locked,
+                );
+                new_items.push(proto_encode_any(
+                    "type.googleapis.com/kiapi.board.types.Arc",
+                    &arc_bytes,
+                ));
+                total_synced += 1;
+            }
+
+            for via in &board.vias {
+                let (net_code, net_name) = resolve_net(via.net_id);
+                let via_bytes = build_via_proto(
+                    via.position,
+                    via.size,
+                    via.drill,
+                    net_code,
+                    &net_name,
+                    via.is_locked,
+                );
+                new_items.push(proto_encode_any(
+                    "type.googleapis.com/kiapi.board.types.Via",
+                    &via_bytes,
+                ));
+                total_synced += 1;
+            }
+
+            if !new_items.is_empty() {
+                for chunk in new_items.chunks(500) {
+                    let mut create_req = Vec::new();
+                    proto_encode_bytes(1, &item_header, &mut create_req);
+                    for item in chunk {
+                        proto_encode_bytes(2, item, &mut create_req);
+                    }
+                    let _ = self.send_command(
+                        "type.googleapis.com/kiapi.common.commands.CreateItems",
+                        &create_req,
+                    )?;
+                }
+            }
+
+            Ok(total_synced)
+        })();
+
+        // Always close the commit session (commit on Ok, drop on Err)
+        let mut end_req = Vec::new();
+        if !commit_id.is_empty() {
+            proto_encode_bytes(1, &commit_id, &mut end_req);
+        }
+        let action = if sync_result.is_ok() { 1 } else { 2 }; // CMA_COMMIT = 1, CMA_DROP = 2
+        proto_encode_varint_field(2, action, &mut end_req);
+        proto_encode_str(3, "Vulcan's Trials PCB save sync", &mut end_req);
+        let _ = self.send_command(
+            "type.googleapis.com/kiapi.common.commands.EndCommit",
+            &end_req,
+        );
+
+        let synced = sync_result?;
+
+        // Refill copper zones in KiCad after updating footprints/tracks/vias
+        let mut refill_req = Vec::new();
+        proto_encode_bytes(1, &doc_spec, &mut refill_req);
+        let _ = self.send_command(
+            "type.googleapis.com/kiapi.board.commands.RefillZones",
+            &refill_req,
+        );
+
+        Ok(synced)
+    }
+}
+
+fn mm_to_nm(mm: f64) -> i64 {
+    (mm * 1_000_000.0).round() as i64
+}
+
+fn normalize_angle_deg(deg: f64) -> f64 {
+    let mut a = deg % 360.0;
+    if a > 180.0 {
+        a -= 360.0;
+    } else if a <= -180.0 {
+        a += 360.0;
+    }
+    a
+}
+
+fn board_layer_to_kiapi(layer_name: &str) -> i32 {
+    match layer_name {
+        "F.Cu" => BL_F_CU,
+        "B.Cu" => BL_B_CU,
+        s if s.starts_with("In") && s.ends_with(".Cu") => {
+            let num_str = &s[2..s.len() - 3];
+            if let Ok(n) = num_str.parse::<i32>() {
+                if (1..=30).contains(&n) {
+                    return BL_IN1_CU + (n - 1);
+                }
+            }
+            BL_F_CU
+        }
+        _ => BL_F_CU,
+    }
+}
+
+fn proto_encode_varint(mut v: u64, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push(((v as u8) & 0x7F) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn proto_encode_tag(field_num: u32, wire_type: u8, out: &mut Vec<u8>) {
+    proto_encode_varint(((field_num as u64) << 3) | (wire_type as u64), out);
+}
+
+fn proto_encode_varint_field(field_num: u32, val: u64, out: &mut Vec<u8>) {
+    if val != 0 {
+        proto_encode_tag(field_num, 0, out);
+        proto_encode_varint(val, out);
+    }
+}
+
+fn proto_encode_f64_field(field_num: u32, val: f64, out: &mut Vec<u8>) {
+    proto_encode_tag(field_num, 1, out);
+    out.extend_from_slice(&val.to_le_bytes());
+}
+
+fn proto_encode_bytes(field_num: u32, bytes: &[u8], out: &mut Vec<u8>) {
+    proto_encode_tag(field_num, 2, out);
+    proto_encode_varint(bytes.len() as u64, out);
+    out.extend_from_slice(bytes);
+}
+
+fn proto_encode_str(field_num: u32, s: &str, out: &mut Vec<u8>) {
+    if !s.is_empty() {
+        proto_encode_bytes(field_num, s.as_bytes(), out);
+    }
+}
+
+fn proto_encode_any(type_url: &str, value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(type_url.len() + value.len() + 8);
+    proto_encode_str(1, type_url, &mut out);
+    if !value.is_empty() {
+        proto_encode_bytes(2, value, &mut out);
+    }
+    out
+}
+
+fn proto_encode_vector2(x_nm: i64, y_nm: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20);
+    proto_encode_varint_field(1, x_nm as u64, &mut out);
+    proto_encode_varint_field(2, y_nm as u64, &mut out);
+    out
+}
+
+fn proto_encode_distance(value_nm: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(10);
+    proto_encode_varint_field(1, value_nm as u64, &mut out);
+    out
+}
+
+fn proto_encode_angle(deg: f64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9);
+    proto_encode_f64_field(1, deg, &mut out);
+    out
+}
+
+fn proto_encode_net(code: i32, name: &str) -> Vec<u8> {
+    let mut net_code = Vec::with_capacity(8);
+    proto_encode_varint_field(1, code as u32 as u64, &mut net_code);
+    let mut out = Vec::with_capacity(name.len() + 12);
+    proto_encode_bytes(1, &net_code, &mut out);
+    proto_encode_str(2, name, &mut out);
+    out
+}
+
+fn build_track_proto(
+    start: (f64, f64),
+    end: (f64, f64),
+    width_mm: f64,
+    layer_enum: i32,
+    net_code: i32,
+    net_name: &str,
+    is_locked: bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    let s_vec = proto_encode_vector2(mm_to_nm(start.0), mm_to_nm(start.1));
+    let e_vec = proto_encode_vector2(mm_to_nm(end.0), mm_to_nm(end.1));
+    let w_dist = proto_encode_distance(mm_to_nm(width_mm));
+    let net_msg = proto_encode_net(net_code, net_name);
+    proto_encode_bytes(2, &s_vec, &mut out);
+    proto_encode_bytes(3, &e_vec, &mut out);
+    proto_encode_bytes(4, &w_dist, &mut out);
+    proto_encode_varint_field(5, if is_locked { 2 } else { 1 }, &mut out);
+    proto_encode_varint_field(6, layer_enum as u64, &mut out);
+    proto_encode_bytes(7, &net_msg, &mut out);
+    out
+}
+
+fn build_arc_proto(
+    start: (f64, f64),
+    mid: (f64, f64),
+    end: (f64, f64),
+    width_mm: f64,
+    layer_enum: i32,
+    net_code: i32,
+    net_name: &str,
+    is_locked: bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(80);
+    let s_vec = proto_encode_vector2(mm_to_nm(start.0), mm_to_nm(start.1));
+    let m_vec = proto_encode_vector2(mm_to_nm(mid.0), mm_to_nm(mid.1));
+    let e_vec = proto_encode_vector2(mm_to_nm(end.0), mm_to_nm(end.1));
+    let w_dist = proto_encode_distance(mm_to_nm(width_mm));
+    let net_msg = proto_encode_net(net_code, net_name);
+    proto_encode_bytes(2, &s_vec, &mut out);
+    proto_encode_bytes(3, &m_vec, &mut out);
+    proto_encode_bytes(4, &e_vec, &mut out);
+    proto_encode_bytes(5, &w_dist, &mut out);
+    proto_encode_varint_field(6, if is_locked { 2 } else { 1 }, &mut out);
+    proto_encode_varint_field(7, layer_enum as u64, &mut out);
+    proto_encode_bytes(8, &net_msg, &mut out);
+    out
+}
+
+fn build_via_proto(
+    position: (f64, f64),
+    size_mm: f64,
+    drill_mm: f64,
+    net_code: i32,
+    net_name: &str,
+    is_locked: bool,
+) -> Vec<u8> {
+    let pos_vec = proto_encode_vector2(mm_to_nm(position.0), mm_to_nm(position.1));
+    let drill_nm = mm_to_nm(drill_mm);
+    let size_nm = mm_to_nm(size_mm);
+
+    // DrillProperties: start_layer=3(F.Cu), end_layer=34(B.Cu), diameter=Vector2, shape=1(DS_CIRCLE)
+    let mut drill_props = Vec::with_capacity(28);
+    proto_encode_varint_field(1, BL_F_CU as u64, &mut drill_props);
+    proto_encode_varint_field(2, BL_B_CU as u64, &mut drill_props);
+    let drill_vec = proto_encode_vector2(drill_nm, drill_nm);
+    proto_encode_bytes(3, &drill_vec, &mut drill_props);
+    proto_encode_varint_field(4, 1, &mut drill_props);
+
+    // PadStackLayer: layer=3(F.Cu), shape=1(PSS_CIRCLE), size=Vector2
+    let mut cu_layer = Vec::with_capacity(24);
+    proto_encode_varint_field(1, BL_F_CU as u64, &mut cu_layer);
+    proto_encode_varint_field(2, 1, &mut cu_layer);
+    let size_vec = proto_encode_vector2(size_nm, size_nm);
+    proto_encode_bytes(3, &size_vec, &mut cu_layer);
+
+    // PadStack: type=1(PST_NORMAL), layers=[3, 34], drill=3, copper_layers=5
+    let mut pad_stack = Vec::with_capacity(64);
+    proto_encode_varint_field(1, 1, &mut pad_stack);
+    proto_encode_varint_field(2, BL_F_CU as u64, &mut pad_stack);
+    proto_encode_varint_field(2, BL_B_CU as u64, &mut pad_stack);
+    proto_encode_bytes(3, &drill_props, &mut pad_stack);
+    proto_encode_bytes(5, &cu_layer, &mut pad_stack);
+
+    let net_msg = proto_encode_net(net_code, net_name);
+    let mut out = Vec::with_capacity(112);
+    proto_encode_bytes(2, &pos_vec, &mut out);
+    proto_encode_bytes(3, &pad_stack, &mut out);
+    proto_encode_varint_field(4, if is_locked { 2 } else { 1 }, &mut out);
+    proto_encode_bytes(5, &net_msg, &mut out);
+    proto_encode_varint_field(6, 1, &mut out); // VT_THROUGH = 1
+    out
+}
+
+fn proto_decode_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut result: u64 = 0;
+    let mut shift = 0;
+    while *pos < buf.len() {
+        let b = buf[*pos];
+        *pos += 1;
+        result |= ((b & 0x7F) as u64) << shift;
+        if (b & 0x80) == 0 {
+            return Some(result);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
+    None
+}
+
+fn proto_bytes_to_varint(buf: &[u8]) -> u64 {
+    let mut pos = 0;
+    proto_decode_varint(buf, &mut pos).unwrap_or(0)
+}
+
+fn proto_walk<F: FnMut(u32, u8, &[u8])>(buf: &[u8], mut f: F) {
+    let mut pos = 0;
+    while pos < buf.len() {
+        let Some(tag_wire) = proto_decode_varint(buf, &mut pos) else {
+            break;
+        };
+        let tag = (tag_wire >> 3) as u32;
+        let wt = (tag_wire & 0x7) as u8;
+        match wt {
+            0 => {
+                let start = pos;
+                if proto_decode_varint(buf, &mut pos).is_none() {
+                    break;
+                }
+                f(tag, wt, &buf[start..pos]);
+            }
+            1 => {
+                if pos + 8 > buf.len() {
+                    break;
+                }
+                f(tag, wt, &buf[pos..pos + 8]);
+                pos += 8;
+            }
+            2 => {
+                let Some(len) = proto_decode_varint(buf, &mut pos) else {
+                    break;
+                };
+                let len = len as usize;
+                if pos + len > buf.len() {
+                    break;
+                }
+                f(tag, wt, &buf[pos..pos + len]);
+                pos += len;
+            }
+            5 => {
+                if pos + 4 > buf.len() {
+                    break;
+                }
+                f(tag, wt, &buf[pos..pos + 4]);
+                pos += 4;
+            }
+            _ => break,
+        }
+    }
+}
+
+fn proto_rewrite<F: FnMut(u32, u8, &[u8], &mut Vec<u8>) -> bool>(buf: &[u8], mut f: F) -> Vec<u8> {
+    let mut out = Vec::with_capacity(buf.len() + 16);
+    proto_walk(buf, |tag, wt, val| {
+        if !f(tag, wt, val, &mut out) {
+            proto_encode_tag(tag, wt, &mut out);
+            if wt == 2 {
+                proto_encode_varint(val.len() as u64, &mut out);
+            }
+            out.extend_from_slice(val);
+        }
+    });
+    out
+}
+
+fn proto_decode_any(buf: &[u8]) -> (String, Vec<u8>) {
+    let mut type_url = String::new();
+    let mut value = Vec::new();
+    proto_walk(buf, |tag, wt, val| match (tag, wt) {
+        (1, 2) => {
+            if let Ok(s) = std::str::from_utf8(val) {
+                type_url = s.to_string();
+            }
+        }
+        (2, 2) => value = val.to_vec(),
+        _ => {}
+    });
+    (type_url, value)
+}
+
+fn proto_decode_vector2(buf: &[u8]) -> (i64, i64) {
+    let mut x: i64 = 0;
+    let mut y: i64 = 0;
+    proto_walk(buf, |tag, wt, val| match (tag, wt) {
+        (1, 0) => x = proto_bytes_to_varint(val) as i64,
+        (2, 0) => y = proto_bytes_to_varint(val) as i64,
+        _ => {}
+    });
+    (x, y)
+}
+
+fn proto_decode_angle(buf: &[u8]) -> f64 {
+    let mut deg = 0.0;
+    proto_walk(buf, |tag, wt, val| {
+        if tag == 1 && wt == 1 && val.len() == 8 {
+            deg = f64::from_le_bytes(val.try_into().unwrap());
+        }
+    });
+    deg
+}
+
+fn extract_item_kiid(item_bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut kiid = None;
+    proto_walk(item_bytes, |tag, wt, val| {
+        if tag == 1 && wt == 2 && kiid.is_none() {
+            kiid = Some(val.to_vec());
+        }
+    });
+    kiid
+}
+
+fn extract_field_text_str(field_bytes: &[u8]) -> String {
+    let mut res = String::new();
+    // Field.text = tag 3 (BoardText) -> BoardText.text = tag 2 (Text) -> Text.text = tag 5 (string)
+    proto_walk(field_bytes, |tag, wt, val| {
+        if tag == 3 && wt == 2 {
+            proto_walk(val, |btag, bwt, bval| {
+                if btag == 2 && bwt == 2 {
+                    proto_walk(bval, |ttag, twt, tval| {
+                        if ttag == 5 && twt == 2 {
+                            if let Ok(s) = std::str::from_utf8(tval) {
+                                res = s.to_string();
+                            }
+                        }
+                    });
+                }
+            });
+        }
+    });
+    res
+}
+
+fn parse_footprint_instance_summary(
+    fp_bytes: &[u8],
+) -> Option<(String, Vec<u8>, i64, i64, f64, i32)> {
+    let mut kiid = None;
+    let mut pos = (0i64, 0i64);
+    let mut deg = 0.0f64;
+    let mut layer = BL_F_CU;
+    let mut ref_str = String::new();
+
+    proto_walk(fp_bytes, |tag, wt, val| match (tag, wt) {
+        (1, 2) => kiid = Some(val.to_vec()),
+        (2, 2) => pos = proto_decode_vector2(val),
+        (3, 2) => deg = proto_decode_angle(val),
+        (4, 0) => layer = proto_bytes_to_varint(val) as i32,
+        (7, 2) => {
+            let s = extract_field_text_str(val);
+            if !s.is_empty() {
+                ref_str = s;
+            }
+        }
+        (6, 2) if ref_str.is_empty() => {
+            proto_walk(val, |dtag, dwt, dval| {
+                if dtag == 7 && dwt == 2 {
+                    let s = extract_field_text_str(dval);
+                    if !s.is_empty() {
+                        ref_str = s;
+                    }
+                }
+            });
+        }
+        _ => {}
+    });
+
+    let kiid = kiid?;
+    if ref_str.is_empty() {
+        return None;
+    }
+    Some((ref_str, kiid, pos.0, pos.1, deg, layer))
+}
+
+/// Applies rigid-body rotation + translation to a `FootprintInstance` protobuf message and all
+/// its child items (`Field`, `BoardText`, `BoardTextBox`, `Pad`, `BoardGraphicShape`, `Zone`, `Dimension`),
+/// matching KiCad 10's `FOOTPRINT::Deserialize` coordinate expectations.
+#[allow(clippy::too_many_arguments)]
+fn transform_footprint_instance_proto(
+    fp_bytes: &[u8],
+    old_x: i64,
+    old_y: i64,
+    old_deg: f64,
+    new_x: i64,
+    new_y: i64,
+    new_deg: f64,
+    is_locked: bool,
+    pad_nets: &HashMap<String, (i32, String)>,
+) -> Vec<u8> {
+    let delta_deg = normalize_angle_deg(new_deg - old_deg);
+    let rad = (-delta_deg).to_radians();
+    let (sin_r, cos_r) = rad.sin_cos();
+
+    let xform_vec2 = |v_bytes: &[u8]| -> Vec<u8> {
+        let (vx, vy) = proto_decode_vector2(v_bytes);
+        let dx = (vx - old_x) as f64;
+        let dy = (vy - old_y) as f64;
+        let rx = dx * cos_r - dy * sin_r;
+        let ry = dx * sin_r + dy * cos_r;
+        proto_encode_vector2(new_x + rx.round() as i64, new_y + ry.round() as i64)
+    };
+
+    let xform_angle = |a_bytes: &[u8]| -> Vec<u8> {
+        let a = proto_decode_angle(a_bytes);
+        proto_encode_angle(normalize_angle_deg(a + delta_deg))
+    };
+
+    let xform_text = |text_bytes: &[u8]| -> Vec<u8> {
+        proto_rewrite(text_bytes, |tag, wt, val, out| match (tag, wt) {
+            (2, 2) => {
+                proto_encode_bytes(2, &xform_vec2(val), out);
+                true
+            }
+            (3, 2) => {
+                let attrs = proto_rewrite(val, |atag, awt, aval, aout| {
+                    if atag == 4 && awt == 2 {
+                        proto_encode_bytes(4, &xform_angle(aval), aout);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                proto_encode_bytes(3, &attrs, out);
+                true
+            }
+            _ => false,
+        })
+    };
+
+    let xform_board_text = |bt_bytes: &[u8]| -> Vec<u8> {
+        proto_rewrite(bt_bytes, |tag, wt, val, out| {
+            if tag == 2 && wt == 2 {
+                proto_encode_bytes(2, &xform_text(val), out);
+                true
+            } else {
+                false
+            }
+        })
+    };
+
+    let xform_field = |field_bytes: &[u8]| -> Vec<u8> {
+        proto_rewrite(field_bytes, |tag, wt, val, out| {
+            if tag == 3 && wt == 2 {
+                proto_encode_bytes(3, &xform_board_text(val), out);
+                true
+            } else {
+                false
+            }
+        })
+    };
+
+    let xform_polyset = |ps_bytes: &[u8]| -> Vec<u8> {
+        let xform_polyline = |pl_bytes: &[u8]| -> Vec<u8> {
+            proto_rewrite(pl_bytes, |tag, wt, val, out| {
+                if tag == 1 && wt == 2 {
+                    let node = proto_rewrite(val, |ntag, nwt, nval, nout| match (ntag, nwt) {
+                        (1, 2) => {
+                            proto_encode_bytes(1, &xform_vec2(nval), nout);
+                            true
+                        }
+                        (2, 2) => {
+                            let arc = proto_rewrite(nval, |atag, awt, aval, aout| {
+                                if (1..=3).contains(&atag) && awt == 2 {
+                                    proto_encode_bytes(atag, &xform_vec2(aval), aout);
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                            proto_encode_bytes(2, &arc, nout);
+                            true
+                        }
+                        _ => false,
+                    });
+                    proto_encode_bytes(1, &node, out);
+                    true
+                } else {
+                    false
+                }
+            })
+        };
+        proto_rewrite(ps_bytes, |tag, wt, val, out| {
+            if tag == 1 && wt == 2 {
+                let poly = proto_rewrite(val, |ptag, pwt, pval, pout| {
+                    if (ptag == 1 || ptag == 2) && pwt == 2 {
+                        proto_encode_bytes(ptag, &xform_polyline(pval), pout);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                proto_encode_bytes(1, &poly, out);
+                true
+            } else {
+                false
+            }
+        })
+    };
+
+    let mut has_pos = false;
+    let mut has_orient = false;
+    let mut has_locked = false;
+
+    let mut out = proto_rewrite(fp_bytes, |tag, wt, val, out| match (tag, wt) {
+        (2, 2) => {
+            has_pos = true;
+            proto_encode_bytes(2, &proto_encode_vector2(new_x, new_y), out);
+            true
+        }
+        (3, 2) => {
+            has_orient = true;
+            proto_encode_bytes(3, &proto_encode_angle(new_deg), out);
+            true
+        }
+        (5, 0) => {
+            has_locked = true;
+            proto_encode_varint_field(5, if is_locked { 2 } else { 1 }, out);
+            true
+        }
+        (7..=10, 2) => {
+            proto_encode_bytes(tag, &xform_field(val), out);
+            true
+        }
+        (6, 2) => {
+            // Footprint definition
+            let def = proto_rewrite(val, |dtag, dwt, dval, dout| match (dtag, dwt) {
+                (7..=10, 2) => {
+                    proto_encode_bytes(dtag, &xform_field(dval), dout);
+                    true
+                }
+                (11, 2) => {
+                    let (turl, ibytes) = proto_decode_any(dval);
+                    let new_ibytes = if turl.ends_with(".Pad") {
+                        let mut pad_num = String::new();
+                        proto_walk(&ibytes, |ptag, pwt, pval| {
+                            if ptag == 3 && pwt == 2 {
+                                if let Ok(s) = std::str::from_utf8(pval) {
+                                    pad_num = s.to_string();
+                                }
+                            }
+                        });
+                        let override_net = pad_nets.get(&pad_num);
+                        let mut wrote_net = false;
+                        let mut p_out = proto_rewrite(&ibytes, |ptag, pwt, pval, pout| match (ptag, pwt) {
+                            (4, 2) if override_net.is_some() => {
+                                let (c, n) = override_net.unwrap();
+                                proto_encode_bytes(4, &proto_encode_net(*c, n), pout);
+                                wrote_net = true;
+                                true
+                            }
+                            (6, 2) => {
+                                let mut has_angle = false;
+                                let mut ps = proto_rewrite(pval, |stag, swt, sval, sout| {
+                                    if stag == 6 && swt == 2 {
+                                        has_angle = true;
+                                        proto_encode_bytes(6, &xform_angle(sval), sout);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
+                                if !has_angle && delta_deg.abs() > 1e-6 {
+                                    proto_encode_bytes(
+                                        6,
+                                        &proto_encode_angle(normalize_angle_deg(delta_deg)),
+                                        &mut ps,
+                                    );
+                                }
+                                proto_encode_bytes(6, &ps, pout);
+                                true
+                            }
+                            _ => false,
+                        });
+                        if !wrote_net {
+                            if let Some((c, n)) = override_net {
+                                proto_encode_bytes(4, &proto_encode_net(*c, n), &mut p_out);
+                            }
+                        }
+                        p_out
+                    } else if turl.ends_with(".BoardText") {
+                        xform_board_text(&ibytes)
+                    } else if turl.ends_with(".Field") {
+                        xform_field(&ibytes)
+                    } else if turl.ends_with(".BoardTextBox") {
+                        proto_rewrite(&ibytes, |btag, bwt, bval, bout| {
+                            if btag == 2 && bwt == 2 {
+                                let tb = proto_rewrite(bval, |ttag, twt, tval, tout| match (ttag, twt) {
+                                    (2 | 3, 2) => {
+                                        proto_encode_bytes(ttag, &xform_vec2(tval), tout);
+                                        true
+                                    }
+                                    (4, 2) => {
+                                        let attrs = proto_rewrite(tval, |atag, awt, aval, aout| {
+                                            if atag == 4 && awt == 2 {
+                                                proto_encode_bytes(4, &xform_angle(aval), aout);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        });
+                                        proto_encode_bytes(4, &attrs, tout);
+                                        true
+                                    }
+                                    _ => false,
+                                });
+                                proto_encode_bytes(2, &tb, bout);
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                    } else if turl.ends_with(".BoardGraphicShape") {
+                        proto_rewrite(&ibytes, |gtag, gwt, gval, gout| {
+                            if gtag == 1 && gwt == 2 {
+                                let gs = proto_rewrite(gval, |stag, swt, sval, sout| match (stag, swt) {
+                                    (4 | 6 | 7 | 9, 2) => {
+                                        let pts = proto_rewrite(sval, |ptag, pwt, pval, pout| {
+                                            if (1..=4).contains(&ptag) && pwt == 2 {
+                                                proto_encode_bytes(ptag, &xform_vec2(pval), pout);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        });
+                                        proto_encode_bytes(stag, &pts, sout);
+                                        true
+                                    }
+                                    (5, 2) => {
+                                        if delta_deg.abs() < 1e-6 {
+                                            let rect = proto_rewrite(sval, |rtag, rwt, rval, rout| {
+                                                if (rtag == 1 || rtag == 2) && rwt == 2 {
+                                                    proto_encode_bytes(rtag, &xform_vec2(rval), rout);
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            });
+                                            proto_encode_bytes(5, &rect, sout);
+                                        } else {
+                                            // Convert rotated rectangle to 4-corner closed PolySet (tag 8)
+                                            let mut tl = (0i64, 0i64);
+                                            let mut br = (0i64, 0i64);
+                                            proto_walk(sval, |rtag, rwt, rval| match (rtag, rwt) {
+                                                (1, 2) => tl = proto_decode_vector2(rval),
+                                                (2, 2) => br = proto_decode_vector2(rval),
+                                                _ => {}
+                                            });
+                                            let corners = [
+                                                (tl.0, tl.1),
+                                                (br.0, tl.1),
+                                                (br.0, br.1),
+                                                (tl.0, br.1),
+                                            ];
+                                            let mut pl = Vec::new();
+                                            for (cx, cy) in corners {
+                                                let v = proto_encode_vector2(cx, cy);
+                                                let xv = xform_vec2(&v);
+                                                let mut node = Vec::new();
+                                                proto_encode_bytes(1, &xv, &mut node);
+                                                proto_encode_bytes(1, &node, &mut pl);
+                                            }
+                                            proto_encode_varint_field(2, 1, &mut pl); // closed = true
+                                            let mut pwh = Vec::new();
+                                            proto_encode_bytes(1, &pl, &mut pwh);
+                                            let mut ps = Vec::new();
+                                            proto_encode_bytes(1, &pwh, &mut ps);
+                                            proto_encode_bytes(8, &ps, sout);
+                                        }
+                                        true
+                                    }
+                                    (8, 2) => {
+                                        proto_encode_bytes(8, &xform_polyset(sval), sout);
+                                        true
+                                    }
+                                    _ => false,
+                                });
+                                proto_encode_bytes(1, &gs, gout);
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                    } else if turl.ends_with(".Zone") {
+                        proto_rewrite(&ibytes, |ztag, zwt, zval, zout| match (ztag, zwt) {
+                            (4, 2) => {
+                                proto_encode_bytes(4, &xform_polyset(zval), zout);
+                                true
+                            }
+                            (10, 2) => {
+                                let fp = proto_rewrite(zval, |ftag, fwt, fval, fout| {
+                                    if ftag == 2 && fwt == 2 {
+                                        proto_encode_bytes(2, &xform_polyset(fval), fout);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
+                                proto_encode_bytes(10, &fp, zout);
+                                true
+                            }
+                            _ => false,
+                        })
+                    } else {
+                        ibytes
+                    };
+                    proto_encode_bytes(11, &proto_encode_any(&turl, &new_ibytes), dout);
+                    true
+                }
+                _ => false,
+            });
+            proto_encode_bytes(6, &def, out);
+            true
+        }
+        _ => false,
+    });
+
+    if !has_pos {
+        proto_encode_bytes(2, &proto_encode_vector2(new_x, new_y), &mut out);
+    }
+    if !has_orient {
+        proto_encode_bytes(3, &proto_encode_angle(new_deg), &mut out);
+    }
+    if !has_locked {
+        proto_encode_varint_field(5, if is_locked { 2 } else { 1 }, &mut out);
+    }
+    out
 }
 
 /// Helper function to scan a directory for KiCad IPC sockets.
@@ -944,4 +2475,219 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn test_nng_protobuf_push_board_state_roundtrip() {
+        let Ok(lib) = NngLib::load() else {
+            return;
+        };
+        let (Some(rep0_open), Some(listen_fn)) = (lib.rep0_open, lib.listen) else {
+            return;
+        };
+
+        let sock_path = format!("/tmp/kicad_nng_test_{}.sock", std::process::id());
+        let _ = fs::remove_file(&sock_path);
+
+        let mut srv_sock = NngSocket::default();
+        unsafe {
+            assert_eq!(rep0_open(&mut srv_sock), 0);
+            if let Some(set_ms) = lib.set_ms {
+                let _ = set_ms(srv_sock, NNG_OPT_RECVTIMEO.as_ptr() as *const _, 5_000);
+                let _ = set_ms(srv_sock, NNG_OPT_SENDTIMEO.as_ptr() as *const _, 5_000);
+            }
+            let uri = format!("ipc://{}\0", sock_path);
+            assert_eq!(listen_fn(srv_sock, uri.as_ptr() as *const _, std::ptr::null_mut(), 0), 0);
+        }
+
+        let srv_sock_id = srv_sock.id;
+        let server_thread = thread::spawn(move || {
+            let srv_lib = NngLib::load().unwrap();
+            let s = NngSocket { id: srv_sock_id };
+            let mut seen_commands = Vec::new();
+
+            loop {
+                let req_bytes = unsafe {
+                    let mut buf_ptr: *mut u8 = std::ptr::null_mut();
+                    let mut buf_len: usize = 0;
+                    let rv = (srv_lib.recv)(s, &mut buf_ptr, &mut buf_len, NNG_FLAG_ALLOC);
+                    if rv != 0 {
+                        break;
+                    }
+                    let slice = std::slice::from_raw_parts(buf_ptr, buf_len).to_vec();
+                    (srv_lib.free)(buf_ptr, buf_len);
+                    slice
+                };
+
+                let mut cmd_type_url = String::new();
+                proto_walk(&req_bytes, |tag, wt, val| {
+                    if tag == 2 && wt == 2 {
+                        let (turl, _) = proto_decode_any(val);
+                        cmd_type_url = turl;
+                    }
+                });
+                seen_commands.push(cmd_type_url.clone());
+
+                let mut resp_payload = Vec::new();
+                let mut resp_type_url = "type.googleapis.com/kiapi.common.types.CommandStatusResponse";
+
+                if cmd_type_url.ends_with(".GetOpenDocuments") {
+                    resp_type_url = "type.googleapis.com/kiapi.common.commands.GetOpenDocumentsResponse";
+                    let mut doc = Vec::new();
+                    proto_encode_varint_field(1, 3, &mut doc);
+                    proto_encode_str(4, "test_board.kicad_pcb", &mut doc);
+                    proto_encode_bytes(1, &doc, &mut resp_payload);
+                } else if cmd_type_url.ends_with(".GetNets") {
+                    resp_type_url = "type.googleapis.com/kiapi.board.commands.NetsResponse";
+                    let net = proto_encode_net(1, "VCC");
+                    proto_encode_bytes(1, &net, &mut resp_payload);
+                } else if cmd_type_url.ends_with(".GetItems") {
+                    resp_type_url = "type.googleapis.com/kiapi.common.commands.GetItemsResponse";
+                    // Return 1 existing footprint R1 and 1 old track
+                    let mut kiid_fp = Vec::new();
+                    proto_encode_str(1, "00000000-0000-4000-8000-000000000001", &mut kiid_fp);
+                    let mut text_msg = Vec::new();
+                    proto_encode_bytes(2, &proto_encode_vector2(10_000_000, 20_000_000), &mut text_msg);
+                    proto_encode_str(5, "R1", &mut text_msg);
+                    let mut bt_msg = Vec::new();
+                    proto_encode_bytes(2, &text_msg, &mut bt_msg);
+                    let mut field_msg = Vec::new();
+                    proto_encode_bytes(3, &bt_msg, &mut field_msg);
+
+                    let mut fp_inst = Vec::new();
+                    proto_encode_bytes(1, &kiid_fp, &mut fp_inst);
+                    proto_encode_bytes(2, &proto_encode_vector2(10_000_000, 20_000_000), &mut fp_inst);
+                    proto_encode_bytes(3, &proto_encode_angle(0.0), &mut fp_inst);
+                    proto_encode_varint_field(4, BL_F_CU as u64, &mut fp_inst);
+                    proto_encode_bytes(7, &field_msg, &mut fp_inst);
+                    let any_fp = proto_encode_any(
+                        "type.googleapis.com/kiapi.board.types.FootprintInstance",
+                        &fp_inst,
+                    );
+                    proto_encode_bytes(3, &any_fp, &mut resp_payload);
+
+                    let mut kiid_trk = Vec::new();
+                    proto_encode_str(1, "00000000-0000-4000-8000-000000000002", &mut kiid_trk);
+                    let mut old_trk = Vec::new();
+                    proto_encode_bytes(1, &kiid_trk, &mut old_trk);
+                    let any_trk = proto_encode_any(
+                        "type.googleapis.com/kiapi.board.types.Track",
+                        &old_trk,
+                    );
+                    proto_encode_bytes(3, &any_trk, &mut resp_payload);
+                } else if cmd_type_url.ends_with(".BeginCommit") {
+                    resp_type_url = "type.googleapis.com/kiapi.common.commands.BeginCommitResponse";
+                    let mut cid = Vec::new();
+                    proto_encode_str(1, "00000000-0000-4000-8000-000000000099", &mut cid);
+                    proto_encode_bytes(1, &cid, &mut resp_payload);
+                } else {
+                    proto_encode_varint_field(1, 1, &mut resp_payload);
+                }
+
+                let mut header = Vec::new();
+                proto_encode_str(1, "test-kicad-token", &mut header);
+                let mut status = Vec::new();
+                proto_encode_varint_field(1, 1, &mut status); // AS_OK = 1
+                let any_resp = proto_encode_any(resp_type_url, &resp_payload);
+                let mut api_resp = Vec::new();
+                proto_encode_bytes(1, &header, &mut api_resp);
+                proto_encode_bytes(2, &status, &mut api_resp);
+                proto_encode_bytes(3, &any_resp, &mut api_resp);
+
+                unsafe {
+                    let _ = (srv_lib.send)(s, api_resp.as_ptr(), api_resp.len(), 0);
+                }
+
+                if cmd_type_url.ends_with(".RefillZones") {
+                    break;
+                }
+            }
+
+            unsafe {
+                let _ = (srv_lib.close)(s);
+            }
+            seen_commands
+        });
+
+        let mut client = KiCadIpcClient::connect(&sock_path).expect("NNG connect must succeed");
+        assert!(client.is_connected());
+
+        let mut board = crate::board::Board::default();
+        board.nets = vec!["".to_string(), "VCC".to_string()];
+        board.footprints.push(crate::board::Footprint {
+            reference: "R1".to_string(),
+            x: 15.0,
+            y: 25.0,
+            rotation: 90.0,
+            layer: 0,
+            ..Default::default()
+        });
+        board.tracks.push(crate::board::TrackSegment {
+            start: (15.0, 25.0),
+            end: (20.0, 25.0),
+            width: 0.25,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+        board.arcs.push(crate::board::ArcSegment::new(
+            (20.0, 26.0),
+            1.0,
+            -std::f64::consts::FRAC_PI_2,
+            0.0,
+            0.25,
+            0,
+            1,
+        ));
+        board.vias.push(crate::board::Via {
+            position: (21.0, 26.0),
+            size: 0.60,
+            drill: 0.30,
+            net_id: 1,
+            is_locked: false,
+        });
+
+        let synced = client
+            .pull_board_into_kicad(
+                &board,
+                Path::new("/tmp/test_board_vulcan.kicad_pcb"),
+                Path::new("/tmp/test_board_vulcan.ses"),
+            )
+            .expect("NNG pull_board_into_kicad must succeed");
+        // 1 updated footprint + 1 track + 1 arc + 1 via = 4 items synced
+        assert_eq!(synced, 4);
+
+        let commands = server_thread.join().expect("NNG server thread join");
+        let _ = fs::remove_file(&sock_path);
+
+        assert!(commands.iter().any(|c| c.ends_with(".Ping")));
+        assert!(commands.iter().any(|c| c.ends_with(".GetOpenDocuments")));
+        assert!(commands.iter().any(|c| c.ends_with(".GetNets")));
+        assert!(commands.iter().any(|c| c.ends_with(".GetItems")));
+        assert!(commands.iter().any(|c| c.ends_with(".BeginCommit")));
+        assert!(commands.iter().any(|c| c.ends_with(".UpdateItems")));
+        assert!(commands.iter().any(|c| c.ends_with(".DeleteItems")));
+        assert!(commands.iter().any(|c| c.ends_with(".CreateItems")));
+        assert!(commands.iter().any(|c| c.ends_with(".EndCommit")));
+        assert!(commands.iter().any(|c| c.ends_with(".RefillZones")));
+    }
+
+    #[test]
+    fn test_nng_worker_thread_drop_does_not_unload_libnng() {
+        for i in 0..4 {
+            let h = thread::spawn(move || {
+                let mut slot = None;
+                let board = crate::board::Board::default();
+                let _ = push_saved_board_to_kicad(
+                    &mut slot,
+                    Some(&format!("/tmp/nonexistent_nng_stop_test_{}.sock", i)),
+                    &board,
+                    Path::new("/tmp/nonexistent.kicad_pcb"),
+                    Path::new("/tmp/nonexistent.ses"),
+                );
+            });
+            h.join().expect("Worker thread must exit cleanly without unloading libnng");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
+
