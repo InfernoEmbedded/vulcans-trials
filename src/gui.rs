@@ -193,6 +193,10 @@ pub struct AppPreferences {
     pub nudge_step_mm: f64,
     #[serde(default = "default_gloss_passes")]
     pub gloss_passes: usize,
+    #[serde(default = "default_acid_trap_fillet_radius")]
+    pub acid_trap_fillet_radius: f64,
+    #[serde(default)]
+    pub allow_via_in_pad: bool,
 
     // Layer visibility & display toggles
     #[serde(default = "default_true")]
@@ -254,6 +258,7 @@ fn default_congestion_factor() -> f64 { 1.50 }
 fn default_crosstalk_penalty() -> f64 { 4.0 }
 fn default_nudge_step() -> f64 { 0.25 }
 fn default_gloss_passes() -> usize { 2 }
+fn default_acid_trap_fillet_radius() -> f64 { 0.35 }
 fn default_true() -> bool { true }
 fn default_bundle_dim() -> f64 { 0.25 }
 
@@ -284,6 +289,8 @@ impl Default for AppPreferences {
             crosstalk_penalty: default_crosstalk_penalty(),
             nudge_step_mm: default_nudge_step(),
             gloss_passes: default_gloss_passes(),
+            acid_trap_fillet_radius: default_acid_trap_fillet_radius(),
+            allow_via_in_pad: false,
             show_courtyards: true,
             show_ratsnest: true,
             show_f_cu: true,
@@ -419,6 +426,8 @@ pub struct VulcansTrialsApp {
     pub crosstalk_penalty: f64,
     pub nudge_step_mm: f64,
     pub gloss_passes: usize,
+    pub acid_trap_fillet_radius: f64,
+    pub allow_via_in_pad: bool,
 
     // Canvas viewport controls
     pub pan_offset: Vec2,
@@ -509,6 +518,8 @@ impl VulcansTrialsApp {
             crosstalk_penalty: 4.0,
             nudge_step_mm: 0.25,
             gloss_passes: 2,
+            acid_trap_fillet_radius: 0.35,
+            allow_via_in_pad: false,
             pan_offset: Vec2::ZERO,
             zoom: 1.0,
             show_courtyards: true,
@@ -594,6 +605,13 @@ impl VulcansTrialsApp {
         self.crosstalk_penalty = prefs.crosstalk_penalty;
         self.nudge_step_mm = prefs.nudge_step_mm;
         self.gloss_passes = prefs.gloss_passes;
+        self.acid_trap_fillet_radius = prefs.acid_trap_fillet_radius;
+        self.allow_via_in_pad = prefs.allow_via_in_pad;
+        if let Ok(mut g) = self.live.lock() {
+            g.acid_trap_fillet_radius = self.acid_trap_fillet_radius;
+            g.allow_via_in_pad = self.allow_via_in_pad;
+            g.board.set_allow_via_in_pad(self.allow_via_in_pad);
+        }
 
         self.show_courtyards = prefs.show_courtyards;
         self.show_ratsnest = prefs.show_ratsnest;
@@ -643,6 +661,8 @@ impl VulcansTrialsApp {
             crosstalk_penalty: self.crosstalk_penalty,
             nudge_step_mm: self.nudge_step_mm,
             gloss_passes: self.gloss_passes,
+            acid_trap_fillet_radius: self.acid_trap_fillet_radius,
+            allow_via_in_pad: self.allow_via_in_pad,
 
             show_courtyards: self.show_courtyards,
             show_ratsnest: self.show_ratsnest,
@@ -755,6 +775,7 @@ impl VulcansTrialsApp {
                 g.push_log(format!("[Error] {}", e));
                 return false;
             }
+            crate::board::Board::refill_zones_in_file(&pcb_path);
             let _ = g.board.save_ses(&ses_path);
             g.push_log(format!("[Saved] {}", self.output_path));
             g.board.clone()
@@ -770,6 +791,22 @@ impl VulcansTrialsApp {
                 .ok()
                 .map(|mut ipc| ipc.pull_board_into_kicad(&board_clone, &pcb_path, &ses_path));
             if let Some(Ok(synced)) = pull_res {
+                if let Ok(mut g) = self.live.lock() {
+                    g.push_log(format!(
+                        "[KiCad-IPC] Pulled updated board into KiCad ({} items synced)",
+                        synced
+                    ));
+                }
+            }
+        } else {
+            let mut tmp_client = None;
+            if let Ok(synced) = crate::ipc::push_saved_board_to_kicad(
+                &mut tmp_client,
+                None,
+                &board_clone,
+                &pcb_path,
+                &ses_path,
+            ) {
                 if let Ok(mut g) = self.live.lock() {
                     g.push_log(format!(
                         "[KiCad-IPC] Pulled updated board into KiCad ({} items synced)",
@@ -835,6 +872,12 @@ impl VulcansTrialsApp {
         let t_scale = self.temp_scale;
         let esc_mult = self.escape_margin_mult;
         let cross_w = self.crossing_weight;
+        let allow_via_in_pad = self.allow_via_in_pad;
+        if let Ok(mut g) = self.live.lock() {
+            g.acid_trap_fillet_radius = self.acid_trap_fillet_radius;
+            g.allow_via_in_pad = allow_via_in_pad;
+            g.board.set_allow_via_in_pad(allow_via_in_pad);
+        }
         let routing_cfg = RoutingConfig {
             crosstalk_penalty: self.crosstalk_penalty,
             any_angle_mode: any_angle,
@@ -847,6 +890,8 @@ impl VulcansTrialsApp {
             congestion_factor: self.congestion_factor,
             nudge_step_mm: self.nudge_step_mm,
             gloss_passes: self.gloss_passes,
+            acid_trap_fillet_radius: self.acid_trap_fillet_radius,
+            allow_via_in_pad: self.allow_via_in_pad,
         };
         let out_path = self.output_path.clone();
         let ipc_client = if self.kicad_ipc_enabled { self.ipc.clone() } else { None };
@@ -894,8 +939,10 @@ impl VulcansTrialsApp {
             }
 
             if do_route && !stop_flag.load(Ordering::Relaxed) {
+                working_board.set_allow_via_in_pad(allow_via_in_pad);
                 let mut grid = RoutingGrid::new(&working_board, grid_res, vulkan)
-                    .with_inner_layer_penalty(inner_plane_pen);
+                    .with_inner_layer_penalty(inner_plane_pen)
+                    .with_allow_via_in_pad(allow_via_in_pad);
                 let mut router = AutoRouter::new(max_passes)
                     .with_allow_component_nudge(allow_comp_nudge)
                     .with_config(routing_cfg)
@@ -910,18 +957,37 @@ impl VulcansTrialsApp {
             }
 
             if !out_path.is_empty() {
-                if let Err(e) = working_board.save_pcb(Path::new(&out_path)) {
+                let pcb_path = Path::new(&out_path);
+                if let Err(e) = working_board.save_pcb(pcb_path) {
                     if let Ok(mut g) = live.lock() {
+                        g.phase = TrialPhase::Completed;
                         g.push_log(format!("[Error] Failed to save {}: {}", out_path, e));
                     }
                 } else {
-                    let ses_path = Path::new(&out_path).with_extension("ses");
+                    crate::board::Board::refill_zones_in_file(pcb_path);
+                    let ses_path = pcb_path.with_extension("ses");
                     let _ = working_board.save_ses(&ses_path);
+                    let mut tmp_client = None;
+                    let pushed = crate::ipc::push_saved_board_to_kicad(
+                        &mut tmp_client,
+                        None,
+                        &working_board,
+                        pcb_path,
+                        &ses_path,
+                    );
                     if let Ok(mut g) = live.lock() {
                         g.phase = TrialPhase::Completed;
                         g.push_log(format!("[Saved] Wrote PCB to {} and {}", out_path, ses_path.display()));
+                        if let Ok(synced) = pushed {
+                            g.push_log(format!(
+                                "[KiCad-IPC] Pulled saved PCB into KiCad ({} items synced)",
+                                synced
+                            ));
+                        }
                     }
                 }
+            } else if let Ok(mut g) = live.lock() {
+                g.phase = TrialPhase::Completed;
             }
 
             running.store(false, Ordering::Relaxed);
@@ -2037,11 +2103,12 @@ impl VulcansTrialsApp {
             return false;
         }
         self.any_angle_mode = enable_organic;
+        g.acid_trap_fillet_radius = self.acid_trap_fillet_radius;
         if enable_organic {
             if g.straight_copper_snapshot.is_none() {
                 g.straight_copper_snapshot = Some((g.board.tracks.clone(), g.board.arcs.clone()));
             }
-            crate::router::convert_tracks_to_organic(&mut g.board);
+            crate::router::convert_tracks_to_organic_with_fillet_radius(&mut g.board, self.acid_trap_fillet_radius);
             let num_tracks = g.board.tracks.len();
             let num_arcs = g.board.arcs.len();
             g.ratsnest = g.board.filter_unrouted_ratsnest(&g.ratsnest);
@@ -2416,10 +2483,35 @@ impl VulcansTrialsApp {
                         egui::Slider::new(&mut self.gloss_passes, 1..=6)
                             .text("Glossing Passes"),
                     );
+                    if ui
+                        .add_enabled(
+                            !is_running,
+                            egui::Slider::new(&mut self.acid_trap_fillet_radius, 0.0..=2.0)
+                                .text("Fillet Radius (<90°)")
+                                .suffix(" mm"),
+                        )
+                        .changed()
+                    {
+                        if let Ok(mut g) = self.live.lock() {
+                            g.acid_trap_fillet_radius = self.acid_trap_fillet_radius;
+                        }
+                    }
                     ui.add_enabled(
                         !is_running,
                         egui::Checkbox::new(&mut self.allow_component_nudge, "Allow Router to Nudge Unlocked Passives"),
                     );
+                    if ui
+                        .add_enabled(
+                            !is_running,
+                            egui::Checkbox::new(&mut self.allow_via_in_pad, "Allow Via-in-Pad"),
+                        )
+                        .changed()
+                    {
+                        if let Ok(mut g) = self.live.lock() {
+                            g.allow_via_in_pad = self.allow_via_in_pad;
+                            g.board.set_allow_via_in_pad(self.allow_via_in_pad);
+                        }
+                    }
                     if ui
                         .add_enabled(
                             !is_running,

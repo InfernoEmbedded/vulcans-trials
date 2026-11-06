@@ -327,13 +327,27 @@ impl McpServer {
                     "vulcans_trials_out.kicad_pcb".to_string()
                 };
 
-                board.save_pcb(Path::new(&out_path))?;
+                let pcb_p = Path::new(&out_path);
+                board.save_pcb(pcb_p)?;
+                crate::board::Board::refill_zones_in_file(pcb_p);
+                let ses_p = pcb_p.with_extension("ses");
+                let _ = board.save_ses(&ses_p);
+                let mut ipc_slot = None;
+                let kicad_synced = crate::ipc::push_saved_board_to_kicad(
+                    &mut ipc_slot,
+                    None,
+                    board,
+                    pcb_p,
+                    &ses_p,
+                )
+                .ok();
                 Ok(json!({
                     "status": "saved",
                     "path": out_path,
                     "track_count": board.tracks.len(),
                     "via_count": board.vias.len(),
                     "arc_count": board.arcs.len(),
+                    "kicad_synced_items": kicad_synced,
                 }))
             }
 
@@ -513,6 +527,7 @@ impl McpServer {
                 let res = args.get("res").and_then(|v| v.as_f64()).unwrap_or(0.10);
                 let inner_pen = args.get("inner_plane_penalty").and_then(|v| v.as_f64()).unwrap_or(8.0);
                 let any_angle = args.get("any_angle").and_then(|v| v.as_bool()).unwrap_or(false);
+                let fillet_radius = args.get("fillet_radius").and_then(|v| v.as_f64()).unwrap_or(0.35);
                 let crosstalk_pen = args.get("crosstalk_penalty").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let allow_nudge = args.get("allow_nudge").and_then(|v| v.as_bool()).unwrap_or(true);
 
@@ -520,6 +535,7 @@ impl McpServer {
                 let router = AutoRouter::new(passes)
                     .with_inner_layer_penalty(inner_pen)
                     .with_any_angle_mode(any_angle)
+                    .with_acid_trap_fillet_radius(fillet_radius)
                     .with_crosstalk_penalty(crosstalk_pen)
                     .with_allow_component_nudge(allow_nudge);
 
@@ -1554,6 +1570,7 @@ pub fn get_all_tool_definitions() -> Vec<Value> {
                     "res": { "type": "number", "description": "Routing grid resolution in mm (default: 0.10)" },
                     "inner_plane_penalty": { "type": "number", "description": "Penalty factor for routing non-plane signals across inner planes (default: 8.0)" },
                     "any_angle": { "type": "boolean", "description": "Enable TopoR-style any-angle topological routing (default: false)" },
+                    "fillet_radius": { "type": "number", "description": "Acute-angle (< 90°) acid-trap fillet radius in mm (default: 0.35, 0.0 to disable)" },
                     "crosstalk_penalty": { "type": "number", "description": "Penalty weight for parallel coupled runs (default: 0.0)" },
                     "allow_nudge": { "type": "boolean", "description": "Allow nudging blocking components and tracks (default: true)" }
                 }

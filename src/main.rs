@@ -61,6 +61,14 @@ struct Args {
     #[arg(long)]
     any_angle: bool,
 
+    /// Automatic acute-angle (< 90°) acid-trap fillet radius in mm (0.0 to disable)
+    #[arg(long, default_value_t = 0.35)]
+    fillet_radius: f64,
+
+    /// Allow vias to be placed inside SMD pads of the same net (disabled by default)
+    #[arg(long)]
+    via_in_pad: bool,
+
     /// Connect to KiCad 10 IPC socket for real-time live canvas streaming (optional socket path)
     #[arg(long, num_args = 0..=1, default_missing_value = "")]
     kicad_ipc: Option<String>,
@@ -260,10 +268,15 @@ fn run_headless_trial(
     }
 
     if do_route {
-        let mut grid = RoutingGrid::new(board, args.res, vulkan).with_inner_layer_penalty(args.inner_plane_penalty);
+        board.set_allow_via_in_pad(args.via_in_pad);
+        let mut grid = RoutingGrid::new(board, args.res, vulkan)
+            .with_inner_layer_penalty(args.inner_plane_penalty)
+            .with_allow_via_in_pad(args.via_in_pad);
         let router = AutoRouter::new(args.passes)
             .with_inner_layer_penalty(args.inner_plane_penalty)
             .with_any_angle_mode(args.any_angle)
+            .with_acid_trap_fillet_radius(args.fillet_radius)
+            .with_allow_via_in_pad(args.via_in_pad)
             .with_ipc(ipc.clone());
         let (routed, total) = router.route_all(board, &mut grid, None, Arc::clone(&stop_flag));
         println!(
@@ -279,19 +292,29 @@ fn run_headless_trial(
 
     let out_path = Path::new(&args.output);
     board.save_pcb(out_path)?;
+    Board::refill_zones_in_file(out_path);
     let ses_path = out_path.with_extension("ses");
     board.save_ses(&ses_path)?;
-    if let Some(ref ipc_arc) = ipc {
+    let pushed = if let Some(ref ipc_arc) = ipc {
         if let Ok(mut client) = ipc_arc.lock() {
             if client.is_connected() {
-                if let Ok(synced) = client.pull_board_into_kicad(board, out_path, &ses_path) {
-                    println!(
-                        "[KiCad-IPC] Pulled updated board into KiCad ({} items synced)",
-                        synced
-                    );
-                }
+                client.pull_board_into_kicad(board, out_path, &ses_path).ok()
+            } else {
+                None
             }
+        } else {
+            None
         }
+    } else {
+        let custom = args.kicad_ipc.as_deref().or(args.ipc.as_deref());
+        let mut slot = None;
+        vulcans_trials::ipc::push_saved_board_to_kicad(&mut slot, custom, board, out_path, &ses_path).ok()
+    };
+    if let Some(synced) = pushed {
+        println!(
+            "[KiCad-IPC] Pulled updated board into KiCad ({} items synced)",
+            synced
+        );
     }
     println!("Saved output to {} and {}", out_path.display(), ses_path.display());
     Ok(())
@@ -303,6 +326,7 @@ fn run_headless_trial(
 // `parse_locked_refs`, `run_self_test`, `run_headless_trial`) is unit-tested below.
 fn main() {
     let args = Args::parse();
+    vulcans_trials::memlog::init_memlog(None);
 
     if args.self_test {
         if let Err(e) = run_self_test() {
@@ -523,6 +547,8 @@ mod tests {
             lock: String::new(),
             inner_plane_penalty: 8.0,
             any_angle: false,
+            fillet_radius: 0.35,
+            via_in_pad: false,
             kicad_ipc: None,
             self_test: false,
             ipc: None,
