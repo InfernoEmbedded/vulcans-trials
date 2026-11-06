@@ -57,7 +57,6 @@ def find_binary() -> str | None:
     # 4. Local workspace / target builds & cargo home
     workspace_candidates = [
         os.path.abspath(os.path.join(plugin_dir, "..", "target", "release", exe_name)),
-        os.path.expanduser(f"~/watt-home/src/vulcans-trials/target/release/{exe_name}"),
         os.path.expanduser(f"~/.cargo/bin/{exe_name}"),
         "/usr/local/bin/vulcans-trials",
         "/usr/bin/vulcans-trials",

@@ -22,12 +22,12 @@ use vulcans_trials::vulkan::VulkanEngine;
 )]
 struct Args {
     /// Input KiCad PCB file (.kicad_pcb)
-    #[arg(short, long, default_value = "/home/deece/src/p1p2esp/p1p2esp.kicad_pcb")]
-    input: String,
+    #[arg(short, long)]
+    input: Option<String>,
 
-    /// Output KiCad PCB file (.kicad_pcb)
-    #[arg(short, long, default_value = "/home/deece/watt-home/src/vulcans-trials/vulcans_trials_out.kicad_pcb")]
-    output: String,
+    /// Output KiCad PCB file (.kicad_pcb) [defaults to <input>_routed.kicad_pcb]
+    #[arg(short, long)]
+    output: Option<String>,
 
     /// Run in headless CLI mode instead of launching the interactive GUI
     #[arg(long)]
@@ -88,6 +88,21 @@ struct Args {
     /// Run as a Model Context Protocol (MCP) server over TCP listening on <bind_addr> (e.g. 127.0.0.1:8765)
     #[arg(long, value_name = "BIND_ADDR")]
     mcp_tcp: Option<String>,
+}
+
+impl Args {
+    pub fn resolved_output_path(&self) -> String {
+        if let Some(ref out) = self.output {
+            return out.clone();
+        }
+        if let Some(ref inp) = self.input {
+            let p = Path::new(inp);
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("board");
+            let parent = p.parent().unwrap_or_else(|| Path::new("."));
+            return parent.join(format!("{}_routed.kicad_pcb", stem)).to_string_lossy().to_string();
+        }
+        "vulcans_trials_out.kicad_pcb".to_string()
+    }
 }
 
 fn parse_locked_refs(lock_arg: &str) -> HashSet<String> {
@@ -290,7 +305,8 @@ fn run_headless_trial(
         );
     }
 
-    let out_path = Path::new(&args.output);
+    let resolved_out = args.resolved_output_path();
+    let out_path = Path::new(&resolved_out);
     board.save_pcb(out_path)?;
     Board::refill_zones_in_file(out_path);
     let ses_path = out_path.with_extension("ses");
@@ -357,16 +373,20 @@ fn main() {
     }
 
     if args.mcp || args.mcp_tcp.is_some() {
-        let initial_board = if Path::new(&args.input).exists() {
-            match Board::load(&args.input, &extra_locked) {
-                Ok(b) => {
-                    eprintln!("[Vulcan's Trials MCP] Pre-loaded PCB '{}': {} footprints, {} nets", args.input, b.footprints.len(), b.nets.len());
-                    Some(b)
+        let initial_board = if let Some(ref in_path) = args.input {
+            if Path::new(in_path).exists() {
+                match Board::load(in_path, &extra_locked) {
+                    Ok(b) => {
+                        eprintln!("[Vulcan's Trials MCP] Pre-loaded PCB '{}': {} footprints, {} nets", in_path, b.footprints.len(), b.nets.len());
+                        Some(b)
+                    }
+                    Err(e) => {
+                        eprintln!("[Vulcan's Trials MCP] Note: Could not pre-load PCB '{}': {}", in_path, e);
+                        None
+                    }
                 }
-                Err(e) => {
-                    eprintln!("[Vulcan's Trials MCP] Note: Could not pre-load PCB '{}': {}", args.input, e);
-                    None
-                }
+            } else {
+                None
             }
         } else {
             None
@@ -391,17 +411,29 @@ fn main() {
         }
     }
 
-    let mut board = match Board::load(&args.input, &extra_locked) {
+    let input_path = match &args.input {
+        Some(p) => p.clone(),
+        None => {
+            eprintln!("Error: Missing required input PCB file.");
+            eprintln!("Usage: vulcans-trials --input <path/to/board.kicad_pcb> [options]");
+            eprintln!("Run 'vulcans-trials --help' for usage details, or '--self-test' to run self-tests.");
+            std::process::exit(1);
+        }
+    };
+
+    let output_path = args.resolved_output_path();
+
+    let mut board = match Board::load(&input_path, &extra_locked) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("Error loading PCB '{}': {}", args.input, e);
+            eprintln!("Error loading PCB '{}': {}", input_path, e);
             std::process::exit(1);
         }
     };
 
     println!(
         "Loaded '{}': {:.1}x{:.1}mm, {} footprints ({} locked), {} nets, {} clusters",
-        args.input,
+        input_path,
         board.max_x - board.min_x,
         board.max_y - board.min_y,
         board.footprints.len(),
@@ -448,8 +480,6 @@ fn main() {
         ..Default::default()
     };
 
-    let input_path = args.input.clone();
-    let output_path = args.output.clone();
     let app_title = format!("Vulcan's Trials v{} — InfernoEmbedded", env!("CARGO_PKG_VERSION"));
     if let Err(e) = eframe::run_native(
         &app_title,
@@ -480,6 +510,9 @@ mod tests {
         let def = Args::try_parse_from(["vulcans-trials"]).unwrap();
         assert!(!def.headless);
         assert!(!def.self_test);
+        assert_eq!(def.input, None);
+        assert_eq!(def.output, None);
+        assert_eq!(def.resolved_output_path(), "vulcans_trials_out.kicad_pcb");
         assert_eq!(def.mode, "both");
         assert_eq!(def.duration, 10);
         assert!((def.res - 0.10).abs() < 1e-6);
@@ -519,6 +552,9 @@ mod tests {
             "/tmp/test_ipc.sock",
         ])
         .unwrap();
+        assert_eq!(custom.input, Some("/tmp/in.kicad_pcb".to_string()));
+        assert_eq!(custom.output, Some("/tmp/out.kicad_pcb".to_string()));
+        assert_eq!(custom.resolved_output_path(), "/tmp/out.kicad_pcb");
         assert!(custom.headless);
         assert!(custom.self_test);
         assert_eq!(custom.ipc, Some("/tmp/test_ipc.sock".to_string()));
@@ -529,6 +565,14 @@ mod tests {
         let locked = parse_locked_refs(&custom.lock);
         assert_eq!(locked.len(), 3);
         assert!(locked.contains("U1") && locked.contains("J2") && locked.contains("R5"));
+
+        let auto_out = Args::try_parse_from([
+            "vulcans-trials",
+            "-i",
+            "/tmp/my_board.kicad_pcb",
+        ])
+        .unwrap();
+        assert_eq!(auto_out.resolved_output_path(), "/tmp/my_board_routed.kicad_pcb");
 
         let ipc_default = Args::try_parse_from(["vulcans-trials", "--kicad-ipc"]).unwrap();
         assert_eq!(ipc_default.kicad_ipc, Some(String::new()));
@@ -556,8 +600,8 @@ mod tests {
 
         let mut board = Board::load(in_pcb, &HashSet::new()).unwrap();
         let args = Args {
-            input: in_pcb.to_string(),
-            output: out_pcb.to_string(),
+            input: Some(in_pcb.to_string()),
+            output: Some(out_pcb.to_string()),
             headless: true,
             mode: "both".to_string(),
             duration: 0,

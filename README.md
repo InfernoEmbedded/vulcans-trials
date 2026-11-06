@@ -30,7 +30,8 @@ Published by **InfernoEmbedded** — Licensed under **GNU GPLv3 (`GPL-3.0-only`)
 
 ### 1. Build Release Binary & Run Self-Test
 ```bash
-cd ~/watt-home/src/vulcans-trials
+git clone https://github.com/InfernoEmbedded/vulcans-trials.git
+cd vulcans-trials
 cargo build --release
 ./target/release/vulcans-trials --self-test
 ```
@@ -44,8 +45,8 @@ cargo build --release
 ```bash
 # Auto-route only
 ./target/release/vulcans-trials --headless --mode route \
-  --input /home/deece/src/p1p2esp/p1p2esp.kicad_pcb \
-  --output /home/deece/watt-home/src/vulcans-trials/test_routed.kicad_pcb
+  --input /path/to/board.kicad_pcb \
+  --output /path/to/board_routed.kicad_pcb
 
 # Full Trial (Auto-Place + Auto-Route)
 ./target/release/vulcans-trials --headless --mode both --duration 30 \
@@ -54,9 +55,18 @@ cargo build --release
 ```
 
 ### 4. KiCad Action Plugin Installation
+
+#### Option A: KiCad Plugin and Content Manager (PCM)
+In KiCad (8.0, 9.0, or 10.0), open **Plugin and Content Manager → Settings (gear icon) → Add Repository** and add:
+```
+https://infernoembedded.github.io/vulcans-trials/repository.json
+```
+Then search for **Vulcan's Trials** and click **Install**.
+
+#### Option B: Manual Plugin Symlink
 Symlink `kicad_plugin` into your KiCad scripting plugins directory:
 ```bash
-ln -s ~/watt-home/src/vulcans-trials/kicad_plugin ~/.local/share/kicad/10.0/scripting/plugins/vulcans_trials
+ln -s "$(pwd)/kicad_plugin" ~/.local/share/kicad/10.0/scripting/plugins/vulcans_trials
 ```
 
 ---
