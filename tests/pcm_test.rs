@@ -327,3 +327,18 @@ fn test_app_icons_exist_for_all_os_and_window_managers() {
     assert!(svg.exists(), "Missing scalable SVG at {}", svg.display());
 }
 
+#[test]
+fn test_windows_rc_script_and_build_script_exist() {
+    let root = get_workspace_root();
+    let rc = root.join("assets").join("vulcans-trials.rc");
+    assert!(rc.exists(), "assets/vulcans-trials.rc must exist");
+    let rc_text = fs::read_to_string(&rc).unwrap();
+    assert!(rc_text.contains("1 ICON \"icon.ico\""));
+
+    let build_rs = root.join("build.rs");
+    assert!(build_rs.exists(), "build.rs must exist");
+    let build_text = fs::read_to_string(&build_rs).unwrap();
+    assert!(build_text.contains("cargo:rerun-if-changed=assets/vulcans-trials.rc"));
+}
+
+

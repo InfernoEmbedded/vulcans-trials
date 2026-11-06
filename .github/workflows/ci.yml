@@ -47,14 +47,14 @@ jobs:
           sudo apt-get install -y \
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libasound2-dev libpulse-dev libudev-dev libcairo2-dev \
-            python3-jsonschema
+            python3-jsonschema python3-cairosvg python3-pil
 
       - name: Install Python dependencies (macOS & Windows)
         if: runner.os != 'Linux'
-        run: pip install jsonschema
+        run: pip install jsonschema cairosvg Pillow
 
-      - name: Run library unit tests (release mode)
-        run: cargo test --release --lib
+      - name: Run all tests (release mode)
+        run: cargo test --release
 
       - name: Compile release binary
         run: cargo build --release

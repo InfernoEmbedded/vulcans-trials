@@ -120,7 +120,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libcairo2-dev
-          pip install jsonschema cairosvg
+          pip install jsonschema cairosvg Pillow
 
       - name: Download all compiled binary artifacts
         uses: actions/download-artifact@v4
@@ -132,89 +132,41 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
-            VERSION="0.1.0"
+            VERSION="1.0.0"
           fi
           echo "RELEASE_VERSION=$VERSION" >> $GITHUB_ENV
           echo "Building KiCad PCM release v$VERSION"
 
       - name: Generate crisp icons
-        run: python3 kicad_plugin/generate_icon.py
+        run: |
+          python3 kicad_plugin/generate_icon.py
+          python3 scripts/generate_app_icons.py
 
       - name: Build universal and platform-bundled KiCad PCM packages
         shell: bash
         run: |
           mkdir -p dist/pcm dist/binaries
 
-          # 1. Universal KiCad PCM Package (host-resolved / unbundled binary)
-          python3 kicad_plugin/build_pcm.py \
+          # Package KiCad PCM packages using unified packaging script
+          python3 scripts/build_kicad_packages.py \
+            --bin-dir staged_binaries \
             --out-dir dist/pcm \
-            --version "$RELEASE_VERSION"
+            --version "$RELEASE_VERSION" \
+            --generate-repo \
+            --no-build-native
 
-          # 2. Linux x86_64 bundled package
-          if [ -f "staged_binaries/binary-x86_64-unknown-linux-gnu/vulcans-trials" ]; then
-            chmod +x staged_binaries/binary-x86_64-unknown-linux-gnu/vulcans-trials
-            python3 kicad_plugin/build_pcm.py \
-              --out-dir dist/pcm \
-              --bin staged_binaries/binary-x86_64-unknown-linux-gnu/vulcans-trials \
-              --platform linux \
-              --arch x86_64 \
-              --version "$RELEASE_VERSION"
-            tar -czf dist/binaries/vulcans-trials-v${RELEASE_VERSION}-x86_64-unknown-linux-gnu.tar.gz \
-              -C staged_binaries/binary-x86_64-unknown-linux-gnu vulcans-trials
-          fi
+          # Also package standalone archives for direct CLI/GUI download
+          for target_dir in staged_binaries/*; do
+            target_name=$(basename "$target_dir")
+            target=${target_name#binary-}
+            if [ -f "$target_dir/vulcans-trials" ]; then
+              tar -czf "dist/binaries/vulcans-trials-v${RELEASE_VERSION}-${target}.tar.gz" -C "$target_dir" vulcans-trials
+            elif [ -f "$target_dir/vulcans-trials.exe" ]; then
+              zip -j "dist/binaries/vulcans-trials-v${RELEASE_VERSION}-${target}.zip" "$target_dir/vulcans-trials.exe"
+            fi
+          done
 
-          # 3. Linux aarch64 bundled package
-          if [ -f "staged_binaries/binary-aarch64-unknown-linux-gnu/vulcans-trials" ]; then
-            chmod +x staged_binaries/binary-aarch64-unknown-linux-gnu/vulcans-trials
-            python3 kicad_plugin/build_pcm.py \
-              --out-dir dist/pcm \
-              --bin staged_binaries/binary-aarch64-unknown-linux-gnu/vulcans-trials \
-              --platform linux \
-              --arch aarch64 \
-              --version "$RELEASE_VERSION"
-            tar -czf dist/binaries/vulcans-trials-v${RELEASE_VERSION}-aarch64-unknown-linux-gnu.tar.gz \
-              -C staged_binaries/binary-aarch64-unknown-linux-gnu vulcans-trials
-          fi
-
-          # 4. Windows x86_64 bundled package
-          if [ -f "staged_binaries/binary-x86_64-pc-windows-msvc/vulcans-trials.exe" ]; then
-            python3 kicad_plugin/build_pcm.py \
-              --out-dir dist/pcm \
-              --bin staged_binaries/binary-x86_64-pc-windows-msvc/vulcans-trials.exe \
-              --platform windows \
-              --arch x86_64 \
-              --version "$RELEASE_VERSION"
-            zip -j dist/binaries/vulcans-trials-v${RELEASE_VERSION}-x86_64-pc-windows-msvc.zip \
-              staged_binaries/binary-x86_64-pc-windows-msvc/vulcans-trials.exe
-          fi
-
-          # 5. macOS x86_64 bundled package
-          if [ -f "staged_binaries/binary-x86_64-apple-darwin/vulcans-trials" ]; then
-            chmod +x staged_binaries/binary-x86_64-apple-darwin/vulcans-trials
-            python3 kicad_plugin/build_pcm.py \
-              --out-dir dist/pcm \
-              --bin staged_binaries/binary-x86_64-apple-darwin/vulcans-trials \
-              --platform macos \
-              --arch x86_64 \
-              --version "$RELEASE_VERSION"
-            tar -czf dist/binaries/vulcans-trials-v${RELEASE_VERSION}-x86_64-apple-darwin.tar.gz \
-              -C staged_binaries/binary-x86_64-apple-darwin vulcans-trials
-          fi
-
-          # 6. macOS aarch64 bundled package
-          if [ -f "staged_binaries/binary-aarch64-apple-darwin/vulcans-trials" ]; then
-            chmod +x staged_binaries/binary-aarch64-apple-darwin/vulcans-trials
-            python3 kicad_plugin/build_pcm.py \
-              --out-dir dist/pcm \
-              --bin staged_binaries/binary-aarch64-apple-darwin/vulcans-trials \
-              --platform macos \
-              --arch aarch64 \
-              --version "$RELEASE_VERSION"
-            tar -czf dist/binaries/vulcans-trials-v${RELEASE_VERSION}-aarch64-apple-darwin.tar.gz \
-              -C staged_binaries/binary-aarch64-apple-darwin vulcans-trials
-          fi
-
-          # Generate SHA256 checksums file
+          # Consolidate SHA256 checksums
           cd dist
           sha256sum pcm/*.zip pcm/*.json binaries/* > SHA256SUMS.txt
           cd ..
