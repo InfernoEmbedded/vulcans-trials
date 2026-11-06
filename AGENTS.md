@@ -71,7 +71,37 @@ Both commands MUST exit with code `0` and zero test failures.
 
 ---
 
-## 4. KiCad File & IPC Safety Rules
+## 4. Mandatory Commit Message Requirements
+
+Every commit in this repository MUST follow strict structured commit formatting. Never create single-line commits or generic commit messages.
+
+### Commit Format Template
+```text
+<type>(<scope>): <concise subject summary under 72 chars>
+
+<Detailed explanation of WHY this change was made: the electrical,
+physical (DRC clearances, impedance coupling, acid traps, annular rings),
+performance, or architectural problem being addressed.>
+
+<Detailed explanation of WHAT changed: specific algorithms, data structures,
+functions added/modified, files touched, CLI flags/GUI controls added,
+and verification tests.>
+
+Signed-off-by: <Author Name> <author-email@example.com>
+Assisted-by: <Agent Name> <agent-email@example.com>
+```
+
+### Commit Guidelines
+1. **Conventional Prefix & Scope:** Use standard types (`feat`, `fix`, `docs`, `refactor`, `test`, `perf`) with meaningful scope (e.g. `router`, `placer`, `board`, `gui`, `ipc`, `gpu`, `cuda`, `memlog`).
+2. **Explain "Why" and "What":** The commit body must provide technical depth. State the root cause or engineering motivation, followed by concrete implementation details.
+3. **Mandatory Developer Trailers:** Every commit MUST conclude with both the author's Signed-off-by (matching author git identity) and the assistant's Assisted-by trailers:
+   - `Signed-off-by: <Author Name> <author-email@example.com>`
+   - `Assisted-by: <Agent Name> <agent-email@example.com>`
+4. **Atomic Commits:** Separate unrelated features, refactors, and bug fixes into distinct commits that build and pass tests independently.
+
+---
+
+## 5. KiCad File & IPC Safety Rules
 
 - **Never corrupt an open `.kicad_pcb`:** When testing against an external project board (such as `/home/deece/src/p1p2esp/p1p2esp.kicad_pcb`), treat the input file as read-only and always write `--output` to a separate file or temporary path unless explicitly instructed otherwise.
 - **DRC Verification:** When modifying routing or via-stitching logic, verify the generated `.kicad_pcb` using KiCad's CLI DRC engine:
