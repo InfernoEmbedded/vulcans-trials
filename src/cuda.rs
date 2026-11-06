@@ -516,7 +516,7 @@ impl CudaEngine {
                 return None;
             }
 
-            let mut name_buf = [0i8; 256];
+            let mut name_buf = [0 as std::ffi::c_char; 256];
             let device_name = if (api.cuDeviceGetName)(name_buf.as_mut_ptr(), 256, dev) == CUDA_SUCCESS {
                 CStr::from_ptr(name_buf.as_ptr())
                     .to_string_lossy()

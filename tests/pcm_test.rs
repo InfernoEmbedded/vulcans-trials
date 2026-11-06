@@ -207,3 +207,85 @@ fn test_build_pcm_bundled_binary_packaging() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_build_multi_platform_kicad_packages_script() {
+    let root = get_workspace_root();
+    let temp_dir = create_temp_dir("multi_platform");
+    let script_path = root.join("scripts").join("build_packages.sh");
+    assert!(script_path.exists(), "build_packages.sh must exist");
+
+    let output = Command::new(&script_path)
+        .arg("--out-dir")
+        .arg(&temp_dir)
+        .arg("--mock-missing")
+        .current_dir(&root)
+        .output()
+        .expect("Failed to execute build_packages.sh");
+
+    assert!(
+        output.status.success(),
+        "build_packages.sh failed:\nSTDOUT:\n{}\nSTDERR:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify all 4 target platforms (Linux x64/arm64, Windows, macOS x64/arm64) plus universal package
+    let expected_archives = [
+        "com.infernoembedded.vulcans-trials_v1.0.0_pcm.zip",
+        "com.infernoembedded.vulcans-trials_v1.0.0_linux_x86_64_pcm.zip",
+        "com.infernoembedded.vulcans-trials_v1.0.0_linux_aarch64_pcm.zip",
+        "com.infernoembedded.vulcans-trials_v1.0.0_windows_x86_64_pcm.zip",
+        "com.infernoembedded.vulcans-trials_v1.0.0_macos_x86_64_pcm.zip",
+        "com.infernoembedded.vulcans-trials_v1.0.0_macos_aarch64_pcm.zip",
+    ];
+
+    for name in &expected_archives {
+        let zip_p = temp_dir.join(name);
+        assert!(zip_p.exists(), "Expected package {} was not created", name);
+        assert!(fs::metadata(&zip_p).unwrap().len() > 1000);
+    }
+
+    // Verify packages.json repository index
+    let pkg_json = temp_dir.join("packages.json");
+    assert!(pkg_json.exists(), "packages.json must be generated");
+    let content = fs::read_to_string(&pkg_json).unwrap();
+    let val: Value = serde_json::from_str(&content).unwrap();
+    let pkg = &val["packages"][0];
+    assert_eq!(pkg["identifier"].as_str(), Some("com.infernoembedded.vulcans-trials"));
+
+    let versions = pkg["versions"].as_array().unwrap();
+    assert!(versions.len() >= 4, "Must register entries for all platforms (got {})", versions.len());
+
+    let mut found_linux = false;
+    let mut found_windows = false;
+    let mut found_macos = false;
+
+    for v in versions {
+        if let Some(plats) = v["platforms"].as_array() {
+            for p in plats {
+                match p.as_str() {
+                    Some("linux") => found_linux = true,
+                    Some("windows") => found_windows = true,
+                    Some("macos") => found_macos = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    assert!(found_linux, "packages.json missing Linux platform");
+    assert!(found_windows, "packages.json missing Windows platform");
+    assert!(found_macos, "packages.json missing macOS platform");
+
+    // Verify SHA256SUMS.txt
+    let sha_path = temp_dir.join("SHA256SUMS.txt");
+    assert!(sha_path.exists(), "SHA256SUMS.txt must be generated");
+    let sha_text = fs::read_to_string(&sha_path).unwrap();
+    for name in &expected_archives {
+        assert!(sha_text.contains(name), "SHA256SUMS.txt must include {}", name);
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+

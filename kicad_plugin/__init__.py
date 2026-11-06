@@ -28,9 +28,15 @@ def find_binary() -> str | None:
     exe_name = "vulcans-trials.exe" if is_win else "vulcans-trials"
     plugin_dir = os.path.dirname(os.path.realpath(__file__))
 
-    # 1. Bundled inside PCM package
+    import platform
+    mach = platform.machine().lower()
+    arch_dir = "aarch64" if mach in ("arm64", "aarch64") else "x86_64"
+
+    # 1. Bundled inside PCM package (architecture-specific subfolder or flat)
     bundled_candidates = [
+        os.path.join(plugin_dir, "bin", arch_dir, exe_name),
         os.path.join(plugin_dir, "bin", exe_name),
+        os.path.join(plugin_dir, "..", "bin", arch_dir, exe_name),
         os.path.join(plugin_dir, "..", "bin", exe_name),
         os.path.join(plugin_dir, exe_name),
     ]
