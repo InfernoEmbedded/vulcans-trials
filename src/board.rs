@@ -849,6 +849,8 @@ pub struct Pad {
     pub swap_group: Option<usize>,
     #[serde(default)]
     pub net_span: Option<(usize, usize)>,
+    #[serde(default)]
+    pub layer: Option<usize>,
 }
 
 impl Default for Pad {
@@ -868,6 +870,7 @@ impl Default for Pad {
             pin_name: String::new(),
             swap_group: None,
             net_span: None,
+            layer: None,
         }
     }
 }
@@ -898,6 +901,7 @@ impl Pad {
             pin_name: String::new(),
             swap_group: None,
             net_span: None,
+            layer: None,
         }
     }
 }
@@ -977,6 +981,15 @@ impl Default for Footprint {
 }
 
 impl Footprint {
+    pub fn pad_layer(&self, pad: &Pad) -> usize {
+        let base = pad.layer.unwrap_or(self.orig_layer);
+        if self.layer != self.orig_layer {
+            1 - base.min(1)
+        } else {
+            base
+        }
+    }
+
     pub fn is_symmetric_passive(&self) -> bool {
         if self.pads.len() != 2 {
             return false;
@@ -1911,6 +1924,9 @@ pub const INTERNAL_COPPER_LAYERS: [&str; 30] = [
 
 pub fn detect_copper_layers(raw_content: &str) -> Vec<&'static str> {
     let mut layers = vec!["F.Cu", "B.Cu"];
+    if !raw_content.contains("\"In") {
+        return layers;
+    }
     for &name in &INTERNAL_COPPER_LAYERS {
         if raw_content.contains(&format!("\"{}\"", name)) {
             layers.push(name);
@@ -1920,6 +1936,22 @@ pub fn detect_copper_layers(raw_content: &str) -> Vec<&'static str> {
 }
 
 impl Board {
+    pub fn allow_via_in_pad(&self) -> bool {
+        self.net_to_class
+            .get("__allow_via_in_pad__")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    }
+
+    pub fn set_allow_via_in_pad(&mut self, allow: bool) {
+        if allow {
+            self.net_to_class
+                .insert("__allow_via_in_pad__".to_string(), "true".to_string());
+        } else {
+            self.net_to_class.remove("__allow_via_in_pad__");
+        }
+    }
+
     pub fn from_kicad_pcb(content: &str) -> Result<Self, String> {
         Self::from_content_with_path(content, "", &HashSet::new())
     }
@@ -2215,6 +2247,13 @@ impl Board {
 
         // Heal any multi-pad footprint whose on-disk (at ...) was left stale relative to routed tracks
         if !board.tracks.is_empty() {
+            let inner_planes = board.inner_plane_nets();
+            let is_plane = |nid: usize, nets: &[String]| -> bool {
+                let net_name = nets.get(nid).map(|s| s.as_str()).unwrap_or("");
+                net_name == "GND"
+                    || net_name.starts_with("GND")
+                    || inner_planes.values().any(|&pn| pn == nid)
+            };
             for fp_idx in 0..board.footprints.len() {
                 let fp = &board.footprints[fp_idx];
                 if fp.pads.len() < 12 {
@@ -2224,7 +2263,7 @@ impl Board {
                     .pads
                     .iter()
                     .filter(|p| {
-                        p.net_id > 1 && !board.is_plane_net(p.net_id) && {
+                        p.net_id > 1 && !is_plane(p.net_id, &board.nets) && {
                             let (px, py) = fp.pad_absolute_position(p);
                             board.tracks.iter().any(|t| {
                                 t.net_id == p.net_id
@@ -2241,7 +2280,7 @@ impl Board {
                 for cand_rot in [0.0, 90.0, 180.0, 270.0] {
                     let mut test_fp = fp.clone();
                     test_fp.rotation = cand_rot;
-                    for p0 in fp.pads.iter().filter(|p| p.net_id > 1 && !board.is_plane_net(p.net_id)) {
+                    for p0 in fp.pads.iter().filter(|p| p.net_id > 1 && !is_plane(p.net_id, &board.nets)) {
                         test_fp.x = 0.0;
                         test_fp.y = 0.0;
                         let (ox0, oy0) = test_fp.pad_absolute_position(p0);
@@ -2255,7 +2294,7 @@ impl Board {
                                     .pads
                                     .iter()
                                     .filter(|p| {
-                                        p.net_id > 1 && !board.is_plane_net(p.net_id) && {
+                                        p.net_id > 1 && !is_plane(p.net_id, &board.nets) && {
                                             let (px, py) = test_fp.pad_absolute_position(p);
                                             board.tracks.iter().any(|ot| {
                                                 ot.net_id == p.net_id
@@ -2288,10 +2327,15 @@ impl Board {
     }
 
     pub fn layer_name(&self, layer_idx: usize) -> &'static str {
-        self.copper_layers()
-            .get(layer_idx)
-            .copied()
-            .unwrap_or(if layer_idx == 0 { "F.Cu" } else { "B.Cu" })
+        match layer_idx {
+            0 => "F.Cu",
+            1 => "B.Cu",
+            _ => self
+                .copper_layers()
+                .get(layer_idx)
+                .copied()
+                .unwrap_or("B.Cu"),
+        }
     }
 
     pub fn layer_plane_net_names(&self) -> HashMap<usize, String> {
@@ -2371,6 +2415,9 @@ impl Board {
     }
 
     pub fn inner_plane_nets(&self) -> HashMap<usize, usize> {
+        if self.copper_layers().len() <= 2 {
+            return HashMap::new();
+        }
         let mut map = self.layer_plane_nets();
         map.retain(|&layer_idx, _| layer_idx >= 2);
         map
@@ -3202,7 +3249,9 @@ impl Board {
             }
         }
 
-        // Strip out existing (segment ...), (via ...), and (arc ...) so we don't duplicate or retain old tracks
+        // Strip out existing (segment ...), (via ...), and (arc ...) so we don't duplicate or retain old tracks.
+        // Zone (filled_polygon ...) blocks are stripped too: they were computed against the old copper, so a
+        // stale fill can leave holes under new vias (KiCad ratsnest airwires) or flood over other-net vias.
         let bytes = self.raw_content.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
@@ -3212,7 +3261,7 @@ impl Board {
                     j += 1;
                 }
                 let word = &self.raw_content[i + 1..j];
-                if word == "segment" || word == "via" || word == "arc" {
+                if word == "segment" || word == "via" || word == "arc" || word == "filled_polygon" {
                     if let Some(end) = find_closing_paren(bytes, i) {
                         let mut start = i;
                         while start > 0 && (bytes[start - 1] == b' ' || bytes[start - 1] == b'\t') {
@@ -3332,6 +3381,24 @@ impl Board {
         }
 
         Ok(())
+    }
+
+    /// Refills copper zones in a saved `.kicad_pcb` via `kicad-cli pcb drc --refill-zones --save-board`, so
+    /// KiCad's file-open ratsnest sees plane connectivity (`to_kicad_pcb` drops the stale fills).
+    /// Best-effort: returns false when the board has no zones or `kicad-cli` is unavailable/fails.
+    pub fn refill_zones_in_file(pcb_path: &Path) -> bool {
+        if !fs::read_to_string(pcb_path).is_ok_and(|s| s.contains("(zone")) {
+            return false;
+        }
+        let report = std::env::temp_dir().join(format!("vulcans_refill_{}.json", std::process::id()));
+        let ok = std::process::Command::new("kicad-cli")
+            .args(["pcb", "drc", "--refill-zones", "--save-board", "--format", "json", "--output"])
+            .arg(&report)
+            .arg(pcb_path)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let _ = fs::remove_file(&report);
+        ok
     }
 
     pub fn generate_back_annotation_report(&self) -> String {
@@ -4364,14 +4431,25 @@ pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetCla
                 .or_else(|| root.get("classes"))
                 .and_then(|v| v.as_array());
             if let Some(classes) = classes_opt {
+                // KiCad netclasses inherit unset diff-pair dimensions from the Default class.
+                let default_cls = classes.iter().find(|c| c.get("name").and_then(|v| v.as_str()) == Some("Default"));
+                let default_dp = |key: &str| default_cls.and_then(|c| c.get(key)).and_then(|v| v.as_f64());
                 for cls in classes {
                     let Some(name) = cls.get("name").and_then(|v| v.as_str()) else { continue };
                     let track_width = cls.get("track_width").and_then(|v| v.as_f64()).unwrap_or(0.20);
                     let clearance = cls.get("clearance").and_then(|v| v.as_f64()).unwrap_or(0.20);
                     let via_dia = cls.get("via_diameter").or_else(|| cls.get("via_dia")).and_then(|v| v.as_f64()).unwrap_or(0.60);
                     let via_drill = cls.get("via_drill").and_then(|v| v.as_f64()).unwrap_or(0.30);
-                    let diff_pair_gap = cls.get("diff_pair_gap").and_then(|v| v.as_f64()).unwrap_or(0.20);
-                    let diff_pair_width = cls.get("diff_pair_width").and_then(|v| v.as_f64()).unwrap_or(track_width);
+                    let diff_pair_gap = cls
+                        .get("diff_pair_gap")
+                        .and_then(|v| v.as_f64())
+                        .or_else(|| default_dp("diff_pair_gap"))
+                        .unwrap_or(0.20);
+                    let diff_pair_width = cls
+                        .get("diff_pair_width")
+                        .and_then(|v| v.as_f64())
+                        .or_else(|| default_dp("diff_pair_width"))
+                        .unwrap_or(track_width);
                     let topology = cls
                         .get("topology")
                         .and_then(|v| v.as_str())
@@ -4641,7 +4719,19 @@ fn parse_footprint(
                 }
                 let tokens: Vec<&str> = p_str[5..].split_whitespace().collect();
                 let p_num = tokens.first().map(|s| s.trim_matches('"').to_string()).unwrap_or_default();
-                let is_th = tokens.get(1).copied() == Some("thru_hole") || tokens.get(1).copied() == Some("np_thru_hole");
+                let is_th = tokens.get(1).copied() == Some("thru_hole")
+                    || tokens.get(1).copied() == Some("np_thru_hole")
+                    || (p_str.contains("\"F.Cu\"") && p_str.contains("\"B.Cu\""))
+                    || p_str.contains("\"*.Cu\"");
+                let pad_layer = if is_th {
+                    None
+                } else if p_str.contains("\"B.Cu\"") && !p_str.contains("\"F.Cu\"") {
+                    Some(1)
+                } else if p_str.contains("\"F.Cu\"") && !p_str.contains("\"B.Cu\"") {
+                    Some(0)
+                } else {
+                    Some(layer)
+                };
                 let shape = tokens.get(2).copied().unwrap_or("rect").to_string();
                 let (off_x, off_y, pad_board_rot) = parse_at_xy_rot(p_str).unwrap_or((0.0, 0.0, 0.0));
                 let rel_rot_norm = ((pad_board_rot - rot) % 360.0 + 360.0) % 360.0;
@@ -4746,6 +4836,7 @@ fn parse_footprint(
                     pin_name,
                     swap_group: pad_swap_group,
                     net_span,
+                    layer: pad_layer,
                 });
                 p_idx = p_end;
                 continue;
@@ -5037,10 +5128,13 @@ pub struct LiveTrialState {
     pub total_conns: usize,
     pub routing_pass: usize,
     pub straight_copper_snapshot: Option<(Vec<TrackSegment>, Vec<ArcSegment>)>,
+    pub acid_trap_fillet_radius: f64,
+    pub allow_via_in_pad: bool,
 }
 
 impl LiveTrialState {
     pub fn new(board: Board) -> Self {
+        let allow_via_in_pad = board.allow_via_in_pad();
         let mut state = Self {
             board,
             ratsnest: Vec::new(),
@@ -5056,6 +5150,8 @@ impl LiveTrialState {
             total_conns: 0,
             routing_pass: 0,
             straight_copper_snapshot: None,
+            acid_trap_fillet_radius: 0.35,
+            allow_via_in_pad,
         };
         state.refresh_ratsnest();
         state
@@ -5534,6 +5630,21 @@ mod tests {
         assert_eq!(live.log_lines.len(), 250);
         assert_eq!(live.status_text, "Log entry 259");
         let _ = fs::remove_file(pcb_path);
+    }
+
+    #[test]
+    fn test_pro_netclass_inherits_default_diff_pair_dims() {
+        // USB_Diff omits diff_pair_width/gap, so KiCad inherits them from Default (0.20/0.25)
+        // rather than using its 0.30 single-ended track_width.
+        let pro = r#"{"net_settings":{"classes":[
+            {"name":"Default","track_width":0.2,"clearance":0.15,"diff_pair_width":0.2,"diff_pair_gap":0.25},
+            {"name":"USB_Diff","track_width":0.3,"clearance":0.2}
+        ]}}"#;
+        let ncs = parse_netclasses_from_pro_or_pcb(pro);
+        let usb = &ncs["USB_Diff"];
+        assert!((usb.diff_pair_width - 0.20).abs() < 1e-9, "got {}", usb.diff_pair_width);
+        assert!((usb.diff_pair_gap - 0.25).abs() < 1e-9, "got {}", usb.diff_pair_gap);
+        assert!((usb.track_width - 0.30).abs() < 1e-9);
     }
 
     #[test]
@@ -6832,6 +6943,32 @@ mod tests {
         assert_eq!(reloaded.vias.len(), 1);
         assert_eq!(reloaded.tracks[0].net_id, reloaded.footprints[0].pads[0].net_id);
         assert_eq!(reloaded.vias[0].net_id, reloaded.footprints[0].pads[0].net_id);
+    }
+
+    #[test]
+    fn test_to_kicad_pcb_drops_stale_zone_fills() {
+        let pcb = r#"(kicad_pcb (version 20260206) (generator_version "10.0")
+  (net 0 "") (net 1 "+3.3V")
+  (zone (net 1) (net_name "+3.3V") (layer "In2.Cu") (filled_areas_thickness no)
+    (polygon (pts (xy 0 0) (xy 10 0) (xy 10 10) (xy 0 10)))
+    (filled_polygon (layer "In2.Cu") (pts (xy 6 0.1) (xy 9.9 0.1) (xy 9.9 9.9) (xy 6 9.9)))
+  )
+)"#;
+        let mut board = Board::from_kicad_pcb(pcb).unwrap();
+        // New via at (2, 5) lies outside the stale fill (x >= 6): keeping it would draw a KiCad airwire.
+        board.vias.push(Via { position: (2.0, 5.0), size: 0.6, drill: 0.3, net_id: 1, is_locked: false });
+        let out = board.to_kicad_pcb().unwrap();
+        assert!(!out.contains("filled_polygon"));
+        assert!(out.contains("(polygon (pts (xy 0 0) (xy 10 0) (xy 10 10) (xy 0 10)))"));
+        assert!(out.contains("(filled_areas_thickness no)"));
+        assert!(out.contains("(via (at 2.0000 5.0000)"));
+        let reloaded = Board::from_kicad_pcb(&out).unwrap();
+        assert_eq!(reloaded.vias.len(), 1);
+
+        let no_zone = std::env::temp_dir().join(format!("vulcan_no_zone_{}.kicad_pcb", std::process::id()));
+        fs::write(&no_zone, "(kicad_pcb (version 20260206))").unwrap();
+        assert!(!Board::refill_zones_in_file(&no_zone), "boards without zones must skip kicad-cli");
+        let _ = fs::remove_file(&no_zone);
     }
 
     #[test]

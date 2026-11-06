@@ -957,6 +957,7 @@ mod tests {
             pin_name: "GPIO0".to_string(),
             swap_group: None,
             net_span: None,
+            layer: None,
         });
         pads.push(Pad {
             number: "2".to_string(),
@@ -973,6 +974,7 @@ mod tests {
             pin_name: "GPIO1".to_string(),
             swap_group: None,
             net_span: None,
+            layer: None,
         });
         pads.push(Pad {
             number: "3".to_string(),
@@ -989,6 +991,7 @@ mod tests {
             pin_name: "GPIO2".to_string(),
             swap_group: None,
             net_span: None,
+            layer: None,
         });
         pads.push(Pad {
             number: "4".to_string(),
@@ -1005,6 +1008,7 @@ mod tests {
             pin_name: "GPIO3".to_string(),
             swap_group: None,
             net_span: None,
+            layer: None,
         });
 
         let u1 = Footprint {

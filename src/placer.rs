@@ -127,7 +127,7 @@ pub fn is_ground_net(name: &str) -> bool {
 }
 
 pub fn is_power_net(name: &str) -> bool {
-    let s = name.trim();
+    let s = name.trim().trim_start_matches('/');
     if s.is_empty() || is_ground_net(s) {
         return false;
     }
@@ -4012,8 +4012,8 @@ mod tests {
         let tie_c6 = ties.iter().find(|t| t.passive_idx == c6_idx).expect("C6 must have tie");
         assert!(tie_c5.is_decoupling && tie_c5.anchor_idx == u1_idx, "C5 must bind to U1");
         assert!(tie_c6.is_decoupling && tie_c6.anchor_idx == u1_idx, "C6 must bind to U1");
-        assert_eq!(board.footprints[u1_idx].pads[tie_c5.anchor_pad_idx].net_name, "VCC_5V");
-        assert_eq!(board.footprints[u1_idx].pads[tie_c6.anchor_pad_idx].net_name, "VRAW");
+        assert_eq!(board.footprints[u1_idx].pads[tie_c5.anchor_pad_idx].net_name.trim_start_matches('/'), "VCC_5V");
+        assert_eq!(board.footprints[u1_idx].pads[tie_c6.anchor_pad_idx].net_name.trim_start_matches('/'), "VRAW");
 
         // Verify C7 (Buck regulator input decoupling cap on /BUCK_VIN) binds to U2
         let c7_idx = fp_index("C7");
