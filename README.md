@@ -5,6 +5,16 @@ Published by **InfernoEmbedded** — Licensed under **GNU GPLv3 (`GPL-3.0-only`)
 
 ---
 
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=riDXxB78Nfg">
+    <img src="https://img.youtube.com/vi/riDXxB78Nfg/maxresdefault.jpg" alt="Vulcan's Trials Auto-Placer and Auto-Router in Action" width="800">
+  </a>
+  <br>
+  <em>▶️ <b>Watch Vulcan's Trials in Action:</b> Real-time 1080p Auto-Placement & Auto-Routing on the 4-layer P1P2ESP board (Click to play on YouTube)</em>
+</p>
+
+---
+
 ## Overview
 
 **Vulcan's Trials** is a unified, hardware-accelerated PCB Auto-Placer and Auto-Router written in Rust for KiCad (`8.0` / `9.0` / `10.0`). It combines:
