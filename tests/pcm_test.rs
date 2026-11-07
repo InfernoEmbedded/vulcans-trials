@@ -17,6 +17,14 @@ fn create_temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+fn python_cmd() -> &'static str {
+    if cfg!(windows) {
+        "python"
+    } else {
+        "python3"
+    }
+}
+
 #[test]
 fn test_metadata_json_syntax_and_schema_compliance() {
     let root = get_workspace_root();
@@ -54,7 +62,7 @@ fn test_metadata_json_syntax_and_schema_compliance() {
 
     // 3. Schema validation via build_pcm.py --validate-only
     let script_path = root.join("kicad_plugin").join("build_pcm.py");
-    let output = Command::new("python3")
+    let output = Command::new(python_cmd())
         .arg(&script_path)
         .arg("--validate-only")
         .current_dir(&root)
@@ -75,7 +83,7 @@ fn test_build_pcm_produces_valid_zip_archive_and_repo_index() {
     let temp_dir = create_temp_dir("build");
     let script_path = root.join("kicad_plugin").join("build_pcm.py");
 
-    let output = Command::new("python3")
+    let output = Command::new(python_cmd())
         .arg(&script_path)
         .arg("--out-dir")
         .arg(&temp_dir)
@@ -97,10 +105,10 @@ fn test_build_pcm_produces_valid_zip_archive_and_repo_index() {
     assert!(zip_size > 1000, "Zip size should be > 1KB (got {} bytes)", zip_size);
 
     // 2. Verify ZIP archive internal directory layout
-    let unzip_check = Command::new("python3")
+    let unzip_check = Command::new(python_cmd())
         .arg("-c")
         .arg(format!(
-            "import zipfile; z = zipfile.ZipFile('{}'); print(sorted(z.namelist()))",
+            "import zipfile; z = zipfile.ZipFile(r'{}'); print(sorted(z.namelist()))",
             zip_path.display()
         ))
         .output()
@@ -173,7 +181,7 @@ fn test_build_pcm_bundled_binary_packaging() {
         return;
     }
 
-    let output = Command::new("python3")
+    let output = Command::new(python_cmd())
         .arg(&script_path)
         .arg("--out-dir")
         .arg(&temp_dir)
@@ -192,10 +200,10 @@ fn test_build_pcm_bundled_binary_packaging() {
     let zip_path = temp_dir.join("com.infernoembedded.vulcans-trials_v1.0.0_linux_x86_64_pcm.zip");
     assert!(zip_path.exists());
 
-    let unzip_check = Command::new("python3")
+    let unzip_check = Command::new(python_cmd())
         .arg("-c")
         .arg(format!(
-            "import zipfile; z = zipfile.ZipFile('{}'); print(sorted(z.namelist()))",
+            "import zipfile; z = zipfile.ZipFile(r'{}'); print(sorted(z.namelist()))",
             zip_path.display()
         ))
         .output()
@@ -212,20 +220,22 @@ fn test_build_pcm_bundled_binary_packaging() {
 fn test_build_multi_platform_kicad_packages_script() {
     let root = get_workspace_root();
     let temp_dir = create_temp_dir("multi_platform");
-    let script_path = root.join("scripts").join("build_packages.sh");
-    assert!(script_path.exists(), "build_packages.sh must exist");
+    let script_path = root.join("scripts").join("build_kicad_packages.py");
+    assert!(script_path.exists(), "build_kicad_packages.py must exist");
 
-    let output = Command::new(&script_path)
+    let output = Command::new(python_cmd())
+        .arg(&script_path)
         .arg("--out-dir")
         .arg(&temp_dir)
         .arg("--mock-missing")
+        .arg("--no-build-native")
         .current_dir(&root)
         .output()
-        .expect("Failed to execute build_packages.sh");
+        .expect("Failed to execute build_kicad_packages.py");
 
     assert!(
         output.status.success(),
-        "build_packages.sh failed:\nSTDOUT:\n{}\nSTDERR:\n{}",
+        "build_kicad_packages.py failed:\nSTDOUT:\n{}\nSTDERR:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

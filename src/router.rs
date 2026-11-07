@@ -1181,7 +1181,10 @@ impl RoutingGrid {
                     (src, dst, net_id, via_cost, clearance_cells.max(0))
                 })
                 .collect();
-        let pool = MultiGpuRouterPool::new();
+        let pool = MultiGpuRouterPool::with_vulkan(self.vulkan.clone());
+        if pool.device_count() == 0 {
+            return vec![None; requests.len()];
+        }
         let raw_paths = pool.solve_batch_3d_wavefront_paths_with_clearance(
             &obs_u32,
             self.width,

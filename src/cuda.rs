@@ -3074,6 +3074,14 @@ impl MultiGpuRouterPool {
         }
     }
 
+    pub fn with_vulkan(vulkan: Option<Arc<crate::vulkan::VulkanEngine>>) -> Self {
+        let cuda_engines = CudaEngine::all_devices();
+        Self {
+            cuda_engines,
+            vulkan_fallback: vulkan,
+        }
+    }
+
     pub fn device_count(&self) -> usize {
         if !self.cuda_engines.is_empty() {
             self.cuda_engines.len()

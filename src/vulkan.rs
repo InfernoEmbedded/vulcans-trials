@@ -2208,6 +2208,30 @@ impl VulkanEngine {
     }
 
     async fn init_async(force_vulkan: bool) -> Option<Self> {
+        let allow_software = std::env::var("VULCANS_ALLOW_SOFTWARE_GPU")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        // Hardware adapter filter: in headless CI environments without physical GPUs,
+        // software / CPU rasterizers (llvmpipe, lavapipe, WARP, SwiftShader, Apple Paravirtual)
+        // are rejected to avoid multi-thread software emulation deadlocks and driver crashes.
+        let is_hw = |a: &wgpu::Adapter| -> bool {
+            if allow_software {
+                return true;
+            }
+            let info = a.get_info();
+            if matches!(info.device_type, wgpu::DeviceType::Cpu | wgpu::DeviceType::VirtualGpu) {
+                return false;
+            }
+            let name = info.name.to_lowercase();
+            !name.contains("llvmpipe")
+                && !name.contains("lavapipe")
+                && !name.contains("basic render")
+                && !name.contains("warp")
+                && !name.contains("paravirtual")
+                && !name.contains("swiftshader")
+        };
+
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..Default::default()
@@ -2216,7 +2240,7 @@ impl VulkanEngine {
         let mut adapters: Vec<wgpu::Adapter> = instance
             .enumerate_adapters(wgpu::Backends::VULKAN)
             .into_iter()
-            .filter(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
+            .filter(&is_hw)
             .collect();
 
         if adapters.is_empty() {
@@ -2227,12 +2251,12 @@ impl VulkanEngine {
             adapters = fallback_inst
                 .enumerate_adapters(wgpu::Backends::all())
                 .into_iter()
-                .filter(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
+                .filter(&is_hw)
                 .collect();
         }
 
-        if adapters.is_empty() {
-            // In headless/CI virtual machines without physical GPUs, allow software adapters (e.g. Mesa lavapipe or WARP)
+        if adapters.is_empty() && allow_software {
+            // Only allow CPU software rasterizers if explicitly enabled via VULCANS_ALLOW_SOFTWARE_GPU=1
             let sw_inst = wgpu::Instance::new(&wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::all(),
                 ..Default::default()

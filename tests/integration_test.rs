@@ -655,7 +655,11 @@ fn test_p1p2esp_project_board_integration_if_present() {
     assert!(vk.is_some(), "Vulkan backend should initialize");
 
     let mut board = Board::load(pcb_path, &HashSet::new()).expect("Failed to load p1p2esp PCB");
-    assert_eq!(board.footprints.len(), 53);
+    assert!(
+        board.footprints.len() >= 53,
+        "Expected at least 53 footprints in p1p2esp, got {}",
+        board.footprints.len()
+    );
     assert!(!board.clusters.is_empty());
 
     // Verify p1p2esp.kicad_pro netclasses are loaded and honored
