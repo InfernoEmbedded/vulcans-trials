@@ -1018,7 +1018,7 @@ fn build_gpu_sa_descriptors(
     let mut net_pads: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
     for (fp_idx, fp) in board.footprints.iter().enumerate() {
         for (pad_idx, pad) in fp.pads.iter().enumerate() {
-            if pad.net_id == 0 || pad.net_name.is_empty() || pad.net_name == "GND" {
+            if pad.net_id == 0 || pad.net_name.is_empty() || is_ground_net(&pad.net_name) {
                 continue;
             }
             net_pads.entry(pad.net_id).or_default().push((fp_idx, pad_idx));

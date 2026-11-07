@@ -10,6 +10,11 @@ pub const DEFAULT_LOCKED_REFS: &[&str] = &[
     "J1", "J2", "H1", "H2", "H3", "H4",
 ];
 
+pub fn is_gnd_net_name(name: &str) -> bool {
+    let base = name.trim().trim_start_matches('/');
+    base.len() >= 3 && base.is_char_boundary(3) && base[..3].eq_ignore_ascii_case("GND")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Point {
     pub x: f64,
@@ -2250,8 +2255,7 @@ impl Board {
             let inner_planes = board.inner_plane_nets();
             let is_plane = |nid: usize, nets: &[String]| -> bool {
                 let net_name = nets.get(nid).map(|s| s.as_str()).unwrap_or("");
-                net_name == "GND"
-                    || net_name.starts_with("GND")
+                is_gnd_net_name(net_name)
                     || inner_planes.values().any(|&pn| pn == nid)
             };
             for fp_idx in 0..board.footprints.len() {
@@ -2425,8 +2429,7 @@ impl Board {
 
     pub fn is_plane_net(&self, net_id: usize) -> bool {
         let net_name = self.nets.get(net_id).map(|s| s.as_str()).unwrap_or("");
-        net_name == "GND"
-            || net_name.starts_with("GND")
+        is_gnd_net_name(net_name)
             || self.inner_plane_nets().values().any(|&pn| pn == net_id)
     }
 
@@ -2980,7 +2983,7 @@ impl Board {
         let mut net_points: HashMap<usize, Vec<Point>> = HashMap::new();
         for (fp_idx, fp) in self.footprints.iter().enumerate() {
             for (pad_idx, pad) in fp.pads.iter().enumerate() {
-                if pad.net_id == 0 || pad.net_name.is_empty() || pad.net_name == "GND" {
+                if pad.net_id == 0 || pad.net_name.is_empty() || is_gnd_net_name(&pad.net_name) {
                     continue;
                 }
                 net_points.entry(pad.net_id).or_default().push(pad_positions[fp_idx][pad_idx]);
@@ -4708,6 +4711,7 @@ fn parse_footprint(
     }
 
     let is_locked = fp_str.contains("(locked yes)")
+        || fp_str.contains("ESP32-C3-WROOM-02")
         || DEFAULT_LOCKED_REFS.contains(&reference.as_str())
         || extra_locked.contains(&reference);
 
@@ -7101,6 +7105,20 @@ mod tests {
         assert!((board.board_edge_clearance() - 0.50).abs() < 1e-6);
         assert!((board.get_netclass_for_net(1).clearance - 0.40).abs() < 1e-6);
         assert!((board.get_netclass_for_net(1).track_width - 0.60).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_is_gnd_net_name_supports_root_sheet_slash_prefix() {
+        assert!(is_gnd_net_name("GND"));
+        assert!(is_gnd_net_name("/GND"));
+        assert!(is_gnd_net_name("gnd"));
+        assert!(is_gnd_net_name("/gnd"));
+        assert!(is_gnd_net_name("GND_EARTH"));
+        assert!(is_gnd_net_name("/GND_PWR"));
+        assert!(!is_gnd_net_name("+3.3V"));
+        assert!(!is_gnd_net_name("/+3.3V"));
+        assert!(!is_gnd_net_name("SGND"));
+        assert!(!is_gnd_net_name(""));
     }
 }
 

@@ -1502,3 +1502,54 @@ fn test_saved_board_drops_stale_zone_fill_and_refills_plane_connectivity() {
     assert_eq!(unconnected_without_refill(&out_pcb), 0, "refilled In2.Cu plane must join R9 and R17 +3.3V pads");
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_esphome_1wire_sensor_example_autoplace_and_autoroute() {
+    let pcb_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("esphome_1wire_sensor")
+        .join("esphome_1wire_sensor.kicad_pcb");
+    assert!(pcb_path.exists(), "Sample project PCB must exist at {:?}", pcb_path);
+
+    let mut board = Board::load(pcb_path.to_str().unwrap(), &HashSet::new()).expect("Load sample PCB");
+    assert_eq!(board.footprints.len(), 15, "Sample board must have 15 footprints");
+    assert_eq!(board.clusters.len(), 4, "Sample schematic must define 4 functional clusters");
+    let gnd_id = *board.net_name_to_id.get("/GND").expect("Sample board must contain /GND net");
+    assert!(board.is_plane_net(gnd_id), "Root-sheet /GND must be recognized as ground plane net");
+
+    let locked_refs: HashSet<String> = board
+        .footprints
+        .iter()
+        .filter(|fp| fp.is_locked)
+        .map(|fp| fp.reference.clone())
+        .collect();
+    assert!(locked_refs.contains("J1"), "J1 USB-C must be locked");
+    assert!(locked_refs.contains("J2"), "J2 1-Wire terminal must be locked");
+    assert!(locked_refs.contains("U3"), "U3 ESP32-C3-WROOM-02 must be locked");
+
+    let vk = VulkanEngine::new();
+    let cfg = PlacementConfig {
+        duration_secs: 1,
+        vulkan: vk.clone(),
+        ..PlacementConfig::default()
+    };
+    let live = Arc::new(Mutex::new(LiveTrialState::new(board.clone())));
+    let placed = run_auto_placer(
+        &mut board,
+        &cfg,
+        Some(Arc::clone(&live)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(placed.overlaps, 0, "Auto-placed sample board must have 0 courtyard overlaps");
+
+    let mut grid = RoutingGrid::new(&board, 0.10, vk);
+    let router = AutoRouter::new(6);
+    let (routed, total) = router.route_all(
+        &mut board,
+        &mut grid,
+        Some(Arc::clone(&live)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(total, 23, "Sample board must have 23 non-plane ratsnest connections");
+    assert_eq!(routed, total, "Auto-router must route 100% (23/23) of connections on sample board");
+}

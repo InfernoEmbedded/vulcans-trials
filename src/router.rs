@@ -5321,12 +5321,18 @@ impl AutoRouter {
                             continue;
                         }
                         let b_name = board.nets.get(trk.net_id).map(|s| s.as_str()).unwrap_or("");
-                        if b_name == "GND" || b_name.contains("USB") {
+                        if crate::board::is_gnd_net_name(b_name) || b_name.contains("USB") {
                             continue;
                         }
                         let d = dist_point_to_segment((conn.start.0, conn.start.1), trk.start, trk.end)
-                            .min(dist_point_to_segment((conn.end.0, conn.end.1), trk.start, trk.end));
-                        if d < 1.8 {
+                            .min(dist_point_to_segment((conn.end.0, conn.end.1), trk.start, trk.end))
+                            .min(dist_segment_to_segment(
+                                (conn.start.0, conn.start.1),
+                                (conn.end.0, conn.end.1),
+                                trk.start,
+                                trk.end,
+                            ));
+                        if d < 2.5 {
                             let e = blocker_dists.entry(trk.net_id).or_insert(f64::INFINITY);
                             if d < *e {
                                 *e = d;
@@ -5335,7 +5341,7 @@ impl AutoRouter {
                     }
                     let mut cands: Vec<(usize, f64)> = blocker_dists.into_iter().collect();
                     cands.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
-                    for (b_net, _) in cands.into_iter().take(4) {
+                    for (b_net, _) in cands.into_iter().take(6) {
                         let snap_tracks = board.tracks.clone();
                         let snap_vias = board.vias.clone();
                         let pre_connected: Vec<bool> = (0..total_conns)
@@ -5473,8 +5479,10 @@ impl AutoRouter {
             if self.config.acid_trap_fillet_radius > 0.0 {
                 // Filleting / pad-exit re-anchoring must never break a net: restore any net it breaks.
                 let pre: Vec<bool> = (0..total_conns).map(|i| Self::is_connection_electrically_connected(board, &connections[i])).collect();
-                let snap = (board.tracks.clone(), board.arcs.clone());
+                let snap = (board.tracks.clone(), board.arcs.clone(), board.vias.clone());
                 fillet_acute_angle_junctions(board, self.config.acid_trap_fillet_radius);
+                widen_tracks_and_arcs_to_netclass(board);
+                prune_dangling_tracks_and_vias(board);
                 let broken: HashSet<usize> = (0..total_conns)
                     .filter(|&i| pre[i] && !Self::is_connection_electrically_connected(board, &connections[i]))
                     .map(|i| connections[i].net_id)
@@ -5482,12 +5490,15 @@ impl AutoRouter {
                 if !broken.is_empty() {
                     board.tracks.retain(|t| !broken.contains(&t.net_id));
                     board.arcs.retain(|a| !broken.contains(&a.net_id));
+                    board.vias.retain(|v| !broken.contains(&v.net_id));
                     board.tracks.extend(snap.0.into_iter().filter(|t| broken.contains(&t.net_id)));
                     board.arcs.extend(snap.1.into_iter().filter(|a| broken.contains(&a.net_id)));
+                    board.vias.extend(snap.2.into_iter().filter(|v| broken.contains(&v.net_id)));
                 }
+            } else {
+                widen_tracks_and_arcs_to_netclass(board);
+                prune_dangling_tracks_and_vias(board);
             }
-            widen_tracks_and_arcs_to_netclass(board);
-            prune_dangling_tracks_and_vias(board);
             None
         };
 
@@ -8398,7 +8409,7 @@ pub fn find_choked_pin_bottlenecks(
 
                 for pad in &fp.pads {
                     if pad.net_id == 0
-                        || pad.net_name == "GND"
+                        || crate::board::is_gnd_net_name(&pad.net_name)
                         || pad.net_name.is_empty()
                         || pad.net_name.starts_with("unconnected")
                         || pad.is_through_hole
@@ -8441,7 +8452,7 @@ pub fn find_choked_pin_bottlenecks(
             let mut candidates: Vec<(PadEdge, &Pad)> = Vec::new();
             for pad in &fp.pads {
                 if pad.net_id == 0
-                    || pad.net_name == "GND"
+                    || crate::board::is_gnd_net_name(&pad.net_name)
                     || pad.net_name.is_empty()
                     || pad.net_name.starts_with("unconnected")
                     || pad.is_through_hole
@@ -8724,7 +8735,7 @@ pub fn find_choked_pin_bottlenecks(
     }
 
     fn connect_u1_ground_pins(&self, board: &mut Board) {
-        let Some(gnd_net_id) = board.nets.iter().position(|n| n == "GND") else {
+        let Some(gnd_net_id) = board.nets.iter().position(|n| crate::board::is_gnd_net_name(n)) else {
             return;
         };
         let Some(u1) = board.footprints.iter().find(|fp| fp.reference == "U1").cloned() else {
@@ -8786,7 +8797,7 @@ pub fn find_choked_pin_bottlenecks(
 
     pub fn add_plane_stitching_vias(&self, board: &mut Board, grid: &RoutingGrid) -> usize {
         let mut plane_net_ids: Vec<usize> = Vec::new();
-        if let Some(gnd_id) = board.nets.iter().position(|n| n == "GND" || n.starts_with("GND")) {
+        if let Some(gnd_id) = board.nets.iter().position(|n| crate::board::is_gnd_net_name(n)) {
             plane_net_ids.push(gnd_id);
         }
         for &nid in board.inner_plane_nets().values() {
@@ -8803,10 +8814,10 @@ pub fn find_choked_pin_bottlenecks(
         let mut added_via_positions: Vec<(f64, f64)> = Vec::new();
 
         for &plane_net_id in &plane_net_ids {
-            let is_gnd = board.nets.get(plane_net_id).map_or(false, |n| n == "GND" || n.starts_with("GND"));
+            let is_gnd = board.nets.get(plane_net_id).map_or(false, |n| crate::board::is_gnd_net_name(n));
 
             for fp in board.footprints.clone() {
-                if is_gnd && fp.reference == "U1" {
+                if is_gnd && fp.reference == "U1" && fp.pads.len() >= 16 {
                     continue;
                 }
                 for pad in &fp.pads {
@@ -10271,7 +10282,7 @@ pub fn find_choked_pin_bottlenecks(
     }
 
     pub fn add_return_path_ground_vias(&self, board: &mut Board, grid: &RoutingGrid) -> usize {
-        let Some(gnd_net_id) = board.nets.iter().position(|n| n == "GND") else {
+        let Some(gnd_net_id) = board.nets.iter().position(|n| crate::board::is_gnd_net_name(n)) else {
             return 0;
         };
 
@@ -12462,8 +12473,7 @@ enum ViaPairMutation {
 fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid, config: &RoutingConfig) -> bool {
     let is_plane_net = |nid: usize| -> bool {
         let net_name = board.nets.get(nid).map(|s| s.as_str()).unwrap_or("");
-        net_name == "GND"
-            || net_name.starts_with("GND")
+        crate::board::is_gnd_net_name(net_name)
             || grid.plane_nets.values().any(|&pn| pn == nid)
     };
 
@@ -13567,8 +13577,7 @@ fn consolidate_single_via_once(
 ) -> bool {
     let is_plane_net = |nid: usize| -> bool {
         let net_name = board.nets.get(nid).map(|s| s.as_str()).unwrap_or("");
-        net_name == "GND"
-            || net_name.starts_with("GND")
+        crate::board::is_gnd_net_name(net_name)
             || grid.plane_nets.values().any(|&pn| pn == nid)
     };
 
@@ -13900,8 +13909,7 @@ fn slide_and_align_via_once(
 ) -> bool {
     let is_plane_net = |nid: usize| -> bool {
         let net_name = board.nets.get(nid).map(|s| s.as_str()).unwrap_or("");
-        net_name == "GND"
-            || net_name.starts_with("GND")
+        crate::board::is_gnd_net_name(net_name)
             || grid.plane_nets.values().any(|&pn| pn == nid)
     };
 
@@ -17923,8 +17931,7 @@ fn prune_redundant_net_cycles(board: &mut Board) -> bool {
     let plane_nets = board.inner_plane_nets();
     let is_plane_net = |nid: usize| -> bool {
         let net_name = board.nets.get(nid).map(|s| s.as_str()).unwrap_or("");
-        net_name == "GND"
-            || net_name.starts_with("GND")
+        crate::board::is_gnd_net_name(net_name)
             || plane_nets.values().any(|&pn| pn == nid)
     };
 
@@ -18233,8 +18240,7 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
     let plane_nets = board.inner_plane_nets();
     let is_plane_net = |b: &Board, nid: usize| -> bool {
         let net_name = b.nets.get(nid).map(|s| s.as_str()).unwrap_or("");
-        net_name == "GND"
-            || net_name.starts_with("GND")
+        crate::board::is_gnd_net_name(net_name)
             || plane_nets.values().any(|&pn| pn == nid)
     };
 
@@ -18602,8 +18608,7 @@ fn prune_orphan_components(board: &mut Board) {
     let plane_nets = board.inner_plane_nets();
     let is_plane_net = |nid: usize| -> bool {
         let net_name = board.nets.get(nid).map(|s| s.as_str()).unwrap_or("");
-        net_name == "GND"
-            || net_name.starts_with("GND")
+        crate::board::is_gnd_net_name(net_name)
             || plane_nets.values().any(|&pn| pn == nid)
     };
 
