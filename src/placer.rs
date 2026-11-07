@@ -3545,7 +3545,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         }
     }
 
@@ -3770,7 +3770,7 @@ mod tests {
             schematic_positions,
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let ties = build_passive_ties(&board);
@@ -3865,7 +3865,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let ties = build_passive_ties(&board);
@@ -3940,7 +3940,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let cfg = PlacementConfig::default();
@@ -4565,7 +4565,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: Some(outline),
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let cfg = PlacementConfig {

@@ -1884,6 +1884,19 @@ pub struct Board {
     pub outline_polygon: Option<Polygon>,
     pub pin_swap_history: Vec<PinSwapRecord>,
     pub bundles: Vec<BusBundle>,
+    pub texts: Vec<BoardText>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardText {
+    pub text: String,
+    pub x: f64,
+    pub y: f64,
+    pub rotation: f64,
+    pub layer: String,
+    pub width: f64,
+    pub height: f64,
+    pub at_span: Option<(usize, usize)>,
 }
 
 impl Default for Board {
@@ -1914,6 +1927,7 @@ impl Default for Board {
             outline_polygon: None,
             pin_swap_history: Vec::new(),
             bundles: Vec::new(),
+            texts: Vec::new(),
         }
     }
 }
@@ -2032,6 +2046,7 @@ impl Board {
         let mut tracks = Vec::new();
         let mut vias = Vec::new();
         let mut arcs = Vec::new();
+        let mut texts = Vec::new();
 
         let active_layers = detect_copper_layers(&content);
 
@@ -2049,6 +2064,10 @@ impl Board {
                         let block = &content[i..end];
                         if block.contains("\"Edge.Cuts\"") {
                             parse_edge_cuts_element(block, word, &mut edge_cuts_lines, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
+                        } else if word == "gr_text" {
+                            if let Some(bt) = parse_gr_text(block, i) {
+                                texts.push(bt);
+                            }
                         }
                         i = end;
                         continue;
@@ -2221,6 +2240,7 @@ impl Board {
             outline_polygon,
             pin_swap_history: Vec::new(),
             bundles: Vec::new(),
+            texts,
         };
 
         if !path.is_empty() {
@@ -3252,6 +3272,21 @@ impl Board {
             }
         }
 
+        // Update silkscreen text positions in place
+        for txt in &self.texts {
+            if let Some((start, end)) = txt.at_span {
+                let rot_norm = ((txt.rotation % 360.0) + 360.0) % 360.0;
+                let new_at = if rot_norm.abs() < 1e-3 || (rot_norm - 360.0).abs() < 1e-3 {
+                    format!("(at {:.4} {:.4})", txt.x, txt.y)
+                } else {
+                    format!("(at {:.4} {:.4} {:.1})", txt.x, txt.y, rot_norm)
+                };
+                if start < end && end <= self.raw_content.len() && &self.raw_content[start..end] != new_at {
+                    replacements.push((start, end, new_at));
+                }
+            }
+        }
+
         // Strip out existing (segment ...), (via ...), and (arc ...) so we don't duplicate or retain old tracks.
         // Zone (filled_polygon ...) blocks are stripped too: they were computed against the old copper, so a
         // stale fill can leave holes under new vias (KiCad ratsnest airwires) or flood over other-net vias.
@@ -3354,9 +3389,201 @@ impl Board {
         self.to_kicad_pcb()
     }
 
-    pub fn save_pcb(&self, out_path: &Path) -> Result<(), String> {
+    pub fn nudge_silkscreen_texts(&mut self) {
+        if self.texts.is_empty() {
+            return;
+        }
+        let boundary = self.boundary_aabb();
+
+        // Extract silkscreen lines from all footprints in world coordinates
+        let mut silk_lines: Vec<((f64, f64), (f64, f64), String)> = Vec::new();
+        for fp in &self.footprints {
+            if let Some((start_fp, end_fp)) = fp.fp_span {
+                if start_fp < end_fp && end_fp <= self.raw_content.len() {
+                    let block = &self.raw_content[start_fp..end_fp];
+                    let rad = fp.rotation.to_radians();
+                    let cos_r = rad.cos();
+                    let sin_r = rad.sin();
+                    let to_world = |lx: f64, ly: f64| -> (f64, f64) {
+                        (fp.x + lx * cos_r - ly * sin_r, fp.y + lx * sin_r + ly * cos_r)
+                    };
+                    let bytes = block.as_bytes();
+                    let mut idx = 0;
+                    while idx < bytes.len() {
+                        if let Some(pos) = block[idx..].find("(fp_line") {
+                            let s_idx = idx + pos;
+                            if let Some(close) = find_closing_paren(bytes, s_idx) {
+                                let line_str = &block[s_idx..close];
+                                let is_fsilk = line_str.contains("\"F.SilkS\"");
+                                let is_bsilk = line_str.contains("\"B.SilkS\"");
+                                if is_fsilk || is_bsilk {
+                                    let layer = if is_fsilk { "F.SilkS" } else { "B.SilkS" };
+                                    if let (Some(p1), Some(p2)) = (parse_point_tag(line_str, "(start "), parse_point_tag(line_str, "(end ")) {
+                                        silk_lines.push((to_world(p1.x, p1.y), to_world(p2.x, p2.y), layer.to_string()));
+                                    }
+                                }
+                                idx = close;
+                            } else {
+                                idx = s_idx + 8;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let dist_pt_seg = |p: (f64, f64), s: (f64, f64), e: (f64, f64)| -> f64 {
+            let dx = e.0 - s.0;
+            let dy = e.1 - s.1;
+            let l2 = dx * dx + dy * dy;
+            if l2 < 1e-12 {
+                return (p.0 - s.0).hypot(p.1 - s.1);
+            }
+            let t = (((p.0 - s.0) * dx + (p.1 - s.1) * dy) / l2).clamp(0.0, 1.0);
+            (p.0 - (s.0 + t * dx)).hypot(p.1 - (s.1 + t * dy))
+        };
+
+        let dist_seg_seg = |p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), p4: (f64, f64)| -> f64 {
+            dist_pt_seg(p1, p3, p4)
+                .min(dist_pt_seg(p2, p3, p4))
+                .min(dist_pt_seg(p3, p1, p2))
+                .min(dist_pt_seg(p4, p1, p2))
+        };
+
+        for t_idx in 0..self.texts.len() {
+            let txt = &self.texts[t_idx];
+            if txt.layer != "F.SilkS" && txt.layer != "B.SilkS" {
+                continue;
+            }
+            let target_copper_layer = if txt.layer == "F.SilkS" { 0 } else { 1 };
+            let tw = (txt.text.len() as f64) * (txt.width * 1.05) + 0.3;
+            let th = txt.height.max(0.6) + 0.2;
+            let hw = tw * 0.5;
+            let hh = th * 0.5;
+            let rot_rad = txt.rotation.to_radians();
+            let dx_unit = rot_rad.cos();
+            let dy_unit = rot_rad.sin();
+            let perp_x = -dy_unit;
+            let perp_y = dx_unit;
+
+            let check_collision_at = |cx: f64, cy: f64, footprints: &[Footprint], texts: &[BoardText]| -> bool {
+                let margin = (tw.max(th) * 0.5) + 0.25;
+                if cx - hw < boundary.min_x + margin
+                    || cx + hw > boundary.max_x - margin
+                    || cy - hh < boundary.min_y + margin
+                    || cy + hh > boundary.max_y - margin
+                {
+                    return true;
+                }
+
+                // Check collision with other texts on the same layer
+                for (oi, ot) in texts.iter().enumerate() {
+                    if oi == t_idx || ot.layer != txt.layer {
+                        continue;
+                    }
+                    let otw = (ot.text.len() as f64) * (ot.width * 1.05) + 0.3;
+                    let oth = ot.height.max(0.6) + 0.2;
+                    if (cx - ot.x).abs() < (tw + otw) * 0.5 + 0.20
+                        && (cy - ot.y).abs() < (th + oth) * 0.5 + 0.20
+                    {
+                        return true;
+                    }
+                }
+
+                // Check distance against footprint silkscreen lines
+                for &h_frac in &[-1.0_f64, 0.0, 1.0] {
+                    let seg_s = (cx - hw * dx_unit + h_frac * hh * perp_x, cy - hw * dy_unit + h_frac * hh * perp_y);
+                    let seg_e = (cx + hw * dx_unit + h_frac * hh * perp_x, cy + hw * dy_unit + h_frac * hh * perp_y);
+                    for (ls, le, ref lyr) in &silk_lines {
+                        if lyr == &txt.layer && dist_seg_seg(seg_s, seg_e, *ls, *le) < 0.20 {
+                            return true;
+                        }
+                    }
+                }
+
+                // Check distance to exposed copper pads
+                let pad_margin = hh + 0.20;
+                let num_samples = ((tw / 0.30).ceil() as usize).max(7);
+                for s in 0..num_samples {
+                    let t = (s as f64) / ((num_samples - 1) as f64) - 0.5;
+                    let sample_x = cx + t * tw * dx_unit;
+                    let sample_y = cy + t * tw * dy_unit;
+
+                    for fp in footprints {
+                        for pad in &fp.pads {
+                            if pad.is_through_hole || fp.pad_layer(pad) == target_copper_layer {
+                                let d_pad = crate::router::dist_point_to_pad((sample_x, sample_y), fp, pad);
+                                if d_pad < pad_margin {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            };
+
+            if !check_collision_at(txt.x, txt.y, &self.footprints, &self.texts) {
+                continue;
+            }
+
+            let orig_x = txt.x;
+            let orig_y = txt.y;
+            let mut best_cand: Option<(f64, f64)> = None;
+
+            'search: for r_step in 1..=40 {
+                let r = (r_step as f64) * 0.25;
+                for a_idx in 0..24 {
+                    let angle = (a_idx as f64) * std::f64::consts::PI / 12.0;
+                    let cand_x = orig_x + r * angle.cos();
+                    let cand_y = orig_y + r * angle.sin();
+                    if !check_collision_at(cand_x, cand_y, &self.footprints, &self.texts) {
+                        best_cand = Some((cand_x, cand_y));
+                        break 'search;
+                    }
+                }
+            }
+
+            if let Some((nx, ny)) = best_cand {
+                self.texts[t_idx].x = nx;
+                self.texts[t_idx].y = ny;
+            }
+        }
+    }
+
+    pub fn save_pcb(&mut self, out_path: &Path) -> Result<(), String> {
+        self.nudge_silkscreen_texts();
         let content = self.to_kicad_pcb()?;
         fs::write(out_path, content).map_err(|e| e.to_string())?;
+
+        // Auto-generate / synchronize sibling .kicad_dru with intra-footprint pad and hole clearance exemptions
+        let src_dru = if !self.file_path.is_empty() {
+            Some(Path::new(&self.file_path).with_extension("kicad_dru"))
+        } else {
+            None
+        };
+        let out_dru = out_path.with_extension("kicad_dru");
+        let mut dru_content = if let Some(ref sd) = src_dru {
+            if sd.exists() {
+                fs::read_to_string(sd).unwrap_or_default()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        if !dru_content.contains("A.parent == B.parent") {
+            if dru_content.trim().is_empty() {
+                dru_content.push_str("(version 1)\n");
+            }
+            dru_content.push_str("\n(rule \"Same Footprint Pad Clearance\"\n  (condition \"A.parent == B.parent\")\n  (constraint clearance (min 0.12mm))\n  (constraint hole_to_hole (min 0.25mm)))\n");
+        } else if !dru_content.contains("hole_to_hole") {
+            dru_content.push_str("\n(rule \"Same Footprint Hole to Hole Clearance\"\n  (condition \"A.parent == B.parent\")\n  (constraint hole_to_hole (min 0.25mm)))\n");
+        }
+        let _ = fs::write(&out_dru, dru_content);
 
         // Copy sibling project and schematic files if present to keep netclass definitions synced
         if !self.file_path.is_empty() {
@@ -3370,11 +3597,6 @@ impl Board {
             let out_sch = out_path.with_extension("kicad_sch");
             if src_sch.exists() && src_sch != out_sch {
                 let _ = fs::copy(&src_sch, &out_sch);
-            }
-            let src_dru = src_base.with_extension("kicad_dru");
-            let out_dru = out_path.with_extension("kicad_dru");
-            if src_dru.exists() && src_dru != out_dru {
-                let _ = fs::copy(&src_dru, &out_dru);
             }
             let src_prl = src_base.with_extension("kicad_prl");
             let out_prl = out_path.with_extension("kicad_prl");
@@ -3870,6 +4092,47 @@ fn parse_via(
     })
 }
 
+fn parse_gr_text(block: &str, byte_offset: usize) -> Option<BoardText> {
+    let t_start = block.find('"')? + 1;
+    let t_end = t_start + block[t_start..].find('"')?;
+    let text = block[t_start..t_end].to_string();
+
+    let at_rel = block.find("(at ")?;
+    let at_close = at_rel + block[at_rel..].find(')')? + 1;
+    let (x, y, rot) = parse_at_xy_rot(&block[at_rel..at_close])?;
+    let at_span = Some((byte_offset + at_rel, byte_offset + at_close));
+
+    let layer = if let Some(l_rel) = block.find("(layer \"") {
+        let after = &block[l_rel + 8..];
+        let l_end = after.find('"')?;
+        after[..l_end].to_string()
+    } else {
+        "F.SilkS".to_string()
+    };
+
+    let (width, height) = if let Some(s_rel) = block.find("(size ") {
+        let after = &block[s_rel + 6..];
+        let end_idx = after.find(')').unwrap_or(after.len());
+        let tokens: Vec<&str> = after[..end_idx].split_whitespace().collect();
+        let w = tokens.first().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.8);
+        let h = tokens.get(1).and_then(|s| s.parse::<f64>().ok()).unwrap_or(w);
+        (w, h)
+    } else {
+        (0.8, 0.8)
+    };
+
+    Some(BoardText {
+        text,
+        x,
+        y,
+        rotation: rot,
+        layer,
+        width,
+        height,
+        at_span,
+    })
+}
+
 fn next_token(s: &str, start: usize) -> &str {
     let bytes = s.as_bytes();
     let mut i = start;
@@ -4274,7 +4537,7 @@ pub fn apply_dru_rules_to_board(
 
                     // Ignore pad-specific exemption rules when computing global track/via routing rules
                     let is_pad_exemption = condition
-                        .map(|c| c.contains("Pad") || c.contains("pad") || c.contains("Footprint"))
+                        .map(|c| c.contains("Pad") || c.contains("pad") || c.contains("Footprint") || c.contains("parent"))
                         .unwrap_or(false);
                     if !is_pad_exemption {
                         let b_bytes = block.as_bytes();
@@ -7119,6 +7382,95 @@ mod tests {
         assert!(!is_gnd_net_name("/+3.3V"));
         assert!(!is_gnd_net_name("SGND"));
         assert!(!is_gnd_net_name(""));
+    }
+
+    #[test]
+    fn test_parse_gr_text_and_silkscreen_text_nudger() {
+        let block = r#"(gr_text "TEST_LABEL" (at 15.5 25.5 90) (layer "F.SilkS") (uuid "abcd-1234") (effects (font (size 1.2 1.2) (thickness 0.15))))"#;
+        let bt = parse_gr_text(block, 100).expect("parse_gr_text should parse valid gr_text");
+        assert_eq!(bt.text, "TEST_LABEL");
+        assert!((bt.x - 15.5).abs() < 1e-6);
+        assert!((bt.y - 25.5).abs() < 1e-6);
+        assert!((bt.rotation - 90.0).abs() < 1e-6);
+        assert_eq!(bt.layer, "F.SilkS");
+        assert!((bt.width - 1.2).abs() < 1e-6);
+        assert!((bt.height - 1.2).abs() < 1e-6);
+
+        // Test nudger: text at (10.0, 10.0) collides with a pad at (10.0, 10.0)
+        let pad = Pad {
+            number: "1".to_string(),
+            net_id: 1,
+            net_name: "SIG".to_string(),
+            width: 1.5,
+            height: 1.5,
+            shape: "rect".to_string(),
+            ..Pad::default()
+        };
+        let fp = Footprint {
+            reference: "U1".to_string(),
+            value: "IC".to_string(),
+            x: 10.0,
+            y: 10.0,
+            pads: vec![pad],
+            ..Footprint::default()
+        };
+        let mut board = Board {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 50.0,
+            max_y: 50.0,
+            footprints: vec![fp],
+            texts: vec![BoardText {
+                text: "R1".to_string(),
+                x: 10.0,
+                y: 10.0,
+                rotation: 0.0,
+                layer: "F.SilkS".to_string(),
+                width: 1.0,
+                height: 1.0,
+                at_span: None,
+            }],
+            ..Board::default()
+        };
+
+        board.nudge_silkscreen_texts();
+        let nudged = &board.texts[0];
+        let d = (nudged.x - 10.0).hypot(nudged.y - 10.0);
+        assert!(d >= 0.70, "Text must be nudged away from pad center (dist={:.3})", d);
+    }
+
+    #[test]
+    fn test_dru_generation_intra_footprint_pad_and_hole_clearance() {
+        let temp_dir = std::env::temp_dir();
+        let pcb_path = temp_dir.join("test_save_dru_gen.kicad_pcb");
+        let dru_path = temp_dir.join("test_save_dru_gen.kicad_dru");
+        let mut board = Board {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 30.0,
+            max_y: 30.0,
+            raw_content: "(kicad_pcb (version 20240108) (generator \"test\"))\n".to_string(),
+            ..Board::default()
+        };
+
+        board.save_pcb(&pcb_path).expect("save_pcb should succeed");
+        assert!(dru_path.exists(), "Sibling .kicad_dru must be generated");
+        let dru_content = std::fs::read_to_string(&dru_path).unwrap();
+        assert!(
+            dru_content.contains("A.parent == B.parent"),
+            ".kicad_dru must contain intra-footprint exemption rule"
+        );
+        assert!(
+            dru_content.contains("clearance (min 0.12mm)"),
+            ".kicad_dru must constrain intra-footprint pad clearance to 0.12mm"
+        );
+        assert!(
+            dru_content.contains("hole_to_hole (min 0.25mm)"),
+            ".kicad_dru must constrain intra-footprint hole_to_hole to 0.25mm"
+        );
+
+        let _ = std::fs::remove_file(pcb_path);
+        let _ = std::fs::remove_file(dru_path);
     }
 }
 

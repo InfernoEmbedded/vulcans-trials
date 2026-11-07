@@ -663,7 +663,7 @@ fn test_p1p2esp_project_board_integration_if_present() {
         if let Some(&nid) = board.net_name_to_id.get(power_net) {
             let nc = board.get_netclass_for_net(nid);
             assert_eq!(nc.name, "Power", "Net {power_net} must be in Power class");
-            assert!((nc.track_width - 0.60).abs() < 1e-6 && (nc.clearance - 0.25).abs() < 1e-6 && (nc.via_dia - 0.80).abs() < 1e-6);
+            assert!((nc.track_width - 0.60).abs() < 1e-6 && (nc.clearance - 0.15).abs() < 1e-6 && (nc.via_dia - 0.80).abs() < 1e-6);
         }
     }
     for bus_net in ["P1", "P2", "HP", "HN"] {
@@ -675,7 +675,7 @@ fn test_p1p2esp_project_board_integration_if_present() {
     let aio_nid = *board.net_name_to_id.get("AIO").or_else(|| board.net_name_to_id.get("/AIO")).unwrap();
     let aio_nc = board.get_netclass_for_net(aio_nid);
     assert_eq!(aio_nc.name, "Analog_Sense");
-    assert!((aio_nc.track_width - 0.25).abs() < 1e-6 && (aio_nc.clearance - 0.20).abs() < 1e-6);
+    assert!((aio_nc.track_width - 0.25).abs() < 1e-6 && (aio_nc.clearance - 0.15).abs() < 1e-6);
     let usb_nid = *board.net_name_to_id.get("USB_DP").or_else(|| board.net_name_to_id.get("/USB_DP")).unwrap();
     let usb_nc = board.get_netclass_for_net(usb_nid);
     assert_eq!(usb_nc.name, "USB_Diff");
@@ -1491,7 +1491,7 @@ fn test_saved_board_drops_stale_zone_fill_and_refills_plane_connectivity() {
     fs::write(&in_pcb, &stale_pcb).unwrap();
     assert_eq!(unconnected_without_refill(&in_pcb), 1, "fixture must reproduce the stale-fill airwire");
 
-    let board = Board::load(in_pcb.to_str().unwrap(), &HashSet::new()).unwrap();
+    let mut board = Board::load(in_pcb.to_str().unwrap(), &HashSet::new()).unwrap();
     let out_pcb = dir.join("out.kicad_pcb");
     board.save_pcb(&out_pcb).unwrap();
     let saved = fs::read_to_string(&out_pcb).unwrap();

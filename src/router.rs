@@ -3179,6 +3179,12 @@ impl AutoRouter {
                     conn.netclass.clearance = conn.netclass.clearance.min(0.15);
                 }
                 conn.netclass.via_dia = conn.netclass.via_dia.min(0.60);
+                let min_annular = board.design_rules().min_via_annular_width;
+                let min_drill = board.design_rules().min_via_drill;
+                if (conn.netclass.via_dia - conn.netclass.via_drill) * 0.5 < min_annular - 1e-4 {
+                    conn.netclass.via_drill = (conn.netclass.via_dia - 2.0 * min_annular).max(min_drill);
+                    conn.netclass.via_dia = conn.netclass.via_dia.max(conn.netclass.via_drill + 2.0 * min_annular);
+                }
             }
             if conn.netclass.name == "USB_Diff" || conn.net_name.contains("USB") {
                 conn.netclass.diff_pair_width = conn.netclass.diff_pair_width.min(0.20);
@@ -3187,8 +3193,14 @@ impl AutoRouter {
             if is_passive_terminal {
                 if !is_power_net && !conn.netclass.name.starts_with("Power") && conn.netclass.name != "P1P2_Bus" {
                     conn.netclass.track_width = conn.netclass.track_width.min(0.15);
+                    conn.netclass.via_dia = conn.netclass.via_dia.min(0.60);
+                    let min_annular = board.design_rules().min_via_annular_width;
+                    let min_drill = board.design_rules().min_via_drill;
+                    if (conn.netclass.via_dia - conn.netclass.via_drill) * 0.5 < min_annular - 1e-4 {
+                        conn.netclass.via_drill = (conn.netclass.via_dia - 2.0 * min_annular).max(min_drill);
+                        conn.netclass.via_dia = conn.netclass.via_dia.max(conn.netclass.via_drill + 2.0 * min_annular);
+                    }
                 }
-                conn.netclass.via_dia = conn.netclass.via_dia.min(0.60);
             }
         }
 
@@ -5052,8 +5064,30 @@ impl AutoRouter {
         self.reconstruct_tracks_and_vias(board, grid, &connections, &routed_paths, &escape_stubs);
         crate::memlog::checkpoint_board("route_all::after_reconstruct_tracks_and_vias", board);
 
+        let reduce_vias_guarded = |board: &mut Board, grid: &mut RoutingGrid, config: &RoutingConfig| {
+            let pre_connected: Vec<bool> = (0..total_conns)
+                .map(|i| Self::is_connection_electrically_connected(board, &connections[i]))
+                .collect();
+            let snap = (board.tracks.clone(), board.arcs.clone(), board.vias.clone());
+            reduce_vias_with_config(board, grid, config);
+            let mut broken_nets = HashSet::new();
+            for i in 0..total_conns {
+                if pre_connected[i] && !Self::is_connection_electrically_connected(board, &connections[i]) {
+                    broken_nets.insert(connections[i].net_id);
+                }
+            }
+            if !broken_nets.is_empty() {
+                board.tracks.retain(|t| !broken_nets.contains(&t.net_id));
+                board.arcs.retain(|a| !broken_nets.contains(&a.net_id));
+                board.vias.retain(|v| !broken_nets.contains(&v.net_id));
+                board.tracks.extend(snap.0.into_iter().filter(|t| broken_nets.contains(&t.net_id)));
+                board.arcs.extend(snap.1.into_iter().filter(|a| broken_nets.contains(&a.net_id)));
+                board.vias.extend(snap.2.into_iter().filter(|v| broken_nets.contains(&v.net_id)));
+            }
+        };
+
         // Phase 3: Via Reduction Pass (eliminates redundant layer-hopping via pairs)
-        self.reduce_vias(board, grid);
+        reduce_vias_guarded(board, grid, &self.config);
         crate::memlog::checkpoint_board("route_all::after_reduce_vias", board);
         prune_dangling_tracks_and_vias(board);
         crate::memlog::checkpoint_board("route_all::after_prune_dangling_initial", board);
@@ -5076,7 +5110,7 @@ impl AutoRouter {
             prune_dangling_tracks_and_vias(board);
             crate::memlog::checkpoint_board(&format!("route_all::after_gloss_prune_{}", pass_i), board);
             if pass_i + 1 < gloss_iters {
-                self.reduce_vias(board, grid);
+                reduce_vias_guarded(board, grid, &self.config);
                 crate::memlog::checkpoint_board(&format!("route_all::after_gloss_reduce_vias_{}", pass_i), board);
                 prune_dangling_tracks_and_vias(board);
             }
@@ -7462,8 +7496,17 @@ pub fn find_choked_pin_bottlenecks(
             } else {
                 conn.netclass.track_width
             };
-            let via_dia = conn.netclass.via_dia;
-            let via_drill = conn.netclass.via_drill;
+            let mut via_dia = conn.netclass.via_dia;
+            let mut via_drill = conn.netclass.via_drill;
+            let min_annular = board.design_rules().min_via_annular_width;
+            let min_drill = board.design_rules().min_via_drill;
+            if (via_dia - via_drill) * 0.5 < min_annular - 1e-4 {
+                if via_dia - 2.0 * min_annular >= min_drill - 1e-4 {
+                    via_drill = (via_dia - 2.0 * min_annular).max(min_drill);
+                } else {
+                    via_dia = via_drill + 2.0 * min_annular;
+                }
+            }
             if path.len() < 2 {
                 if (conn.start.0 - conn.end.0).hypot(conn.start.1 - conn.end.1) > 1e-4 {
                     board.tracks.push(TrackSegment {
@@ -13165,8 +13208,11 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid, config: &Routi
                                 }
                             })
                         });
+                        let all_incident_reaches = drop_incident.iter().all(|&(_, l, other_pt, _)| {
+                            is_reachable_from_keep(keep_pos, drop_idx, other_pt, l, &rem_track_indices, &new_segs)
+                        });
 
-                        if chains_continuous && drop_pads_continuous {
+                        if chains_continuous && drop_pads_continuous && all_incident_reaches {
                             let mut bbox_pts = vec![keep_pos, drop_pos];
                             for ch in &chains {
                                 bbox_pts.extend_from_slice(&ch.pts);
@@ -18556,8 +18602,24 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
 
                 let valid_connected_layers = connected_layers.iter().filter(|&&l| has_outward_reach(l)).count();
 
-                if !touches_pad && !has_plane {
-                    if connected_tracks <= 1 || valid_connected_layers < 2 {
+                if !touches_pad {
+                    if has_plane {
+                        let all_plane_layers = board.layer_plane_nets();
+                        let plane_layer_count = all_plane_layers.values().filter(|&&pn| pn == v.net_id).count();
+                        if plane_layer_count < 2 {
+                            let valid_other_layers = connected_layers
+                                .iter()
+                                .filter(|&&l| {
+                                    let is_plane_layer = all_plane_layers.get(&l).copied() == Some(v.net_id);
+                                    !is_plane_layer && has_outward_reach(l)
+                                })
+                                .count();
+                            if valid_other_layers == 0 {
+                                pruned_vias[v_idx] = true;
+                                changed = true;
+                            }
+                        }
+                    } else if connected_tracks <= 1 || valid_connected_layers < 2 {
                         pruned_vias[v_idx] = true;
                         changed = true;
                     }
@@ -18909,6 +18971,19 @@ pub fn validate_and_clean_copper(board: &mut Board) {
         if nc_idx >= max_fp_end {
             board.raw_content.truncate(nc_idx);
             board.raw_content.push_str("\n)\n");
+        }
+    }
+
+    // Enforce board setup constraints for minimum via annular width on all emitted vias
+    let min_annular = board.design_rules().min_via_annular_width;
+    let min_drill = board.design_rules().min_via_drill;
+    for v in &mut board.vias {
+        if !v.is_locked && (v.size - v.drill) * 0.5 < min_annular - 1e-4 {
+            if v.size - 2.0 * min_annular >= min_drill - 1e-4 {
+                v.drill = (v.size - 2.0 * min_annular).max(min_drill);
+            } else {
+                v.size = v.drill + 2.0 * min_annular;
+            }
         }
     }
 
@@ -19962,7 +20037,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         }
     }
 
@@ -20503,7 +20578,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -20604,7 +20679,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&route_board, 0.20, None);
@@ -20718,7 +20793,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -20905,7 +20980,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let grid = RoutingGrid::new(&board, 0.20, None);
@@ -20977,7 +21052,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let grid = RoutingGrid::new(&board, 0.20, None);
@@ -21057,7 +21132,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -21154,7 +21229,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -21231,7 +21306,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -21315,7 +21390,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let grid = RoutingGrid::new(&board, 0.20, None);
@@ -21418,7 +21493,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -21520,7 +21595,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -21568,7 +21643,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let nudge = NudgeEngine::new();
@@ -21647,7 +21722,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let nudge = NudgeEngine::new();
@@ -21718,7 +21793,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let orig_tracks = board.tracks.clone();
@@ -21820,7 +21895,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         prune_dangling_tracks_and_vias(&mut board);
@@ -21873,7 +21948,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let via_dia = 0.60;
@@ -22043,7 +22118,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.10, None);
@@ -22144,7 +22219,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.10, None);
@@ -22236,7 +22311,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.10, None);
@@ -23518,7 +23593,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -23601,7 +23676,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let router = AutoRouter::new(2);
@@ -24816,7 +24891,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -24912,7 +24987,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let router = AutoRouter::new(2);
@@ -25010,7 +25085,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let mut grid_comp = RoutingGrid::new(&board_comp, 0.25, None);
@@ -25104,7 +25179,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let router = AutoRouter::new(2);
@@ -25357,7 +25432,7 @@ mod tests {
             schematic_positions: HashMap::new(),
             outline_polygon: None,
             pin_swap_history: Vec::new(),
-            bundles: Vec::new(),
+            bundles: Vec::new(), texts: Vec::new(),
         };
 
         let mut grid = RoutingGrid::new(&board, 0.20, None);
@@ -27162,5 +27237,90 @@ mod tests {
         for t in &before {
             assert!(board.tracks.contains(t), "branch {:?} must survive pruning: {:?}", t, board.tracks);
         }
+    }
+
+    #[test]
+    fn test_via_annular_width_and_single_plane_via_pruning() {
+        // 1. Test via annular width clamping in validate_and_clean_copper
+        let mut board = Board {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 50.0,
+            max_y: 50.0,
+            nets: vec![String::new(), "GND".to_string(), "+3.3V".to_string()],
+            vias: vec![Via {
+                position: (10.0, 10.0),
+                size: 0.60,
+                drill: 0.45, // annular width = (0.60 - 0.45)/2 = 0.075mm (< 0.10mm board setup default)
+                net_id: 2,
+                is_locked: false,
+            }],
+            ..Board::default()
+        };
+
+        validate_and_clean_copper(&mut board);
+        let v = &board.vias[0];
+        let annular = (v.size - v.drill) * 0.5;
+        assert!(
+            annular >= 0.10 - 1e-4,
+            "Via annular width must be clamped to >= 0.10mm (got {:.4}mm: size={}, drill={})",
+            annular, v.size, v.drill
+        );
+        assert!(v.drill <= 0.40 + 1e-4, "Drill must be reduced to 0.40mm to maintain 0.10mm annular width");
+
+        // 2. Test single-plane orphan via pruning
+        // Plane zone on layer 1 (In1.Cu) for +3.3V (net_id = 2)
+        board.net_name_to_id.insert("+3.3V".to_string(), 2);
+        board.raw_content = r#"(kicad_pcb (version 20240108)
+  (zone (net 2) (net_name "+3.3V") (layer "In1.Cu")
+    (polygon (pts (xy 0 0) (xy 50 0) (xy 50 50) (xy 0 50))))
+)"#.to_string();
+
+        // Via 1: orphan on single plane layer (no tracks on any layer)
+        board.vias = vec![
+            Via {
+                position: (15.0, 15.0),
+                size: 0.60,
+                drill: 0.30,
+                net_id: 2,
+                is_locked: false,
+            },
+            // Via 2: connected to a track leading to a pad on layer 0
+            Via {
+                position: (25.0, 25.0),
+                size: 0.60,
+                drill: 0.30,
+                net_id: 2,
+                is_locked: false,
+            },
+        ];
+        board.tracks.push(TrackSegment {
+            start: (25.0, 25.0),
+            end: (30.0, 25.0),
+            width: 0.30,
+            layer: 0,
+            net_id: 2,
+            is_locked: false,
+        });
+        board.footprints.push(Footprint {
+            reference: "U1".to_string(),
+            value: "IC".to_string(),
+            x: 30.0,
+            y: 25.0,
+            pads: vec![Pad {
+                number: "1".to_string(),
+                net_id: 2,
+                net_name: "+3.3V".to_string(),
+                width: 1.0,
+                height: 1.0,
+                shape: "rect".to_string(),
+                ..Pad::default()
+            }],
+            ..Footprint::default()
+        });
+
+        prune_dangling_tracks_and_vias(&mut board);
+        assert_eq!(board.vias.len(), 1, "Orphan single-plane via must be pruned");
+        assert_eq!(board.vias[0].position, (25.0, 25.0), "Connected via must be retained");
     }
 }
