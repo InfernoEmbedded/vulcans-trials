@@ -1006,8 +1006,19 @@ impl NngKiCadClient {
         )?;
         let mut docs: Vec<Vec<u8>> = Vec::new();
         proto_walk(&resp, |tag, wt, val| {
-            if tag == 1 && wt == 2 {
-                docs.push(val.to_vec());
+            if (tag == 1 || tag == 2) && wt == 2 {
+                // Check if val contains an inner DocumentSpecifier at tag 1 (KiCad 10 repeated documents wrapper)
+                let mut inner_spec = None;
+                proto_walk(val, |itag, iwt, ival| {
+                    if itag == 1 && iwt == 2 {
+                        inner_spec = Some(ival.to_vec());
+                    }
+                });
+                if let Some(spec) = inner_spec {
+                    docs.push(spec);
+                } else {
+                    docs.push(val.to_vec());
+                }
             }
         });
         if docs.is_empty() {
@@ -1050,6 +1061,10 @@ impl NngKiCadClient {
             {
                 return Ok(doc.clone());
             }
+        }
+
+        if docs.len() == 1 {
+            return Ok(docs[0].clone());
         }
 
         Err(std::io::Error::new(
@@ -1108,10 +1123,13 @@ impl NngKiCadClient {
         for kot in [KOT_PCB_FOOTPRINT, KOT_PCB_TRACE, KOT_PCB_VIA, KOT_PCB_ARC] {
             proto_encode_varint_field(2, kot as u64, &mut get_items_req);
         }
-        let (_, get_items_resp) = self.send_command(
-            "type.googleapis.com/kiapi.common.commands.GetItems",
-            &get_items_req,
-        )?;
+        let get_items_resp = self
+            .send_command(
+                "type.googleapis.com/kiapi.common.commands.GetItems",
+                &get_items_req,
+            )
+            .map(|(_, resp)| resp)
+            .unwrap_or_default();
 
         let mut live_footprints: HashMap<String, (Vec<u8>, Vec<u8>, i64, i64, f64, i32)> =
             HashMap::new();
@@ -1375,12 +1393,16 @@ impl NngKiCadClient {
 
         let synced = sync_result?;
 
-        // Refill copper zones in KiCad after updating footprints/tracks/vias
+        // Refill copper zones in KiCad after updating footprints/tracks/vias and refresh display
         let mut refill_req = Vec::new();
         proto_encode_bytes(1, &doc_spec, &mut refill_req);
         let _ = self.send_command(
             "type.googleapis.com/kiapi.board.commands.RefillZones",
             &refill_req,
+        );
+        let _ = self.send_command(
+            "type.googleapis.com/kiapi.common.commands.RefreshEditor",
+            &[],
         );
 
         Ok(synced)
@@ -2675,6 +2697,111 @@ mod tests {
         assert!(commands.iter().any(|c| c.ends_with(".CreateItems")));
         assert!(commands.iter().any(|c| c.ends_with(".EndCommit")));
         assert!(commands.iter().any(|c| c.ends_with(".RefillZones")));
+    }
+
+    #[test]
+    fn test_nng_kicad10_get_open_documents_nested_response() {
+        let Ok(lib) = NngLib::load() else {
+            return;
+        };
+        let (Some(rep0_open), Some(listen_fn)) = (lib.rep0_open, lib.listen) else {
+            return;
+        };
+
+        let sock_path = format!("/tmp/kicad_nng_nested_doc_test_{}.sock", std::process::id());
+        let _ = fs::remove_file(&sock_path);
+
+        let mut srv_sock = NngSocket::default();
+        unsafe {
+            assert_eq!(rep0_open(&mut srv_sock), 0);
+            if let Some(set_ms) = lib.set_ms {
+                let _ = set_ms(srv_sock, NNG_OPT_RECVTIMEO.as_ptr() as *const _, 5_000);
+                let _ = set_ms(srv_sock, NNG_OPT_SENDTIMEO.as_ptr() as *const _, 5_000);
+            }
+            let uri = format!("ipc://{}\0", sock_path);
+            assert_eq!(listen_fn(srv_sock, uri.as_ptr() as *const _, std::ptr::null_mut(), 0), 0);
+        }
+
+        let srv_sock_id = srv_sock.id;
+        let server_thread = thread::spawn(move || {
+            let srv_lib = NngLib::load().unwrap();
+            let s = NngSocket { id: srv_sock_id };
+
+            let _req_bytes = unsafe {
+                let mut buf_ptr: *mut u8 = std::ptr::null_mut();
+                let mut buf_len: usize = 0;
+                let rv = (srv_lib.recv)(s, &mut buf_ptr, &mut buf_len, NNG_FLAG_ALLOC);
+                assert_eq!(rv, 0);
+                let slice = std::slice::from_raw_parts(buf_ptr, buf_len).to_vec();
+                (srv_lib.free)(buf_ptr, buf_len);
+                slice
+            };
+
+            // KiCad 10 nested GetOpenDocumentsResponse:
+            // Tag 2 contains Document wrapper, inside is Tag 1 with DocumentSpecifier
+            let mut doc_spec = Vec::new();
+            proto_encode_varint_field(1, 3, &mut doc_spec); // DOCTYPE_PCB = 3
+            proto_encode_str(4, "nested_board.kicad_pcb", &mut doc_spec);
+
+            let mut doc_wrapper = Vec::new();
+            proto_encode_bytes(1, &doc_spec, &mut doc_wrapper);
+
+            let mut get_docs_resp = Vec::new();
+            proto_encode_bytes(2, &doc_wrapper, &mut get_docs_resp);
+
+            let any_resp = proto_encode_any(
+                "type.googleapis.com/kiapi.common.commands.GetOpenDocumentsResponse",
+                &get_docs_resp,
+            );
+
+            let mut header = Vec::new();
+            proto_encode_str(1, "mock-token", &mut header);
+            let mut status = Vec::new();
+            proto_encode_varint_field(1, 1, &mut status); // AS_OK = 1
+            let mut resp_msg = Vec::new();
+            proto_encode_bytes(1, &header, &mut resp_msg);
+            proto_encode_bytes(2, &status, &mut resp_msg);
+            proto_encode_bytes(3, &any_resp, &mut resp_msg);
+
+            unsafe {
+                assert_eq!((srv_lib.send)(s, resp_msg.as_ptr(), resp_msg.len(), 0), 0);
+                let _ = (srv_lib.close)(s);
+            }
+        });
+
+        let mut client = NngKiCadClient {
+            lib: Box::leak(Box::new(NngLib::load().unwrap())),
+            sock: NngSocket::default(),
+            token: "mock-token".to_string(),
+            client_name: "test-client".to_string(),
+        };
+
+        unsafe {
+            let lib = client.lib;
+            assert_eq!((lib.req0_open)(&mut client.sock), 0);
+            let uri = format!("ipc://{}\0", sock_path);
+            assert_eq!((lib.dial)(client.sock, uri.as_ptr() as *const _, std::ptr::null_mut(), 0), 0);
+        }
+
+        let board = crate::board::Board {
+            file_path: "/tmp/nested_board.kicad_pcb".to_string(),
+            ..crate::board::Board::default()
+        };
+
+        let doc = client
+            .get_open_pcb_document(&board, Path::new("/tmp/nested_board_vulcan.kicad_pcb"))
+            .expect("Must resolve nested KiCad 10 document specifier");
+
+        let mut extracted_name = String::new();
+        proto_walk(&doc, |tag, wt, val| {
+            if tag == 4 && wt == 2 {
+                extracted_name = std::str::from_utf8(val).unwrap().to_string();
+            }
+        });
+        assert_eq!(extracted_name, "nested_board.kicad_pcb");
+
+        server_thread.join().expect("Server thread join");
+        let _ = fs::remove_file(&sock_path);
     }
 
     #[test]

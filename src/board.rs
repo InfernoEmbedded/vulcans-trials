@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_LOCKED_REFS: &[&str] = &[
@@ -3553,9 +3553,75 @@ impl Board {
         }
     }
 
+    /// Formats the current UTC timestamp as YYYYMMDDHHMMSS without third-party crates.
+    pub fn current_timestamp_yyyymmddhhmmss() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let sec = secs % 60;
+        let mins = secs / 60;
+        let min = mins % 60;
+        let hours = mins / 60;
+        let hour = hours % 24;
+        let mut days = (hours / 24) as i64;
+
+        // Convert days since Jan 1 1970 to year, month, day using standard civil calendar algorithm
+        days += 719468;
+        let era = if days >= 0 { days } else { days - 146096 } / 146097;
+        let doe = (days - era * 146097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = (yoe as i64) + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+
+        format!("{:04}{:02}{:02}{:02}{:02}{:02}", y, m, d, hour, min, sec)
+    }
+
+    /// Computes the backup path for a PCB file being overwritten:
+    /// `<board_stem>.kicad_pcb_bak.YYYYMMDDHHMMSS`
+    pub fn compute_pcb_backup_path(out_path: &Path) -> PathBuf {
+        let ts = Self::current_timestamp_yyyymmddhhmmss();
+        let path_str = out_path.to_string_lossy();
+        let base = if path_str.ends_with(".kicad_pcb") {
+            format!(
+                "{}.kicad_pcb_bak.{}",
+                &path_str[..path_str.len() - ".kicad_pcb".len()],
+                ts
+            )
+        } else {
+            format!("{}.kicad_pcb_bak.{}", path_str, ts)
+        };
+        let mut bak = PathBuf::from(&base);
+        let mut counter = 1;
+        while bak.exists() {
+            bak = PathBuf::from(format!("{}.{}", base, counter));
+            counter += 1;
+        }
+        bak
+    }
+
     pub fn save_pcb(&mut self, out_path: &Path) -> Result<(), String> {
         self.nudge_silkscreen_texts();
         let content = self.to_kicad_pcb()?;
+
+        // If overwriting an existing PCB file, save a timestamped backup first
+        if out_path.exists() {
+            let bak_path = Self::compute_pcb_backup_path(out_path);
+            if let Err(e) = fs::copy(out_path, &bak_path) {
+                eprintln!(
+                    "[Warning] Failed to backup original PCB to '{}': {}",
+                    bak_path.display(),
+                    e
+                );
+            }
+        }
+
         fs::write(out_path, content).map_err(|e| e.to_string())?;
 
         // Auto-generate / synchronize sibling .kicad_dru with intra-footprint pad and hole clearance exemptions
@@ -7471,6 +7537,68 @@ mod tests {
 
         let _ = std::fs::remove_file(pcb_path);
         let _ = std::fs::remove_file(dru_path);
+    }
+
+    #[test]
+    fn test_current_timestamp_format_and_backup_path() {
+        let ts = Board::current_timestamp_yyyymmddhhmmss();
+        assert_eq!(ts.len(), 14, "Timestamp must be 14 digits YYYYMMDDHHMMSS");
+        assert!(ts.chars().all(|c| c.is_ascii_digit()), "Timestamp must only contain digits");
+
+        let pcb = Path::new("/tmp/my_test_board.kicad_pcb");
+        let bak = Board::compute_pcb_backup_path(pcb);
+        let bak_str = bak.to_string_lossy();
+        assert!(
+            bak_str.starts_with("/tmp/my_test_board.kicad_pcb_bak."),
+            "Backup path must start with base name and .kicad_pcb_bak. suffix, got: {}",
+            bak_str
+        );
+    }
+
+    #[test]
+    fn test_save_pcb_creates_backup_when_overwriting() {
+        let temp_dir = std::env::temp_dir();
+        let test_id = std::process::id();
+        let pcb_path = temp_dir.join(format!("test_overwrite_board_{}.kicad_pcb", test_id));
+        let dru_path = temp_dir.join(format!("test_overwrite_board_{}.kicad_dru", test_id));
+
+        // Create original file
+        let original_content = "(kicad_pcb (version 20240108) (generator \"original\"))\n";
+        std::fs::write(&pcb_path, original_content).unwrap();
+
+        let mut board = Board {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 20.0,
+            max_y: 20.0,
+            raw_content: "(kicad_pcb (version 20240108) (generator \"updated\"))\n".to_string(),
+            ..Board::default()
+        };
+
+        board.save_pcb(&pcb_path).expect("save_pcb must succeed");
+
+        // Verify updated file content
+        let updated_content = std::fs::read_to_string(&pcb_path).unwrap();
+        assert!(updated_content.contains("updated"), "PCB file must contain updated content");
+
+        // Search for the generated backup file: test_overwrite_board_{test_id}.kicad_pcb_bak.YYYYMMDDHHMMSS
+        let prefix = format!("test_overwrite_board_{}.kicad_pcb_bak.", test_id);
+        let found_bak = std::fs::read_dir(&temp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with(&prefix));
+
+        assert!(found_bak.is_some(), "Backup file matching .kicad_pcb_bak.YYYYMMDDHHMMSS must exist");
+        let bak_entry = found_bak.unwrap();
+        let bak_content = std::fs::read_to_string(bak_entry.path()).unwrap();
+        assert_eq!(
+            bak_content, original_content,
+            "Backup file must contain original pre-overwrite content"
+        );
+
+        let _ = std::fs::remove_file(&pcb_path);
+        let _ = std::fs::remove_file(&dru_path);
+        let _ = std::fs::remove_file(bak_entry.path());
     }
 }
 

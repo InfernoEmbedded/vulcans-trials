@@ -1557,3 +1557,43 @@ fn test_esphome_1wire_sensor_example_autoplace_and_autoroute() {
     );
     assert_eq!(placed.overlaps, 0, "Auto-placed sample board must have 0 courtyard overlaps");
 }
+
+#[test]
+fn test_save_pcb_overwrites_with_timestamped_backup() {
+    let dir = temp_test_dir("overwrite_backup");
+    let target_pcb = dir.join("my_board.kicad_pcb");
+    fs::write(&target_pcb, "(kicad_pcb (version 20240108) (generator \"original_board\"))\n").unwrap();
+
+    let mut board = Board {
+        min_x: 0.0,
+        min_y: 0.0,
+        max_x: 10.0,
+        max_y: 10.0,
+        raw_content: "(kicad_pcb (version 20240108) (generator \"updated_board\"))\n".to_string(),
+        ..Board::default()
+    };
+
+    board.save_pcb(&target_pcb).expect("save_pcb should succeed");
+
+    // The target file now has updated content
+    let content = fs::read_to_string(&target_pcb).unwrap();
+    assert!(content.contains("updated_board"));
+
+    // A backup file with suffix .kicad_pcb_bak.YYYYMMDDHHMMSS must exist
+    let files: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+
+    let bak_file = files
+        .iter()
+        .find(|f| f.starts_with("my_board.kicad_pcb_bak."));
+    assert!(bak_file.is_some(), "Expected backup file, found: {:?}", files);
+
+    let bak_path = dir.join(bak_file.unwrap());
+    let bak_content = fs::read_to_string(&bak_path).unwrap();
+    assert!(bak_content.contains("original_board"), "Backup must contain original content");
+
+    let _ = fs::remove_dir_all(&dir);
+}

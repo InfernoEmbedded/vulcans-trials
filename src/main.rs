@@ -455,6 +455,9 @@ fn main() {
             eprintln!("[KiCad-IPC] Warning: No active KiCad 10 socket found");
             None
         }
+    } else if let Some(c) = vulcans_trials::ipc::KiCadIpcClient::connect_or_discover(None) {
+        println!("[KiCad-IPC] Auto-discovered KiCad socket: {:?}", c.socket_path());
+        Some(Arc::new(std::sync::Mutex::new(c)))
     } else {
         None
     };

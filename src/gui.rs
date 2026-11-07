@@ -769,6 +769,7 @@ impl VulcansTrialsApp {
     pub fn save_output_and_pull_to_kicad(&mut self) -> bool {
         let pcb_path = PathBuf::from(&self.output_path);
         let ses_path = pcb_path.with_extension("ses");
+        let was_existing = pcb_path.exists();
         let board_clone = {
             let mut g = self.live.lock().unwrap();
             if let Err(e) = g.board.save_pcb(&pcb_path) {
@@ -777,6 +778,11 @@ impl VulcansTrialsApp {
             }
             crate::board::Board::refill_zones_in_file(&pcb_path);
             let _ = g.board.save_ses(&ses_path);
+            if was_existing {
+                g.push_log(format!(
+                    "[Backup] Overwrote existing PCB: original backed up as .kicad_pcb_bak.YYYYMMDDHHMMSS"
+                ));
+            }
             g.push_log(format!("[Saved] {}", self.output_path));
             g.board.clone()
         };
@@ -793,25 +799,36 @@ impl VulcansTrialsApp {
             if let Some(Ok(synced)) = pull_res {
                 if let Ok(mut g) = self.live.lock() {
                     g.push_log(format!(
-                        "[KiCad-IPC] Pulled updated board into KiCad ({} items synced)",
+                        "[KiCad-IPC] Pulled updated board into KiCad & refilled zones ({} items synced)",
                         synced
                     ));
+                }
+            } else if let Some(Err(ref e)) = pull_res {
+                if let Ok(mut g) = self.live.lock() {
+                    g.push_log(format!("[KiCad-IPC] Pull note: {}", e));
                 }
             }
         } else {
             let mut tmp_client = None;
-            if let Ok(synced) = crate::ipc::push_saved_board_to_kicad(
+            match crate::ipc::push_saved_board_to_kicad(
                 &mut tmp_client,
                 None,
                 &board_clone,
                 &pcb_path,
                 &ses_path,
             ) {
-                if let Ok(mut g) = self.live.lock() {
-                    g.push_log(format!(
-                        "[KiCad-IPC] Pulled updated board into KiCad ({} items synced)",
-                        synced
-                    ));
+                Ok(synced) => {
+                    if let Ok(mut g) = self.live.lock() {
+                        g.push_log(format!(
+                            "[KiCad-IPC] Pulled updated board into KiCad & refilled zones ({} items synced)",
+                            synced
+                        ));
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut g) = self.live.lock() {
+                        g.push_log(format!("[KiCad-IPC] Note: {}", e));
+                    }
                 }
             }
         }

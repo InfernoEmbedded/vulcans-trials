@@ -85,10 +85,16 @@ def get_ipc_endpoint() -> str | None:
     if not sys.platform.startswith("win"):
         pid = os.getpid()
         candidates = [
+            "/tmp/kicad/api.sock",
+            "/tmp/kicad/kicad.sock",
             f"/tmp/kicad_ipc_{pid}.sock",
             "/tmp/kicad_ipc.sock",
             os.path.expanduser("~/.kicad_ipc.sock"),
         ]
+        if "XDG_RUNTIME_DIR" in os.environ:
+            candidates.insert(1, os.path.join(os.environ["XDG_RUNTIME_DIR"], "kicad", "api.sock"))
+            candidates.insert(2, os.path.join(os.environ["XDG_RUNTIME_DIR"], "kicad", "kicad.sock"))
+
         for sock in candidates:
             if os.path.exists(sock):
                 return sock
@@ -168,6 +174,32 @@ def import_ses_with_view_refresh(board, ses_path: str) -> bool:
 
 
 if HAS_GUI:
+    class VulcanBoardWatcher(wx.Timer):
+        """Monitors for saved .ses or .kicad_pcb from Vulcan's Trials and updates PCBNEW."""
+        def __init__(self, board, pcb_path: str, ses_path: str):
+            super().__init__()
+            self.board = board
+            self.pcb_path = pcb_path
+            self.ses_path = ses_path
+            self.last_pcb_mtime = os.path.getmtime(pcb_path) if os.path.exists(pcb_path) else 0
+            self.last_ses_mtime = os.path.getmtime(ses_path) if os.path.exists(ses_path) else 0
+
+        def Notify(self):
+            cur_ses_mtime = os.path.getmtime(self.ses_path) if os.path.exists(self.ses_path) else 0
+            cur_pcb_mtime = os.path.getmtime(self.pcb_path) if os.path.exists(self.pcb_path) else 0
+            if cur_ses_mtime > self.last_ses_mtime:
+                self.last_ses_mtime = cur_ses_mtime
+                self.last_pcb_mtime = cur_pcb_mtime
+                import_ses_with_view_refresh(self.board, self.ses_path)
+            elif cur_pcb_mtime > self.last_pcb_mtime:
+                self.last_pcb_mtime = cur_pcb_mtime
+                try:
+                    pcbnew.Refresh()
+                except Exception:
+                    pass
+
+    _ACTIVE_WATCHER = None
+
     class VulcansTrialsPlugin(pcbnew.ActionPlugin):
         def defaults(self):
             self.name = "Vulcan's Trials"
@@ -177,6 +209,7 @@ if HAS_GUI:
             self.icon_file_name = os.path.join(os.path.dirname(__file__), "icon.png")
 
         def Run(self):
+            global _ACTIVE_WATCHER
             board = pcbnew.GetBoard()
             board_path = board.GetFileName() if board else ""
             if not board_path or not os.path.exists(board_path):
@@ -200,12 +233,20 @@ if HAS_GUI:
                 return
 
             out_path = os.path.splitext(board_path)[0] + "_vulcan.kicad_pcb"
+            ses_path = os.path.splitext(out_path)[0] + ".ses"
             cmd = [binary, "--input", board_path, "--output", out_path]
 
             ipc_ep = get_ipc_endpoint()
             if ipc_ep:
                 connect_ipc(ipc_ep)
                 cmd.extend(["--ipc", ipc_ep])
+
+            # Start watcher in PCBNEW to auto-import / refresh when Vulcan's Trials saves
+            try:
+                _ACTIVE_WATCHER = VulcanBoardWatcher(board, out_path, ses_path)
+                _ACTIVE_WATCHER.Start(1000)
+            except Exception:
+                pass
 
             subprocess.Popen(cmd)
 
