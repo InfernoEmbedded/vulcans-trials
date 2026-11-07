@@ -4295,7 +4295,10 @@ pub fn draw_color_legend(painter: &egui::Painter, canvas_rect: Rect, board: &Boa
 
 fn draw_load_badge(ui: &mut egui::Ui, label: &str, pct: f32, history: &[f32], color: Color32, tooltip: &str) {
     ui.horizontal(|ui| {
-        ui.label(format!("{}: {:>4.0}%", label, pct)).on_hover_text(tooltip);
+        // 1. Anchored constant-width label so the graph start position is anchored
+        ui.add_sized([65.0, 18.0], egui::Label::new(egui::RichText::new(label).strong())).on_hover_text(tooltip);
+
+        // 2. Anchored sparkline graph with fixed size
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(72.0, 18.0), Sense::hover());
         resp.on_hover_text(tooltip);
         let painter = ui.painter_at(rect);
@@ -4310,6 +4313,17 @@ fn draw_load_badge(ui: &mut egui::Ui, label: &str, pct: f32, history: &[f32], co
                 painter.line_segment([Pos2::new(x0, y0), Pos2::new(x1, y1)], Stroke::new(1.5_f32, color));
             }
         }
+
+        // 3. Monospace fixed-width percentage placed after the graph so the graph never shifts as numbers change
+        ui.add_sized(
+            [42.0, 18.0],
+            egui::Label::new(
+                egui::RichText::new(format!("{:>3.0}%", pct.clamp(0.0, 100.0)))
+                    .monospace()
+                    .color(color)
+                    .strong(),
+            ),
+        ).on_hover_text(tooltip);
     });
 }
 
@@ -6264,5 +6278,35 @@ mod tests {
         assert!(app.frame_count >= 35);
 
         let _ = fs::remove_file(&pcb_path);
+    }
+
+    #[test]
+    fn test_load_badges_anchored_layout_and_fixed_width() {
+        let ctx = egui::Context::default();
+        let mut raw_input = egui::RawInput::default();
+        raw_input.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0)));
+
+        let mut rects = Vec::new();
+        // Render badges with varying load percentages (0%, 5%, 50%, 100%)
+        for &pct in &[0.0_f32, 5.0, 50.0, 100.0] {
+            let history = vec![0.0, 10.0, pct, pct];
+            let _ = ctx.run(raw_input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let r = ui.horizontal(|ui| {
+                        draw_load_badge(ui, "CPU Load", pct, &history, Color32::BLUE, "CPU tooltip");
+                    }).response.rect;
+                    rects.push(r);
+                });
+            });
+        }
+
+        // Verify the badge bounding width remains invariant regardless of load percentage
+        for i in 1..rects.len() {
+            assert!(
+                (rects[i].width() - rects[0].width()).abs() < 1e-2,
+                "Badge width must be invariant as numbers change: rect[0]={:?}, rect[{}]={:?}",
+                rects[0], i, rects[i]
+            );
+        }
     }
 }
