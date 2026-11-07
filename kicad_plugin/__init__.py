@@ -141,6 +141,105 @@ def connect_ipc(endpoint: str | None = None) -> bool:
         return False
 
 
+def trigger_kicad_revert_ipc(endpoint: str | None = None) -> bool:
+    """Send RevertDocument and RefillZones to KiCad over IPC socket if available."""
+    if not endpoint:
+        endpoint = get_ipc_endpoint()
+    if not endpoint:
+        return False
+    try:
+        import ctypes
+        libnng = ctypes.CDLL("libnng.so.1")
+        class NngSocket(ctypes.Structure):
+            _fields_ = [("id", ctypes.c_uint32)]
+        sock = NngSocket()
+        if libnng.nng_req0_open(ctypes.byref(sock)) != 0:
+            return False
+        uri = f"ipc://{endpoint}\0".encode("utf-8")
+        if libnng.nng_dial(sock, uri, None, 0) != 0:
+            libnng.nng_close(sock)
+            return False
+
+        def send_cmd(type_url, payload=b"", token=b""):
+            hdr = b""
+            if token:
+                hdr += bytes([10, len(token)]) + token
+            client = b"vulcan-plugin-watcher"
+            hdr += bytes([18, len(client)]) + client
+            u_bytes = type_url.encode("utf-8")
+            any_msg = bytes([10, len(u_bytes)]) + u_bytes + bytes([18, len(payload)]) + payload
+            req = bytes([10, len(hdr)]) + hdr + bytes([18, len(any_msg)]) + any_msg
+            if libnng.nng_send(sock, req, len(req), 0) != 0:
+                return 0, b"", b""
+            buf_ptr = ctypes.c_void_p()
+            buf_len = ctypes.c_size_t()
+            if libnng.nng_recv(sock, ctypes.byref(buf_ptr), ctypes.byref(buf_len), 1) != 0:
+                return 0, b"", b""
+            raw = ctypes.string_at(buf_ptr.value, buf_len.value)
+            libnng.nng_free(buf_ptr, buf_len)
+
+            t = b""
+            status = 0
+            val = b""
+            i = 0
+            while i < len(raw):
+                wb = raw[i]; i += 1
+                tag = wb >> 3; wt = wb & 7
+                if wt == 0:
+                    v = 0; s = 0
+                    while True:
+                        b = raw[i]; i += 1; v |= (b & 0x7f) << s
+                        if not (b & 0x80): break
+                        s += 7
+                elif wt == 2:
+                    l = 0; s = 0
+                    while True:
+                        b = raw[i]; i += 1; l |= (b & 0x7f) << s
+                        if not (b & 0x80): break
+                        s += 7
+                    chunk = raw[i:i+l]; i += l
+                    if tag == 1 and len(chunk) > 2 and chunk[0] == 10:
+                        t = chunk[2:2+chunk[1]]
+                    elif tag == 2 and len(chunk) >= 2 and chunk[0] == 8:
+                        status = chunk[1]
+                    elif tag == 3 and len(chunk) > 2:
+                        j = 0
+                        while j < len(chunk):
+                            awb = chunk[j]; j += 1
+                            atag = awb >> 3; awt = awb & 7
+                            if awt == 2:
+                                al = 0; as_shift = 0
+                                while True:
+                                    ab = chunk[j]; j += 1; al |= (ab & 0x7f) << as_shift
+                                    if not (ab & 0x80): break
+                                    as_shift += 7
+                                if atag == 2: val = chunk[j:j+al]
+                                j += al
+                            elif awt == 0:
+                                while chunk[j] & 0x80: j += 1
+                                j += 1
+                            else: break
+            return status, t, val
+
+        # Ping
+        _, tok, _ = send_cmd("type.googleapis.com/kiapi.common.commands.Ping")
+        # GetOpenDocuments
+        st, tok, resp = send_cmd("type.googleapis.com/kiapi.common.commands.GetOpenDocuments", bytes([8, 3]), tok)
+        if st == 1 and resp:
+            doc_len = resp[1]
+            doc_spec = resp[2:2+doc_len]
+            rev_req = bytes([10, len(doc_spec)]) + doc_spec
+            rst, tok, _ = send_cmd("type.googleapis.com/kiapi.common.commands.RevertDocument", rev_req, tok)
+            if rst == 1:
+                send_cmd("type.googleapis.com/kiapi.board.commands.RefillZones", rev_req, tok)
+                libnng.nng_close(sock)
+                return True
+        libnng.nng_close(sock)
+    except Exception:
+        pass
+    return False
+
+
 def import_ses_with_view_refresh(board, ses_path: str) -> bool:
     """Import a Specctra .ses file into KiCad and force a KIGFX::VIEW R-tree update on all footprints.
 
@@ -187,16 +286,16 @@ if HAS_GUI:
         def Notify(self):
             cur_ses_mtime = os.path.getmtime(self.ses_path) if os.path.exists(self.ses_path) else 0
             cur_pcb_mtime = os.path.getmtime(self.pcb_path) if os.path.exists(self.pcb_path) else 0
-            if cur_ses_mtime > self.last_ses_mtime:
+            if cur_ses_mtime > self.last_ses_mtime or cur_pcb_mtime > self.last_pcb_mtime:
                 self.last_ses_mtime = cur_ses_mtime
                 self.last_pcb_mtime = cur_pcb_mtime
-                import_ses_with_view_refresh(self.board, self.ses_path)
-            elif cur_pcb_mtime > self.last_pcb_mtime:
-                self.last_pcb_mtime = cur_pcb_mtime
-                try:
-                    pcbnew.Refresh()
-                except Exception:
-                    pass
+                if not trigger_kicad_revert_ipc():
+                    if os.path.exists(self.ses_path):
+                        import_ses_with_view_refresh(self.board, self.ses_path)
+                    try:
+                        pcbnew.Refresh()
+                    except Exception:
+                        pass
 
     _ACTIVE_WATCHER = None
 

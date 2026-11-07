@@ -1112,6 +1112,32 @@ impl NngKiCadClient {
 
     fn push_board_state(&mut self, board: &Board, pcb_path: &Path) -> std::io::Result<usize> {
         let doc_spec = self.get_open_pcb_document(board, pcb_path)?;
+
+        // 1. Try atomic document revert from disk.
+        // When Vulcan's Trials saves, the .kicad_pcb file on disk is already updated with all
+        // placements, routed tracks, vias, silkscreen offsets, netclasses, and filled zones.
+        // RevertDocument commands KiCad 10 / PCBNew to reload the document from disk (the exact IPC
+        // equivalent of File -> Revert), perfectly synchronizing all board objects in a single atomic step.
+        let mut rev_req = Vec::new();
+        proto_encode_bytes(1, &doc_spec, &mut rev_req);
+        if self
+            .send_command(
+                "type.googleapis.com/kiapi.common.commands.RevertDocument",
+                &rev_req,
+            )
+            .is_ok()
+        {
+            // Successfully reverted board in KiCad! Refill zones and return total items.
+            let mut refill_req = Vec::new();
+            proto_encode_bytes(1, &doc_spec, &mut refill_req);
+            let _ = self.send_command(
+                "type.googleapis.com/kiapi.board.commands.RefillZones",
+                &refill_req,
+            );
+            let total_items = board.footprints.len() + board.tracks.len() + board.arcs.len() + board.vias.len();
+            return Ok(total_items);
+        }
+
         let kicad_nets = self.get_nets_map(&doc_spec).unwrap_or_default();
 
         let mut item_header = Vec::new();
@@ -1159,9 +1185,11 @@ impl NngKiCadClient {
         });
 
         // Begin atomic KiCad undo/redo commit session
+        let mut begin_req = Vec::new();
+        proto_encode_bytes(1, &item_header, &mut begin_req);
         let (_, begin_resp) = self.send_command(
             "type.googleapis.com/kiapi.common.commands.BeginCommit",
-            &[],
+            &begin_req,
         )?;
         let mut commit_id = Vec::new();
         proto_walk(&begin_resp, |tag, wt, val| {
@@ -1386,6 +1414,7 @@ impl NngKiCadClient {
         let action = if sync_result.is_ok() { 1 } else { 2 }; // CMA_COMMIT = 1, CMA_DROP = 2
         proto_encode_varint_field(2, action, &mut end_req);
         proto_encode_str(3, "Vulcan's Trials PCB save sync", &mut end_req);
+        proto_encode_bytes(4, &item_header, &mut end_req);
         let _ = self.send_command(
             "type.googleapis.com/kiapi.common.commands.EndCommit",
             &end_req,
@@ -2607,6 +2636,11 @@ mod tests {
                     let mut cid = Vec::new();
                     proto_encode_str(1, "00000000-0000-4000-8000-000000000099", &mut cid);
                     proto_encode_bytes(1, &cid, &mut resp_payload);
+                } else if cmd_type_url.ends_with(".RevertDocument") {
+                    // Simulate KiCad instance without RevertDocument so this test exercises
+                    // the complete fallback item-by-item sync pipeline
+                    resp_type_url = "type.googleapis.com/kiapi.common.types.CommandStatusResponse";
+                    proto_encode_varint_field(1, 5, &mut resp_payload);
                 } else {
                     proto_encode_varint_field(1, 1, &mut resp_payload);
                 }
@@ -2614,7 +2648,11 @@ mod tests {
                 let mut header = Vec::new();
                 proto_encode_str(1, "test-kicad-token", &mut header);
                 let mut status = Vec::new();
-                proto_encode_varint_field(1, 1, &mut status); // AS_OK = 1
+                if cmd_type_url.ends_with(".RevertDocument") {
+                    proto_encode_varint_field(1, 5, &mut status); // status != 1 (error)
+                } else {
+                    proto_encode_varint_field(1, 1, &mut status); // AS_OK = 1
+                }
                 let any_resp = proto_encode_any(resp_type_url, &resp_payload);
                 let mut api_resp = Vec::new();
                 proto_encode_bytes(1, &header, &mut api_resp);
@@ -2697,6 +2735,142 @@ mod tests {
         assert!(commands.iter().any(|c| c.ends_with(".CreateItems")));
         assert!(commands.iter().any(|c| c.ends_with(".EndCommit")));
         assert!(commands.iter().any(|c| c.ends_with(".RefillZones")));
+    }
+
+    #[test]
+    fn test_nng_protobuf_revert_document_on_save() {
+        let Ok(lib) = NngLib::load() else {
+            return;
+        };
+        let (Some(rep0_open), Some(listen_fn)) = (lib.rep0_open, lib.listen) else {
+            return;
+        };
+
+        let sock_path = format!("/tmp/kicad_nng_revert_test_{}.sock", std::process::id());
+        let _ = fs::remove_file(&sock_path);
+
+        let mut srv_sock = NngSocket::default();
+        unsafe {
+            assert_eq!(rep0_open(&mut srv_sock), 0);
+            if let Some(set_ms) = lib.set_ms {
+                let _ = set_ms(srv_sock, NNG_OPT_RECVTIMEO.as_ptr() as *const _, 5_000);
+                let _ = set_ms(srv_sock, NNG_OPT_SENDTIMEO.as_ptr() as *const _, 5_000);
+            }
+            let uri = format!("ipc://{}\0", sock_path);
+            assert_eq!(listen_fn(srv_sock, uri.as_ptr() as *const _, std::ptr::null_mut(), 0), 0);
+        }
+
+        let srv_sock_id = srv_sock.id;
+        let server_thread = thread::spawn(move || {
+            let srv_lib = NngLib::load().unwrap();
+            let s = NngSocket { id: srv_sock_id };
+            let mut seen_commands = Vec::new();
+
+            loop {
+                let req_bytes = unsafe {
+                    let mut buf_ptr: *mut u8 = std::ptr::null_mut();
+                    let mut buf_len: usize = 0;
+                    let rv = (srv_lib.recv)(s, &mut buf_ptr, &mut buf_len, NNG_FLAG_ALLOC);
+                    if rv != 0 {
+                        break;
+                    }
+                    let slice = std::slice::from_raw_parts(buf_ptr, buf_len).to_vec();
+                    (srv_lib.free)(buf_ptr, buf_len);
+                    slice
+                };
+
+                let mut cmd_type_url = String::new();
+                proto_walk(&req_bytes, |tag, wt, val| {
+                    if tag == 2 && wt == 2 {
+                        let (turl, _) = proto_decode_any(val);
+                        cmd_type_url = turl;
+                    }
+                });
+                seen_commands.push(cmd_type_url.clone());
+
+                let mut resp_payload = Vec::new();
+                let mut resp_type_url = "type.googleapis.com/kiapi.common.types.CommandStatusResponse";
+
+                if cmd_type_url.ends_with(".GetOpenDocuments") {
+                    resp_type_url = "type.googleapis.com/kiapi.common.commands.GetOpenDocumentsResponse";
+                    let mut doc = Vec::new();
+                    proto_encode_varint_field(1, 3, &mut doc);
+                    proto_encode_str(4, "revert_board.kicad_pcb", &mut doc);
+                    proto_encode_bytes(1, &doc, &mut resp_payload);
+                } else if cmd_type_url.ends_with(".RevertDocument") {
+                    resp_type_url = "type.googleapis.com/kiapi.common.commands.RevertDocument";
+                    proto_encode_varint_field(1, 1, &mut resp_payload);
+                } else if cmd_type_url.ends_with(".RefillZones") {
+                    resp_type_url = "type.googleapis.com/kiapi.common.types.CommandStatusResponse";
+                    proto_encode_varint_field(1, 1, &mut resp_payload);
+                } else {
+                    proto_encode_varint_field(1, 1, &mut resp_payload);
+                }
+
+                let mut header = Vec::new();
+                proto_encode_str(1, "test-kicad-token", &mut header);
+                let mut status = Vec::new();
+                proto_encode_varint_field(1, 1, &mut status); // AS_OK = 1
+                let any_resp = proto_encode_any(resp_type_url, &resp_payload);
+                let mut api_resp = Vec::new();
+                proto_encode_bytes(1, &header, &mut api_resp);
+                proto_encode_bytes(2, &status, &mut api_resp);
+                proto_encode_bytes(3, &any_resp, &mut api_resp);
+
+                unsafe {
+                    let _ = (srv_lib.send)(s, api_resp.as_ptr(), api_resp.len(), 0);
+                }
+
+                if cmd_type_url.ends_with(".RefillZones") {
+                    break;
+                }
+            }
+
+            unsafe {
+                let _ = (srv_lib.close)(s);
+            }
+            seen_commands
+        });
+
+        let mut client = KiCadIpcClient::connect(&sock_path).expect("NNG connect must succeed");
+        assert!(client.is_connected());
+
+        let mut board = crate::board::Board::default();
+        board.file_path = "/tmp/revert_board.kicad_pcb".to_string();
+        board.footprints.push(crate::board::Footprint {
+            reference: "U1".to_string(),
+            x: 10.0,
+            y: 20.0,
+            ..Default::default()
+        });
+        board.tracks.push(crate::board::TrackSegment {
+            start: (10.0, 20.0),
+            end: (15.0, 20.0),
+            width: 0.25,
+            layer: 0,
+            net_id: 1,
+            is_locked: false,
+        });
+
+        let synced = client
+            .pull_board_into_kicad(
+                &board,
+                Path::new("/tmp/revert_board.kicad_pcb"),
+                Path::new("/tmp/revert_board.ses"),
+            )
+            .expect("NNG pull_board_into_kicad with RevertDocument must succeed");
+        // 1 footprint + 1 track = 2 items
+        assert_eq!(synced, 2);
+
+        let commands = server_thread.join().expect("NNG server thread join");
+        let _ = fs::remove_file(&sock_path);
+
+        assert!(commands.iter().any(|c| c.ends_with(".Ping")));
+        assert!(commands.iter().any(|c| c.ends_with(".GetOpenDocuments")));
+        assert!(commands.iter().any(|c| c.ends_with(".RevertDocument")));
+        assert!(commands.iter().any(|c| c.ends_with(".RefillZones")));
+        // Must NOT need BeginCommit / UpdateItems when RevertDocument succeeds
+        assert!(!commands.iter().any(|c| c.ends_with(".BeginCommit")));
     }
 
     #[test]
