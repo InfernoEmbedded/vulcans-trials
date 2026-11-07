@@ -2160,8 +2160,10 @@ impl VulcansTrialsApp {
         egui::TopBottomPanel::top("vulcan_top_bar").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new(format!("⚡ Vulcan's Trials v{}", env!("CARGO_PKG_VERSION"))).color(Color32::from_rgb(255, 145, 50)));
-                ui.label(egui::RichText::new("by InfernoEmbedded (GPLv3)").weak());
+                ui.heading(egui::RichText::new(format!("⚡ Vulcan's Trials v{}", env!("CARGO_PKG_VERSION"))).color(Color32::from_rgb(255, 145, 50)))
+                    .on_hover_text("Vulcan's Trials — Unified Vulkan GPU + multi-core CPU PCB Auto-Placer and Auto-Router for KiCad 8/9/10.");
+                ui.label(egui::RichText::new("by InfernoEmbedded (GPLv3)").weak())
+                    .on_hover_text("Licensed under GNU General Public License v3.0 (GPL-3.0-only).");
                 ui.separator();
 
                 if let Some(ref vk) = self.vulkan {
@@ -2169,25 +2171,43 @@ impl VulcansTrialsApp {
                         egui::RichText::new(format!("Vulkan GPU: {} [{}]", vk.device_name, vk.backend_name))
                             .color(Color32::from_rgb(110, 230, 130))
                             .strong(),
-                    );
+                    )
+                    .on_hover_text("Active Vulkan GPU compute device accelerating 2D Euclidean Distance Field (EDF) obstacle transforms via WGSL shaders.");
                 } else {
-                    ui.label(egui::RichText::new("GPU: CPU Fallback").color(Color32::YELLOW));
+                    ui.label(egui::RichText::new("GPU: CPU Fallback").color(Color32::YELLOW))
+                        .on_hover_text("No Vulkan GPU adapter initialized; obstacle distance field transforms are evaluated on multi-core CPU worker threads.");
                 }
 
                 ui.separator();
-                draw_load_badge(ui, "CPU Load", telem.cpu_load_pct, &telem.cpu_history, Color32::from_rgb(80, 180, 255));
+                draw_load_badge(
+                    ui,
+                    "CPU Load",
+                    telem.cpu_load_pct,
+                    &telem.cpu_history,
+                    Color32::from_rgb(80, 180, 255),
+                    "Live system CPU utilization (%) sampled from /proc/stat across multi-core Simulated Annealing and PathFinder routing threads.",
+                );
                 ui.separator();
-                draw_load_badge(ui, "GPU Load", telem.gpu_load_pct, &telem.gpu_history, Color32::from_rgb(255, 120, 60));
+                draw_load_badge(
+                    ui,
+                    "GPU Load",
+                    telem.gpu_load_pct,
+                    &telem.gpu_history,
+                    Color32::from_rgb(255, 120, 60),
+                    "Live GPU compute utilization (%) combining Vulkan WGSL compute duty cycle and nvidia-smi / DRM sysfs telemetry.",
+                );
             });
 
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(snap.phase.label()).strong());
+                ui.label(egui::RichText::new(snap.phase.label()).strong())
+                    .on_hover_text("Current execution phase of the trial pipeline (Idle, Auto-Placing, Auto-Routing, or Completed).");
                 ui.add(
                     egui::ProgressBar::new(snap.progress)
                         .text(snap.status_text.as_str())
                         .animate(is_running),
-                );
+                )
+                .on_hover_text("Live trial progress bar and status summary showing current annealing temperature, rip-up pass, or DRC convergence state.");
             });
             ui.add_space(4.0);
         });
@@ -2199,7 +2219,8 @@ impl VulcansTrialsApp {
             .max_width(310.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
-                ui.heading("Controls");
+                ui.heading("Controls")
+                    .on_hover_text("Board file management, interactive manual routing/sketch tools, and automated placement/routing trial execution.");
 
                 if let Some(ref route) = self.active_route {
                     let layer_name = snap.board.layer_name(route.current_layer);
@@ -2211,7 +2232,8 @@ impl VulcansTrialsApp {
                             ))
                             .color(Color32::from_rgb(255, 220, 80))
                             .strong(),
-                        );
+                        )
+                        .on_hover_text("Active manual track routing: Left-click to anchor a 45° dogleg corner or finish on a same-net pad/via, press 'V' to insert a layer-transition via, '/' to toggle dogleg posture, or 'Esc' to cancel.");
                     });
                     ui.add_space(2.0);
                 } else if self.route_tool_active {
@@ -2219,22 +2241,31 @@ impl VulcansTrialsApp {
                         ui.label(
                             egui::RichText::new("Route Mode Active | Click pad, via, or track to start [Esc to exit]")
                                 .color(Color32::from_rgb(100, 220, 255)),
-                        );
+                        )
+                        .on_hover_text("Interactive manual routing mode is armed: click any copper pad, via, or trace on the canvas to start routing its net, or press 'Esc' to exit.");
                     });
                     ui.add_space(2.0);
                 }
 
                 ui.horizontal(|ui| {
-                    ui.label("Input PCB:");
-                    ui.text_edit_singleline(&mut self.input_path);
+                    ui.label("Input PCB:")
+                        .on_hover_text("Source KiCad board file (.kicad_pcb) to load. Companion .kicad_sch files in the same directory are parsed automatically for schematic cluster affinity.");
+                    ui.text_edit_singleline(&mut self.input_path)
+                        .on_hover_text("Filesystem path to the input .kicad_pcb file. Treated as read-only unless Output PCB points to the same path.");
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Output PCB:");
-                    ui.text_edit_singleline(&mut self.output_path);
+                    ui.label("Output PCB:")
+                        .on_hover_text("Destination path for the placed and routed KiCad board (.kicad_pcb) and companion Specctra session (.ses) file.");
+                    ui.text_edit_singleline(&mut self.output_path)
+                        .on_hover_text("Filesystem path where .kicad_pcb and .ses outputs are written upon trial completion or manual save.");
                 });
 
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(!is_running, egui::Button::new("📂 Reload Input PCB")).clicked() {
+                    if ui
+                        .add_enabled(!is_running, egui::Button::new("📂 Reload Input PCB"))
+                        .on_hover_text("Reload the source .kicad_pcb file from disk, discarding unsaved placement or routing edits and resetting board state.")
+                        .clicked()
+                    {
                         if let Ok(b) = Board::load(&self.input_path, &HashSet::new()) {
                             let mut g = self.live.lock().unwrap();
                             *g = LiveTrialState::new(b);
@@ -2249,6 +2280,7 @@ impl VulcansTrialsApp {
                                     .color(Color32::from_rgb(255, 140, 140)),
                             ),
                         )
+                        .on_hover_text("Rip up all unlocked routed copper tracks and vias, and move all unlocked footprints off the board into the Holding Palette (locked footprints and locked traces are preserved).")
                         .clicked()
                     {
                         self.show_holding_palette = true;
@@ -2272,7 +2304,11 @@ impl VulcansTrialsApp {
                     } else {
                         egui::Button::new("⚡ Route Track (X)")
                     };
-                    if ui.add_enabled(!is_running, route_btn).clicked() {
+                    if ui
+                        .add_enabled(!is_running, route_btn)
+                        .on_hover_text("Toggle interactive 45° dogleg manual routing mode (Shortcut: X). Click any pad, via, or track to start routing; press 'V' to place a via and switch layers, '/' to flip dogleg posture, or 'Esc' to cancel.")
+                        .clicked()
+                    {
                         self.route_tool_active = !self.route_tool_active;
                         if !self.route_tool_active {
                             self.active_route = None;
@@ -2288,7 +2324,11 @@ impl VulcansTrialsApp {
                     } else {
                         egui::Button::new("🌊 Bus Sketch (B)")
                     };
-                    if ui.add_enabled(!is_running, bundle_btn).clicked() {
+                    if ui
+                        .add_enabled(!is_running, bundle_btn)
+                        .on_hover_text("Toggle multi-net Bus Bundle river-routing sketch mode (Shortcut: B). Left-click waypoints on the canvas to draw a guide spine, then press 'Enter' or Right-Click to pack and route parallel bus traces.")
+                        .clicked()
+                    {
                         self.bundle_sketch_active = !self.bundle_sketch_active;
                         if !self.bundle_sketch_active {
                             self.bundle_guide_points.clear();
@@ -2307,6 +2347,7 @@ impl VulcansTrialsApp {
                                     .strong(),
                             ),
                         )
+                        .on_hover_text("Run a complete end-to-end trial: execute Parallel Tempering Simulated Annealing auto-placement (including components in the Holding Palette), legalize courtyards, and run multi-layer PathFinder auto-routing.")
                         .clicked()
                     {
                         self.start_trial(true, true);
@@ -2314,6 +2355,7 @@ impl VulcansTrialsApp {
 
                     if ui
                         .add_enabled(is_running, egui::Button::new("⏹ Stop"))
+                        .on_hover_text("Gracefully stop the active auto-placement or auto-routing worker thread after the current pass completes.")
                         .clicked()
                     {
                         self.stop_flag.store(true, Ordering::Relaxed);
@@ -2323,12 +2365,14 @@ impl VulcansTrialsApp {
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(!is_running, egui::Button::new("📐 Auto-Place Only"))
+                        .on_hover_text("Run only the multi-core Parallel Tempering Simulated Annealing auto-placer and SAT courtyard legalizer without routing tracks.")
                         .clicked()
                     {
                         self.start_trial(true, false);
                     }
                     if ui
                         .add_enabled(!is_running, egui::Button::new("⚡ Auto-Route Only"))
+                        .on_hover_text("Run only the multi-layer 3D A* and PathFinder negotiated-congestion auto-router on the current component placement.")
                         .clicked()
                     {
                         self.start_trial(false, true);
@@ -2345,7 +2389,7 @@ impl VulcansTrialsApp {
                 if ui
                     .add_enabled(!is_running && has_copper, egui::Button::new(swap_label))
                     .on_hover_text(
-                        "Post-route swap between straight octilinear (45°/90°) tracks and smooth, hand-drawn organic curved tracks",
+                        "Post-route swap between straight octilinear (45°/90°) tracks and smooth, hand-drawn TopoR-style organic tangent arcs while preserving DRC clearances.",
                     )
                     .clicked()
                 {
@@ -2354,71 +2398,86 @@ impl VulcansTrialsApp {
 
                 if ui
                     .add_enabled(!is_running, egui::Button::new("💾 Save Output (.kicad_pcb + .ses)"))
+                    .on_hover_text("Write the current component placement, copper tracks, arcs, and stitched vias to the Output .kicad_pcb file and Specctra .ses session file, refill zones, and sync to KiCad over IPC.")
                     .clicked()
                 {
                     self.save_output_and_pull_to_kicad();
                 }
 
                 ui.separator();
-                ui.heading("Parameters");
+                ui.heading("Parameters")
+                    .on_hover_text("Primary placement duration, courtyard clearance, routing grid resolution, and PathFinder iteration limits.");
                 ui.add_enabled(
                     !is_running,
                     egui::Slider::new(&mut self.place_duration_secs, 2..=600).text("Place Time (s)"),
-                );
+                )
+                .on_hover_text("Wall-clock duration in seconds (2–600 s, default 120 s) for Parallel Tempering Simulated Annealing placement optimization before final SAT courtyard legalization.");
                 ui.add_enabled(
                     !is_running,
                     egui::Slider::new(&mut self.min_spacing_mm, 0.10..=1.00).text("Courtyard Gap (mm)"),
-                );
+                )
+                .on_hover_text("Minimum physical courtyard-to-courtyard clearance in millimeters (0.10–1.00 mm, default 0.25 mm) enforced between adjacent components on the same board side.");
                 ui.add_enabled(
                     !is_running,
                     egui::Slider::new(&mut self.grid_res_mm, 0.05..=0.25).text("Route Grid (mm)"),
-                );
+                )
+                .on_hover_text("Uniform spatial grid resolution in millimeters (0.05–0.25 mm, default 0.10 mm) for the 3D A* router and Vulkan GPU Euclidean Distance Field obstacle map. Finer values aid 0.5 mm-pitch QFN escapes at higher compute cost.");
                 ui.add_enabled(
                     !is_running,
                     egui::Slider::new(&mut self.max_ripup_passes, 1..=30).text("Max Rip-up Passes"),
-                );
+                )
+                .on_hover_text("Maximum number of PathFinder negotiated-congestion rip-up and reroute passes (1–30 passes, default 15) used to resolve copper shorts and routing bottlenecks.");
 
                 ui.collapsing("Advanced Autoplacer", |ui| {
                     ui.add_enabled(
                         !is_running,
                         egui::Checkbox::new(&mut self.allow_layer_flip, "Allow SMD Side Flip (F.Cu ↔ B.Cu)"),
-                    );
+                    )
+                    .on_hover_text("Allow the Simulated Annealing auto-placer to flip unlocked SMD footprints between Top (F.Cu) and Bottom (B.Cu) layers. Leave unchecked for single-sided SMT assembly (e.g. JLCPCB F.Cu standard assembly).");
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.max_jump_radius_mm, 2.0..=50.0)
                             .text("Max Jump Radius (mm)")
                             .suffix(" mm"),
-                    );
+                    )
+                    .on_hover_text("Maximum translation distance in millimeters (2.0–50.0 mm, default 20.0 mm) for single-component perturbation moves at high annealing temperatures.");
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.pair_swap_prob, 0.0..=0.50)
                             .text("Pair Swap %")
                             .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)),
-                    );
+                    )
+                    .on_hover_text("Probability (0%–50%, default 15%) of proposing a pairwise coordinate swap between two unlocked footprints during a Simulated Annealing step.");
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.centroid_pull_prob, 0.0..=0.60)
                             .text("Centroid Pull %")
                             .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)),
-                    );
+                    )
+                    .on_hover_text("Probability (0%–60%, default 20%) of biasing a component perturbation toward the ratsnest force-directed centroid of its connected pads to minimize wirelength.");
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.temp_scale, 0.2..=4.0)
                             .text("Annealing Temp Scale")
                             .suffix("x"),
-                    );
+                    )
+                    .on_hover_text("Scaling multiplier (0.2x–4.0x, default 1.0x) applied to the Parallel Tempering replica temperature ladder (T_min to T_max). Higher values promote broader uphill exploration.");
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.escape_margin_mult, 0.5..=3.0)
                             .text("Escape Corridor Halo")
                             .suffix("x"),
-                    );
+                    )
+                    .on_hover_text("Multiplier (0.5x–3.0x, default 1.0x) expanding the virtual pin-density courtyard halo around high-pin-count ICs and connectors to preserve routing escape corridors.");
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.crossing_weight, 50.0..=600.0)
                             .text("Crossing Penalty Weight"),
-                    );
-                });
+                    )
+                    .on_hover_text("Objective cost weight (50–600, default 200) penalizing each topological MST ratsnest airwire intersection to untangle signal flow before routing.");
+                })
+                .header_response
+                .on_hover_text("Expand advanced Parallel Tempering Simulated Annealing exploration probabilities, temperature scaling, and cost weights.");
 
                 ui.collapsing("Advanced Autorouter", |ui| {
                     ui.add_enabled(
@@ -2426,63 +2485,74 @@ impl VulcansTrialsApp {
                         egui::Slider::new(&mut self.via_merge_radius_mm, 0.50..=8.00)
                             .text("Via Merge Radius (mm)")
                             .suffix(" mm"),
-                    );
+                    )
+                    .on_hover_text("Maximum search radius in millimeters (0.50–8.00 mm, default 4.00 mm) for consolidating redundant same-net vias during post-route optimization.");
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.via_detour_budget_mm, 0.50..=8.00)
                             .text("Via Merge Detour Budget (mm)")
                             .suffix(" mm"),
-                    );
+                    )
+                    .on_hover_text("Maximum extra trace detour length in millimeters (0.50–8.00 mm, default 3.50 mm) allowed when merging two same-net vias into one.");
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.via_hop_max_detour_ratio, 1.00..=2.00)
                             .text("Via Hop Max Detour Ratio")
                             .suffix("x"),
-                    );
+                    )
+                    .on_hover_text("Maximum ratio of single-layer rerouted path length to direct distance (1.00x–2.00x, default 1.25x) when eliminating a dual-via layer hop.");
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.plane_via_share_radius_mm, 0.50..=8.00)
                             .text("Plane Via Share Radius (mm)")
                             .suffix(" mm"),
-                    );
+                    )
+                    .on_hover_text("Maximum distance in millimeters (0.50–8.00 mm, default 3.50 mm) within which nearby ground or power pads can share an existing reference-plane fanout via.");
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.return_via_max_dist_mm, 0.50..=3.50)
                             .text("Return Via Max Radius (mm)")
                             .suffix(" mm"),
-                    );
+                    )
+                    .on_hover_text("Maximum distance in millimeters (0.50–3.50 mm, default 1.40 mm) from a layer-transition signal via to a GND via before automatic return-current ground stitching places a companion GND via.");
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.via_pad_snap_dist_mm, 0.00..=1.50)
                             .text("Via-to-Pad Snap Dist (mm)")
                             .suffix(" mm"),
-                    );
+                    )
+                    .on_hover_text("Threshold distance in millimeters (0.00–1.50 mm, default 0.50 mm) within which post-route cleanup snaps nearly aligned fanout vias onto the exact X/Y centerline of connected SMD pads.");
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.inner_plane_penalty, 1.0..=30.0)
                             .text("Inner Plane Penalty"),
-                    );
+                    )
+                    .on_hover_text("Routing cost multiplier (1.0–30.0, default 8.0) penalizing signal tracks on dedicated inner ground/power planes (In1.Cu / In2.Cu) to keep reference planes unbroken.");
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.congestion_factor, 0.50..=5.00)
                             .text("Congestion Penalty Factor"),
-                    );
+                    )
+                    .on_hover_text("PathFinder historical congestion escalation rate (0.50–5.00, default 1.50) controlling how strongly contested grid cells are penalized across rip-up passes.");
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.crosstalk_penalty, 0.0..=20.0)
                             .text("Crosstalk Penalty Weight"),
-                    );
+                    )
+                    .on_hover_text("Soft proximity cost weight (0.0–20.0, default 4.0) discouraging long parallel coupled runs between adjacent signal traces to reduce electromagnetic crosstalk.");
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.nudge_step_mm, 0.05..=1.00)
                             .text("Shove / Nudge Step (mm)")
                             .suffix(" mm"),
-                    );
+                    )
+                    .on_hover_text("Incremental step distance in millimeters (0.05–1.00 mm, default 0.25 mm) used by the NudgeEngine when shifting unlocked passives to open blocked routing channels.");
                     ui.add_enabled(
                         !is_running,
                         egui::Slider::new(&mut self.gloss_passes, 1..=6)
                             .text("Glossing Passes"),
-                    );
+                    )
+                    .on_hover_text("Number of post-route trace rubber-banding, staircase removal, and corner-shortening glossing passes (1–6 passes, default 2).");
                     if ui
                         .add_enabled(
                             !is_running,
@@ -2490,6 +2560,7 @@ impl VulcansTrialsApp {
                                 .text("Fillet Radius (<90°)")
                                 .suffix(" mm"),
                         )
+                        .on_hover_text("Tangent arc fillet radius in millimeters (0.0–2.0 mm, default 0.35 mm) applied to sharp corners (< 90°) and organic TopoR bends to eliminate acid traps and impedance discontinuities.")
                         .changed()
                     {
                         if let Ok(mut g) = self.live.lock() {
@@ -2499,12 +2570,14 @@ impl VulcansTrialsApp {
                     ui.add_enabled(
                         !is_running,
                         egui::Checkbox::new(&mut self.allow_component_nudge, "Allow Router to Nudge Unlocked Passives"),
-                    );
+                    )
+                    .on_hover_text("Allow the dynamic NudgeEngine to slightly shift unlocked 2-pad passives (resistors, capacitors) within courtyard DRC limits when pad escape channels are blocked.");
                     if ui
                         .add_enabled(
                             !is_running,
                             egui::Checkbox::new(&mut self.allow_via_in_pad, "Allow Via-in-Pad"),
                         )
+                        .on_hover_text("Permit placing vias directly inside SMD pads (e.g. QFN thermal pads or tight BGA fanouts). Leave unchecked for standard non-filled/non-capped SMT assembly to prevent solder wicking.")
                         .changed()
                     {
                         if let Ok(mut g) = self.live.lock() {
@@ -2517,16 +2590,24 @@ impl VulcansTrialsApp {
                             !is_running,
                             egui::Checkbox::new(&mut self.any_angle_mode, "Any-Angle / Organic Mode (TopoR Arcs)"),
                         )
+                        .on_hover_text("Enable any-angle Euclidean rubber-band routing and smooth tangent arc fillets (TopoR style) instead of strict 45°/90° octilinear traces.")
                         .changed()
                         && has_copper
                     {
                         self.swap_organic_tracks(self.any_angle_mode);
                     }
-                });
+                })
+                .header_response
+                .on_hover_text("Expand advanced 3D A* and PathFinder router parameters: via merging, return-current stitching, plane penalties, crosstalk, glossing, and organic TopoR arcs.");
 
                 ui.separator();
-                ui.heading("KiCad 10 IPC Live Sync");
-                if ui.checkbox(&mut self.kicad_ipc_enabled, "KiCad IPC Live Sync").changed() {
+                ui.heading("KiCad 10 IPC Live Sync")
+                    .on_hover_text("Real-time bidirectional board synchronization with a running KiCad 10 PCB editor over its local IPC socket.");
+                if ui
+                    .checkbox(&mut self.kicad_ipc_enabled, "KiCad IPC Live Sync")
+                    .on_hover_text("Enable live streaming of component placements, routed tracks, and vias to an open KiCad 10 PCB editor session.")
+                    .changed()
+                {
                     if self.kicad_ipc_enabled && !self.is_ipc_connected() {
                         self.try_connect_ipc(false);
                     } else if !self.kicad_ipc_enabled {
@@ -2535,13 +2616,19 @@ impl VulcansTrialsApp {
                 }
 
                 ui.horizontal(|ui| {
-                    ui.label("Socket:");
+                    ui.label("Socket:")
+                        .on_hover_text("UNIX domain socket URI for the KiCad 10 IPC server (typically ipc:///tmp/kicad/api.sock).");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.kicad_ipc_socket_path)
                             .hint_text("ipc:///tmp/kicad/api.sock")
                             .desired_width(160.0),
-                    );
-                    if ui.button("Connect").clicked() {
+                    )
+                    .on_hover_text("Custom KiCad IPC socket URI or filesystem path. Leave default to auto-discover active KiCad sockets.");
+                    if ui
+                        .button("Connect")
+                        .on_hover_text("Immediately attempt to connect or reconnect to the configured KiCad IPC socket.")
+                        .clicked()
+                    {
                         self.kicad_ipc_enabled = true;
                         self.try_connect_ipc(false);
                     }
@@ -2568,12 +2655,15 @@ impl VulcansTrialsApp {
                     }
                 };
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Status:").strong());
-                    ui.label(egui::RichText::new(status_text).color(status_col));
+                    ui.label(egui::RichText::new("Status:").strong())
+                        .on_hover_text("Current connection state of the KiCad 10 IPC client.");
+                    ui.label(egui::RichText::new(status_text).color(status_col))
+                        .on_hover_text("Live IPC link status; automatically polls for a running KiCad instance every 2 seconds when enabled.");
                 });
 
                 ui.separator();
-                ui.heading("Visibility & View");
+                ui.heading("Visibility & View")
+                    .on_hover_text("Toggle visibility of copper layers, vias, ratsnest airwires, courtyards, reference designators, and camera viewport controls.");
                 let active_layers = snap.board.copper_layers();
                 let display_layers = kicad_layer_display_order(&active_layers);
                 let plane_names = snap.board.layer_plane_net_names();
@@ -2581,7 +2671,8 @@ impl VulcansTrialsApp {
                     ui.checkbox(
                         &mut self.show_holding_palette,
                         format!("Holding Palette ({})", snap.board.holding_palette.len()),
-                    );
+                    )
+                    .on_hover_text("Show or hide the Holding Palette panel containing unplaced or cleared components (Right-click any unlocked footprint on the canvas to move it to the Holding Palette).");
                     // KiCad layer order with colour swatches (text tinted to the canvas colour)
                     for &layer_name in &display_layers {
                         let l_idx = active_layers.iter().position(|&l| l == layer_name);
@@ -2605,16 +2696,31 @@ impl VulcansTrialsApp {
                         };
                         let col = copper_layer_color(layer_name);
                         let mut vis = self.is_layer_visible(layer_name);
-                        if ui.checkbox(&mut vis, egui::RichText::new(label).color(col)).changed() {
+                        if ui
+                            .checkbox(&mut vis, egui::RichText::new(label).color(col))
+                            .on_hover_text(format!(
+                                "Toggle display and interactive click hit-testing for copper tracks, arcs, and SMD pads on layer {}.",
+                                layer_name
+                            ))
+                            .changed()
+                        {
                             self.set_layer_visible(layer_name, vis);
                         }
                     }
-                    ui.checkbox(&mut self.show_vias, egui::RichText::new("Vias").color(COL_VIA));
-                    ui.checkbox(&mut self.show_ratsnest, egui::RichText::new("Ratsnest").color(COL_RATSNEST));
-                    ui.checkbox(&mut self.show_courtyards, egui::RichText::new("Courtyards").color(COL_F_CRTYD));
-                    ui.checkbox(&mut self.show_refs, "References");
+                    ui.checkbox(&mut self.show_vias, egui::RichText::new("Vias").color(COL_VIA))
+                        .on_hover_text("Toggle display and click selection of through-hole and blind/buried vias (copper annular rings and drill holes).");
+                    ui.checkbox(&mut self.show_ratsnest, egui::RichText::new("Ratsnest").color(COL_RATSNEST))
+                        .on_hover_text("Toggle display of unrouted Euclidean Minimum Spanning Tree (MST) ratsnest airwire lines between pads.");
+                    ui.checkbox(&mut self.show_courtyards, egui::RichText::new("Courtyards").color(COL_F_CRTYD))
+                        .on_hover_text("Toggle display of component courtyard collision polygons (F.CrtYd in magenta, B.CrtYd in cyan, locked footprints in gold).");
+                    ui.checkbox(&mut self.show_refs, "References")
+                        .on_hover_text("Toggle display of component reference designator labels (e.g. U1, R10, C4) centered on each footprint.");
                 });
-                if ui.button("🔍 Reset Camera View").clicked() {
+                if ui
+                    .button("🔍 Reset Camera View")
+                    .on_hover_text("Reset canvas pan offset to (0, 0) and zoom to 1.0x so the entire PCB outline fits centered in the viewport (Drag canvas to pan, scroll wheel to zoom).")
+                    .clicked()
+                {
                     self.pan_offset = Vec2::ZERO;
                     self.zoom = 1.0;
                 }
@@ -2622,10 +2728,14 @@ impl VulcansTrialsApp {
                 ui.separator();
                 ui.collapsing(format!("Net Classes ({})", snap.board.netclasses.len()), |ui| {
                     egui::Grid::new("netclasses_grid").striped(true).show(ui, |ui| {
-                        ui.label(egui::RichText::new("Class").strong());
-                        ui.label(egui::RichText::new("Width").strong());
-                        ui.label(egui::RichText::new("Clearance").strong());
-                        ui.label(egui::RichText::new("Nets").strong());
+                        ui.label(egui::RichText::new("Class").strong())
+                            .on_hover_text("Netclass name parsed from the KiCad project or board setup.");
+                        ui.label(egui::RichText::new("Width").strong())
+                            .on_hover_text("Nominal copper track width in millimeters assigned to this netclass.");
+                        ui.label(egui::RichText::new("Clearance").strong())
+                            .on_hover_text("Minimum edge-to-edge copper clearance in millimeters enforced bidirectionally for nets in this class.");
+                        ui.label(egui::RichText::new("Nets").strong())
+                            .on_hover_text("Number of electrical nets assigned to this netclass.");
                         ui.end_row();
 
                         let mut sorted_classes: Vec<&String> = snap.board.netclasses.keys().collect();
@@ -2633,19 +2743,24 @@ impl VulcansTrialsApp {
                         for cname in sorted_classes {
                             let nc = &snap.board.netclasses[cname];
                             let count = snap.board.net_to_class.values().filter(|&v| v == cname).count();
-                            ui.label(cname);
+                            ui.label(cname)
+                                .on_hover_text(format!("Netclass '{}': via diameter {:.2} mm, via drill {:.2} mm.", cname, nc.via_dia, nc.via_drill));
                             ui.label(format!("{:.2} mm", nc.track_width));
                             ui.label(format!("{:.2} mm", nc.clearance));
                             ui.label(format!("{}", count));
                             ui.end_row();
                         }
                     });
-                });
+                })
+                .header_response
+                .on_hover_text("Inspect KiCad netclass design rules (track widths, bidirectional clearances, and net counts).");
 
                 ui.separator();
-                ui.heading("Live Metrics");
+                ui.heading("Live Metrics")
+                    .on_hover_text("Real-time placement and routing quality metrics updated continuously during trial execution.");
                 egui::Grid::new("metrics_grid").striped(true).show(ui, |ui| {
-                    ui.label("Footprints:");
+                    ui.label("Footprints:")
+                        .on_hover_text("Total component footprints placed on the board, along with locked and bottom-side (B.Cu) counts.");
                     let locked_n = snap.board.footprints.iter().filter(|f| f.is_locked).count();
                     let back_n = snap.board.footprints.iter().filter(|f| f.layer == 1).count();
                     ui.label(format!(
@@ -2653,42 +2768,59 @@ impl VulcansTrialsApp {
                         snap.board.footprints.len(),
                         locked_n,
                         back_n
-                    ));
+                    ))
+                    .on_hover_text("Click any footprint body on the canvas to toggle its lock state, or press 'M' / 'R' / 'F' to move, rotate 90°, or flip unlocked components.");
                     ui.end_row();
 
-                    ui.label("Ratsnest Crossings:");
-                    ui.label(format!("{}", snap.crossings));
+                    ui.label("Ratsnest Crossings:")
+                        .on_hover_text("Pairwise geometric intersections between unrouted MST airwire segments. Minimizing crossings reduces via count and layer congestion.");
+                    ui.label(format!("{}", snap.crossings))
+                        .on_hover_text("Current number of topological ratsnest airwire crossings.");
                     ui.end_row();
 
-                    ui.label("MST Wirelength:");
-                    ui.label(format!("{:.1} mm", snap.wirelength_mm));
+                    ui.label("MST Wirelength:")
+                        .on_hover_text("Total Euclidean Minimum Spanning Tree (MST) airwire length in millimeters across all nets.");
+                    ui.label(format!("{:.1} mm", snap.wirelength_mm))
+                        .on_hover_text("Lower MST wirelength indicates tighter, more compact signal routing paths.");
                     ui.end_row();
 
-                    ui.label("Courtyard Overlaps:");
-                    ui.label(format!("{}", snap.overlaps));
+                    ui.label("Courtyard Overlaps:")
+                        .on_hover_text("Number of physical courtyard polygon collisions detected via Separating Axis Theorem (SAT) on the same board side. Must be 0 for DRC-clean assembly.");
+                    ui.label(format!("{}", snap.overlaps))
+                        .on_hover_text("Current count of overlapping component courtyards.");
                     ui.end_row();
 
-                    ui.label("SA Throughput:");
-                    ui.label(format!("{:.0} evals/sec", snap.evals_per_sec));
+                    ui.label("SA Throughput:")
+                        .on_hover_text("Simulated Annealing placement evaluation rate in candidate board states per second across all CPU threads.");
+                    ui.label(format!("{:.0} evals/sec", snap.evals_per_sec))
+                        .on_hover_text("Measured multi-core Parallel Tempering evaluation throughput.");
                     ui.end_row();
 
-                    ui.label("Routed Connections:");
+                    ui.label("Routed Connections:")
+                        .on_hover_text("Number and percentage of two-terminal pad-to-pad net connections successfully routed without copper shorts.");
                     let pct = if snap.total_conns > 0 {
                         (snap.routed_conns as f64 / snap.total_conns as f64) * 100.0
                     } else {
                         0.0
                     };
-                    ui.label(format!("{}/{} ({:.1}%)", snap.routed_conns, snap.total_conns, pct));
+                    ui.label(format!("{}/{} ({:.1}%)", snap.routed_conns, snap.total_conns, pct))
+                        .on_hover_text("Target is 100.0% routed connections with 0 DRC violations.");
                     ui.end_row();
 
-                    ui.label("Tracks / Vias:");
-                    ui.label(format!("{} segs / {} vias", snap.board.tracks.len(), snap.board.vias.len()));
+                    ui.label("Tracks / Vias:")
+                        .on_hover_text("Total number of routed copper track segments and layer-transition vias currently on the board.");
+                    ui.label(format!("{} segs / {} vias", snap.board.tracks.len(), snap.board.vias.len()))
+                        .on_hover_text("Current count of straight/curved track segments and plated through-hole vias.");
                     ui.end_row();
                 });
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("💾 Save Preferences").clicked() {
+                    if ui
+                        .button("💾 Save Preferences")
+                        .on_hover_text("Explicitly write all current placer, router, viewport, and IPC settings to the persistent preferences.json configuration file.")
+                        .clicked()
+                    {
                         self.save_preferences();
                     }
                     let cfg_path = self.preferences_path.clone().unwrap_or_else(AppPreferences::config_path);
@@ -2701,7 +2833,8 @@ impl VulcansTrialsApp {
                 });
 
                 ui.separator();
-                ui.heading("Activity Log");
+                ui.heading("Activity Log")
+                    .on_hover_text("Chronological log of placement milestones, PathFinder rip-up passes, interactive edits, file saves, and KiCad IPC events.");
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
@@ -2721,8 +2854,13 @@ impl VulcansTrialsApp {
                 .show(ctx, |ui| {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.heading(format!("Holding Palette ({})", snap.board.holding_palette.len()));
-                        if ui.add_enabled(!is_running, egui::Button::new("Place All")).clicked() {
+                        ui.heading(format!("Holding Palette ({})", snap.board.holding_palette.len()))
+                            .on_hover_text("Staging area for unplaced or cleared footprints waiting to be positioned on the PCB.");
+                        if ui
+                            .add_enabled(!is_running, egui::Button::new("Place All"))
+                            .on_hover_text("Automatically place all components from the Holding Palette onto the board at non-overlapping locations that minimize ratsnest wirelength.")
+                            .clicked()
+                        {
                             let cfg = PlacementConfig {
                                 min_spacing_mm: self.min_spacing_mm,
                                 allow_layer_flip: self.allow_layer_flip,
@@ -2739,7 +2877,8 @@ impl VulcansTrialsApp {
                             .weak()
                             .italics()
                             .size(11.0),
-                    );
+                    )
+                    .on_hover_text("Components are ordered in natural alphanumeric designator order (e.g. C1, C2, C10, R1, U1).");
                     ui.separator();
 
                     egui::ScrollArea::vertical()
@@ -2749,16 +2888,31 @@ impl VulcansTrialsApp {
                             let mut place_single_idx = None;
                             for (idx, fp) in snap.board.holding_palette.iter().enumerate() {
                                 ui.horizontal(|ui| {
-                                    draw_mini_footprint(ui, fp, Vec2::new(44.0, 44.0));
+                                    let layer_str = if fp.layer == 1 { "B.Cu" } else { "F.Cu" };
+                                    draw_mini_footprint(ui, fp, Vec2::new(44.0, 44.0)).on_hover_text(format!(
+                                        "Preview of {} ({}) — {} pads on {}.",
+                                        fp.reference,
+                                        fp.value,
+                                        fp.pads.len(),
+                                        layer_str
+                                    ));
                                     ui.vertical(|ui| {
                                         ui.horizontal(|ui| {
                                             ui.label(
                                                 egui::RichText::new(&fp.reference)
                                                     .strong()
                                                     .color(Color32::from_rgb(255, 215, 100)),
-                                            );
+                                            )
+                                            .on_hover_text(format!("Reference designator {} ({})", fp.reference, fp.value));
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                if ui.add_enabled(!is_running, egui::Button::new("Place")).clicked() {
+                                                if ui
+                                                    .add_enabled(!is_running, egui::Button::new("Place"))
+                                                    .on_hover_text(format!(
+                                                        "Find the lowest-cost, non-overlapping board coordinate and rotation for {} and place it onto the PCB.",
+                                                        fp.reference
+                                                    ))
+                                                    .clicked()
+                                                {
                                                     place_single_idx = Some(idx);
                                                 }
                                             });
@@ -2768,7 +2922,6 @@ impl VulcansTrialsApp {
                                                 .size(11.0)
                                                 .color(Color32::from_rgb(210, 215, 220)),
                                         );
-                                        let layer_str = if fp.layer == 1 { "B.Cu" } else { "F.Cu" };
                                         let pad_count = fp.pads.len();
                                         let pad_label = if pad_count == 1 {
                                             format!("1 pad · {}", layer_str)
@@ -3784,10 +3937,11 @@ pub fn draw_color_legend(painter: &egui::Painter, canvas_rect: Rect, board: &Boa
     );
 }
 
-fn draw_load_badge(ui: &mut egui::Ui, label: &str, pct: f32, history: &[f32], color: Color32) {
+fn draw_load_badge(ui: &mut egui::Ui, label: &str, pct: f32, history: &[f32], color: Color32, tooltip: &str) {
     ui.horizontal(|ui| {
-        ui.label(format!("{}: {:>4.0}%", label, pct));
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(72.0, 18.0), Sense::hover());
+        ui.label(format!("{}: {:>4.0}%", label, pct)).on_hover_text(tooltip);
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(72.0, 18.0), Sense::hover());
+        resp.on_hover_text(tooltip);
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 2.0, Color32::from_rgb(30, 34, 40));
         if history.len() >= 2 {
@@ -5373,6 +5527,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_ipc_auto_retry_and_pull_on_save() {
         use std::io::{BufRead, BufReader};
         use std::os::unix::net::UnixListener;
@@ -5475,5 +5630,115 @@ mod tests {
         let _ = fs::remove_file(&sock_path);
         let _ = fs::remove_file(&out_pcb_path);
         let _ = fs::remove_file(&out_ses_path);
+    }
+
+    #[test]
+    fn test_gui_controls_and_parameters_tooltips_exercised() {
+        let in_path = format!(
+            "/tmp/vulcan_gui_tooltips_test_{}.kicad_pcb",
+            std::process::id()
+        );
+        let mut board = make_gui_test_board(&in_path);
+        // Populate holding palette so Holding Palette panel and its Place / Place All tooltips are rendered
+        let held_fp = board.footprints[1].clone();
+        board.holding_palette.push(held_fp);
+
+        let mut app = VulcansTrialsApp::new(in_path.clone(), String::new(), board, None);
+        app.show_holding_palette = true;
+
+        let ctx = egui::Context::default();
+        ctx.style_mut(|s| {
+            s.interaction.tooltip_delay = 0.0;
+            s.interaction.show_tooltips_only_when_still = false;
+        });
+
+        // Open all collapsible panels (Advanced Autoplacer, Advanced Autorouter, Net Classes)
+        let panel_id = egui::Id::new("vulcan_controls_panel");
+        for section in [
+            "Advanced Autoplacer",
+            "Advanced Autorouter",
+            "Net Classes (1)",
+        ] {
+            let id = panel_id.with(section);
+            egui::collapsing_header::CollapsingState::load_with_default_open(&ctx, id, true)
+                .store(&ctx);
+        }
+
+        let screen_rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1400.0, 2000.0));
+
+        // 1. Warm up layout across all expanded panels and record baseline shape count without hover
+        let mut warmup = egui::RawInput::default();
+        warmup.screen_rect = Some(screen_rect);
+        let _ = ctx.run(warmup.clone(), |ctx| {
+            app.render_ui(ctx);
+        });
+        let baseline_output = ctx.run(warmup, |ctx| {
+            app.render_ui(ctx);
+        });
+        let baseline_shapes = baseline_output.shapes.len();
+
+        // 2. Sweep pointer across top telemetry bar, left control & parameter widgets, and holding palette
+        let mut tooltip_frames = 0usize;
+        let mut sample_positions = Vec::new();
+        // Top bar positions (heading, GPU status, CPU/GPU load badges, progress bar)
+        for x in [60.0_f32, 340.0, 520.0, 680.0, 250.0] {
+            sample_positions.push(Pos2::new(x, 16.0));
+            sample_positions.push(Pos2::new(x, 42.0));
+        }
+        // Left panel vertical scan across buttons, core sliders, advanced placer/router sliders, IPC, visibility checkboxes, netclasses, metrics
+        for y_step in (65..1650).step_by(18) {
+            sample_positions.push(Pos2::new(90.0, y_step as f32));
+            sample_positions.push(Pos2::new(210.0, y_step as f32));
+        }
+        // Holding palette panel positions (heading, Place All button, mini footprint preview, individual Place button)
+        for y in [75.0_f32, 100.0, 140.0] {
+            sample_positions.push(Pos2::new(360.0, y));
+            sample_positions.push(Pos2::new(430.0, y));
+            sample_positions.push(Pos2::new(530.0, y));
+        }
+
+        for pos in sample_positions {
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(screen_rect);
+            input.events.push(egui::Event::PointerMoved(pos));
+            let output = ctx.run(input, |ctx| {
+                app.render_ui(ctx);
+            });
+            if output.shapes.len() > baseline_shapes {
+                tooltip_frames += 1;
+            }
+        }
+        assert!(
+            tooltip_frames >= 20,
+            "Hovering across GUI controls and parameter sliders must render tooltip popups (got {} tooltip frames)",
+            tooltip_frames
+        );
+
+        // 3. Also exercise route_tool_active and active_route banner tooltips
+        app.route_tool_active = true;
+        let mut input_route_mode = egui::RawInput::default();
+        input_route_mode.screen_rect = Some(screen_rect);
+        let _ = ctx.run(input_route_mode, |ctx| {
+            app.render_ui(ctx);
+        });
+
+        app.active_route = Some(ActiveRoute {
+            net_id: 2,
+            net_name: "SIG".to_string(),
+            current_layer: 0,
+            track_width: 0.25,
+            via_dia: 0.6,
+            via_drill: 0.3,
+            anchor_points: vec![(110.0, 115.0, 0)],
+            posture_diagonal_first: false,
+            vias_placed: Vec::new(),
+        });
+        let mut input_active_route = egui::RawInput::default();
+        input_active_route.screen_rect = Some(screen_rect);
+        let _ = ctx.run(input_active_route, |ctx| {
+            app.render_ui(ctx);
+        });
+
+        let _ = fs::remove_file(&in_path);
     }
 }
