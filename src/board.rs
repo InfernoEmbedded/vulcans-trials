@@ -2244,9 +2244,31 @@ impl Board {
         };
 
         if !path.is_empty() {
+            let resolve_sibling_ext = |p: &str, raw: &str, ext: &str| -> Option<std::path::PathBuf> {
+                let direct = Path::new(p).with_extension(ext);
+                if direct.exists() {
+                    return Some(direct);
+                }
+                if let Some(sf_idx) = raw.find("(sheetfile \"") {
+                    let after = &raw[sf_idx + 12..];
+                    if let Some(q_end) = after.find('"') {
+                        let sheet_name = &after[..q_end];
+                        if let (Some(parent), Some(stem)) = (
+                            Path::new(p).parent(),
+                            Path::new(sheet_name).file_stem().and_then(|s| s.to_str()),
+                        ) {
+                            let fallback = parent.join(format!("{}.{}", stem, ext));
+                            if fallback.exists() {
+                                return Some(fallback);
+                            }
+                        }
+                    }
+                }
+                None
+            };
+
             // Auto-load project netclasses and design rules if sibling .kicad_pro exists
-            let pro_path = Path::new(path).with_extension("kicad_pro");
-            if pro_path.exists() {
+            if let Some(pro_path) = resolve_sibling_ext(path, &board.raw_content, "kicad_pro") {
                 board.load_project_netclasses(&pro_path);
                 // The project defines its own classes; drop built-in fallbacks left with no nets.
                 let used: HashSet<&String> = board.net_to_class.values().collect();
@@ -2254,14 +2276,12 @@ impl Board {
             }
 
             // Auto-load custom DRC rules if sibling .kicad_dru exists
-            let dru_path = Path::new(path).with_extension("kicad_dru");
-            if dru_path.exists() {
+            if let Some(dru_path) = resolve_sibling_ext(path, &board.raw_content, "kicad_dru") {
                 board.load_design_rules_dru(&dru_path);
             }
 
             // Auto-load schematic functional clusters if sibling .kicad_sch exists
-            let sch_path = Path::new(path).with_extension("kicad_sch");
-            if sch_path.exists() {
+            if let Some(sch_path) = resolve_sibling_ext(path, &board.raw_content, "kicad_sch") {
                 board.load_schematic_clusters(&sch_path);
             }
         }
@@ -3393,6 +3413,18 @@ impl Board {
         if self.texts.is_empty() {
             return;
         }
+        let vk = crate::vulkan::VulkanEngine::new();
+        self.nudge_silkscreen_texts_with_gpu(vk.as_ref());
+    }
+
+    pub fn nudge_silkscreen_texts_with_gpu(
+        &mut self,
+        vulkan: Option<&std::sync::Arc<crate::vulkan::VulkanEngine>>,
+    ) {
+        use rayon::prelude::*;
+        if self.texts.is_empty() {
+            return;
+        }
         let boundary = self.boundary_aabb();
 
         // Extract silkscreen lines from all footprints in world coordinates
@@ -3452,35 +3484,219 @@ impl Board {
                 .min(dist_pt_seg(p4, p1, p2))
         };
 
-        for t_idx in 0..self.texts.len() {
-            let txt = &self.texts[t_idx];
-            if txt.layer != "F.SilkS" && txt.layer != "B.SilkS" {
-                continue;
+        // Precompute spiral search offsets (0 = original pose, 1..=960 = 40 radial steps x 24 angles)
+        let mut spiral_offsets: Vec<(f64, f64)> = Vec::with_capacity(1 + 40 * 24);
+        spiral_offsets.push((0.0, 0.0));
+        for r_step in 1..=40 {
+            let r = (r_step as f64) * 0.25;
+            for a_idx in 0..24 {
+                let angle = (a_idx as f64) * std::f64::consts::PI / 12.0;
+                spiral_offsets.push((r * angle.cos(), r * angle.sin()));
             }
-            let target_copper_layer = if txt.layer == "F.SilkS" { 0 } else { 1 };
-            let tw = (txt.text.len() as f64) * (txt.width * 1.05) + 0.3;
-            let th = txt.height.max(0.6) + 0.2;
-            let hw = tw * 0.5;
-            let hh = th * 0.5;
-            let rot_rad = txt.rotation.to_radians();
-            let dx_unit = rot_rad.cos();
-            let dy_unit = rot_rad.sin();
-            let perp_x = -dy_unit;
-            let perp_y = dx_unit;
+        }
+        let num_cands_per_text = spiral_offsets.len();
 
-            let check_collision_at = |cx: f64, cy: f64, footprints: &[Footprint], texts: &[BoardText]| -> bool {
-                let margin = (tw.max(th) * 0.5) + 0.25;
-                if cx - hw < boundary.min_x + margin
-                    || cx + hw > boundary.max_x - margin
-                    || cy - hh < boundary.min_y + margin
-                    || cy + hh > boundary.max_y - margin
-                {
-                    return true;
+        let silk_text_indices: Vec<usize> = (0..self.texts.len())
+            .filter(|&i| self.texts[i].layer == "F.SilkS" || self.texts[i].layer == "B.SilkS")
+            .collect();
+        if silk_text_indices.is_empty() {
+            return;
+        }
+
+        // Optional GPU batch pre-filtering against board pad and via copper obstacles
+        let gpu_rejected: Option<Vec<bool>> = vulkan.and_then(|vk| {
+            let mut gpu_pads = Vec::new();
+            for fp in &self.footprints {
+                for pad in &fp.pads {
+                    let (px, py) = fp.pad_absolute_position(pad);
+                    let flipped = fp.layer != fp.orig_layer;
+                    let pad_rot = if flipped { -pad.rotation } else { pad.rotation };
+                    let total_rot_rad = -(fp.rotation + pad_rot).to_radians() as f32;
+                    let layer_bits: u32 = if pad.is_through_hole {
+                        0xFFFF
+                    } else {
+                        1u32 << (fp.pad_layer(pad).min(15) as u32)
+                    };
+                    let shape_code: u32 = if pad.shape == "circle" {
+                        1
+                    } else if pad.shape == "oval" {
+                        2
+                    } else {
+                        0
+                    };
+                    gpu_pads.push(crate::vulkan::GpuDrcPad {
+                        x: px as f32,
+                        y: py as f32,
+                        hw: (pad.width * 0.5) as f32,
+                        hh: (pad.height * 0.5) as f32,
+                        rot_rad: total_rot_rad,
+                        clearance: 0.12,
+                        layer_mask: layer_bits | (shape_code << 16),
+                        net_id: pad.net_id as u32,
+                    });
                 }
+            }
+            let gpu_vias: Vec<crate::vulkan::GpuDrcVia> = self
+                .vias
+                .iter()
+                .map(|v| crate::vulkan::GpuDrcVia {
+                    x: v.position.0 as f32,
+                    y: v.position.1 as f32,
+                    radius: (v.size * 0.5) as f32,
+                    clearance: 0.12,
+                    net_id: v.net_id as u32,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                })
+                .collect();
 
-                // Check collision with other texts on the same layer
+            let mut cands = Vec::with_capacity(silk_text_indices.len() * num_cands_per_text);
+            for &t_idx in &silk_text_indices {
+                let txt = &self.texts[t_idx];
+                let target_copper_layer = if txt.layer == "F.SilkS" { 0u32 } else { 1u32 };
+                let tw = (txt.text.len() as f64) * (txt.width * 1.05) + 0.3;
+                let th = txt.height.max(0.6) + 0.2;
+                let rot_rad = txt.rotation.to_radians();
+                let dx_unit = rot_rad.cos();
+                let dy_unit = rot_rad.sin();
+                let (maj_x, maj_y, half_span, min_dim) = if tw >= th {
+                    (dx_unit, dy_unit, (tw - th) * 0.5, th)
+                } else {
+                    (-dy_unit, dx_unit, (th - tw) * 0.5, tw)
+                };
+                for &(ox, oy) in &spiral_offsets {
+                    let cx = txt.x + ox;
+                    let cy = txt.y + oy;
+                    cands.push(crate::vulkan::GpuDrcCandidate {
+                        x1: (cx - half_span * maj_x) as f32,
+                        y1: (cy - half_span * maj_y) as f32,
+                        x2: (cx + half_span * maj_x) as f32,
+                        y2: (cy + half_span * maj_y) as f32,
+                        radius_or_half_width: (min_dim * 0.5) as f32,
+                        clearance: 0.12,
+                        layer: target_copper_layer,
+                        net_id: u32::MAX - 10,
+                        kind: 1,
+                        _pad0: 0,
+                        _pad1: 0,
+                        ignore_same_net_pads: 0,
+                    });
+                }
+            }
+
+            vk.evaluate_drc_candidates(&gpu_pads, &[], &gpu_vias, &cands)
+                .map(|flags| flags.into_iter().map(|f| f == 0).collect())
+        });
+
+        let footprints_ref = &self.footprints;
+        let vias_ref = &self.vias;
+        let texts_snapshot = self.texts.clone();
+
+        // Parallel static collision pre-evaluation (boundary + silkscreen lines + copper pads/vias)
+        let static_valid_per_text: Vec<Vec<bool>> = silk_text_indices
+            .par_iter()
+            .enumerate()
+            .map(|(batch_idx, &t_idx)| {
+                let txt = &texts_snapshot[t_idx];
+                let target_copper_layer = if txt.layer == "F.SilkS" { 0 } else { 1 };
+                let tw = (txt.text.len() as f64) * (txt.width * 1.05) + 0.3;
+                let th = txt.height.max(0.6) + 0.2;
+                let hw = tw * 0.5;
+                let hh = th * 0.5;
+                let rot_rad = txt.rotation.to_radians();
+                let dx_unit = rot_rad.cos();
+                let dy_unit = rot_rad.sin();
+                let perp_x = -dy_unit;
+                let perp_y = dx_unit;
+                let margin = (tw.max(th) * 0.5) + 0.25;
+                let pad_margin = hh + 0.20;
+                let num_samples = ((tw / 0.15).ceil() as usize).max(9);
+
+                let mut valid = vec![false; num_cands_per_text];
+                for (c_idx, &(ox, oy)) in spiral_offsets.iter().enumerate() {
+                    if let Some(ref rejected) = gpu_rejected {
+                        if rejected[batch_idx * num_cands_per_text + c_idx] {
+                            continue;
+                        }
+                    }
+                    let cx = txt.x + ox;
+                    let cy = txt.y + oy;
+                    if cx - hw < boundary.min_x + margin
+                        || cx + hw > boundary.max_x - margin
+                        || cy - hh < boundary.min_y + margin
+                        || cy + hh > boundary.max_y - margin
+                    {
+                        continue;
+                    }
+
+                    // Check distance against footprint silkscreen lines
+                    let mut silk_hit = false;
+                    'silk_chk: for &h_frac in &[-1.0_f64, 0.0, 1.0] {
+                        let seg_s = (
+                            cx - hw * dx_unit + h_frac * hh * perp_x,
+                            cy - hw * dy_unit + h_frac * hh * perp_y,
+                        );
+                        let seg_e = (
+                            cx + hw * dx_unit + h_frac * hh * perp_x,
+                            cy + hw * dy_unit + h_frac * hh * perp_y,
+                        );
+                        for (ls, le, ref lyr) in &silk_lines {
+                            if lyr == &txt.layer && dist_seg_seg(seg_s, seg_e, *ls, *le) < 0.20 {
+                                silk_hit = true;
+                                break 'silk_chk;
+                            }
+                        }
+                    }
+                    if silk_hit {
+                        continue;
+                    }
+
+                    // Check distance to exposed copper pads and vias
+                    let mut copper_hit = false;
+                    'cop_chk: for s in 0..num_samples {
+                        let t = (s as f64) / ((num_samples - 1) as f64) - 0.5;
+                        let sample_x = cx + t * tw * dx_unit;
+                        let sample_y = cy + t * tw * dy_unit;
+
+                        for fp in footprints_ref {
+                            for pad in &fp.pads {
+                                if pad.is_through_hole || fp.pad_layer(pad) == target_copper_layer {
+                                    let d_pad = crate::router::dist_point_to_pad((sample_x, sample_y), fp, pad);
+                                    if d_pad < pad_margin {
+                                        copper_hit = true;
+                                        break 'cop_chk;
+                                    }
+                                }
+                            }
+                        }
+                        for v in vias_ref {
+                            if (sample_x - v.position.0).hypot(sample_y - v.position.1) - v.size * 0.5 < pad_margin {
+                                copper_hit = true;
+                                break 'cop_chk;
+                            }
+                        }
+                    }
+                    if !copper_hit {
+                        valid[c_idx] = true;
+                    }
+                }
+                valid
+            })
+            .collect();
+
+        // Sequential silkscreen-to-silkscreen collision resolution
+        for (batch_idx, &t_idx) in silk_text_indices.iter().enumerate() {
+            let static_valid = &static_valid_per_text[batch_idx];
+            let layer = self.texts[t_idx].layer.clone();
+            let tw = (self.texts[t_idx].text.len() as f64) * (self.texts[t_idx].width * 1.05) + 0.3;
+            let th = self.texts[t_idx].height.max(0.6) + 0.2;
+            let orig_x = self.texts[t_idx].x;
+            let orig_y = self.texts[t_idx].y;
+
+            let collides_with_other_texts = |cx: f64, cy: f64, texts: &[BoardText]| -> bool {
                 for (oi, ot) in texts.iter().enumerate() {
-                    if oi == t_idx || ot.layer != txt.layer {
+                    if oi == t_idx || ot.layer != layer {
                         continue;
                     }
                     let otw = (ot.text.len() as f64) * (ot.width * 1.05) + 0.3;
@@ -3491,64 +3707,25 @@ impl Board {
                         return true;
                     }
                 }
-
-                // Check distance against footprint silkscreen lines
-                for &h_frac in &[-1.0_f64, 0.0, 1.0] {
-                    let seg_s = (cx - hw * dx_unit + h_frac * hh * perp_x, cy - hw * dy_unit + h_frac * hh * perp_y);
-                    let seg_e = (cx + hw * dx_unit + h_frac * hh * perp_x, cy + hw * dy_unit + h_frac * hh * perp_y);
-                    for (ls, le, ref lyr) in &silk_lines {
-                        if lyr == &txt.layer && dist_seg_seg(seg_s, seg_e, *ls, *le) < 0.20 {
-                            return true;
-                        }
-                    }
-                }
-
-                // Check distance to exposed copper pads
-                let pad_margin = hh + 0.20;
-                let num_samples = ((tw / 0.30).ceil() as usize).max(7);
-                for s in 0..num_samples {
-                    let t = (s as f64) / ((num_samples - 1) as f64) - 0.5;
-                    let sample_x = cx + t * tw * dx_unit;
-                    let sample_y = cy + t * tw * dy_unit;
-
-                    for fp in footprints {
-                        for pad in &fp.pads {
-                            if pad.is_through_hole || fp.pad_layer(pad) == target_copper_layer {
-                                let d_pad = crate::router::dist_point_to_pad((sample_x, sample_y), fp, pad);
-                                if d_pad < pad_margin {
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
                 false
             };
 
-            if !check_collision_at(txt.x, txt.y, &self.footprints, &self.texts) {
+            if static_valid[0] && !collides_with_other_texts(orig_x, orig_y, &self.texts) {
                 continue;
             }
 
-            let orig_x = txt.x;
-            let orig_y = txt.y;
-            let mut best_cand: Option<(f64, f64)> = None;
-
-            'search: for r_step in 1..=40 {
-                let r = (r_step as f64) * 0.25;
-                for a_idx in 0..24 {
-                    let angle = (a_idx as f64) * std::f64::consts::PI / 12.0;
-                    let cand_x = orig_x + r * angle.cos();
-                    let cand_y = orig_y + r * angle.sin();
-                    if !check_collision_at(cand_x, cand_y, &self.footprints, &self.texts) {
-                        best_cand = Some((cand_x, cand_y));
-                        break 'search;
-                    }
+            for c_idx in 1..num_cands_per_text {
+                if !static_valid[c_idx] {
+                    continue;
                 }
-            }
-
-            if let Some((nx, ny)) = best_cand {
-                self.texts[t_idx].x = nx;
-                self.texts[t_idx].y = ny;
+                let (ox, oy) = spiral_offsets[c_idx];
+                let cand_x = orig_x + ox;
+                let cand_y = orig_y + oy;
+                if !collides_with_other_texts(cand_x, cand_y, &self.texts) {
+                    self.texts[t_idx].x = cand_x;
+                    self.texts[t_idx].y = cand_y;
+                    break;
+                }
             }
         }
     }
@@ -5493,6 +5670,89 @@ fn parse_footprint(
     if !crtyd_lines.is_empty() {
         let chained = chain_lines_into_polygons(crtyd_lines);
         courtyards.extend(chained);
+    }
+
+    // Auto-heal footprints where top-level (at X Y) rotation was stripped to 0° while child pads
+    // retained their old board-space angle, causing pads to overlap locally or protrude outside CrtYd.
+    if pads.len() >= 2 && pads.iter().any(|p| p.rotation.abs() > 1e-3) {
+        let non_zero_rots: Vec<f64> = pads
+            .iter()
+            .filter(|p| p.rotation.abs() > 1e-3)
+            .map(|p| p.rotation)
+            .collect();
+        let same_rot = non_zero_rots.len() == pads.len()
+            && non_zero_rots.iter().all(|&r| (r - non_zero_rots[0]).abs() < 1e-3);
+        if same_rot {
+            let pad_eff_dims = |p: &Pad, zero_rot: bool| -> (f64, f64) {
+                if zero_rot {
+                    (p.width, p.height)
+                } else {
+                    let rad = p.rotation.to_radians();
+                    let c = rad.cos().abs();
+                    let s = rad.sin().abs();
+                    (p.width * c + p.height * s, p.width * s + p.height * c)
+                }
+            };
+            let pads_overlap_locally = |ps: &[Pad], zero_rot: bool| -> bool {
+                for i in 0..ps.len() {
+                    if ps[i].number.is_empty() {
+                        continue;
+                    }
+                    let (wi, hi) = pad_eff_dims(&ps[i], zero_rot);
+                    for j in (i + 1)..ps.len() {
+                        if ps[j].number.is_empty() || ps[i].number == ps[j].number {
+                            continue;
+                        }
+                        if !(ps[i].is_through_hole || ps[j].is_through_hole || ps[i].layer == ps[j].layer) {
+                            continue;
+                        }
+                        let (wj, hj) = pad_eff_dims(&ps[j], zero_rot);
+                        if (ps[i].offset_x - ps[j].offset_x).abs() < (wi + wj) * 0.5 - 1e-3
+                            && (ps[i].offset_y - ps[j].offset_y).abs() < (hi + hj) * 0.5 - 1e-3
+                        {
+                            return true;
+                        }
+                    }
+                }
+                false
+            };
+            let pads_outside_courtyard = |ps: &[Pad], crtyds: &[Polygon], zero_rot: bool| -> bool {
+                if crtyds.is_empty() {
+                    return false;
+                }
+                let mut c_min_x = f64::INFINITY;
+                let mut c_min_y = f64::INFINITY;
+                let mut c_max_x = f64::NEG_INFINITY;
+                let mut c_max_y = f64::NEG_INFINITY;
+                for poly in crtyds {
+                    for pt in &poly.vertices {
+                        c_min_x = c_min_x.min(pt.x);
+                        c_min_y = c_min_y.min(pt.y);
+                        c_max_x = c_max_x.max(pt.x);
+                        c_max_y = c_max_y.max(pt.y);
+                    }
+                }
+                if c_min_x >= c_max_x || c_min_y >= c_max_y {
+                    return false;
+                }
+                ps.iter().any(|p| {
+                    let (ew, eh) = pad_eff_dims(p, zero_rot);
+                    p.offset_x - ew * 0.5 < c_min_x - 0.05
+                        || p.offset_x + ew * 0.5 > c_max_x + 0.05
+                        || p.offset_y - eh * 0.5 < c_min_y - 0.05
+                        || p.offset_y + eh * 0.5 > c_max_y + 0.05
+                })
+            };
+
+            if (pads_overlap_locally(&pads, false) && !pads_overlap_locally(&pads, true))
+                || (pads_outside_courtyard(&pads, &courtyards, false)
+                    && !pads_outside_courtyard(&pads, &courtyards, true))
+            {
+                for p in &mut pads {
+                    p.rotation = 0.0;
+                }
+            }
+        }
     }
 
     // Fallback if no courtyard primitives found on CrtYd
@@ -7820,6 +8080,139 @@ mod tests {
         let nudged = &board.texts[0];
         let d = (nudged.x - 10.0).hypot(nudged.y - 10.0);
         assert!(d >= 0.70, "Text must be nudged away from pad center (dist={:.3})", d);
+    }
+
+    #[test]
+    fn test_gpu_silkscreen_text_nudger_batch_equivalence() {
+        let pad1 = Pad {
+            number: "1".to_string(),
+            net_id: 1,
+            net_name: "NET1".to_string(),
+            offset_x: -1.0,
+            offset_y: 0.0,
+            width: 1.4,
+            height: 1.4,
+            shape: "rect".to_string(),
+            ..Pad::default()
+        };
+        let pad2 = Pad {
+            number: "2".to_string(),
+            net_id: 2,
+            net_name: "NET2".to_string(),
+            offset_x: 1.0,
+            offset_y: 0.0,
+            width: 1.4,
+            height: 1.4,
+            shape: "rect".to_string(),
+            ..Pad::default()
+        };
+        let fp = Footprint {
+            reference: "U1".to_string(),
+            value: "IC".to_string(),
+            x: 15.0,
+            y: 15.0,
+            pads: vec![pad1, pad2],
+            ..Footprint::default()
+        };
+        let via = Via {
+            position: (15.0, 16.5),
+            size: 0.8,
+            drill: 0.4,
+            is_locked: false,
+            net_id: 1,
+        };
+        let base_board = Board {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 40.0,
+            max_y: 40.0,
+            footprints: vec![fp],
+            vias: vec![via],
+            texts: vec![
+                BoardText {
+                    text: "U1".to_string(),
+                    x: 14.0,
+                    y: 15.0,
+                    rotation: 0.0,
+                    layer: "F.SilkS".to_string(),
+                    width: 1.0,
+                    height: 1.0,
+                    at_span: None,
+                },
+                BoardText {
+                    text: "C1".to_string(),
+                    x: 15.0,
+                    y: 16.5,
+                    rotation: 90.0,
+                    layer: "F.SilkS".to_string(),
+                    width: 0.8,
+                    height: 0.8,
+                    at_span: None,
+                },
+            ],
+            ..Board::default()
+        };
+
+        let mut cpu_board = base_board.clone();
+        cpu_board.nudge_silkscreen_texts_with_gpu(None);
+
+        let vk = crate::vulkan::VulkanEngine::new();
+        let mut gpu_board = base_board.clone();
+        gpu_board.nudge_silkscreen_texts_with_gpu(vk.as_ref());
+
+        for (i, (ct, gt)) in cpu_board.texts.iter().zip(gpu_board.texts.iter()).enumerate() {
+            assert!(
+                (ct.x - gt.x).abs() < 1e-6 && (ct.y - gt.y).abs() < 1e-6,
+                "Text {} CPU ({:.3}, {:.3}) vs GPU ({:.3}, {:.3}) mismatch",
+                i,
+                ct.x,
+                ct.y,
+                gt.x,
+                gt.y
+            );
+            // Verify nudged text clears all pads and vias
+            for fp in &gpu_board.footprints {
+                for pad in &fp.pads {
+                    let d_pad = crate::router::dist_point_to_pad((gt.x, gt.y), fp, pad);
+                    assert!(d_pad >= 0.50, "Text {} too close to pad (d={:.3})", i, d_pad);
+                }
+            }
+            for v in &gpu_board.vias {
+                let d_via = (gt.x - v.position.0).hypot(gt.y - v.position.1) - v.size * 0.5;
+                assert!(d_via >= 0.50, "Text {} too close to via (d={:.3})", i, d_via);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_footprint_heals_stripped_pad_rotations_l1_and_u1() {
+        let mut net_map = HashMap::new();
+        let mut nets = Vec::new();
+        let extra_locked = HashSet::new();
+
+        let l1_block = r#"(footprint "Inductor_SMD:L_1210_3225Metric" (layer "F.Cu") (at 115 91.4) (property "Reference" "L1") (fp_rect (start -2.1 -1.8) (end 2.1 1.8) (layer "F.CrtYd")) (pad "1" smd rect (at -1.525 0 90) (size 1.5 3.6) (layers "F.Cu" "F.Paste" "F.Mask")) (pad "2" smd rect (at 1.525 0 90) (size 1.5 3.6) (layers "F.Cu" "F.Paste" "F.Mask")))"#;
+        let l1 = parse_footprint(l1_block, 0, &mut nets, &mut net_map, &extra_locked)
+            .expect("L1 should parse");
+        assert_eq!(l1.pads.len(), 2);
+        for pad in &l1.pads {
+            assert!(
+                pad.rotation.abs() < 1e-6,
+                "L1 stripped pad rotation should be healed to 0.0, got {}",
+                pad.rotation
+            );
+        }
+
+        let u1_block = r#"(footprint "Package_DFN_QFN:QFN-16-1EP_3x3mm_P0.5mm" (layer "F.Cu") (at 108 111.8) (property "Reference" "U1") (fp_rect (start -2.0 -2.0) (end 2.0 2.0) (layer "F.CrtYd")) (pad "1" smd rect (at -1.7875 -1.25 270) (size 0.575 0.35) (layers "F.Cu" "F.Paste" "F.Mask")) (pad "2" smd rect (at -1.7875 -0.75 270) (size 0.575 0.35) (layers "F.Cu" "F.Paste" "F.Mask")))"#;
+        let u1 = parse_footprint(u1_block, 0, &mut nets, &mut net_map, &extra_locked)
+            .expect("U1 should parse");
+        assert_eq!(u1.pads.len(), 2);
+        for pad in &u1.pads {
+            assert!(
+                pad.rotation.abs() < 1e-6,
+                "U1 stripped pad rotation should be healed to 0.0, got {}",
+                pad.rotation
+            );
+        }
     }
 
     #[test]

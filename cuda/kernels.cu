@@ -53,7 +53,7 @@ struct GpuSaParams {
 };
 
 // -----------------------------------------------------------------------------
-// 1. Distance Field Kernel
+// 1. Distance Field Kernels (Direct, Separable 2-Pass 1D, and Shared-Memory Tiled)
 // -----------------------------------------------------------------------------
 
 __global__ void distance_field_kernel(
@@ -103,7 +103,89 @@ __global__ void distance_field_kernel(
     dist_out[idx] = sqrtf(min_d2);
 }
 
-// Optimized Distance Field Kernel with 2D Shared Memory Tiling
+// Pass 1 (Horizontal 1D) of Separable Euclidean Distance Transform
+__global__ void distance_field_separable_h_kernel(
+    const unsigned int* __restrict__ obstacles,
+    float* __restrict__ temp_h,
+    unsigned int width,
+    unsigned int height,
+    unsigned int num_layers,
+    int radius
+) {
+    int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    unsigned int layer = blockIdx.z;
+    int w = (int)width;
+    int h = (int)height;
+
+    if (x >= w || y >= h || layer >= num_layers) {
+        return;
+    }
+
+    unsigned int layer_offset = layer * width * height;
+    unsigned int row_offset = layer_offset + (unsigned int)(y * w);
+    unsigned int idx = row_offset + (unsigned int)x;
+    if (obstacles[idx] != 0u) {
+        temp_h[idx] = 0.0f;
+        return;
+    }
+
+    int r = radius;
+    float min_dx_sq = (float)(r * r + 1);
+    int dx_min = (-r > -x) ? -r : -x;
+    int dx_max = (r < (w - 1 - x)) ? r : (w - 1 - x);
+    for (int dx = dx_min; dx <= dx_max; ++dx) {
+        if (obstacles[row_offset + (unsigned int)(x + dx)] != 0u) {
+            float d2 = (float)(dx * dx);
+            if (d2 < min_dx_sq) {
+                min_dx_sq = d2;
+            }
+        }
+    }
+    temp_h[idx] = min_dx_sq;
+}
+
+// Pass 2 (Vertical 1D) of Separable Euclidean Distance Transform
+__global__ void distance_field_separable_v_kernel(
+    const float* __restrict__ temp_h,
+    float* __restrict__ dist_out,
+    unsigned int width,
+    unsigned int height,
+    unsigned int num_layers,
+    int radius
+) {
+    int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    unsigned int layer = blockIdx.z;
+    int w = (int)width;
+    int h = (int)height;
+
+    if (x >= w || y >= h || layer >= num_layers) {
+        return;
+    }
+
+    unsigned int layer_offset = layer * width * height;
+    unsigned int idx = layer_offset + (unsigned int)(y * w + x);
+    if (temp_h[idx] == 0.0f) {
+        dist_out[idx] = 0.0f;
+        return;
+    }
+
+    int r = radius;
+    float best_d_sq = (float)(r * r + 1);
+    int dy_min = (-r > -y) ? -r : -y;
+    int dy_max = (r < (h - 1 - y)) ? r : (h - 1 - y);
+    for (int dy = dy_min; dy <= dy_max; ++dy) {
+        int ny = y + dy;
+        float d2 = temp_h[layer_offset + (unsigned int)(ny * w + x)] + (float)(dy * dy);
+        if (d2 < best_d_sq) {
+            best_d_sq = d2;
+        }
+    }
+    dist_out[idx] = sqrtf(best_d_sq);
+}
+
+// Optimized Distance Field Kernel with 2D Shared Memory Tiling + 2-Pass Separable 1D Reduction
 __global__ void distance_field_tiled_kernel(
     const unsigned int* __restrict__ obstacles,
     float* __restrict__ dist_out,
@@ -113,6 +195,7 @@ __global__ void distance_field_tiled_kernel(
 ) {
     extern __shared__ unsigned char smem_raw[];
     unsigned int* s_tile = (unsigned int*)smem_raw;
+    __shared__ float s_temp_h[128 * 16];
 
     int bx = blockIdx.x * blockDim.x;
     int by = blockIdx.y * blockDim.y;
@@ -143,6 +226,50 @@ __global__ void distance_field_tiled_kernel(
 
     __syncthreads();
 
+    float inf_d2 = (float)(r * r + 1);
+    if (tile_h <= 128 && blockDim.x <= 16) {
+        for (int sy = ty; sy < tile_h; sy += blockDim.y) {
+            int smem_row = sy * tile_w;
+            int center_col = tx + r;
+            float min_dx_sq = inf_d2;
+            if (s_tile[smem_row + center_col] != 0u) {
+                min_dx_sq = 0.0f;
+            } else {
+                for (int dx = -r; dx <= r; ++dx) {
+                    if (s_tile[smem_row + center_col + dx] != 0u) {
+                        float d2 = (float)(dx * dx);
+                        if (d2 < min_dx_sq) {
+                            min_dx_sq = d2;
+                        }
+                    }
+                }
+            }
+            s_temp_h[sy * 16 + tx] = min_dx_sq;
+        }
+        __syncthreads();
+
+        int gx = bx + tx;
+        int gy = by + ty;
+        if (gx >= w || gy >= h) {
+            return;
+        }
+        unsigned int idx = (unsigned int)(gy * w + gx);
+        if (s_temp_h[(ty + r) * 16 + tx] == 0.0f) {
+            dist_out[idx] = 0.0f;
+            return;
+        }
+
+        float best_d_sq = inf_d2;
+        for (int dy = -r; dy <= r; ++dy) {
+            float d2 = s_temp_h[(ty + r + dy) * 16 + tx] + (float)(dy * dy);
+            if (d2 < best_d_sq) {
+                best_d_sq = d2;
+            }
+        }
+        dist_out[idx] = sqrtf(best_d_sq);
+        return;
+    }
+
     int gx = bx + tx;
     int gy = by + ty;
     if (gx >= w || gy >= h) {
@@ -157,7 +284,7 @@ __global__ void distance_field_tiled_kernel(
         return;
     }
 
-    float min_d2 = (float)(r * r + 1);
+    float min_d2 = inf_d2;
 
     for (int dy = -r; dy <= r; ++dy) {
         int smem_row = (ty + r + dy) * tile_w;
@@ -174,7 +301,7 @@ __global__ void distance_field_tiled_kernel(
     dist_out[idx] = sqrtf(min_d2);
 }
 
-// Multi-Layer 3D Batched Distance Field Kernel with 2D Shared Memory Tiling per Z-Layer
+// Multi-Layer 3D Batched Distance Field Kernel with 2D Shared Memory Tiling + Separable 1D per Z-Layer
 __global__ void distance_field_3d_tiled_kernel(
     const unsigned int* __restrict__ obstacles,
     float* __restrict__ dist_out,
@@ -190,6 +317,7 @@ __global__ void distance_field_3d_tiled_kernel(
 
     extern __shared__ unsigned char smem_raw[];
     unsigned int* s_tile = (unsigned int*)smem_raw;
+    __shared__ float s_temp_h[128 * 16];
 
     int bx = blockIdx.x * blockDim.x;
     int by = blockIdx.y * blockDim.y;
@@ -221,6 +349,50 @@ __global__ void distance_field_3d_tiled_kernel(
 
     __syncthreads();
 
+    float inf_d2 = (float)(r * r + 1);
+    if (tile_h <= 128 && blockDim.x <= 16) {
+        for (int sy = ty; sy < tile_h; sy += blockDim.y) {
+            int smem_row = sy * tile_w;
+            int center_col = tx + r;
+            float min_dx_sq = inf_d2;
+            if (s_tile[smem_row + center_col] != 0u) {
+                min_dx_sq = 0.0f;
+            } else {
+                for (int dx = -r; dx <= r; ++dx) {
+                    if (s_tile[smem_row + center_col + dx] != 0u) {
+                        float d2 = (float)(dx * dx);
+                        if (d2 < min_dx_sq) {
+                            min_dx_sq = d2;
+                        }
+                    }
+                }
+            }
+            s_temp_h[sy * 16 + tx] = min_dx_sq;
+        }
+        __syncthreads();
+
+        int gx = bx + tx;
+        int gy = by + ty;
+        if (gx >= w || gy >= h) {
+            return;
+        }
+        unsigned int idx = layer_offset + (unsigned int)(gy * w + gx);
+        if (s_temp_h[(ty + r) * 16 + tx] == 0.0f) {
+            dist_out[idx] = 0.0f;
+            return;
+        }
+
+        float best_d_sq = inf_d2;
+        for (int dy = -r; dy <= r; ++dy) {
+            float d2 = s_temp_h[(ty + r + dy) * 16 + tx] + (float)(dy * dy);
+            if (d2 < best_d_sq) {
+                best_d_sq = d2;
+            }
+        }
+        dist_out[idx] = sqrtf(best_d_sq);
+        return;
+    }
+
     int gx = bx + tx;
     int gy = by + ty;
     if (gx >= w || gy >= h) {
@@ -235,7 +407,7 @@ __global__ void distance_field_3d_tiled_kernel(
         return;
     }
 
-    float min_d2 = (float)(r * r + 1);
+    float min_d2 = inf_d2;
 
     for (int dy = -r; dy <= r; ++dy) {
         int smem_row = (ty + r + dy) * tile_w;

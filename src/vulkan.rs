@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
+use rayon::prelude::*;
 use std::fs;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
@@ -14,51 +15,77 @@ struct GridParams {
     width: u32,
     height: u32,
     radius: i32,
-    _pad: u32,
+    num_layers: u32,
 }
 
 @group(0) @binding(0) var<storage, read> obstacles: array<u32>;
-@group(0) @binding(1) var<storage, read_write> dist_out: array<f32>;
-@group(0) @binding(2) var<uniform> params: GridParams;
+@group(0) @binding(1) var<storage, read_write> temp_h: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dist_out: array<f32>;
+@group(0) @binding(3) var<uniform> params: GridParams;
 
 @compute @workgroup_size(16, 16, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn pass_h(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = i32(gid.x);
     let y = i32(gid.y);
+    let z = gid.z;
     let w = i32(params.width);
     let h = i32(params.height);
-    if (x >= w || y >= h) {
+    if (x >= w || y >= h || z >= params.num_layers) {
         return;
     }
 
-    let idx = u32(y * w + x);
+    let layer_offset = z * params.width * params.height;
+    let idx = layer_offset + u32(y * w + x);
     if (obstacles[idx] != 0u) {
-        dist_out[idx] = 0.0;
+        temp_h[idx] = 0.0;
         return;
     }
 
     let r = params.radius;
-    var min_d2: f32 = f32(r * r + 1);
+    var min_dx_sq: f32 = f32(r * r + 1);
+    for (var dx: i32 = -r; dx <= r; dx = dx + 1) {
+        let nx = x + dx;
+        if (nx < 0 || nx >= w) {
+            continue;
+        }
+        let nidx = layer_offset + u32(y * w + nx);
+        if (obstacles[nidx] != 0u) {
+            let d2 = f32(dx * dx);
+            if (d2 < min_dx_sq) {
+                min_dx_sq = d2;
+            }
+        }
+    }
+    temp_h[idx] = min_dx_sq;
+}
+
+@compute @workgroup_size(16, 16, 1)
+fn pass_v(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    let z = gid.z;
+    let w = i32(params.width);
+    let h = i32(params.height);
+    if (x >= w || y >= h || z >= params.num_layers) {
+        return;
+    }
+
+    let layer_offset = z * params.width * params.height;
+    let idx = layer_offset + u32(y * w + x);
+    let r = params.radius;
+    var best_d_sq: f32 = f32(r * r + 1);
     for (var dy: i32 = -r; dy <= r; dy = dy + 1) {
         let ny = y + dy;
         if (ny < 0 || ny >= h) {
             continue;
         }
-        for (var dx: i32 = -r; dx <= r; dx = dx + 1) {
-            let nx = x + dx;
-            if (nx < 0 || nx >= w) {
-                continue;
-            }
-            let nidx = u32(ny * w + nx);
-            if (obstacles[nidx] != 0u) {
-                let d2 = f32(dx * dx + dy * dy);
-                if (d2 < min_d2) {
-                    min_d2 = d2;
-                }
-            }
+        let nidx = layer_offset + u32(ny * w + x);
+        let d2 = temp_h[nidx] + f32(dy * dy);
+        if (d2 < best_d_sq) {
+            best_d_sq = d2;
         }
     }
-    dist_out[idx] = sqrt(min_d2);
+    dist_out[idx] = min(sqrt(best_d_sq), f32(r) + 1.0);
 }
 "#;
 
@@ -1906,6 +1933,48 @@ pub fn morton2d_encode(x: u16, y: u16) -> u32 {
     part1by1(x as u32) | (part1by1(y as u32) << 1)
 }
 
+/// Fast FNV-1a-style hash over `(primitives.len(), first/last/stride bit-patterns)` for LBVH caching.
+#[inline]
+pub fn hash_lbvh_primitives(primitives: &[([f32; 4], u32, u32)]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325 ^ (primitives.len() as u64);
+    let mix = |mut acc: u64, v: u64| -> u64 {
+        acc ^= v;
+        acc.wrapping_mul(0x100000001b3)
+    };
+    let n = primitives.len();
+    if n == 0 {
+        return h;
+    }
+    let stride = (n / 64).max(1);
+    let mut idx = 0usize;
+    while idx < n {
+        let (aabb, lm, net) = primitives[idx];
+        let b0 = (aabb[0].to_bits() as u64) | ((aabb[1].to_bits() as u64) << 32);
+        let b1 = (aabb[2].to_bits() as u64) | ((aabb[3].to_bits() as u64) << 32);
+        let b2 = (lm as u64) | ((net as u64) << 32) ^ ((idx as u64) << 16);
+        h = mix(h, b0);
+        h = mix(h, b1);
+        h = mix(h, b2);
+        idx += stride;
+    }
+    let (aabb, lm, net) = primitives[n - 1];
+    h = mix(h, (aabb[0].to_bits() as u64) | ((aabb[1].to_bits() as u64) << 32));
+    h = mix(h, (aabb[2].to_bits() as u64) | ((aabb[3].to_bits() as u64) << 32));
+    h = mix(h, (lm as u64) | ((net as u64) << 32));
+    h
+}
+
+static GLOBAL_LBVH_CACHE: OnceLock<Mutex<Option<(u64, Vec<GpuBvhNode>)>>> = OnceLock::new();
+static GLOBAL_LBVH_BUILDS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_LBVH_HITS: AtomicU64 = AtomicU64::new(0);
+
+pub fn lbvh_cache_stats() -> (u64, u64) {
+    (
+        GLOBAL_LBVH_BUILDS.load(Ordering::Relaxed),
+        GLOBAL_LBVH_HITS.load(Ordering::Relaxed),
+    )
+}
+
 /// Builds a flat, cache-aligned 32-byte-per-node binary LBVH (`Vec<GpuBvhNode>`) sorted by
 /// 2D Morton Z-order curve over the input primitives `(aabb, layer_mask, net_id)`.
 pub fn build_gpu_lbvh(primitives: &[([f32; 4], u32, u32)]) -> Vec<GpuBvhNode> {
@@ -1922,62 +1991,88 @@ pub fn build_gpu_lbvh(primitives: &[([f32; 4], u32, u32)]) -> Vec<GpuBvhNode> {
         }];
     }
 
-    let mut c_min_x = f32::INFINITY;
-    let mut c_min_y = f32::INFINITY;
-    let mut c_max_x = f32::NEG_INFINITY;
-    let mut c_max_y = f32::NEG_INFINITY;
-
-    for &(aabb, _, _) in primitives {
-        let cx = 0.5 * (aabb[0] + aabb[2]);
-        let cy = 0.5 * (aabb[1] + aabb[3]);
-        c_min_x = c_min_x.min(cx);
-        c_min_y = c_min_y.min(cy);
-        c_max_x = c_max_x.max(cx);
-        c_max_y = c_max_y.max(cy);
+    let key = hash_lbvh_primitives(primitives);
+    let cache_mutex = GLOBAL_LBVH_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache_mutex.lock() {
+        if let Some((cached_key, ref cached_nodes)) = *guard {
+            if cached_key == key && cached_nodes.len() == primitives.len() * 2 - 1 {
+                GLOBAL_LBVH_HITS.fetch_add(1, Ordering::Relaxed);
+                return cached_nodes.clone();
+            }
+        }
     }
+
+    GLOBAL_LBVH_BUILDS.fetch_add(1, Ordering::Relaxed);
+
+    let (c_min_x, c_min_y, c_max_x, c_max_y) = if primitives.len() >= 256 {
+        primitives
+            .par_iter()
+            .fold(
+                || (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
+                |(min_x, min_y, max_x, max_y), &(aabb, _, _)| {
+                    let cx = 0.5 * (aabb[0] + aabb[2]);
+                    let cy = 0.5 * (aabb[1] + aabb[3]);
+                    (min_x.min(cx), min_y.min(cy), max_x.max(cx), max_y.max(cy))
+                },
+            )
+            .reduce(
+                || (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
+                |a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)),
+            )
+    } else {
+        let mut c_min_x = f32::INFINITY;
+        let mut c_min_y = f32::INFINITY;
+        let mut c_max_x = f32::NEG_INFINITY;
+        let mut c_max_y = f32::NEG_INFINITY;
+        for &(aabb, _, _) in primitives {
+            let cx = 0.5 * (aabb[0] + aabb[2]);
+            let cy = 0.5 * (aabb[1] + aabb[3]);
+            c_min_x = c_min_x.min(cx);
+            c_min_y = c_min_y.min(cy);
+            c_max_x = c_max_x.max(cx);
+            c_max_y = c_max_y.max(cy);
+        }
+        (c_min_x, c_min_y, c_max_x, c_max_y)
+    };
 
     let span_x = (c_max_x - c_min_x).max(1e-5);
     let span_y = (c_max_y - c_min_y).max(1e-5);
 
-    let mut morton_pairs: Vec<(u32, usize)> = primitives
-        .iter()
-        .enumerate()
-        .map(|(idx, &(aabb, _, _))| {
-            let cx = 0.5 * (aabb[0] + aabb[2]);
-            let cy = 0.5 * (aabb[1] + aabb[3]);
-            let qx = (((cx - c_min_x) / span_x).clamp(0.0, 1.0) * 65535.0) as u16;
-            let qy = (((cy - c_min_y) / span_y).clamp(0.0, 1.0) * 65535.0) as u16;
-            (morton2d_encode(qx, qy), idx)
-        })
-        .collect();
+    let mut morton_pairs: Vec<(u32, usize)> = if primitives.len() >= 256 {
+        primitives
+            .par_iter()
+            .enumerate()
+            .map(|(idx, &(aabb, _, _))| {
+                let cx = 0.5 * (aabb[0] + aabb[2]);
+                let cy = 0.5 * (aabb[1] + aabb[3]);
+                let qx = (((cx - c_min_x) / span_x).clamp(0.0, 1.0) * 65535.0) as u16;
+                let qy = (((cy - c_min_y) / span_y).clamp(0.0, 1.0) * 65535.0) as u16;
+                (morton2d_encode(qx, qy), idx)
+            })
+            .collect()
+    } else {
+        primitives
+            .iter()
+            .enumerate()
+            .map(|(idx, &(aabb, _, _))| {
+                let cx = 0.5 * (aabb[0] + aabb[2]);
+                let cy = 0.5 * (aabb[1] + aabb[3]);
+                let qx = (((cx - c_min_x) / span_x).clamp(0.0, 1.0) * 65535.0) as u16;
+                let qy = (((cy - c_min_y) / span_y).clamp(0.0, 1.0) * 65535.0) as u16;
+                (morton2d_encode(qx, qy), idx)
+            })
+            .collect()
+    };
 
-    morton_pairs.sort_unstable();
+    if primitives.len() >= 256 {
+        morton_pairs.par_sort_unstable();
+    } else {
+        morton_pairs.sort_unstable();
+    }
 
-    let mut nodes = Vec::with_capacity(primitives.len() * 2 - 1);
-
-    fn build_recursive(
-        slice: &[(u32, usize)],
-        primitives: &[([f32; 4], u32, u32)],
-        nodes: &mut Vec<GpuBvhNode>,
-    ) -> usize {
-        let node_idx = nodes.len();
-        if slice.len() == 1 {
-            let orig_idx = slice[0].1;
-            let (aabb, layer_mask, net_id) = primitives[orig_idx];
-            nodes.push(GpuBvhNode {
-                min_x: aabb[0].min(aabb[2]),
-                min_y: aabb[1].min(aabb[3]),
-                max_x: aabb[0].max(aabb[2]),
-                max_y: aabb[1].max(aabb[3]),
-                left_or_prim: orig_idx as i32,
-                right_or_count: 1,
-                layer_mask,
-                net_id,
-            });
-            return node_idx;
-        }
-
-        nodes.push(GpuBvhNode {
+    let total_nodes = primitives.len() * 2 - 1;
+    let mut nodes = vec![
+        GpuBvhNode {
             min_x: 0.0,
             min_y: 0.0,
             max_x: 0.0,
@@ -1986,21 +2081,59 @@ pub fn build_gpu_lbvh(primitives: &[([f32; 4], u32, u32)]) -> Vec<GpuBvhNode> {
             right_or_count: 0,
             layer_mask: 0,
             net_id: 0,
-        });
+        };
+        total_nodes
+    ];
+
+    fn build_slice(
+        slice: &[(u32, usize)],
+        primitives: &[([f32; 4], u32, u32)],
+        base_idx: usize,
+        out_nodes: &mut [GpuBvhNode],
+    ) {
+        if slice.len() == 1 {
+            let orig_idx = slice[0].1;
+            let (aabb, layer_mask, net_id) = primitives[orig_idx];
+            out_nodes[0] = GpuBvhNode {
+                min_x: aabb[0].min(aabb[2]),
+                min_y: aabb[1].min(aabb[3]),
+                max_x: aabb[0].max(aabb[2]),
+                max_y: aabb[1].max(aabb[3]),
+                left_or_prim: orig_idx as i32,
+                right_or_count: 1,
+                layer_mask,
+                net_id,
+            };
+            return;
+        }
 
         let mid = slice.len() / 2;
-        let left_idx = build_recursive(&slice[..mid], primitives, nodes);
-        let right_idx = build_recursive(&slice[mid..], primitives, nodes);
+        let left_nodes_len = 2 * mid - 1;
+        let left_idx = base_idx + 1;
+        let right_idx = base_idx + 1 + left_nodes_len;
 
-        let left = nodes[left_idx];
-        let right = nodes[right_idx];
+        let (_, rest) = out_nodes.split_at_mut(1);
+        let (left_out, right_out) = rest.split_at_mut(left_nodes_len);
+
+        if slice.len() >= 256 {
+            rayon::join(
+                || build_slice(&slice[..mid], primitives, left_idx, left_out),
+                || build_slice(&slice[mid..], primitives, right_idx, right_out),
+            );
+        } else {
+            build_slice(&slice[..mid], primitives, left_idx, left_out);
+            build_slice(&slice[mid..], primitives, right_idx, right_out);
+        }
+
+        let left = left_out[0];
+        let right = right_out[0];
         let same_net = if left.net_id != 0 && left.net_id == right.net_id {
             left.net_id
         } else {
             0
         };
 
-        nodes[node_idx] = GpuBvhNode {
+        out_nodes[0] = GpuBvhNode {
             min_x: left.min_x.min(right.min_x),
             min_y: left.min_y.min(right.min_y),
             max_x: left.max_x.max(right.max_x),
@@ -2010,10 +2143,12 @@ pub fn build_gpu_lbvh(primitives: &[([f32; 4], u32, u32)]) -> Vec<GpuBvhNode> {
             layer_mask: left.layer_mask | right.layer_mask,
             net_id: same_net,
         };
-        node_idx
     }
 
-    build_recursive(&morton_pairs, primitives, &mut nodes);
+    build_slice(&morton_pairs, primitives, 0, &mut nodes);
+    if let Ok(mut guard) = cache_mutex.lock() {
+        *guard = Some((key, nodes.clone()));
+    }
     nodes
 }
 
@@ -2208,7 +2343,7 @@ struct GridParams {
     width: u32,
     height: u32,
     radius: i32,
-    _pad: u32,
+    num_layers: u32,
 }
 
 #[repr(C)]
@@ -2400,6 +2535,25 @@ pub enum GpuBackendKind {
     CudaPtx,
 }
 
+pub struct CachedWavefrontBuffers {
+    pub total_cells: usize,
+    pub max_path_len: u32,
+    pub obst_buf: wgpu::Buffer,
+    pub df_buf: wgpu::Buffer,
+    pub hist_buf: wgpu::Buffer,
+    pub usage_buf: wgpu::Buffer,
+    pub cost_buf: wgpu::Buffer,
+    pub dist_a_buf: wgpu::Buffer,
+    pub dist_b_buf: wgpu::Buffer,
+    pub path_out_buf: wgpu::Buffer,
+    pub path_len_buf: wgpu::Buffer,
+    pub staging_buf: wgpu::Buffer,
+    pub staging_len_buf: wgpu::Buffer,
+    pub staging_path_buf: wgpu::Buffer,
+    pub alloc_count: usize,
+    pub reuse_count: usize,
+}
+
 pub struct VulkanEngine {
     pub device_name: String,
     pub backend_name: String,
@@ -2410,6 +2564,7 @@ pub struct VulkanEngine {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    df_v_pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     placement_pipeline: wgpu::ComputePipeline,
     placement_bgl: wgpu::BindGroupLayout,
@@ -2430,6 +2585,9 @@ pub struct VulkanEngine {
     drc_pipeline: wgpu::ComputePipeline,
     drc_bgl: wgpu::BindGroupLayout,
     dispatch_lock: Mutex<()>,
+    pub wavefront_buffers: Mutex<Option<CachedWavefrontBuffers>>,
+    pub lbvh_cache: Mutex<Option<(u64, Vec<GpuBvhNode>)>>,
+    pub lbvh_cache_hits: AtomicU64,
     pub compute_busy_ns: Arc<AtomicU64>,
     pub extra_devices: Vec<Arc<VulkanEngine>>,
 }
@@ -2662,6 +2820,16 @@ impl VulkanEngine {
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
@@ -2678,10 +2846,19 @@ impl VulkanEngine {
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("DistanceField ComputePipeline"),
+            label: Some("DistanceField PassH ComputePipeline"),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: Some("main"),
+            entry_point: Some("pass_h"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let df_v_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("DistanceField PassV ComputePipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("pass_v"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -3426,6 +3603,7 @@ impl VulkanEngine {
             device,
             queue,
             pipeline,
+            df_v_pipeline,
             bind_group_layout,
             placement_pipeline,
             placement_bgl,
@@ -3446,9 +3624,29 @@ impl VulkanEngine {
             drc_pipeline,
             drc_bgl,
             dispatch_lock: Mutex::new(()),
+            wavefront_buffers: Mutex::new(None),
+            lbvh_cache: Mutex::new(None),
+            lbvh_cache_hits: AtomicU64::new(0),
             compute_busy_ns,
             extra_devices,
         })
+    }
+
+    pub fn build_cached_lbvh(&self, primitives: &[([f32; 4], u32, u32)]) -> Vec<GpuBvhNode> {
+        let key = hash_lbvh_primitives(primitives);
+        if let Ok(guard) = self.lbvh_cache.lock() {
+            if let Some((cached_key, ref cached_nodes)) = *guard {
+                if cached_key == key && (primitives.is_empty() || cached_nodes.len() == primitives.len() * 2 - 1) {
+                    self.lbvh_cache_hits.fetch_add(1, Ordering::Relaxed);
+                    return cached_nodes.clone();
+                }
+            }
+        }
+        let nodes = build_gpu_lbvh(primitives);
+        if let Ok(mut guard) = self.lbvh_cache.lock() {
+            *guard = Some((key, nodes.clone()));
+        }
+        nodes
     }
 
     pub fn compute_distance_field(&self, obstacles: &[u32], width: u32, height: u32, radius: i32) -> Option<Vec<f32>> {
@@ -3466,13 +3664,37 @@ impl VulkanEngine {
             }
         }
 
+        self.compute_distance_field_vulkan_wgsl(obstacles, width, height, 1, radius)
+    }
+
+    pub fn compute_distance_field_vulkan_wgsl(
+        &self,
+        obstacles_flat: &[u32],
+        width: u32,
+        height: u32,
+        num_layers: u32,
+        radius: i32,
+    ) -> Option<Vec<f32>> {
+        let layer_cells = (width * height) as usize;
+        let total = layer_cells * (num_layers as usize);
+        if obstacles_flat.len() != total || total == 0 || num_layers == 0 {
+            return None;
+        }
+
         let _guard = self.dispatch_lock.lock().ok()?;
         let byte_size = (total * std::mem::size_of::<f32>()) as u64;
 
         let obs_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Obstacles Buffer"),
-            contents: bytemuck::cast_slice(obstacles),
+            contents: bytemuck::cast_slice(obstacles_flat),
             usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let temp_h_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Dist TempH Buffer"),
+            size: byte_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
         });
 
         let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -3493,7 +3715,7 @@ impl VulkanEngine {
             width,
             height,
             radius,
-            _pad: 0,
+            num_layers,
         };
         let param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("GridParams Uniform"),
@@ -3511,10 +3733,14 @@ impl VulkanEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: out_buf.as_entire_binding(),
+                    resource: temp_h_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
+                    resource: out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
                     resource: param_buf.as_entire_binding(),
                 },
             ],
@@ -3526,21 +3752,25 @@ impl VulkanEngine {
 
         let wg_x = (width + 15) / 16;
         let wg_y = (height + 15) / 16;
-        let passes = if total >= 4096 && radius > 12 {
-            64
-        } else if total >= 4096 {
-            8
-        } else {
-            1
-        };
-        for _ in 0..passes {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("DistanceField ComputePass"),
+        let wg_z = num_layers;
+
+        {
+            let mut cpass_h = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("DistanceField PassH ComputePass"),
                 timestamp_writes: None,
             });
-            cpass.set_pipeline(&self.pipeline);
-            cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+            cpass_h.set_pipeline(&self.pipeline);
+            cpass_h.set_bind_group(0, &bind_group, &[]);
+            cpass_h.dispatch_workgroups(wg_x, wg_y, wg_z);
+        }
+        {
+            let mut cpass_v = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("DistanceField PassV ComputePass"),
+                timestamp_writes: None,
+            });
+            cpass_v.set_pipeline(&self.df_v_pipeline);
+            cpass_v.set_bind_group(0, &bind_group, &[]);
+            cpass_v.dispatch_workgroups(wg_x, wg_y, wg_z);
         }
 
         encoder.copy_buffer_to_buffer(&out_buf, 0, &staging_buf, 0, byte_size);
@@ -3553,7 +3783,7 @@ impl VulkanEngine {
             let _ = tx.send(res);
         });
         self.device.poll(wgpu::Maintain::Wait);
-        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+        let elapsed_ns = (start_t.elapsed().as_nanos() as u64).max(1);
         self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
 
         let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
@@ -3568,6 +3798,7 @@ impl VulkanEngine {
 
         staging_buf.destroy();
         out_buf.destroy();
+        temp_h_buf.destroy();
         obs_buf.destroy();
         param_buf.destroy();
 
@@ -3597,13 +3828,7 @@ impl VulkanEngine {
             }
         }
 
-        let mut out = Vec::with_capacity(total);
-        for l in 0..(num_layers as usize) {
-            let offset = l * layer_cells;
-            let df = self.compute_distance_field(&obstacles_flat[offset..offset + layer_cells], width, height, radius)?;
-            out.extend_from_slice(&df);
-        }
-        Some(out)
+        self.compute_distance_field_vulkan_wgsl(obstacles_flat, width, height, num_layers, radius)
     }
 
 
@@ -4203,6 +4428,143 @@ impl VulkanEngine {
         self.compute_3d_wavefront_vulkan_wgsl(cell_costs, seeds, params, via_cost, iterations)
     }
 
+    fn with_wavefront_buffers<R, F: FnOnce(&CachedWavefrontBuffers) -> R>(
+        &self,
+        total: usize,
+        f: F,
+    ) -> Option<R> {
+        let mut guard = self.wavefront_buffers.lock().ok()?;
+        let needs_alloc = match *guard {
+            Some(ref c) => c.total_cells != total,
+            None => true,
+        };
+        if needs_alloc {
+            let prev_alloc = if let Some(old) = guard.take() {
+                old.obst_buf.destroy();
+                old.df_buf.destroy();
+                old.hist_buf.destroy();
+                old.usage_buf.destroy();
+                old.cost_buf.destroy();
+                old.dist_a_buf.destroy();
+                old.dist_b_buf.destroy();
+                old.path_out_buf.destroy();
+                old.path_len_buf.destroy();
+                old.staging_buf.destroy();
+                old.staging_len_buf.destroy();
+                old.staging_path_buf.destroy();
+                old.alloc_count
+            } else {
+                0
+            };
+
+            let u32_byte_size = (total * std::mem::size_of::<u32>()) as u64;
+            let f32_byte_size = (total * std::mem::size_of::<f32>()) as u64;
+            let max_path_len = total.min(65536).max(64) as u32;
+            let path_byte_size = (max_path_len as usize * 3 * std::mem::size_of::<u32>()) as u64;
+            let len_byte_size = std::mem::size_of::<u32>() as u64;
+
+            let zero_f32 = vec![0.0f32; total];
+            let zero_u32 = vec![0u32; total];
+
+            let obst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("CachedWavefront Obstacles Buffer"),
+                size: u32_byte_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let df_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("CachedWavefront ZeroDF Buffer"),
+                contents: bytemuck::cast_slice(&zero_f32),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+            let hist_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("CachedWavefront ZeroHist Buffer"),
+                contents: bytemuck::cast_slice(&zero_f32),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+            let usage_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("CachedWavefront ZeroUsage Buffer"),
+                contents: bytemuck::cast_slice(&zero_u32),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+            let cost_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("CachedWavefront CellCosts Buffer"),
+                size: f32_byte_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let dist_a_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("CachedWavefront Dist A Buffer"),
+                size: f32_byte_size,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let dist_b_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("CachedWavefront Dist B Buffer"),
+                size: f32_byte_size,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let path_out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("CachedWavefront PathOut Buffer"),
+                size: path_byte_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let path_len_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("CachedWavefront PathLen Buffer"),
+                contents: bytemuck::bytes_of(&0u32),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            });
+            let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("CachedWavefront Staging Buffer"),
+                size: f32_byte_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let staging_len_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("CachedWavefront Staging PathLen Buffer"),
+                size: len_byte_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let staging_path_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("CachedWavefront Staging Path Buffer"),
+                size: path_byte_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            *guard = Some(CachedWavefrontBuffers {
+                total_cells: total,
+                max_path_len,
+                obst_buf,
+                df_buf,
+                hist_buf,
+                usage_buf,
+                cost_buf,
+                dist_a_buf,
+                dist_b_buf,
+                path_out_buf,
+                path_len_buf,
+                staging_buf,
+                staging_len_buf,
+                staging_path_buf,
+                alloc_count: prev_alloc + 1,
+                reuse_count: 0,
+            });
+        } else if let Some(ref mut c) = *guard {
+            c.reuse_count += 1;
+        }
+        guard.as_ref().map(f)
+    }
+
     pub fn compute_3d_wavefront_vulkan_wgsl(
         &self,
         cell_costs: &[f32],
@@ -4232,136 +4594,115 @@ impl VulkanEngine {
         let _guard = self.dispatch_lock.lock().ok()?;
         let byte_size = (total * std::mem::size_of::<f32>()) as u64;
 
-        let costs_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Wavefront3D CellCosts Buffer"),
-            contents: bytemuck::cast_slice(cell_costs),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let wf_buf_a = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Wavefront3D Buffer A"),
-            contents: bytemuck::cast_slice(&init_wf),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let wf_buf_b = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Wavefront3D Buffer B"),
-            contents: bytemuck::cast_slice(&init_wf),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Wavefront3D Staging Buffer"),
-            size: byte_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        self.with_wavefront_buffers(total, |pool| {
+            self.queue.write_buffer(&pool.cost_buf, 0, bytemuck::cast_slice(cell_costs));
+            self.queue.write_buffer(&pool.dist_a_buf, 0, bytemuck::cast_slice(&init_wf));
+            self.queue.write_buffer(&pool.dist_b_buf, 0, bytemuck::cast_slice(&init_wf));
 
-        let wf_params = WavefrontUniformParams {
-            width: params.width,
-            height: params.height,
-            num_layers: params.num_layers,
-            via_cost,
-        };
-        let param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("WavefrontUniformParams Buffer"),
-            contents: bytemuck::bytes_of(&wf_params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-
-        let bg_ab = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Wavefront3D BindGroup A->B"),
-            layout: &self.wavefront_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: costs_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wf_buf_a.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wf_buf_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: param_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let bg_ba = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Wavefront3D BindGroup B->A"),
-            layout: &self.wavefront_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: costs_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wf_buf_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wf_buf_a.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: param_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Wavefront3D CommandEncoder"),
-        });
-
-        let wg_x = (params.width + 15) / 16;
-        let wg_y = (params.height + 15) / 16;
-        let wg_z = params.num_layers;
-
-        for iter in 0..iterations {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Wavefront3D ComputePass"),
-                timestamp_writes: None,
+            let wf_params = WavefrontUniformParams {
+                width: params.width,
+                height: params.height,
+                num_layers: params.num_layers,
+                via_cost,
+            };
+            let param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("WavefrontUniformParams Buffer"),
+                contents: bytemuck::bytes_of(&wf_params),
+                usage: wgpu::BufferUsages::UNIFORM,
             });
-            cpass.set_pipeline(&self.wavefront_pipeline);
-            cpass.set_bind_group(0, if iter % 2 == 0 { &bg_ab } else { &bg_ba }, &[]);
-            cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
-        }
 
-        let final_buf = if iterations % 2 == 1 { &wf_buf_b } else { &wf_buf_a };
-        encoder.copy_buffer_to_buffer(final_buf, 0, &staging_buf, 0, byte_size);
+            let bg_ab = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Wavefront3D BindGroup A->B"),
+                layout: &self.wavefront_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: pool.cost_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: pool.dist_a_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: pool.dist_b_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: param_buf.as_entire_binding(),
+                    },
+                ],
+            });
 
-        let start_t = Instant::now();
-        self.queue.submit(Some(encoder.finish()));
+            let bg_ba = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Wavefront3D BindGroup B->A"),
+                layout: &self.wavefront_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: pool.cost_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: pool.dist_b_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: pool.dist_a_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: param_buf.as_entire_binding(),
+                    },
+                ],
+            });
 
-        let slice = staging_buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
-        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Wavefront3D CommandEncoder"),
+            });
 
-        let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
-            let data = slice.get_mapped_range();
-            let vec: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
-            drop(data);
-            staging_buf.unmap();
-            Some(vec)
-        } else {
-            None
-        };
+            let wg_x = (params.width + 15) / 16;
+            let wg_y = (params.height + 15) / 16;
+            let wg_z = params.num_layers;
 
-        staging_buf.destroy();
-        wf_buf_a.destroy();
-        wf_buf_b.destroy();
-        costs_buf.destroy();
-        param_buf.destroy();
+            for iter in 0..iterations {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Wavefront3D ComputePass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.wavefront_pipeline);
+                cpass.set_bind_group(0, if iter % 2 == 0 { &bg_ab } else { &bg_ba }, &[]);
+                cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
+            }
 
-        result
+            let final_buf = if iterations % 2 == 1 { &pool.dist_b_buf } else { &pool.dist_a_buf };
+            encoder.copy_buffer_to_buffer(final_buf, 0, &pool.staging_buf, 0, byte_size);
+
+            let start_t = Instant::now();
+            self.queue.submit(Some(encoder.finish()));
+
+            let slice = pool.staging_buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |res| {
+                let _ = tx.send(res);
+            });
+            self.device.poll(wgpu::Maintain::Wait);
+            let elapsed_ns = (start_t.elapsed().as_nanos() as u64).max(1);
+            self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+            let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
+                let data = slice.get_mapped_range();
+                let vec: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+                drop(data);
+                pool.staging_buf.unmap();
+                Some(vec)
+            } else {
+                None
+            };
+
+            param_buf.destroy();
+            result
+        })?
     }
 
     pub fn solve_3d_wavefront_path(
@@ -4475,329 +4816,262 @@ impl VulkanEngine {
         }
 
         let _guard = self.dispatch_lock.lock().ok()?;
-        let f32_byte_size = (total * std::mem::size_of::<f32>()) as u64;
-        let max_path_len = total.min(65536).max(64) as u32;
-        let path_byte_size = (max_path_len as usize * 3 * std::mem::size_of::<u32>()) as u64;
         let len_byte_size = std::mem::size_of::<u32>() as u64;
 
-        let zero_f32 = vec![0.0f32; total];
-        let zero_u32 = vec![0u32; total];
         let mut init_wf = vec![1.0e20f32; total];
         init_wf[src_idx] = 0.0;
 
-        let obs_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("WavefrontSolve Obstacles Buffer"),
-            contents: bytemuck::cast_slice(obstacle_grid),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let df_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("WavefrontSolve ZeroDF Buffer"),
-            contents: bytemuck::cast_slice(&zero_f32),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let hist_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("WavefrontSolve ZeroHist Buffer"),
-            contents: bytemuck::cast_slice(&zero_f32),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let usage_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("WavefrontSolve ZeroUsage Buffer"),
-            contents: bytemuck::cast_slice(&zero_u32),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let costs_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("WavefrontSolve CellCosts Buffer"),
-            size: f32_byte_size,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
+        self.with_wavefront_buffers(total, |pool| {
+            let max_path_len = pool.max_path_len;
+            let path_byte_size = (max_path_len as usize * 3 * std::mem::size_of::<u32>()) as u64;
 
-        let rc_params = GpuRouteCostParams {
-            width: gw as u32,
-            height: gh as u32,
-            num_layers: layers as u32,
-            net_id,
-            clearance_cells: clearance_cells.max(0),
-            present_congestion_factor: 0.0,
-            obstacle_clearance_weight: 0.0,
-            plane_layer_mask: 0,
-        };
-        let rc_param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("WavefrontSolve RouteCostParams Buffer"),
-            contents: bytemuck::bytes_of(&rc_params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+            self.queue.write_buffer(&pool.obst_buf, 0, bytemuck::cast_slice(obstacle_grid));
+            self.queue.write_buffer(&pool.dist_a_buf, 0, bytemuck::cast_slice(&init_wf));
+            self.queue.write_buffer(&pool.dist_b_buf, 0, bytemuck::cast_slice(&init_wf));
+            self.queue.write_buffer(&pool.path_len_buf, 0, bytemuck::bytes_of(&0u32));
 
-        let wf_buf_a = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("WavefrontSolve WF Buffer A"),
-            contents: bytemuck::cast_slice(&init_wf),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let wf_buf_b = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("WavefrontSolve WF Buffer B"),
-            contents: bytemuck::cast_slice(&init_wf),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let wf_params = WavefrontUniformParams {
-            width: gw as u32,
-            height: gh as u32,
-            num_layers: layers as u32,
-            via_cost,
-        };
-        let wf_param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("WavefrontSolve WFParams Buffer"),
-            contents: bytemuck::bytes_of(&wf_params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-
-        let path_out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("WavefrontSolve PathOut Buffer"),
-            size: path_byte_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let path_len_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("WavefrontSolve PathLen Buffer"),
-            contents: bytemuck::bytes_of(&0u32),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let bt_params = WavefrontBacktrackUniformParams {
-            width: gw as u32,
-            height: gh as u32,
-            num_layers: layers as u32,
-            via_cost,
-            src_x: src.0 as u32,
-            src_y: src.1 as u32,
-            src_layer: src.2 as u32,
-            dst_x: dst.0 as u32,
-            dst_y: dst.1 as u32,
-            dst_layer: dst.2 as u32,
-            max_path_len,
-            pad: 0,
-        };
-        let bt_param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("WavefrontSolve BacktrackParams Buffer"),
-            contents: bytemuck::bytes_of(&bt_params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-
-        let staging_len_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("WavefrontSolve Staging PathLen Buffer"),
-            size: len_byte_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let staging_path_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("WavefrontSolve Staging Path Buffer"),
-            size: path_byte_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let bg_rc = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("WavefrontSolve RouteCost BindGroup"),
-            layout: &self.route_cost_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: obs_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: df_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: hist_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: usage_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: costs_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: rc_param_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let bg_wf_ab = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("WavefrontSolve WF BindGroup A->B"),
-            layout: &self.wavefront_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: costs_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wf_buf_a.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wf_buf_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wf_param_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let bg_wf_ba = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("WavefrontSolve WF BindGroup B->A"),
-            layout: &self.wavefront_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: costs_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wf_buf_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wf_buf_a.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wf_param_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let iterations = ((gw + gh + (gw * gh / 2).min(512) + layers * 4)
-            .max(32)
-            .min(4096)) as u32;
-        let final_wf_buf = if iterations % 2 == 1 { &wf_buf_b } else { &wf_buf_a };
-
-        let bg_bt = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("WavefrontSolve Backtrack BindGroup"),
-            layout: &self.wavefront_backtrack_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: final_wf_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: costs_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: path_out_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: path_len_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: bt_param_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("WavefrontSolve CommandEncoder"),
-        });
-
-        let wg_x = (gw as u32 + 15) / 16;
-        let wg_y = (gh as u32 + 15) / 16;
-        let wg_z = layers as u32;
-
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("WavefrontSolve RouteCost Pass"),
-                timestamp_writes: None,
+            let rc_params = GpuRouteCostParams {
+                width: gw as u32,
+                height: gh as u32,
+                num_layers: layers as u32,
+                net_id,
+                clearance_cells: clearance_cells.max(0),
+                present_congestion_factor: 0.0,
+                obstacle_clearance_weight: 0.0,
+                plane_layer_mask: 0,
+            };
+            let rc_param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("WavefrontSolve RouteCostParams Buffer"),
+                contents: bytemuck::bytes_of(&rc_params),
+                usage: wgpu::BufferUsages::UNIFORM,
             });
-            cpass.set_pipeline(&self.route_cost_pipeline);
-            cpass.set_bind_group(0, &bg_rc, &[]);
-            cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
-        }
 
-        for iter in 0..iterations {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("WavefrontSolve Relax Pass"),
-                timestamp_writes: None,
+            let wf_params = WavefrontUniformParams {
+                width: gw as u32,
+                height: gh as u32,
+                num_layers: layers as u32,
+                via_cost,
+            };
+            let wf_param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("WavefrontSolve WFParams Buffer"),
+                contents: bytemuck::bytes_of(&wf_params),
+                usage: wgpu::BufferUsages::UNIFORM,
             });
-            cpass.set_pipeline(&self.wavefront_pipeline);
-            cpass.set_bind_group(0, if iter % 2 == 0 { &bg_wf_ab } else { &bg_wf_ba }, &[]);
-            cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
-        }
 
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("WavefrontSolve Backtrack Pass"),
-                timestamp_writes: None,
+            let bt_params = WavefrontBacktrackUniformParams {
+                width: gw as u32,
+                height: gh as u32,
+                num_layers: layers as u32,
+                via_cost,
+                src_x: src.0 as u32,
+                src_y: src.1 as u32,
+                src_layer: src.2 as u32,
+                dst_x: dst.0 as u32,
+                dst_y: dst.1 as u32,
+                dst_layer: dst.2 as u32,
+                max_path_len,
+                pad: 0,
+            };
+            let bt_param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("WavefrontSolve BacktrackParams Buffer"),
+                contents: bytemuck::bytes_of(&bt_params),
+                usage: wgpu::BufferUsages::UNIFORM,
             });
-            cpass.set_pipeline(&self.wavefront_backtrack_pipeline);
-            cpass.set_bind_group(0, &bg_bt, &[]);
-            cpass.dispatch_workgroups(1, 1, 1);
-        }
 
-        encoder.copy_buffer_to_buffer(&path_len_buf, 0, &staging_len_buf, 0, len_byte_size);
-        encoder.copy_buffer_to_buffer(&path_out_buf, 0, &staging_path_buf, 0, path_byte_size);
+            let bg_rc = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("WavefrontSolve RouteCost BindGroup"),
+                layout: &self.route_cost_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: pool.obst_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: pool.df_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: pool.hist_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: pool.usage_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: pool.cost_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: rc_param_buf.as_entire_binding(),
+                    },
+                ],
+            });
 
-        let start_t = Instant::now();
-        self.queue.submit(Some(encoder.finish()));
+            let bg_wf_ab = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("WavefrontSolve WF BindGroup A->B"),
+                layout: &self.wavefront_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: pool.cost_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: pool.dist_a_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: pool.dist_b_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wf_param_buf.as_entire_binding(),
+                    },
+                ],
+            });
 
-        let len_slice = staging_len_buf.slice(..);
-        let path_slice = staging_path_buf.slice(..);
-        let (tx1, rx1) = std::sync::mpsc::channel();
-        let (tx2, rx2) = std::sync::mpsc::channel();
-        len_slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx1.send(res);
-        });
-        path_slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx2.send(res);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
-        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+            let bg_wf_ba = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("WavefrontSolve WF BindGroup B->A"),
+                layout: &self.wavefront_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: pool.cost_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: pool.dist_b_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: pool.dist_a_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wf_param_buf.as_entire_binding(),
+                    },
+                ],
+            });
 
-        let mut result = None;
-        if rx1.recv().ok().and_then(|r| r.ok()).is_some()
-            && rx2.recv().ok().and_then(|r| r.ok()).is_some()
-        {
-            let len_data = len_slice.get_mapped_range();
-            let path_len = bytemuck::cast_slice::<u8, u32>(&len_data)[0];
-            drop(len_data);
-            staging_len_buf.unmap();
+            let iterations = ((gw + gh + (gw * gh / 2).min(512) + layers * 4)
+                .max(32)
+                .min(4096)) as u32;
+            let final_wf_buf = if iterations % 2 == 1 { &pool.dist_b_buf } else { &pool.dist_a_buf };
 
-            if path_len > 0 && path_len <= max_path_len {
-                let path_data = path_slice.get_mapped_range();
-                let words = &bytemuck::cast_slice::<u8, u32>(&path_data)[..(path_len as usize * 3)];
-                let mut path = Vec::with_capacity(path_len as usize);
-                for c in words.chunks_exact(3) {
-                    path.push((c[0] as usize, c[1] as usize, c[2] as usize));
-                }
-                result = Some(path);
+            let bg_bt = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("WavefrontSolve Backtrack BindGroup"),
+                layout: &self.wavefront_backtrack_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: final_wf_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: pool.cost_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: pool.path_out_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: pool.path_len_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: bt_param_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("WavefrontSolve CommandEncoder"),
+            });
+
+            let wg_x = (gw as u32 + 15) / 16;
+            let wg_y = (gh as u32 + 15) / 16;
+            let wg_z = layers as u32;
+
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("WavefrontSolve RouteCost Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.route_cost_pipeline);
+                cpass.set_bind_group(0, &bg_rc, &[]);
+                cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
             }
-            staging_path_buf.unmap();
-        }
 
-        staging_len_buf.destroy();
-        staging_path_buf.destroy();
-        bt_param_buf.destroy();
-        path_len_buf.destroy();
-        path_out_buf.destroy();
-        wf_param_buf.destroy();
-        wf_buf_b.destroy();
-        wf_buf_a.destroy();
-        rc_param_buf.destroy();
-        costs_buf.destroy();
-        usage_buf.destroy();
-        hist_buf.destroy();
-        df_buf.destroy();
-        obs_buf.destroy();
+            for iter in 0..iterations {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("WavefrontSolve Relax Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.wavefront_pipeline);
+                cpass.set_bind_group(0, if iter % 2 == 0 { &bg_wf_ab } else { &bg_wf_ba }, &[]);
+                cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
+            }
 
-        result
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("WavefrontSolve Backtrack Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.wavefront_backtrack_pipeline);
+                cpass.set_bind_group(0, &bg_bt, &[]);
+                cpass.dispatch_workgroups(1, 1, 1);
+            }
+
+            encoder.copy_buffer_to_buffer(&pool.path_len_buf, 0, &pool.staging_len_buf, 0, len_byte_size);
+            encoder.copy_buffer_to_buffer(&pool.path_out_buf, 0, &pool.staging_path_buf, 0, path_byte_size);
+
+            let start_t = Instant::now();
+            self.queue.submit(Some(encoder.finish()));
+
+            let len_slice = pool.staging_len_buf.slice(..);
+            let path_slice = pool.staging_path_buf.slice(..);
+            let (tx1, rx1) = std::sync::mpsc::channel();
+            let (tx2, rx2) = std::sync::mpsc::channel();
+            len_slice.map_async(wgpu::MapMode::Read, move |res| {
+                let _ = tx1.send(res);
+            });
+            path_slice.map_async(wgpu::MapMode::Read, move |res| {
+                let _ = tx2.send(res);
+            });
+            self.device.poll(wgpu::Maintain::Wait);
+            let elapsed_ns = (start_t.elapsed().as_nanos() as u64).max(1);
+            self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+            let mut result = None;
+            if rx1.recv().ok().and_then(|r| r.ok()).is_some()
+                && rx2.recv().ok().and_then(|r| r.ok()).is_some()
+            {
+                let len_data = len_slice.get_mapped_range();
+                let path_len = bytemuck::cast_slice::<u8, u32>(&len_data)[0];
+                drop(len_data);
+                pool.staging_len_buf.unmap();
+
+                if path_len > 0 && path_len <= max_path_len {
+                    let path_data = path_slice.get_mapped_range();
+                    let words = &bytemuck::cast_slice::<u8, u32>(&path_data)[..(path_len as usize * 3)];
+                    let mut path = Vec::with_capacity(path_len as usize);
+                    for c in words.chunks_exact(3) {
+                        path.push((c[0] as usize, c[1] as usize, c[2] as usize));
+                    }
+                    result = Some(path);
+                }
+                pool.staging_path_buf.unmap();
+            }
+
+            bt_param_buf.destroy();
+            wf_param_buf.destroy();
+            rc_param_buf.destroy();
+
+            result
+        })?
     }
 
     pub fn solve_batch_3d_wavefront_paths(
@@ -6247,6 +6521,220 @@ mod tests {
             .run_gpu_sa_placer_chains(&fp_descs, &edges, &smd_poses, &sa_params, 1, Some(&th_courtyards))
             .expect("Through-Hole layer test");
         assert_eq!(th_scores[0][2], 1.0, "Through-Hole component must collide with bottom-layer SMD component");
+    }
+
+    #[test]
+    fn test_separable_distance_field_exact_equivalence() {
+        let w = 40u32;
+        let h = 32u32;
+        let layers = 2u32;
+        let radius = 9i32;
+        let layer_cells = (w * h) as usize;
+        let mut obs = vec![0u32; layer_cells * layers as usize];
+        // Populate varied obstacle pattern across both layers
+        for l in 0..layers as usize {
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    if (x == 5 && y == 7)
+                        || (x == 19 + l * 3 && (10..=15).contains(&y))
+                        || (y == 24 && (28..=33).contains(&x))
+                        || (x == 0 && y == 0 && l == 1)
+                    {
+                        obs[l * layer_cells + y * (w as usize) + x] = (l as u32) + 1;
+                    }
+                }
+            }
+        }
+
+        // Exact 2D window reference on CPU
+        let mut ref_df = vec![0.0f32; obs.len()];
+        for l in 0..layers as usize {
+            let base = l * layer_cells;
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let idx = base + (y as usize) * (w as usize) + (x as usize);
+                    if obs[idx] != 0 {
+                        ref_df[idx] = 0.0;
+                        continue;
+                    }
+                    let mut min_d2 = (radius * radius + 1) as f32;
+                    for dy in -radius..=radius {
+                        let ny = y + dy;
+                        if ny < 0 || ny >= h as i32 {
+                            continue;
+                        }
+                        for dx in -radius..=radius {
+                            let nx = x + dx;
+                            if nx < 0 || nx >= w as i32 {
+                                continue;
+                            }
+                            let nidx = base + (ny as usize) * (w as usize) + (nx as usize);
+                            if obs[nidx] != 0 {
+                                let d2 = (dx * dx + dy * dy) as f32;
+                                if d2 < min_d2 {
+                                    min_d2 = d2;
+                                }
+                            }
+                        }
+                    }
+                    ref_df[idx] = min_d2.sqrt();
+                }
+            }
+        }
+
+        if let Some(vk) = VulkanEngine::new() {
+            let vk_wgsl_df = vk
+                .compute_distance_field_vulkan_wgsl(&obs, w, h, layers, radius)
+                .expect("Vulkan separable distance field failed");
+            assert_eq!(vk_wgsl_df.len(), ref_df.len());
+            for (i, (&got, &exp)) in vk_wgsl_df.iter().zip(ref_df.iter()).enumerate() {
+                assert!(
+                    (got - exp).abs() < 1e-5,
+                    "Vulkan WGSL separable DF mismatch at cell {}: got {}, expected {}",
+                    i,
+                    got,
+                    exp
+                );
+            }
+
+            if let Some(cuda) = &vk.cuda_engine {
+                let cuda_sep = cuda
+                    .compute_distance_field_separable(&obs[..layer_cells], w, h, radius)
+                    .expect("CUDA separable 2D distance field failed");
+                for (i, (&got, &exp)) in cuda_sep.iter().zip(ref_df[..layer_cells].iter()).enumerate() {
+                    assert!(
+                        (got - exp).abs() < 1e-5,
+                        "CUDA separable 2D DF mismatch at cell {}: got {}, expected {}",
+                        i,
+                        got,
+                        exp
+                    );
+                }
+
+                let cuda_layers = cuda
+                    .compute_distance_field_layers(&obs, w, h, layers, radius)
+                    .expect("CUDA separable 3D layers distance field failed");
+                for (i, (&got, &exp)) in cuda_layers.iter().zip(ref_df.iter()).enumerate() {
+                    assert!(
+                        (got - exp).abs() < 1e-5,
+                        "CUDA separable 3D DF mismatch at cell {}: got {}, expected {}",
+                        i,
+                        got,
+                        exp
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_wavefront_buffer_pool_reuse_and_lbvh_cache() {
+        // 1. Verify parallel + cached LBVH exact equivalence and cache hits
+        let mut prims = Vec::with_capacity(600);
+        for i in 0..600usize {
+            let x = (i % 30) as f32 * 2.5;
+            let y = (i / 30) as f32 * 2.5;
+            let layer_mask = 1u32 << (i % 4);
+            let net_id = ((i % 12) + 1) as u32;
+            prims.push(([x, y, x + 1.0, y + 0.8], layer_mask, net_id));
+        }
+
+        let (_, hits_before) = lbvh_cache_stats();
+        let bvh_first = build_gpu_lbvh(&prims);
+        let bvh_second = build_gpu_lbvh(&prims);
+        let (_, hits_after) = lbvh_cache_stats();
+        assert_eq!(bvh_first.len(), prims.len() * 2 - 1);
+        assert_eq!(bvh_first, bvh_second, "Cached parallel LBVH must match initial build bit-for-bit");
+        assert!(hits_after > hits_before, "Global LBVH cache must record a cache hit on identical primitive slice");
+
+        // Verify DRC queries on the parallel-built LBVH match brute-force CPU
+        let mut queries = Vec::with_capacity(32);
+        for i in 0..32usize {
+            let x1 = (i * 3) as f32;
+            let y1 = (i * 2) as f32;
+            queries.push(GpuDrcRayQuery {
+                x1,
+                y1,
+                x2: x1 + 8.0,
+                y2: y1 + 5.0,
+                clearance: 0.2,
+                layer_mask: 1u32 << (i % 4),
+                net_id: ((i % 12) + 1) as u32,
+                _pad: 0,
+            });
+        }
+        let cpu_drc = evaluate_drc_brute_force_cpu(&prims, &queries);
+
+        if let Some(vk) = VulkanEngine::new() {
+            let n1 = vk.build_cached_lbvh(&prims);
+            let hits_0 = vk.lbvh_cache_hits.load(Ordering::Relaxed);
+            let n2 = vk.build_cached_lbvh(&prims);
+            let hits_1 = vk.lbvh_cache_hits.load(Ordering::Relaxed);
+            assert_eq!(n1, n2);
+            assert_eq!(hits_1, hits_0 + 1, "VulkanEngine::build_cached_lbvh must reuse cached LBVH");
+
+            let gpu_drc = vk
+                .evaluate_drc_rt_bvh(&n1, &queries)
+                .expect("GPU RT BVH DRC failed");
+            assert_eq!(gpu_drc, cpu_drc, "Parallel LBVH GPU DRC must match CPU brute-force reference");
+
+            // 2. Verify persistent wavefront device buffer pool reuse on Vulkan WGSL
+            let gw = 16usize;
+            let gh = 16usize;
+            let layers = 2usize;
+            let total = gw * gh * layers;
+            let mut obs = vec![0u32; total];
+            obs[5 * gw + 5] = 99;
+
+            let p1 = vk
+                .solve_3d_wavefront_path_vulkan_wgsl(&obs, gw, gh, layers, (1, 1, 0), (12, 12, 1), 1, 2.0, 1)
+                .expect("First Vulkan wavefront path failed");
+            let (alloc_1, reuse_1) = {
+                let guard = vk.wavefront_buffers.lock().unwrap();
+                let pool = guard.as_ref().expect("Wavefront buffer pool should be populated");
+                (pool.alloc_count, pool.reuse_count)
+            };
+            assert_eq!(alloc_1, 1);
+
+            let p2 = vk
+                .solve_3d_wavefront_path_vulkan_wgsl(&obs, gw, gh, layers, (2, 2, 0), (14, 10, 1), 1, 2.0, 1)
+                .expect("Second Vulkan wavefront path failed");
+            let (alloc_2, reuse_2) = {
+                let guard = vk.wavefront_buffers.lock().unwrap();
+                let pool = guard.as_ref().expect("Wavefront buffer pool should be populated");
+                (pool.alloc_count, pool.reuse_count)
+            };
+            assert_eq!(alloc_2, 1, "Wavefront buffer pool must not reallocate for same total_cells");
+            assert_eq!(reuse_2, reuse_1 + 1, "Wavefront buffer pool must increment reuse_count");
+            assert_eq!(p1.first().copied(), Some((1, 1, 0)));
+            assert_eq!(p1.last().copied(), Some((12, 12, 1)));
+            assert_eq!(p2.first().copied(), Some((2, 2, 0)));
+            assert_eq!(p2.last().copied(), Some((14, 10, 1)));
+
+            // Verify CUDA wavefront buffer pool reuse if CUDA is active
+            if let Some(cuda) = &vk.cuda_engine {
+                let cp1 = cuda
+                    .solve_3d_wavefront_path_with_clearance(&obs, gw, gh, layers, (1, 1, 0), (12, 12, 1), 1, 2.0, 1)
+                    .expect("First CUDA wavefront path failed");
+                let (c_alloc_1, c_reuse_1) = {
+                    let guard = cuda.wavefront_buffers.lock().unwrap();
+                    let pool = guard.as_ref().expect("CUDA wavefront buffer pool should be populated");
+                    (pool.alloc_count, pool.reuse_count)
+                };
+                let cp2 = cuda
+                    .solve_3d_wavefront_path_with_clearance(&obs, gw, gh, layers, (2, 2, 0), (14, 10, 1), 1, 2.0, 1)
+                    .expect("Second CUDA wavefront path failed");
+                let (c_alloc_2, c_reuse_2) = {
+                    let guard = cuda.wavefront_buffers.lock().unwrap();
+                    let pool = guard.as_ref().expect("CUDA wavefront buffer pool should be populated");
+                    (pool.alloc_count, pool.reuse_count)
+                };
+                assert_eq!(c_alloc_2, c_alloc_1, "CUDA wavefront buffer pool must not reallocate for same total_cells");
+                assert_eq!(c_reuse_2, c_reuse_1 + 1, "CUDA wavefront buffer pool must increment reuse_count");
+                assert_eq!(cp1, p1);
+                assert_eq!(cp2, p2);
+            }
+        }
     }
 }
 

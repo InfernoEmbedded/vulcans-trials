@@ -354,8 +354,26 @@ impl CudaDriverApi {
 struct PersistentDeviceBuffers {
     d_obs: CUdeviceptr,
     obs_cap_bytes: usize,
+    d_temp: CUdeviceptr,
+    temp_cap_bytes: usize,
     d_out: CUdeviceptr,
     out_cap_bytes: usize,
+}
+
+pub struct CachedWavefrontBuffers {
+    pub total_cells: usize,
+    pub d_obs: CUdeviceptr,
+    pub d_df: CUdeviceptr,
+    pub d_hist: CUdeviceptr,
+    pub d_usage: CUdeviceptr,
+    pub d_costs: CUdeviceptr,
+    pub d_wf_a: CUdeviceptr,
+    pub d_wf_b: CUdeviceptr,
+    pub d_path_out: CUdeviceptr,
+    pub d_path_len: CUdeviceptr,
+    pub max_path_len: u32,
+    pub alloc_count: usize,
+    pub reuse_count: usize,
 }
 
 pub struct CudaEngine {
@@ -369,8 +387,10 @@ pub struct CudaEngine {
     module: CUmodule,
     ampere_module: CUmodule,
     fn_dist_field: CUfunction,
+    fn_dist_field_sep_h: CUfunction,
+    fn_dist_field_sep_v: CUfunction,
     fn_dist_field_tiled: CUfunction,
-    fn_dist_field_3d_tiled: CUfunction,
+    pub fn_dist_field_3d_tiled: CUfunction,
     pub fn_dist_field_tensor_core: CUfunction,
     pub fn_dist_field_3d_tensor_core: CUfunction,
     fn_batch_placement: CUfunction,
@@ -393,6 +413,7 @@ pub struct CudaEngine {
     pub optix: Option<Arc<OptixDriverApi>>,
     dispatch_lock: Mutex<()>,
     persistent_buffers: Mutex<PersistentDeviceBuffers>,
+    pub wavefront_buffers: Mutex<Option<CachedWavefrontBuffers>>,
     pub compute_busy_ns: Arc<AtomicU64>,
 }
 
@@ -421,10 +442,34 @@ impl Drop for CudaEngine {
                     bufs.d_obs = 0;
                     bufs.obs_cap_bytes = 0;
                 }
+                if bufs.d_temp != 0 {
+                    let _ = (self.cuda.cuMemFree_v2)(bufs.d_temp);
+                    bufs.d_temp = 0;
+                    bufs.temp_cap_bytes = 0;
+                }
                 if bufs.d_out != 0 {
                     let _ = (self.cuda.cuMemFree_v2)(bufs.d_out);
                     bufs.d_out = 0;
                     bufs.out_cap_bytes = 0;
+                }
+            }
+            if let Ok(mut wf_opt) = self.wavefront_buffers.lock() {
+                if let Some(wf) = wf_opt.take() {
+                    for ptr in [
+                        wf.d_obs,
+                        wf.d_df,
+                        wf.d_hist,
+                        wf.d_usage,
+                        wf.d_costs,
+                        wf.d_wf_a,
+                        wf.d_wf_b,
+                        wf.d_path_out,
+                        wf.d_path_len,
+                    ] {
+                        if ptr != 0 {
+                            let _ = (self.cuda.cuMemFree_v2)(ptr);
+                        }
+                    }
                 }
             }
             if !self.ampere_module.is_null() {
@@ -548,6 +593,8 @@ impl CudaEngine {
             }
 
             let mut fn_dist_field: CUfunction = ptr::null_mut();
+            let mut fn_dist_field_sep_h: CUfunction = ptr::null_mut();
+            let mut fn_dist_field_sep_v: CUfunction = ptr::null_mut();
             let mut fn_dist_field_tiled: CUfunction = ptr::null_mut();
             let mut fn_dist_field_3d_tiled: CUfunction = ptr::null_mut();
             let mut fn_dist_field_tensor_core: CUfunction = ptr::null_mut();
@@ -567,6 +614,8 @@ impl CudaEngine {
             let mut fn_batch_drc: CUfunction = ptr::null_mut();
 
             let c_df = CString::new("distance_field_kernel").unwrap();
+            let c_df_sh = CString::new("distance_field_separable_h_kernel").unwrap();
+            let c_df_sv = CString::new("distance_field_separable_v_kernel").unwrap();
             let c_dft = CString::new("distance_field_tiled_kernel").unwrap();
             let c_df3d = CString::new("distance_field_3d_tiled_kernel").unwrap();
             let c_dftc = CString::new("distance_field_tensor_core_kernel").unwrap();
@@ -586,6 +635,8 @@ impl CudaEngine {
             let c_drc = CString::new("batch_drc_eval_kernel").unwrap();
 
             if (api.cuModuleGetFunction)(&mut fn_dist_field, module, c_df.as_ptr()) != CUDA_SUCCESS
+                || (api.cuModuleGetFunction)(&mut fn_dist_field_sep_h, module, c_df_sh.as_ptr()) != CUDA_SUCCESS
+                || (api.cuModuleGetFunction)(&mut fn_dist_field_sep_v, module, c_df_sv.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_dist_field_tiled, module, c_dft.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_dist_field_3d_tiled, module, c_df3d.as_ptr()) != CUDA_SUCCESS
                 || (api.cuModuleGetFunction)(&mut fn_dist_field_tensor_core, module, c_dftc.as_ptr()) != CUDA_SUCCESS
@@ -669,6 +720,8 @@ impl CudaEngine {
                 module,
                 ampere_module,
                 fn_dist_field,
+                fn_dist_field_sep_h,
+                fn_dist_field_sep_v,
                 fn_dist_field_tiled,
                 fn_dist_field_3d_tiled,
                 fn_dist_field_tensor_core,
@@ -695,9 +748,12 @@ impl CudaEngine {
                 persistent_buffers: Mutex::new(PersistentDeviceBuffers {
                     d_obs: 0,
                     obs_cap_bytes: 0,
+                    d_temp: 0,
+                    temp_cap_bytes: 0,
                     d_out: 0,
                     out_cap_bytes: 0,
                 }),
+                wavefront_buffers: Mutex::new(None),
                 compute_busy_ns: Arc::new(AtomicU64::new(0)),
             };
 
@@ -709,6 +765,11 @@ impl CudaEngine {
                     let _ = (engine.cuda.cuMemFree_v2)(bufs.d_obs);
                     bufs.d_obs = 0;
                     bufs.obs_cap_bytes = 0;
+                }
+                if bufs.d_temp != 0 {
+                    let _ = (engine.cuda.cuMemFree_v2)(bufs.d_temp);
+                    bufs.d_temp = 0;
+                    bufs.temp_cap_bytes = 0;
                 }
                 if bufs.d_out != 0 {
                     let _ = (engine.cuda.cuMemFree_v2)(bufs.d_out);
@@ -1045,7 +1106,7 @@ impl CudaEngine {
         self.dispatch_profile = profile;
     }
 
-    unsafe fn ensure_persistent_buffers(&self, in_bytes: usize, out_bytes: usize) -> Option<(CUdeviceptr, CUdeviceptr)> {
+    unsafe fn ensure_persistent_buffers(&self, in_bytes: usize, out_bytes: usize) -> Option<(CUdeviceptr, CUdeviceptr, CUdeviceptr)> {
         let mut bufs = self.persistent_buffers.lock().unwrap_or_else(|e| e.into_inner());
         if bufs.obs_cap_bytes < in_bytes || bufs.d_obs == 0 {
             if bufs.d_obs != 0 {
@@ -1060,6 +1121,19 @@ impl CudaEngine {
             bufs.d_obs = new_obs;
             bufs.obs_cap_bytes = in_bytes;
         }
+        if bufs.temp_cap_bytes < out_bytes || bufs.d_temp == 0 {
+            if bufs.d_temp != 0 {
+                let _ = (self.cuda.cuMemFree_v2)(bufs.d_temp);
+                bufs.d_temp = 0;
+                bufs.temp_cap_bytes = 0;
+            }
+            let mut new_temp: CUdeviceptr = 0;
+            if (self.cuda.cuMemAlloc_v2)(&mut new_temp, out_bytes) != CUDA_SUCCESS {
+                return None;
+            }
+            bufs.d_temp = new_temp;
+            bufs.temp_cap_bytes = out_bytes;
+        }
         if bufs.out_cap_bytes < out_bytes || bufs.d_out == 0 {
             if bufs.d_out != 0 {
                 let _ = (self.cuda.cuMemFree_v2)(bufs.d_out);
@@ -1073,7 +1147,17 @@ impl CudaEngine {
             bufs.d_out = new_out;
             bufs.out_cap_bytes = out_bytes;
         }
-        Some((bufs.d_obs, bufs.d_out))
+        Some((bufs.d_obs, bufs.d_temp, bufs.d_out))
+    }
+
+    pub fn compute_distance_field_separable(
+        &self,
+        obstacles: &[u32],
+        width: u32,
+        height: u32,
+        radius: i32,
+    ) -> Option<Vec<f32>> {
+        self.launch_distance_field_kernel(self.fn_dist_field, obstacles, width, height, radius, false)
     }
 
     pub fn compute_distance_field(&self, obstacles: &[u32], width: u32, height: u32, radius: i32) -> Option<Vec<f32>> {
@@ -1166,7 +1250,7 @@ impl CudaEngine {
             let in_bytes = total * std::mem::size_of::<u32>();
             let out_bytes = total * std::mem::size_of::<f32>();
 
-            let (mut d_obs, mut d_out) = self.ensure_persistent_buffers(in_bytes, out_bytes)?;
+            let (mut d_obs, mut d_temp, mut d_out) = self.ensure_persistent_buffers(in_bytes, out_bytes)?;
 
             let start_t = Instant::now();
 
@@ -1178,14 +1262,6 @@ impl CudaEngine {
             let block_y: c_uint = 16;
             let grid_x: c_uint = (width + block_x - 1) / block_x;
             let grid_y: c_uint = (height + block_y - 1) / block_y;
-
-            let passes = if total >= 4096 && radius > 12 {
-                64
-            } else if total >= 4096 {
-                8
-            } else {
-                1
-            };
 
             let smem_bytes = if use_shared_memory {
                 let tile_w = block_x as i32 + 2 * radius;
@@ -1199,15 +1275,66 @@ impl CudaEngine {
             let mut h_arg = height;
             let mut r_arg = radius;
 
-            let mut args = [
-                &mut d_obs as *mut _ as *mut c_void,
-                &mut d_out as *mut _ as *mut c_void,
-                &mut w_arg as *mut _ as *mut c_void,
-                &mut h_arg as *mut _ as *mut c_void,
-                &mut r_arg as *mut _ as *mut c_void,
-            ];
+            if !use_shared_memory && kernel == self.fn_dist_field {
+                let mut l_arg = 1u32;
+                let mut args_h = [
+                    &mut d_obs as *mut _ as *mut c_void,
+                    &mut d_temp as *mut _ as *mut c_void,
+                    &mut w_arg as *mut _ as *mut c_void,
+                    &mut h_arg as *mut _ as *mut c_void,
+                    &mut l_arg as *mut _ as *mut c_void,
+                    &mut r_arg as *mut _ as *mut c_void,
+                ];
+                if (self.cuda.cuLaunchKernel)(
+                    self.fn_dist_field_sep_h,
+                    grid_x,
+                    grid_y,
+                    1,
+                    block_x,
+                    block_y,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    args_h.as_mut_ptr(),
+                    ptr::null_mut(),
+                ) != CUDA_SUCCESS
+                {
+                    return None;
+                }
 
-            for _ in 0..passes {
+                let mut args_v = [
+                    &mut d_temp as *mut _ as *mut c_void,
+                    &mut d_out as *mut _ as *mut c_void,
+                    &mut w_arg as *mut _ as *mut c_void,
+                    &mut h_arg as *mut _ as *mut c_void,
+                    &mut l_arg as *mut _ as *mut c_void,
+                    &mut r_arg as *mut _ as *mut c_void,
+                ];
+                if (self.cuda.cuLaunchKernel)(
+                    self.fn_dist_field_sep_v,
+                    grid_x,
+                    grid_y,
+                    1,
+                    block_x,
+                    block_y,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    args_v.as_mut_ptr(),
+                    ptr::null_mut(),
+                ) != CUDA_SUCCESS
+                {
+                    return None;
+                }
+            } else {
+                let mut args = [
+                    &mut d_obs as *mut _ as *mut c_void,
+                    &mut d_out as *mut _ as *mut c_void,
+                    &mut w_arg as *mut _ as *mut c_void,
+                    &mut h_arg as *mut _ as *mut c_void,
+                    &mut r_arg as *mut _ as *mut c_void,
+                ];
+
                 if (self.cuda.cuLaunchKernel)(
                     kernel,
                     grid_x,
@@ -1232,7 +1359,7 @@ impl CudaEngine {
             }
 
             let _ = (self.cuda.cuCtxSynchronize)();
-            let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+            let elapsed_ns = (start_t.elapsed().as_nanos() as u64).max(1);
             self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
 
             Some(result)
@@ -1264,19 +1391,13 @@ impl CudaEngine {
             return None;
         }
 
-        let kernel = if self.dispatch_profile.best_distance_field == DistanceFieldVariant::TensorCore {
-            self.fn_dist_field_3d_tensor_core
-        } else {
-            self.fn_dist_field_3d_tiled
-        };
-
         let _guard = self.dispatch_lock.lock().ok()?;
         unsafe {
             let _ = (self.cuda.cuCtxSetCurrent)(self.ctx);
             let in_bytes = total * std::mem::size_of::<u32>();
             let out_bytes = total * std::mem::size_of::<f32>();
 
-            let (mut d_obs, mut d_out) = self.ensure_persistent_buffers(in_bytes, out_bytes)?;
+            let (mut d_obs, mut d_temp, mut d_out) = self.ensure_persistent_buffers(in_bytes, out_bytes)?;
 
             let start_t = Instant::now();
 
@@ -1290,35 +1411,25 @@ impl CudaEngine {
             let grid_y: c_uint = (height + block_y - 1) / block_y;
             let grid_z: c_uint = num_layers;
 
-            let tile_w = block_x as i32 + 2 * radius;
-            let tile_h = block_y as i32 + 2 * radius;
-            let smem_bytes = (tile_w * tile_h * 4) as c_uint;
-
-            let passes = if layer_cells >= 4096 && radius > 12 {
-                16
-            } else if layer_cells >= 4096 {
-                4
-            } else {
-                1
-            };
-
             let mut w_arg = width;
             let mut h_arg = height;
             let mut l_arg = num_layers;
             let mut r_arg = radius;
 
-            let mut args = [
-                &mut d_obs as *mut _ as *mut c_void,
-                &mut d_out as *mut _ as *mut c_void,
-                &mut w_arg as *mut _ as *mut c_void,
-                &mut h_arg as *mut _ as *mut c_void,
-                &mut l_arg as *mut _ as *mut c_void,
-                &mut r_arg as *mut _ as *mut c_void,
-            ];
-
-            for _ in 0..passes {
+            if self.dispatch_profile.best_distance_field == DistanceFieldVariant::TensorCore {
+                let tile_w = block_x as i32 + 2 * radius;
+                let tile_h = block_y as i32 + 2 * radius;
+                let smem_bytes = (tile_w * tile_h * 4) as c_uint;
+                let mut args = [
+                    &mut d_obs as *mut _ as *mut c_void,
+                    &mut d_out as *mut _ as *mut c_void,
+                    &mut w_arg as *mut _ as *mut c_void,
+                    &mut h_arg as *mut _ as *mut c_void,
+                    &mut l_arg as *mut _ as *mut c_void,
+                    &mut r_arg as *mut _ as *mut c_void,
+                ];
                 if (self.cuda.cuLaunchKernel)(
-                    kernel,
+                    self.fn_dist_field_3d_tensor_core,
                     grid_x,
                     grid_y,
                     grid_z,
@@ -1333,6 +1444,56 @@ impl CudaEngine {
                 {
                     return None;
                 }
+            } else {
+                let mut args_h = [
+                    &mut d_obs as *mut _ as *mut c_void,
+                    &mut d_temp as *mut _ as *mut c_void,
+                    &mut w_arg as *mut _ as *mut c_void,
+                    &mut h_arg as *mut _ as *mut c_void,
+                    &mut l_arg as *mut _ as *mut c_void,
+                    &mut r_arg as *mut _ as *mut c_void,
+                ];
+                if (self.cuda.cuLaunchKernel)(
+                    self.fn_dist_field_sep_h,
+                    grid_x,
+                    grid_y,
+                    grid_z,
+                    block_x,
+                    block_y,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    args_h.as_mut_ptr(),
+                    ptr::null_mut(),
+                ) != CUDA_SUCCESS
+                {
+                    return None;
+                }
+
+                let mut args_v = [
+                    &mut d_temp as *mut _ as *mut c_void,
+                    &mut d_out as *mut _ as *mut c_void,
+                    &mut w_arg as *mut _ as *mut c_void,
+                    &mut h_arg as *mut _ as *mut c_void,
+                    &mut l_arg as *mut _ as *mut c_void,
+                    &mut r_arg as *mut _ as *mut c_void,
+                ];
+                if (self.cuda.cuLaunchKernel)(
+                    self.fn_dist_field_sep_v,
+                    grid_x,
+                    grid_y,
+                    grid_z,
+                    block_x,
+                    block_y,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    args_v.as_mut_ptr(),
+                    ptr::null_mut(),
+                ) != CUDA_SUCCESS
+                {
+                    return None;
+                }
             }
 
             let mut result = vec![0.0f32; total];
@@ -1341,7 +1502,7 @@ impl CudaEngine {
             }
 
             let _ = (self.cuda.cuCtxSynchronize)();
-            let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+            let elapsed_ns = (start_t.elapsed().as_nanos() as u64).max(1);
             self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
 
             Some(result)
@@ -2023,6 +2184,143 @@ impl CudaEngine {
         results
     }
 
+    unsafe fn ensure_wavefront_buffers(
+        &self,
+        total: usize,
+    ) -> Option<(
+        CUdeviceptr,
+        CUdeviceptr,
+        CUdeviceptr,
+        CUdeviceptr,
+        CUdeviceptr,
+        CUdeviceptr,
+        CUdeviceptr,
+        CUdeviceptr,
+        CUdeviceptr,
+        u32,
+    )> {
+        let mut guard = self.wavefront_buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_alloc_count = if let Some(ref mut cached) = *guard {
+            if cached.total_cells == total && cached.d_obs != 0 {
+                cached.reuse_count += 1;
+                return Some((
+                    cached.d_obs,
+                    cached.d_df,
+                    cached.d_hist,
+                    cached.d_usage,
+                    cached.d_costs,
+                    cached.d_wf_a,
+                    cached.d_wf_b,
+                    cached.d_path_out,
+                    cached.d_path_len,
+                    cached.max_path_len,
+                ));
+            }
+            let prev = cached.alloc_count;
+            for ptr in [
+                cached.d_obs,
+                cached.d_df,
+                cached.d_hist,
+                cached.d_usage,
+                cached.d_costs,
+                cached.d_wf_a,
+                cached.d_wf_b,
+                cached.d_path_out,
+                cached.d_path_len,
+            ] {
+                if ptr != 0 {
+                    let _ = (self.cuda.cuMemFree_v2)(ptr);
+                }
+            }
+            *guard = None;
+            prev
+        } else {
+            0
+        };
+
+        let max_path_len = total.min(65536).max(64) as u32;
+        let u32_bytes = total * std::mem::size_of::<u32>();
+        let f32_bytes = total * std::mem::size_of::<f32>();
+        let path_bytes = (max_path_len as usize) * 3 * std::mem::size_of::<u32>();
+        let len_bytes = std::mem::size_of::<u32>();
+
+        let mut d_obs: CUdeviceptr = 0;
+        let mut d_df: CUdeviceptr = 0;
+        let mut d_hist: CUdeviceptr = 0;
+        let mut d_usage: CUdeviceptr = 0;
+        let mut d_costs: CUdeviceptr = 0;
+        let mut d_wf_a: CUdeviceptr = 0;
+        let mut d_wf_b: CUdeviceptr = 0;
+        let mut d_path_out: CUdeviceptr = 0;
+        let mut d_path_len: CUdeviceptr = 0;
+
+        let alloc_ok = (self.cuda.cuMemAlloc_v2)(&mut d_obs, u32_bytes) == CUDA_SUCCESS
+            && (self.cuda.cuMemAlloc_v2)(&mut d_df, f32_bytes) == CUDA_SUCCESS
+            && (self.cuda.cuMemAlloc_v2)(&mut d_hist, f32_bytes) == CUDA_SUCCESS
+            && (self.cuda.cuMemAlloc_v2)(&mut d_usage, u32_bytes) == CUDA_SUCCESS
+            && (self.cuda.cuMemAlloc_v2)(&mut d_costs, f32_bytes) == CUDA_SUCCESS
+            && (self.cuda.cuMemAlloc_v2)(&mut d_wf_a, f32_bytes) == CUDA_SUCCESS
+            && (self.cuda.cuMemAlloc_v2)(&mut d_wf_b, f32_bytes) == CUDA_SUCCESS
+            && (self.cuda.cuMemAlloc_v2)(&mut d_path_out, path_bytes) == CUDA_SUCCESS
+            && (self.cuda.cuMemAlloc_v2)(&mut d_path_len, len_bytes) == CUDA_SUCCESS;
+
+        if !alloc_ok {
+            for ptr in [
+                d_obs, d_df, d_hist, d_usage, d_costs, d_wf_a, d_wf_b, d_path_out, d_path_len,
+            ] {
+                if ptr != 0 {
+                    let _ = (self.cuda.cuMemFree_v2)(ptr);
+                }
+            }
+            return None;
+        }
+
+        let zero_f32 = vec![0.0f32; total];
+        let zero_u32 = vec![0u32; total];
+        if (self.cuda.cuMemcpyHtoD_v2)(d_df, zero_f32.as_ptr() as *const c_void, f32_bytes) != CUDA_SUCCESS
+            || (self.cuda.cuMemcpyHtoD_v2)(d_hist, zero_f32.as_ptr() as *const c_void, f32_bytes) != CUDA_SUCCESS
+            || (self.cuda.cuMemcpyHtoD_v2)(d_usage, zero_u32.as_ptr() as *const c_void, u32_bytes) != CUDA_SUCCESS
+        {
+            for ptr in [
+                d_obs, d_df, d_hist, d_usage, d_costs, d_wf_a, d_wf_b, d_path_out, d_path_len,
+            ] {
+                if ptr != 0 {
+                    let _ = (self.cuda.cuMemFree_v2)(ptr);
+                }
+            }
+            return None;
+        }
+
+        *guard = Some(CachedWavefrontBuffers {
+            total_cells: total,
+            d_obs,
+            d_df,
+            d_hist,
+            d_usage,
+            d_costs,
+            d_wf_a,
+            d_wf_b,
+            d_path_out,
+            d_path_len,
+            max_path_len,
+            alloc_count: prev_alloc_count + 1,
+            reuse_count: 0,
+        });
+
+        Some((
+            d_obs,
+            d_df,
+            d_hist,
+            d_usage,
+            d_costs,
+            d_wf_a,
+            d_wf_b,
+            d_path_out,
+            d_path_len,
+            max_path_len,
+        ))
+    }
+
     pub fn compute_3d_wavefront(
         &self,
         cell_costs: &[f32],
@@ -2054,31 +2352,14 @@ impl CudaEngine {
             let _ = (self.cuda.cuCtxSetCurrent)(self.ctx);
             let f32_bytes = total * std::mem::size_of::<f32>();
 
-            let mut d_costs: CUdeviceptr = 0;
-            let mut d_wf_a: CUdeviceptr = 0;
-            let mut d_wf_b: CUdeviceptr = 0;
-
-            if (self.cuda.cuMemAlloc_v2)(&mut d_costs, f32_bytes) != CUDA_SUCCESS {
-                return None;
-            }
-            if (self.cuda.cuMemAlloc_v2)(&mut d_wf_a, f32_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_costs);
-                return None;
-            }
-            if (self.cuda.cuMemAlloc_v2)(&mut d_wf_b, f32_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_costs);
-                let _ = (self.cuda.cuMemFree_v2)(d_wf_a);
-                return None;
-            }
+            let (_, _, _, _, mut d_costs, d_wf_a, d_wf_b, _, _, _) =
+                self.ensure_wavefront_buffers(total)?;
 
             let start_t = Instant::now();
 
             if (self.cuda.cuMemcpyHtoD_v2)(d_costs, cell_costs.as_ptr() as *const c_void, f32_bytes) != CUDA_SUCCESS
                 || (self.cuda.cuMemcpyHtoD_v2)(d_wf_a, init_wf.as_ptr() as *const c_void, f32_bytes) != CUDA_SUCCESS
             {
-                let _ = (self.cuda.cuMemFree_v2)(d_costs);
-                let _ = (self.cuda.cuMemFree_v2)(d_wf_a);
-                let _ = (self.cuda.cuMemFree_v2)(d_wf_b);
                 return None;
             }
 
@@ -2118,9 +2399,6 @@ impl CudaEngine {
                     ptr::null_mut(),
                 ) != CUDA_SUCCESS
                 {
-                    let _ = (self.cuda.cuMemFree_v2)(d_costs);
-                    let _ = (self.cuda.cuMemFree_v2)(d_wf_a);
-                    let _ = (self.cuda.cuMemFree_v2)(d_wf_b);
                     return None;
                 }
             }
@@ -2128,19 +2406,12 @@ impl CudaEngine {
             let final_dev = if iterations % 2 == 1 { d_wf_b } else { d_wf_a };
             let mut result = vec![0.0f32; total];
             if (self.cuda.cuMemcpyDtoH_v2)(result.as_mut_ptr() as *mut c_void, final_dev, f32_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_costs);
-                let _ = (self.cuda.cuMemFree_v2)(d_wf_a);
-                let _ = (self.cuda.cuMemFree_v2)(d_wf_b);
                 return None;
             }
 
             let _ = (self.cuda.cuCtxSynchronize)();
-            let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+            let elapsed_ns = (start_t.elapsed().as_nanos() as u64).max(1);
             self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-
-            let _ = (self.cuda.cuMemFree_v2)(d_costs);
-            let _ = (self.cuda.cuMemFree_v2)(d_wf_a);
-            let _ = (self.cuda.cuMemFree_v2)(d_wf_b);
 
             Some(result)
         }
@@ -2828,72 +3099,34 @@ impl CudaEngine {
             Err(_) => return vec![None; requests.len()],
         };
 
-        let max_path_len = total.min(65536).max(64) as u32;
         let u32_bytes = total * std::mem::size_of::<u32>();
         let f32_bytes = total * std::mem::size_of::<f32>();
-        let path_bytes = (max_path_len as usize) * 3 * std::mem::size_of::<u32>();
         let len_bytes = std::mem::size_of::<u32>();
 
-        let zero_f32 = vec![0.0f32; total];
-        let zero_u32 = vec![0u32; total];
         let mut init_wf = vec![1.0e20f32; total];
 
         unsafe {
             let _ = (self.cuda.cuCtxSetCurrent)(self.ctx);
 
-            let mut d_obs: CUdeviceptr = 0;
-            let mut d_df: CUdeviceptr = 0;
-            let mut d_hist: CUdeviceptr = 0;
-            let mut d_usage: CUdeviceptr = 0;
-            let mut d_costs: CUdeviceptr = 0;
-            let mut d_wf_a: CUdeviceptr = 0;
-            let mut d_wf_b: CUdeviceptr = 0;
-            let mut d_path_out: CUdeviceptr = 0;
-            let mut d_path_len: CUdeviceptr = 0;
-
-            let alloc_ok = (self.cuda.cuMemAlloc_v2)(&mut d_obs, u32_bytes) == CUDA_SUCCESS
-                && (self.cuda.cuMemAlloc_v2)(&mut d_df, f32_bytes) == CUDA_SUCCESS
-                && (self.cuda.cuMemAlloc_v2)(&mut d_hist, f32_bytes) == CUDA_SUCCESS
-                && (self.cuda.cuMemAlloc_v2)(&mut d_usage, u32_bytes) == CUDA_SUCCESS
-                && (self.cuda.cuMemAlloc_v2)(&mut d_costs, f32_bytes) == CUDA_SUCCESS
-                && (self.cuda.cuMemAlloc_v2)(&mut d_wf_a, f32_bytes) == CUDA_SUCCESS
-                && (self.cuda.cuMemAlloc_v2)(&mut d_wf_b, f32_bytes) == CUDA_SUCCESS
-                && (self.cuda.cuMemAlloc_v2)(&mut d_path_out, path_bytes) == CUDA_SUCCESS
-                && (self.cuda.cuMemAlloc_v2)(&mut d_path_len, len_bytes) == CUDA_SUCCESS;
-
-            let free_all = |api: &CudaDriverApi, ptrs: [CUdeviceptr; 9]| {
-                for ptr in ptrs {
-                    if ptr != 0 {
-                        let _ = (api.cuMemFree_v2)(ptr);
-                    }
-                }
+            let (
+                mut d_obs,
+                mut d_df,
+                mut d_hist,
+                mut d_usage,
+                mut d_costs,
+                d_wf_a,
+                d_wf_b,
+                mut d_path_out,
+                mut d_path_len,
+                max_path_len,
+            ) = match self.ensure_wavefront_buffers(total) {
+                Some(b) => b,
+                None => return vec![None; requests.len()],
             };
-
-            if !alloc_ok {
-                free_all(
-                    &self.cuda,
-                    [
-                        d_obs, d_df, d_hist, d_usage, d_costs, d_wf_a, d_wf_b, d_path_out,
-                        d_path_len,
-                    ],
-                );
-                return vec![None; requests.len()];
-            }
 
             let start_t = Instant::now();
 
-            if (self.cuda.cuMemcpyHtoD_v2)(d_obs, obstacle_grid.as_ptr() as *const c_void, u32_bytes) != CUDA_SUCCESS
-                || (self.cuda.cuMemcpyHtoD_v2)(d_df, zero_f32.as_ptr() as *const c_void, f32_bytes) != CUDA_SUCCESS
-                || (self.cuda.cuMemcpyHtoD_v2)(d_hist, zero_f32.as_ptr() as *const c_void, f32_bytes) != CUDA_SUCCESS
-                || (self.cuda.cuMemcpyHtoD_v2)(d_usage, zero_u32.as_ptr() as *const c_void, u32_bytes) != CUDA_SUCCESS
-            {
-                free_all(
-                    &self.cuda,
-                    [
-                        d_obs, d_df, d_hist, d_usage, d_costs, d_wf_a, d_wf_b, d_path_out,
-                        d_path_len,
-                    ],
-                );
+            if (self.cuda.cuMemcpyHtoD_v2)(d_obs, obstacle_grid.as_ptr() as *const c_void, u32_bytes) != CUDA_SUCCESS {
                 return vec![None; requests.len()];
             }
 
@@ -3108,14 +3341,8 @@ impl CudaEngine {
             }
 
             let _ = (self.cuda.cuCtxSynchronize)();
-            let elapsed_ns = start_t.elapsed().as_nanos() as u64;
+            let elapsed_ns = (start_t.elapsed().as_nanos() as u64).max(1);
             self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-            free_all(
-                &self.cuda,
-                [
-                    d_obs, d_df, d_hist, d_usage, d_costs, d_wf_a, d_wf_b, d_path_out, d_path_len,
-                ],
-            );
             outputs
         }
     }
