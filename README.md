@@ -16,8 +16,8 @@ Published by **InfernoEmbedded** — Licensed under **GNU GPLv3 (`GPL-3.0-only`)
 
 2. **Vulkan Compute + Negotiated-Congestion 3D Auto-Router (`src/vulkan.rs`, `src/router.rs`):**
    - Explicitly targets **Vulkan** (`wgpu::Backends::VULKAN`) with WGSL compute shaders (`DISTANCE_FIELD_WGSL`) to accelerate 2D obstacle Euclidean Distance Field transforms on the GPU.
-   - Enforces bidirectional per-netclass clearance ($\max(\text{clearance}_A, \text{clearance}_B)$), track widths (`Power_15V`, `Power_3V3`, `Power_5V`, `Switching`, `HBS_Bus`, `USB_Diff`, `Default`), keepout zones, and fine-pitch SMD pad-to-via exclusions.
-   - Generates deterministic staggered pin-escape stubs ($\Delta \ge 0.75\text{ mm}$) for fine-pitch QFN (`U1`) and USB-C (`J2`) packages, plus automated ground-plane via stitching.
+   - Enforces bidirectional per-netclass clearance ($\max(\text{clearance}_A, \text{clearance}_B)$), project netclass track widths (Power, Differential Pairs, High-Speed Buses, Default), keepout zones, and fine-pitch SMD pad-to-via exclusions.
+   - Generates deterministic staggered pin-escape stubs ($\Delta \ge 0.75\text{ mm}$) for fine-pitch QFN, BGA, and USB-C packages, plus automated ground-plane via stitching.
    - Supports dynamic component nudging (`NudgeEngine`) and multi-pass PathFinder negotiated-congestion rip-up and reroute.
 
 3. **Real-Time Interactive GUI (`src/gui.rs`):**
