@@ -3695,17 +3695,23 @@ impl Board {
                 continue;
             }
             let up = title.to_uppercase();
-            let (anchor_prefix, max_radius, weight) = if up.contains("BUCK") || up.contains("POWER") {
-                (Some('U'), 4.5, 150.0)
-            } else if up.contains("SURGE") || up.contains("INPUT") || up.contains("USB") {
-                (Some('J'), 6.8, 100.0)
-            } else if up.contains("ESP32") || up.contains("CONTROLS") {
-                (Some('U'), 12.0, 50.0)
-            } else if up.contains("TRANSCEIVER") || up.contains("MAX22088") {
-                (Some('U'), 7.5, 100.0)
-            } else {
-                (None, 7.0, 60.0)
-            };
+            let (anchor_prefix, max_radius, weight) =
+                if up.contains("BUCK") || up.contains("POWER") || up.contains("LDO") {
+                    (Some('U'), 4.5, 150.0)
+                } else if up.contains("SURGE")
+                    || up.contains("INPUT")
+                    || up.contains("USB")
+                    || up.contains("SENSOR")
+                    || up.contains("1-WIRE")
+                {
+                    (Some('J'), 6.8, 100.0)
+                } else if up.contains("ESP32") || up.contains("CONTROLS") || up.contains("MCU") {
+                    (Some('U'), 12.0, 50.0)
+                } else if up.contains("TRANSCEIVER") || up.contains("MAX22088") || up.contains("UART") {
+                    (Some('U'), 7.5, 100.0)
+                } else {
+                    (None, 7.0, 60.0)
+                };
             let anchor_idx = anchor_prefix.and_then(|pref| {
                 m_refs
                     .iter()

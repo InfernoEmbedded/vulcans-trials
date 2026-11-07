@@ -1,7 +1,10 @@
 /target/
 *.kicad_pcb
 !tests/boards/*.kicad_pcb
+!examples/**/*.kicad_pcb
 *.ses
+*.lck
+*.kicad_prl
 kicad_plugin/pcm/
 __pycache__/
 *.pyc

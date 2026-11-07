@@ -71,6 +71,13 @@ ln -s "$(pwd)/kicad_plugin" ~/.local/share/kicad/10.0/scripting/plugins/vulcans_
 
 ---
 
+## End-to-End Tutorial & Sample Project
+See [`TUTORIAL.md`](./TUTORIAL.md) for a complete walkthrough of designing a schematic with numbered functional clusters (`1. USB & UART BRIDGE`, `2. 3.3V LDO POWER`, `3. ESP32-C3 MCU`, `4. 1-WIRE SENSOR`) and schematic decoupling capacitor affinity, locking fixed edge components on the PCB (`J1`, `U3` with antenna overhang + keepout, `J2`), and auto-placing and auto-routing the board with Vulcan's Trials.
+
+The full sample KiCad 10 project and matching ESPHome firmware configuration are located in [`examples/esphome_1wire_sensor/`](./examples/esphome_1wire_sensor/).
+
+---
+
 ## Commercial Feature Comparison & Roadmap
 See [`ROADMAP.md`](./ROADMAP.md) for the full feature comparison against commercial EDA autorouters (Cadence Allegro / Specctra, Altium ActiveRoute, Siemens Xpedition, Zuken CR-8000, Eremex TopoR) and the 6-phase development roadmap.
 
