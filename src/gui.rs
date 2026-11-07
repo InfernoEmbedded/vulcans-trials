@@ -26,6 +26,7 @@ pub const COL_PAD_TH: Color32 = Color32::from_rgb(0xE3, 0xB7, 0x2E);
 pub const COL_VIA: Color32 = Color32::from_rgb(0xEC, 0xEC, 0xEC);
 pub const COL_F_CRTYD: Color32 = Color32::from_rgb(0xFF, 0x26, 0xE2);
 pub const COL_B_CRTYD: Color32 = Color32::from_rgb(0x26, 0xE2, 0xFF);
+pub const COL_GROUP_CRTYD: Color32 = Color32::from_rgb(80, 255, 120);
 pub const COL_EDGE_CUTS: Color32 = Color32::from_rgb(0xD0, 0xD2, 0xCD);
 pub const COL_RATSNEST: Color32 = Color32::from_rgb(0x00, 0xF8, 0xFF);
 // Keepout: Color32::from_rgba_unmultiplied(255, 0, 5, 128) (#FF000580)
@@ -3672,14 +3673,22 @@ impl VulcansTrialsApp {
             }
 
             // 9. Draw Courtyards on top (KiCad draws F.CrtYd/B.CrtYd above copper)
+            let same_group_indices = self
+                .hovered_footprint
+                .filter(|_| self.moving_footprint.is_none())
+                .map(|h_idx| same_group_footprint_indices(b, h_idx))
+                .unwrap_or_default();
             for (idx, fp) in b.footprints.iter().enumerate() {
                 let is_moving = self.moving_footprint.as_ref().map_or(false, |m| m.fp_index == idx);
                 let is_hovered = self.hovered_footprint == Some(idx) && !is_moving;
+                let is_same_group = same_group_indices.contains(&idx) && !is_moving && !is_hovered;
                 if self.show_courtyards {
                     let stroke_col = if is_moving {
                         Color32::from_rgb(255, 230, 80)
                     } else if is_hovered {
                         Color32::from_rgb(255, 255, 255)
+                    } else if is_same_group {
+                        COL_GROUP_CRTYD
                     } else if fp.is_locked {
                         Color32::from_rgb(240, 175, 50)
                     } else if fp.layer == 1 {
@@ -3687,7 +3696,13 @@ impl VulcansTrialsApp {
                     } else {
                         COL_F_CRTYD
                     };
-                    let stroke_w = if is_moving { 2.4_f32 } else if is_hovered { 1.8_f32 } else { 1.2_f32 };
+                    let stroke_w = if is_moving {
+                        2.4_f32
+                    } else if is_hovered || is_same_group {
+                        1.8_f32
+                    } else {
+                        1.2_f32
+                    };
                     let polys = fp.transformed_perimeters_layered(Point::new(fp.x, fp.y), fp.rotation, fp.layer, 0.0);
                     for poly in polys {
                         if poly.vertices.len() >= 3 {
@@ -4161,6 +4176,53 @@ impl eframe::App for VulcansTrialsApp {
     }
 }
 
+/// Returns the set of footprint indices (`!= hovered_idx`) that belong to the same schematic
+/// functional cluster (`board.clusters`) or passive-tie group as `hovered_idx`.
+pub fn same_group_footprint_indices(board: &Board, hovered_idx: usize) -> HashSet<usize> {
+    let mut group = HashSet::new();
+    let Some(hovered_fp) = board.footprints.get(hovered_idx) else {
+        return group;
+    };
+    let hovered_ref = &hovered_fp.reference;
+
+    for cluster in &board.clusters {
+        if cluster.member_refs.iter().any(|r| r == hovered_ref)
+            || cluster.member_indices.contains(&hovered_idx)
+        {
+            for (i, fp) in board.footprints.iter().enumerate() {
+                if i != hovered_idx
+                    && (cluster.member_refs.contains(&fp.reference)
+                        || cluster.member_indices.contains(&i))
+                {
+                    group.insert(i);
+                }
+            }
+        }
+    }
+
+    if group.is_empty() {
+        let ties = crate::placer::build_passive_ties(board);
+        let mut target_anchors = HashSet::new();
+        for tie in &ties {
+            if tie.anchor_idx == hovered_idx || tie.passive_idx == hovered_idx {
+                target_anchors.insert(tie.anchor_idx);
+            }
+        }
+        for tie in &ties {
+            if target_anchors.contains(&tie.anchor_idx) {
+                if tie.anchor_idx != hovered_idx {
+                    group.insert(tie.anchor_idx);
+                }
+                if tie.passive_idx != hovered_idx {
+                    group.insert(tie.passive_idx);
+                }
+            }
+        }
+    }
+
+    group
+}
+
 pub fn draw_lock_icon(painter: &egui::Painter, fp_rect: Rect) {
     let min_dim = fp_rect.width().min(fp_rect.height());
     if min_dim < 2.0 {
@@ -4243,6 +4305,7 @@ pub fn draw_color_legend(painter: &egui::Painter, canvas_rect: Rect, board: &Boa
     items.push(("Ratsnest (Unrouted)".to_string(), COL_RATSNEST));
     items.push(("Courtyard (F.Cu Top)".to_string(), COL_F_CRTYD));
     items.push(("Courtyard (B.Cu Bottom)".to_string(), COL_B_CRTYD));
+    items.push(("Courtyard (Same Group)".to_string(), COL_GROUP_CRTYD));
     items.push(("Courtyard (Locked 🔒)".to_string(), Color32::from_rgb(240, 175, 50)));
     items.push(("SMD Pad (F.Cu / B.Cu colour)".to_string(), COL_F_CU));
     items.push(("Through-Hole Pad".to_string(), COL_PAD_TH));
@@ -6308,5 +6371,31 @@ mod tests {
                 rects[0], i, rects[i]
             );
         }
+    }
+
+    #[test]
+    fn test_hover_component_highlights_same_group_courtyards() {
+        let pcb_path = format!("/tmp/test_hover_group_{}.kicad_pcb", std::process::id());
+        let mut board = make_gui_test_board(&pcb_path);
+        board.clusters.push(crate::board::CompiledCluster {
+            name: "1. Buck Power".to_string(),
+            anchor_idx: Some(0),
+            member_indices: vec![0, 1],
+            member_refs: vec![
+                board.footprints[0].reference.clone(),
+                board.footprints[1].reference.clone(),
+            ],
+            max_radius: 5.0,
+            weight: 100.0,
+        });
+
+        let grp0 = same_group_footprint_indices(&board, 0);
+        assert!(grp0.contains(&1), "Hovering footprint 0 must highlight group member 1");
+        assert!(!grp0.contains(&0), "Hovered footprint itself is not in same_group_footprint_indices");
+
+        let grp1 = same_group_footprint_indices(&board, 1);
+        assert!(grp1.contains(&0), "Hovering footprint 1 must highlight group member 0");
+
+        let _ = fs::remove_file(&pcb_path);
     }
 }
