@@ -2152,12 +2152,14 @@ fn scan_dir_for_socket(dir: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
+    #[cfg(unix)]
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::thread;
 
     #[test]
+    #[cfg(unix)]
     fn test_mock_ipc_server_handshake_and_batch_formatting() {
         let sock_path = format!("/tmp/kicad_ipc_test_handshake_{}.sock", std::process::id());
         let _ = fs::remove_file(&sock_path);
@@ -2230,6 +2232,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_kicad_ipc_footprint_move_stream() {
         let sock_path = format!("/tmp/kicad_ipc_test_stream_{}.sock", std::process::id());
         let _ = fs::remove_file(&sock_path);
@@ -2283,6 +2286,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_kicad_ipc_track_and_via_batch_commit() {
         let sock_path = format!("/tmp/kicad_ipc_test_tracks_{}.sock", std::process::id());
         let _ = fs::remove_file(&sock_path);
@@ -2386,6 +2390,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_connect_with_ipc_uri_scheme() {
         let sock_path = format!("/tmp/kicad_ipc_uri_test_{}.sock", std::process::id());
         let _ = fs::remove_file(&sock_path);
@@ -2410,6 +2415,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_pull_board_into_kicad_sends_footprint_tracks_and_pull_board() {
         let sock_path = format!("/tmp/kicad_ipc_pull_board_test_{}.sock", std::process::id());
         let _ = fs::remove_file(&sock_path);

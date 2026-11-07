@@ -117,29 +117,32 @@ fn run_self_test() -> Result<(), String> {
     println!("=== Vulcan's Trials v{} (InfernoEmbedded) — Self-Test Suite ===", env!("CARGO_PKG_VERSION"));
 
     // 1. Verify Vulkan Compute Engine & WGSL Distance Field Shader
-    let vk = VulkanEngine::new().ok_or("Failed to initialize Vulkan compute backend")?;
-    println!(
-        "[PASS] Vulkan Engine initialized: {} [{}] — {}",
-        vk.device_name, vk.backend_name, vk.driver_info
-    );
+    if let Some(vk) = VulkanEngine::new() {
+        println!(
+            "[PASS] Vulkan Engine initialized: {} [{}] — {}",
+            vk.device_name, vk.backend_name, vk.driver_info
+        );
 
-    let mut obs = vec![0u32; 16 * 16];
-    obs[8 * 16 + 8] = 1; // Single obstacle at (8, 8)
-    let df = vk
-        .compute_distance_field(&obs, 16, 16, 10)
-        .ok_or("Vulkan compute_distance_field returned None")?;
-    let d_center = df[8 * 16 + 8];
-    let d_offset = df[8 * 16 + 11]; // 3 cells away along +X
-    if d_center.abs() > 1e-4 || (d_offset - 3.0).abs() > 1e-3 {
-        return Err(format!(
-            "Distance field mismatch: center={}, +3_offset={}",
-            d_center, d_offset
-        ));
+        let mut obs = vec![0u32; 16 * 16];
+        obs[8 * 16 + 8] = 1; // Single obstacle at (8, 8)
+        let df = vk
+            .compute_distance_field(&obs, 16, 16, 10)
+            .ok_or("Vulkan compute_distance_field returned None")?;
+        let d_center = df[8 * 16 + 8];
+        let d_offset = df[8 * 16 + 11]; // 3 cells away along +X
+        if d_center.abs() > 1e-4 || (d_offset - 3.0).abs() > 1e-3 {
+            return Err(format!(
+                "Distance field mismatch: center={}, +3_offset={}",
+                d_center, d_offset
+            ));
+        }
+        println!(
+            "[PASS] Vulkan WGSL Compute Shader distance field verified (d(0)=0.0, d(3)={:.2})",
+            d_offset
+        );
+    } else {
+        println!("[NOTE] No Vulkan/GPU hardware adapter detected — CPU fallback active");
     }
-    println!(
-        "[PASS] Vulkan WGSL Compute Shader distance field verified (d(0)=0.0, d(3)={:.2})",
-        d_offset
-    );
 
     // 2. Verify SAT Courtyard Polygon Collision & Segment Crossing Math
     let poly_a = Polygon::new(vec![

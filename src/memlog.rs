@@ -338,8 +338,11 @@ mod tests {
     #[test]
     fn test_read_proc_statm_and_checkpoint_logging() {
         let (rss, vmsize, _data) = read_proc_statm_mb();
-        assert!(rss > 0.0, "Process RSS in MB must be positive on Linux");
-        assert!(vmsize >= rss, "Virtual memory size must be >= RSS");
+        #[cfg(target_os = "linux")]
+        {
+            assert!(rss > 0.0, "Process RSS in MB must be positive on Linux");
+            assert!(vmsize >= rss, "Virtual memory size must be >= RSS");
+        }
 
         let tmp_log = "/tmp/vulcans_trials_mem_unit_test.log";
         init_memlog(Some(tmp_log));

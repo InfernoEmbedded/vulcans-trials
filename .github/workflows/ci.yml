@@ -47,11 +47,18 @@ jobs:
           sudo apt-get install -y \
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libasound2-dev libpulse-dev libudev-dev libcairo2-dev \
+            libvulkan1 mesa-vulkan-drivers \
             python3-jsonschema python3-cairosvg python3-pil
 
       - name: Install Python dependencies (macOS & Windows)
         if: runner.os != 'Linux'
         run: pip install jsonschema cairosvg Pillow
+
+      - name: Ensure /tmp directory exists on Windows
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force -Path "\tmp" | Out-Null
+          New-Item -ItemType Directory -Force -Path "C:\tmp" | Out-Null
 
       - name: Run all tests (release mode)
         run: cargo test --release
@@ -63,4 +70,4 @@ jobs:
         run: ${{ matrix.bin_path }} --self-test
 
       - name: Validate KiCad PCM metadata schema compliance
-        run: python3 kicad_plugin/build_pcm.py --validate-only
+        run: python kicad_plugin/build_pcm.py --validate-only

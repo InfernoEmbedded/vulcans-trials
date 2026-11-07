@@ -24499,6 +24499,9 @@ mod tests {
     #[test]
     fn test_gpu_3d_wavefront_backtrack_path_valid_and_obstacle_free() {
         let vk = VulkanEngine::new();
+        if vk.is_none() {
+            return;
+        }
         let board = make_router_test_board();
         let mut grid = RoutingGrid::new(&board, 0.25, vk);
 
