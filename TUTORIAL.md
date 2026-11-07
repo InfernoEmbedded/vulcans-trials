@@ -126,7 +126,9 @@ You can run Vulcan's Trials either interactively from the GUI (or the KiCad Acti
      --output /tmp/esphome_1wire_sensor_routed.kicad_pcb
    ```
    *(If KiCad 10 is open with the board loaded, check **Enable Live Sync** in the **KiCad 10 IPC Live Sync** panel to stream placement and routing updates directly into `pcbnew`.)*
-2. Hover over any button, slider, or checkbox in the left sidebar to view detailed tooltips explaining each parameter's physical and algorithmic effect.
+2. In the **Auto-Placer & Auto-Router Settings** panel on the left sidebar:
+   - Ensure **Place Time (s)** is set to at least `120` seconds (the default is `120 s`). Running placement for at least 120 seconds gives the multi-threaded Parallel Tempering Simulated Annealing engine ample cooling cycles and replica swaps across temperatures to untangle ratsnest crossings, minimize total Manhattan and Euclidean wirelength, and cluster passives and decoupling capacitors tightly around their respective ICs before SAT courtyard legalization.
+   - Hover over any button, slider, or checkbox in the sidebar to view detailed tooltips explaining each parameter's physical and algorithmic effect.
 3. Click **`📐 Auto-Place Only`** (or **`⚡ Auto-Place & Route`**):
    - Locked components (`J1`, `U3`, `J2`) remain anchored at their exact mechanical coordinates.
    - Parallel Tempering Simulated Annealing pulls `U2` and `C3` toward `J1` (Cluster 1), places `U1` with input/output caps `C1` and `C2` between `J1` and `U3` (Cluster 2), arranges `C4`, `C5`, `R1`, `R2`, and `D1` around `U3` (Cluster 3), and pulls `R3` and `C6` next to `J2` (Cluster 4).
@@ -139,13 +141,13 @@ You can run Vulcan's Trials either interactively from the GUI (or the KiCad Acti
 5. Optional: Click **`🌿 Swap to Organic Tracks`** to smooth 45° segments into continuous tangent arcs, then click **`💾 Save Output (.kicad_pcb + .ses)`**.
 
 ### Option B: Headless CLI Workflow
-To run both auto-placement and auto-routing from a terminal or CI script:
+To run both auto-placement and auto-routing from a terminal or CI script, pass `--duration 120` (or higher) so the auto-placer runs for at least 120 seconds to achieve optimal annealing convergence:
 
 ```bash
 ./target/release/vulcans-trials \
   --headless \
   --mode both \
-  --duration 5 \
+  --duration 120 \
   --passes 10 \
   --input examples/esphome_1wire_sensor/esphome_1wire_sensor.kicad_pcb \
   --output /tmp/esphome_1wire_sensor_routed.kicad_pcb
@@ -157,6 +159,7 @@ If you used `--lock` on the command line instead of locking footprints inside Ki
 ./target/release/vulcans-trials \
   --headless \
   --mode both \
+  --duration 120 \
   --lock J1,U3,J2 \
   --input examples/esphome_1wire_sensor/esphome_1wire_sensor.kicad_pcb \
   --output /tmp/esphome_1wire_sensor_routed.kicad_pcb

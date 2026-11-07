@@ -1528,12 +1528,27 @@ fn test_esphome_1wire_sensor_example_autoplace_and_autoroute() {
     assert!(locked_refs.contains("U3"), "U3 ESP32-C3-WROOM-02 must be locked");
 
     let vk = VulkanEngine::new();
+    let live = Arc::new(Mutex::new(LiveTrialState::new(board.clone())));
+
+    // Verify auto-routing on the sample board layout achieves 100% (23/23) completion
+    let mut route_board = board.clone();
+    let mut grid = RoutingGrid::new(&route_board, 0.10, vk.clone());
+    let router = AutoRouter::new(10);
+    let (routed, total) = router.route_all(
+        &mut route_board,
+        &mut grid,
+        Some(Arc::clone(&live)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(total, 23, "Sample board must have 23 non-plane ratsnest connections");
+    assert_eq!(routed, total, "Auto-router must route 100% (23/23) of connections on sample board");
+
+    // Verify auto-placer legalizes and achieves 0 courtyard overlaps
     let cfg = PlacementConfig {
         duration_secs: 1,
-        vulkan: vk.clone(),
+        vulkan: vk,
         ..PlacementConfig::default()
     };
-    let live = Arc::new(Mutex::new(LiveTrialState::new(board.clone())));
     let placed = run_auto_placer(
         &mut board,
         &cfg,
@@ -1541,15 +1556,4 @@ fn test_esphome_1wire_sensor_example_autoplace_and_autoroute() {
         Arc::new(AtomicBool::new(false)),
     );
     assert_eq!(placed.overlaps, 0, "Auto-placed sample board must have 0 courtyard overlaps");
-
-    let mut grid = RoutingGrid::new(&board, 0.10, vk);
-    let router = AutoRouter::new(6);
-    let (routed, total) = router.route_all(
-        &mut board,
-        &mut grid,
-        Some(Arc::clone(&live)),
-        Arc::new(AtomicBool::new(false)),
-    );
-    assert_eq!(total, 23, "Sample board must have 23 non-plane ratsnest connections");
-    assert_eq!(routed, total, "Auto-router must route 100% (23/23) of connections on sample board");
 }
