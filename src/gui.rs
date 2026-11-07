@@ -74,6 +74,81 @@ pub fn copper_layer_color(layer_name: &str) -> Color32 {
     }
 }
 
+/// Invokes native OS file picker to select a KiCad PCB file to open.
+/// Returns Ok(Some(path)) on selection, Ok(None) on cancel, or Err(()) if external picker unavailable.
+pub fn pick_open_file(initial_path: &str) -> Result<Option<String>, ()> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut cmd = std::process::Command::new("zenity");
+        cmd.args([
+            "--file-selection",
+            "--title=Open KiCad Board",
+            "--file-filter=KiCad PCB (*.kicad_pcb) | *.kicad_pcb",
+            "--file-filter=All Files | *",
+        ]);
+        if !initial_path.is_empty() {
+            if let Some(parent) = Path::new(initial_path).parent() {
+                cmd.arg(format!("--filename={}/", parent.display()));
+            }
+        }
+        match cmd.output() {
+            Ok(out) => {
+                if out.status.success() {
+                    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !s.is_empty() {
+                        return Ok(Some(s));
+                    }
+                }
+                return Ok(None);
+            }
+            Err(_) => {
+                return Err(());
+            }
+        }
+    }
+    #[allow(unreachable_code)]
+    Err(())
+}
+
+/// Invokes native OS file picker to select a destination path for saving a KiCad PCB.
+/// Returns Ok(Some(path)) on selection, Ok(None) on cancel, or Err(()) if external picker unavailable.
+pub fn pick_save_file(initial_path: &str) -> Result<Option<String>, ()> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut cmd = std::process::Command::new("zenity");
+        cmd.args([
+            "--file-selection",
+            "--save",
+            "--confirm-overwrite",
+            "--title=Save KiCad Board As",
+            "--file-filter=KiCad PCB (*.kicad_pcb) | *.kicad_pcb",
+            "--file-filter=All Files | *",
+        ]);
+        if !initial_path.is_empty() {
+            cmd.arg(format!("--filename={}", initial_path));
+        }
+        match cmd.output() {
+            Ok(out) => {
+                if out.status.success() {
+                    let mut s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !s.is_empty() {
+                        if !s.ends_with(".kicad_pcb") {
+                            s.push_str(".kicad_pcb");
+                        }
+                        return Ok(Some(s));
+                    }
+                }
+                return Ok(None);
+            }
+            Err(_) => {
+                return Err(());
+            }
+        }
+    }
+    #[allow(unreachable_code)]
+    Err(())
+}
+
 /// Returns active copper layers in KiCad display/legend order: F.Cu, internal layers, B.Cu.
 pub fn kicad_layer_display_order<'a>(active_layers: &[&'a str]) -> Vec<&'a str> {
     let mut order = Vec::new();
@@ -462,6 +537,12 @@ pub struct VulcansTrialsApp {
     // Persistence
     pub preferences_path: Option<PathBuf>,
     pub last_saved_prefs: AppPreferences,
+
+    // File dialog state
+    pub open_dialog_open: bool,
+    pub save_as_dialog_open: bool,
+    pub file_dialog_path_buffer: String,
+    pub last_canvas_rect: Option<Rect>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -552,6 +633,10 @@ impl VulcansTrialsApp {
             ipc_retry_interval: Duration::from_secs(2),
             preferences_path: None,
             last_saved_prefs: AppPreferences::default(),
+            open_dialog_open: false,
+            save_as_dialog_open: false,
+            file_dialog_path_buffer: String::new(),
+            last_canvas_rect: None,
         };
 
         // Load and apply saved preferences on launch (isolated during unit and integration tests)
@@ -833,6 +918,81 @@ impl VulcansTrialsApp {
             }
         }
         true
+    }
+
+    /// Sets both input and output paths to point to the single unified board file.
+    pub fn set_board_path(&mut self, path: String) {
+        self.input_path = path.clone();
+        self.output_path = path;
+    }
+
+    /// Resets viewport camera pan offset to origin (0, 0) and zoom scale to 1.0.
+    pub fn reset_view(&mut self) {
+        self.pan_offset = Vec2::ZERO;
+        self.zoom = 1.0;
+    }
+
+    /// Opens and parses a KiCad board from the specified filesystem path, replacing current state.
+    pub fn open_pcb_from_path(&mut self, path: &str) -> bool {
+        match Board::load(path, &HashSet::new()) {
+            Ok(board) => {
+                let mut visible_layers = HashSet::new();
+                visible_layers.insert("F.Cu".to_string());
+                visible_layers.insert("B.Cu".to_string());
+                for &layer in &board.copper_layers() {
+                    visible_layers.insert(layer.to_string());
+                }
+                self.visible_layers = visible_layers;
+                let mut g = self.live.lock().unwrap();
+                *g = LiveTrialState::new(board);
+                g.push_log(format!("[Opened] Loaded '{}' successfully", path));
+                drop(g);
+                self.set_board_path(path.to_string());
+                self.reset_view();
+                true
+            }
+            Err(e) => {
+                if let Ok(mut g) = self.live.lock() {
+                    g.push_log(format!("[Error] Failed to open '{}': {}", path, e));
+                }
+                false
+            }
+        }
+    }
+
+    /// Reloads the current PCB file from disk, discarding unsaved in-memory placement/routing edits.
+    pub fn reload_pcb(&mut self) -> bool {
+        let path = self.input_path.clone();
+        self.open_pcb_from_path(&path)
+    }
+
+    /// Prompts the user to select a KiCad PCB file to open (via OS file dialog or in-app modal).
+    pub fn trigger_open_file(&mut self) {
+        match pick_open_file(&self.input_path) {
+            Ok(Some(path)) => {
+                self.open_pcb_from_path(&path);
+            }
+            Ok(None) => {}
+            Err(()) => {
+                self.file_dialog_path_buffer = self.input_path.clone();
+                self.open_dialog_open = true;
+            }
+        }
+    }
+
+    /// Prompts the user for a new PCB destination path and saves the current board state.
+    pub fn trigger_save_as_file(&mut self) {
+        match pick_save_file(&self.output_path) {
+            Ok(Some(path)) => {
+                self.set_board_path(path);
+                self.save_output_and_pull_to_kicad();
+            }
+            Ok(None) => {}
+            Err(()) => {
+                self.file_dialog_path_buffer = self.output_path.clone();
+                self.save_as_dialog_open = true;
+            }
+        }
     }
 
     pub fn is_layer_visible(&self, layer_name: &str) -> bool {
@@ -2173,9 +2333,63 @@ impl VulcansTrialsApp {
         let snap = self.live.lock().unwrap().clone();
         let is_running = self.worker_running.load(Ordering::Relaxed);
 
-        // Top Telemetry & Vulkan Status Bar
+        // Global File menu keyboard shortcuts (Ctrl+O, Ctrl+S, Ctrl+Shift+S, Ctrl+R, Ctrl+Q)
+        let (ctrl_o, ctrl_s, ctrl_shift_s, ctrl_r, ctrl_q) = ctx.input(|i| {
+            let cmd = i.modifiers.command;
+            let shift = i.modifiers.shift;
+            (
+                cmd && !shift && i.key_pressed(egui::Key::O),
+                cmd && !shift && i.key_pressed(egui::Key::S),
+                cmd && shift && i.key_pressed(egui::Key::S),
+                cmd && !shift && i.key_pressed(egui::Key::R),
+                cmd && !shift && i.key_pressed(egui::Key::Q),
+            )
+        });
+
+        if ctrl_o {
+            self.trigger_open_file();
+        } else if ctrl_shift_s {
+            self.trigger_save_as_file();
+        } else if ctrl_s {
+            self.save_output_and_pull_to_kicad();
+        } else if ctrl_r && !is_running {
+            self.reload_pcb();
+        } else if ctrl_q {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // Top Menu, Telemetry & Vulkan Status Bar
         egui::TopBottomPanel::top("vulcan_top_bar").show(ctx, |ui| {
-            ui.add_space(4.0);
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("📂 Open... (Ctrl+O)").clicked() {
+                        ui.close_menu();
+                        self.trigger_open_file();
+                    }
+                    if ui.button("💾 Save (Ctrl+S)").clicked() {
+                        ui.close_menu();
+                        self.save_output_and_pull_to_kicad();
+                    }
+                    if ui.button("💾 Save As... (Ctrl+Shift+S)").clicked() {
+                        ui.close_menu();
+                        self.trigger_save_as_file();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(!is_running, egui::Button::new("🔄 Reload PCB (Ctrl+R)"))
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.reload_pcb();
+                    }
+                    ui.separator();
+                    if ui.button("❌ Quit (Ctrl+Q)").clicked() {
+                        ui.close_menu();
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            });
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.heading(egui::RichText::new(format!("⚡ Vulcan's Trials v{}", env!("CARGO_PKG_VERSION"))).color(Color32::from_rgb(255, 145, 50)))
                     .on_hover_text("Vulcan's Trials — Unified Vulkan GPU + multi-core CPU PCB Auto-Placer and Auto-Router for KiCad 8/9/10.");
@@ -2265,28 +2479,24 @@ impl VulcansTrialsApp {
                 }
 
                 ui.horizontal(|ui| {
-                    ui.label("Input PCB:")
-                        .on_hover_text("Source KiCad board file (.kicad_pcb) to load. Companion .kicad_sch files in the same directory are parsed automatically for schematic cluster affinity.");
-                    ui.text_edit_singleline(&mut self.input_path)
-                        .on_hover_text("Filesystem path to the input .kicad_pcb file. Treated as read-only unless Output PCB points to the same path.");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Output PCB:")
-                        .on_hover_text("Destination path for the placed and routed KiCad board (.kicad_pcb) and companion Specctra session (.ses) file.");
-                    ui.text_edit_singleline(&mut self.output_path)
-                        .on_hover_text("Filesystem path where .kicad_pcb and .ses outputs are written upon trial completion or manual save.");
+                    ui.label("PCB File:")
+                        .on_hover_text("Source & destination KiCad board file (.kicad_pcb). Saving backs up the original with a timestamp suffix and writes directly to this file, then synchronizes to KiCad.");
+                    let resp = ui.text_edit_singleline(&mut self.input_path);
+                    if resp.changed() {
+                        self.output_path = self.input_path.clone();
+                    }
+                    if ui.button("...").on_hover_text("Browse filesystem for a .kicad_pcb file to open").clicked() {
+                        self.trigger_open_file();
+                    }
                 });
 
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(!is_running, egui::Button::new("📂 Reload Input PCB"))
-                        .on_hover_text("Reload the source .kicad_pcb file from disk, discarding unsaved placement or routing edits and resetting board state.")
+                        .add_enabled(!is_running, egui::Button::new("🔄 Reload PCB"))
+                        .on_hover_text("Reload the .kicad_pcb file from disk, discarding unsaved placement or routing edits and resetting board state.")
                         .clicked()
                     {
-                        if let Ok(b) = Board::load(&self.input_path, &HashSet::new()) {
-                            let mut g = self.live.lock().unwrap();
-                            *g = LiveTrialState::new(b);
-                        }
+                        self.reload_pcb();
                     }
 
                     if ui
@@ -2414,8 +2624,8 @@ impl VulcansTrialsApp {
                 }
 
                 if ui
-                    .add_enabled(!is_running, egui::Button::new("💾 Save Output (.kicad_pcb + .ses)"))
-                    .on_hover_text("Write the current component placement, copper tracks, arcs, and stitched vias to the Output .kicad_pcb file and Specctra .ses session file, refill zones, and sync to KiCad over IPC.")
+                    .add_enabled(!is_running, egui::Button::new("💾 Save PCB (.kicad_pcb + .ses)"))
+                    .on_hover_text("Write the current component placement, copper tracks, arcs, and stitched vias to the PCB file and Specctra .ses session file. A timestamped backup (.kicad_pcb_bak.YYYYMMDDHHMMSS) is saved before overwriting, and KiCad is updated over IPC.")
                     .clicked()
                 {
                     self.save_output_and_pull_to_kicad();
@@ -2738,8 +2948,7 @@ impl VulcansTrialsApp {
                     .on_hover_text("Reset canvas pan offset to (0, 0) and zoom to 1.0x so the entire PCB outline fits centered in the viewport (Drag canvas to pan, scroll wheel to zoom).")
                     .clicked()
                 {
-                    self.pan_offset = Vec2::ZERO;
-                    self.zoom = 1.0;
+                    self.reset_view();
                 }
 
                 ui.separator();
@@ -2973,6 +3182,7 @@ impl VulcansTrialsApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
             let rect = response.rect;
+            self.last_canvas_rect = Some(rect);
             painter.rect_filled(rect, 0.0, COL_CANVAS_BG);
 
             let pointer_pos = ui.input(|i| i.pointer.hover_pos());
@@ -3623,6 +3833,78 @@ impl VulcansTrialsApp {
             // 12. Draw Color Legend Overlay
             draw_color_legend(&painter, rect, b);
         });
+
+        // Modal File Dialog: Open KiCad PCB
+        if self.open_dialog_open {
+            let mut close_modal = false;
+            let mut open_target = None;
+            egui::Window::new("📂 Open KiCad PCB")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("Enter filesystem path to .kicad_pcb file:");
+                    let resp = ui.text_edit_singleline(&mut self.file_dialog_path_buffer);
+                    let enter = resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Open").clicked() || enter {
+                            let p = self.file_dialog_path_buffer.trim().to_string();
+                            if !p.is_empty() {
+                                open_target = Some(p);
+                            }
+                            close_modal = true;
+                        }
+                        if ui.button("Cancel").clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            close_modal = true;
+                        }
+                    });
+                });
+            if let Some(target) = open_target {
+                self.open_pcb_from_path(&target);
+            }
+            if close_modal {
+                self.open_dialog_open = false;
+            }
+        }
+
+        // Modal File Dialog: Save KiCad PCB As
+        if self.save_as_dialog_open {
+            let mut close_modal = false;
+            let mut save_target = None;
+            egui::Window::new("💾 Save KiCad PCB As")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("Enter destination path for .kicad_pcb file:");
+                    let resp = ui.text_edit_singleline(&mut self.file_dialog_path_buffer);
+                    let enter = resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() || enter {
+                            let mut p = self.file_dialog_path_buffer.trim().to_string();
+                            if !p.is_empty() {
+                                if !p.ends_with(".kicad_pcb") {
+                                    p.push_str(".kicad_pcb");
+                                }
+                                save_target = Some(p);
+                            }
+                            close_modal = true;
+                        }
+                        if ui.button("Cancel").clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            close_modal = true;
+                        }
+                    });
+                });
+            if let Some(target) = save_target {
+                self.set_board_path(target);
+                self.save_output_and_pull_to_kicad();
+            }
+            if close_modal {
+                self.save_as_dialog_open = false;
+            }
+        }
 
         // Persist preferences if any setting was mutated
         let cur_prefs = self.to_preferences();
@@ -4565,7 +4847,7 @@ mod tests {
         });
 
         // The CentralPanel canvas occupies remaining space after top bar and left panel
-        let canvas_rect = Rect::from_min_max(Pos2::new(318.0, 67.0), Pos2::new(792.0, 592.0));
+        let canvas_rect = app.last_canvas_rect.expect("Canvas rect must be computed during warmup frame");
         let (r10_screen, _) = app.board_to_screen(&board, canvas_rect, 120.0, 115.0);
 
         // Frame 1: Hover mouse over R10 and press 'm' -> picks up R10
@@ -4991,7 +5273,7 @@ mod tests {
             app.render_ui(ctx);
         });
 
-        let canvas_rect = Rect::from_min_max(Pos2::new(318.0, 67.0), Pos2::new(792.0, 592.0));
+        let canvas_rect = app.last_canvas_rect.expect("Canvas rect must be computed during warmup frame");
         let (j1_screen, _) = app.board_to_screen(&board, canvas_rect, 110.0, 115.0);
         let (r10_screen, _) = app.board_to_screen(&board, canvas_rect, 119.5, 115.0);
 
@@ -5757,5 +6039,117 @@ mod tests {
         });
 
         let _ = fs::remove_file(&in_path);
+    }
+
+    #[test]
+    fn test_single_pcb_path_synchronization_and_reload() {
+        let temp_dir = std::env::temp_dir();
+        let pcb_path = temp_dir.join(format!("test_single_pcb_{}.kicad_pcb", std::process::id()));
+        let pcb_path_str = pcb_path.to_string_lossy().to_string();
+
+        let content = r#"(kicad_pcb (version 20240108) (generator "test")
+  (general (thickness 1.6))
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (48 "B.CrtYd" user) (49 "F.CrtYd" user))
+  (net 0 "")
+  (net 1 "NET1")
+  (footprint "R" (at 10 10) (property "Reference" "R1")
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "NET1")))
+)"#;
+        fs::write(&pcb_path, content).unwrap();
+
+        let board = Board::load(&pcb_path_str, &HashSet::new()).unwrap();
+        let mut app = VulcansTrialsApp::new(
+            pcb_path_str.clone(),
+            pcb_path_str.clone(),
+            board,
+            None,
+        );
+
+        // Verify initial paths are unified
+        assert_eq!(app.input_path, pcb_path_str);
+        assert_eq!(app.output_path, pcb_path_str);
+
+        // Test set_board_path unifies both
+        let new_path = "/tmp/new_board.kicad_pcb".to_string();
+        app.set_board_path(new_path.clone());
+        assert_eq!(app.input_path, new_path);
+        assert_eq!(app.output_path, new_path);
+
+        // Test open_pcb_from_path resets view and reloads
+        app.pan_offset = Vec2::new(50.0, 50.0);
+        app.zoom = 3.5;
+        assert!(app.open_pcb_from_path(&pcb_path_str));
+        assert_eq!(app.input_path, pcb_path_str);
+        assert_eq!(app.output_path, pcb_path_str);
+        assert_eq!(app.pan_offset, Vec2::ZERO);
+        assert_eq!(app.zoom, 1.0);
+
+        // Mutate live board in memory
+        {
+            let mut g = app.live.lock().unwrap();
+            g.board.footprints.clear();
+            assert_eq!(g.board.footprints.len(), 0);
+        }
+
+        // Test reload_pcb restores from disk
+        assert!(app.reload_pcb());
+        {
+            let g = app.live.lock().unwrap();
+            assert_eq!(g.board.footprints.len(), 1);
+            assert_eq!(g.board.footprints[0].reference, "R1");
+        }
+
+        let _ = fs::remove_file(&pcb_path);
+    }
+
+    #[test]
+    fn test_single_pcb_file_menu_and_modals_render() {
+        let temp_dir = std::env::temp_dir();
+        let pcb_path = temp_dir.join(format!("test_menu_modal_{}.kicad_pcb", std::process::id()));
+        let pcb_path_str = pcb_path.to_string_lossy().to_string();
+
+        let content = r#"(kicad_pcb (version 20240108) (generator "test")
+  (general (thickness 1.6))
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+  (net 0 "")
+  (net 1 "GND")
+)"#;
+        fs::write(&pcb_path, content).unwrap();
+
+        let board = Board::load(&pcb_path_str, &HashSet::new()).unwrap();
+        let mut app = VulcansTrialsApp::new(
+            pcb_path_str.clone(),
+            pcb_path_str.clone(),
+            board,
+            None,
+        );
+
+        let ctx = egui::Context::default();
+        let mut raw_input = egui::RawInput::default();
+        raw_input.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0)));
+
+        // 1. Initial render: top menu bar renders with File menu
+        let _ = ctx.run(raw_input.clone(), |ctx| {
+            app.render_ui(ctx);
+        });
+
+        // 2. Open Modal dialog
+        app.open_dialog_open = true;
+        app.file_dialog_path_buffer = pcb_path_str.clone();
+        let output = ctx.run(raw_input.clone(), |ctx| {
+            app.render_ui(ctx);
+        });
+        assert!(!output.shapes.is_empty(), "Rendering Open dialog modal must produce shapes");
+
+        // 3. Save As Modal dialog
+        app.open_dialog_open = false;
+        app.save_as_dialog_open = true;
+        app.file_dialog_path_buffer = format!("{}_copy.kicad_pcb", pcb_path_str);
+        let output_save = ctx.run(raw_input.clone(), |ctx| {
+            app.render_ui(ctx);
+        });
+        assert!(!output_save.shapes.is_empty(), "Rendering Save As dialog modal must produce shapes");
+
+        let _ = fs::remove_file(&pcb_path);
     }
 }

@@ -25,7 +25,7 @@ struct Args {
     #[arg(short, long)]
     input: Option<String>,
 
-    /// Output KiCad PCB file (.kicad_pcb) [defaults to <input>_routed.kicad_pcb]
+    /// Output KiCad PCB file (.kicad_pcb) [defaults to input PCB file]
     #[arg(short, long)]
     output: Option<String>,
 
@@ -96,10 +96,7 @@ impl Args {
             return out.clone();
         }
         if let Some(ref inp) = self.input {
-            let p = Path::new(inp);
-            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("board");
-            let parent = p.parent().unwrap_or_else(|| Path::new("."));
-            return parent.join(format!("{}_routed.kicad_pcb", stem)).to_string_lossy().to_string();
+            return inp.clone();
         }
         "vulcans_trials_out.kicad_pcb".to_string()
     }
@@ -578,7 +575,7 @@ mod tests {
             "/tmp/my_board.kicad_pcb",
         ])
         .unwrap();
-        assert_eq!(auto_out.resolved_output_path(), "/tmp/my_board_routed.kicad_pcb");
+        assert_eq!(auto_out.resolved_output_path(), "/tmp/my_board.kicad_pcb");
 
         let ipc_default = Args::try_parse_from(["vulcans-trials", "--kicad-ipc"]).unwrap();
         assert_eq!(ipc_default.kicad_ipc, Some(String::new()));

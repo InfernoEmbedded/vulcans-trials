@@ -232,9 +232,8 @@ if HAS_GUI:
                 )
                 return
 
-            out_path = os.path.splitext(board_path)[0] + "_vulcan.kicad_pcb"
-            ses_path = os.path.splitext(out_path)[0] + ".ses"
-            cmd = [binary, "--input", board_path, "--output", out_path]
+            ses_path = os.path.splitext(board_path)[0] + ".ses"
+            cmd = [binary, "--input", board_path]
 
             ipc_ep = get_ipc_endpoint()
             if ipc_ep:
@@ -243,7 +242,7 @@ if HAS_GUI:
 
             # Start watcher in PCBNEW to auto-import / refresh when Vulcan's Trials saves
             try:
-                _ACTIVE_WATCHER = VulcanBoardWatcher(board, out_path, ses_path)
+                _ACTIVE_WATCHER = VulcanBoardWatcher(board, board_path, ses_path)
                 _ACTIVE_WATCHER.Start(1000)
             except Exception:
                 pass
