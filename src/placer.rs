@@ -1267,6 +1267,20 @@ pub fn legalize_placement(
 
     let boundary = board.boundary_aabb();
     let ties = build_passive_ties(board);
+    let mut initial = initial;
+    for i in &movable {
+        let (cx_min, cx_max, cy_min, cy_max) = board.footprints[*i].origin_clamp_range(
+            initial.rotations[*i],
+            initial.layers[*i],
+            config.min_spacing_mm,
+            &boundary,
+        );
+        initial.positions[*i].x = initial.positions[*i].x.clamp(cx_min, cx_max);
+        initial.positions[*i].y = initial.positions[*i].y.clamp(cy_min, cy_max);
+        initial.update_component(*i, board, config);
+    }
+    initial.evaluate(board, config, &ties);
+
     let solved = AtomicBool::new(false);
     let steps_per_thread = (10000 / num_threads).max(2500);
 
@@ -1670,7 +1684,15 @@ pub fn prioritize_and_position_initial_components(
     }
 
     // Decoupling caps have been placed directly at their power pins.
-    // Remaining components retain their valid positions.
+    // Ensure any remaining unlocked components staged outside board boundary are pulled inside.
+    for fp in board.footprints.iter_mut() {
+        if !fp.is_locked {
+            let (cx_min, cx_max, cy_min, cy_max) = fp.origin_clamp_range(fp.rotation, fp.layer, config.min_spacing_mm, &boundary);
+            fp.x = fp.x.clamp(cx_min, cx_max);
+            fp.y = fp.y.clamp(cy_min, cy_max);
+        }
+    }
+
     if let Some(st) = live {
         if let Ok(mut g) = st.lock() {
             g.push_log("[Auto-Placer] Prioritized differential pairs and situated decoupling caps near device power pins".to_string());

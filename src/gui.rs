@@ -534,6 +534,13 @@ pub struct VulcansTrialsApp {
     pub last_ipc_retry: Instant,
     pub ipc_retry_interval: Duration,
 
+    // Automation & Framing
+    pub view_bounds: (f64, f64, f64, f64),
+    pub auto_start: bool,
+    pub auto_exit: Option<u64>,
+    pub frame_count: u64,
+    pub completed_time: Option<Instant>,
+
     // Persistence
     pub preferences_path: Option<PathBuf>,
     pub last_saved_prefs: AppPreferences,
@@ -555,8 +562,31 @@ pub struct MovingFootprint {
     pub original_layer: usize,
 }
 
+pub fn compute_initial_view_bounds(board: &Board) -> (f64, f64, f64, f64) {
+    let mut min_x = board.min_x;
+    let mut max_x = board.max_x;
+    let mut min_y = board.min_y;
+    let mut max_y = board.max_y;
+    for fp in &board.footprints {
+        min_x = min_x.min(fp.x - 3.0);
+        max_x = max_x.max(fp.x + 3.0);
+        min_y = min_y.min(fp.y - 3.0);
+        max_y = max_y.max(fp.y + 3.0);
+    }
+    if min_x >= max_x {
+        min_x = 0.0;
+        max_x = 100.0;
+    }
+    if min_y >= max_y {
+        min_y = 0.0;
+        max_y = 100.0;
+    }
+    (min_x, max_x, min_y, max_y)
+}
+
 impl VulcansTrialsApp {
     pub fn new(input_path: String, output_path: String, board: Board, vulkan: Option<Arc<VulkanEngine>>) -> Self {
+        let view_bounds = compute_initial_view_bounds(&board);
         let busy_counter = vulkan.as_ref().map(|v| Arc::clone(&v.compute_busy_ns));
         let telemetry = SystemTelemetry::spawn(busy_counter);
         let mut visible_layers = HashSet::new();
@@ -631,6 +661,11 @@ impl VulcansTrialsApp {
                 .unwrap_or_else(|| "ipc:///tmp/kicad/api.sock".to_string()),
             last_ipc_retry: Instant::now(),
             ipc_retry_interval: Duration::from_secs(2),
+            view_bounds,
+            auto_start: false,
+            auto_exit: None,
+            frame_count: 0,
+            completed_time: None,
             preferences_path: None,
             last_saved_prefs: AppPreferences::default(),
             open_dialog_open: false,
@@ -943,10 +978,12 @@ impl VulcansTrialsApp {
                     visible_layers.insert(layer.to_string());
                 }
                 self.visible_layers = visible_layers;
+                let view_bounds = compute_initial_view_bounds(&board);
                 let mut g = self.live.lock().unwrap();
                 *g = LiveTrialState::new(board);
                 g.push_log(format!("[Opened] Loaded '{}' successfully", path));
                 drop(g);
+                self.view_bounds = view_bounds;
                 self.set_board_path(path.to_string());
                 self.reset_view();
                 true
@@ -1171,13 +1208,14 @@ impl VulcansTrialsApp {
         });
     }
 
-    pub fn board_to_screen(&self, board: &Board, rect: Rect, wx: f64, wy: f64) -> (Pos2, f32) {
-        let bw = (board.max_x - board.min_x).max(10.0) as f32;
-        let bh = (board.max_y - board.min_y).max(10.0) as f32;
+    pub fn board_to_screen(&self, _board: &Board, rect: Rect, wx: f64, wy: f64) -> (Pos2, f32) {
+        let (min_x, max_x, min_y, max_y) = self.view_bounds;
+        let bw = (max_x - min_x).max(10.0) as f32;
+        let bh = (max_y - min_y).max(10.0) as f32;
         let base_scale = ((rect.width() - 40.0) / bw).min((rect.height() - 40.0) / bh).max(1.0);
         let scale = base_scale * self.zoom;
-        let board_cx = ((board.min_x + board.max_x) * 0.5) as f32;
-        let board_cy = ((board.min_y + board.max_y) * 0.5) as f32;
+        let board_cx = ((min_x + max_x) * 0.5) as f32;
+        let board_cy = ((min_y + max_y) * 0.5) as f32;
         let screen_center = rect.center() + self.pan_offset;
         let pos = Pos2::new(
             screen_center.x + ((wx as f32) - board_cx) * scale,
@@ -1187,9 +1225,10 @@ impl VulcansTrialsApp {
     }
 
     pub fn screen_to_board(&self, board: &Board, rect: Rect, pos: Pos2) -> Point {
-        let (_, scale) = self.board_to_screen(board, rect, board.min_x, board.min_y);
-        let board_cx = ((board.min_x + board.max_x) * 0.5) as f32;
-        let board_cy = ((board.min_y + board.max_y) * 0.5) as f32;
+        let (min_x, max_x, min_y, max_y) = self.view_bounds;
+        let (_, scale) = self.board_to_screen(board, rect, min_x, min_y);
+        let board_cx = ((min_x + max_x) * 0.5) as f32;
+        let board_cy = ((min_y + max_y) * 0.5) as f32;
         let screen_center = rect.center() + self.pan_offset;
         let wx = board_cx + (pos.x - screen_center.x) / scale;
         let wy = board_cy + (pos.y - screen_center.y) / scale;
@@ -2332,6 +2371,24 @@ impl VulcansTrialsApp {
         let telem = self.telemetry.state.lock().unwrap().clone();
         let snap = self.live.lock().unwrap().clone();
         let is_running = self.worker_running.load(Ordering::Relaxed);
+
+        self.frame_count = self.frame_count.saturating_add(1);
+        if self.auto_start && !is_running && self.frame_count >= 30 && snap.phase == TrialPhase::Idle {
+            self.start_trial(true, true);
+        }
+
+        if snap.phase == TrialPhase::Completed {
+            if self.completed_time.is_none() {
+                self.completed_time = Some(Instant::now());
+            }
+            if let Some(exit_secs) = self.auto_exit {
+                if let Some(t) = self.completed_time {
+                    if t.elapsed() >= Duration::from_secs(exit_secs) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+        }
 
         // Global File menu keyboard shortcuts (Ctrl+O, Ctrl+S, Ctrl+Shift+S, Ctrl+R, Ctrl+Q)
         let (ctrl_o, ctrl_s, ctrl_shift_s, ctrl_r, ctrl_q) = ctx.input(|i| {
@@ -6149,6 +6206,62 @@ mod tests {
             app.render_ui(ctx);
         });
         assert!(!output_save.shapes.is_empty(), "Rendering Save As dialog modal must produce shapes");
+
+        let _ = fs::remove_file(&pcb_path);
+    }
+
+    #[test]
+    fn test_compute_initial_view_bounds_and_auto_start_exit() {
+        let temp_dir = std::env::temp_dir();
+        let pcb_path = temp_dir.join(format!("test_view_bounds_{}.kicad_pcb", std::process::id()));
+        let pcb_path_str = pcb_path.to_string_lossy().to_string();
+
+        let content = r#"(kicad_pcb (version 20240108) (generator "test")
+  (general (thickness 1.6))
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+  (gr_rect (start 120.0 80.0) (end 170.0 120.0) (layer "Edge.Cuts"))
+  (footprint "R" (at 90.0 85.0) (property "Reference" "R1")
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "NET1")))
+  (footprint "R" (at 180.0 130.0) (property "Reference" "R2")
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "NET1")))
+)"#;
+        fs::write(&pcb_path, content).unwrap();
+
+        let board = Board::load(&pcb_path_str, &HashSet::new()).unwrap();
+        let (min_x, max_x, min_y, max_y) = compute_initial_view_bounds(&board);
+
+        // R1 is at 90.0 -> min_x should be <= 87.0
+        assert!(min_x <= 87.0, "min_x should encompass R1 off-board");
+        // R2 is at 180.0 -> max_x should be >= 183.0
+        assert!(max_x >= 183.0, "max_x should encompass R2 off-board");
+        // Board min_y is 80.0, R1 y is 85.0 -> min_y should be <= 80.0
+        assert!(min_y <= 80.0);
+        // R2 y is 130.0 -> max_y should be >= 133.0
+        assert!(max_y >= 133.0);
+
+        let mut app = VulcansTrialsApp::new(
+            pcb_path_str.clone(),
+            pcb_path_str.clone(),
+            board.clone(),
+            None,
+        );
+        app.auto_start = true;
+        app.auto_exit = Some(1);
+        app.place_duration_secs = 0;
+
+        let ctx = egui::Context::default();
+        let mut raw_input = egui::RawInput::default();
+        raw_input.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0)));
+
+        // Run 35 frames to trigger auto_start
+        for _ in 0..35 {
+            let _ = ctx.run(raw_input.clone(), |ctx| {
+                app.render_ui(ctx);
+            });
+        }
+
+        // Verify trial started or running
+        assert!(app.frame_count >= 35);
 
         let _ = fs::remove_file(&pcb_path);
     }

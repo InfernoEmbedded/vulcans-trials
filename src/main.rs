@@ -88,6 +88,14 @@ struct Args {
     /// Run as a Model Context Protocol (MCP) server over TCP listening on <bind_addr> (e.g. 127.0.0.1:8765)
     #[arg(long, value_name = "BIND_ADDR")]
     mcp_tcp: Option<String>,
+
+    /// Automatically trigger auto-placement and auto-routing after opening the GUI
+    #[arg(long)]
+    auto_start: bool,
+
+    /// Automatically close the application N seconds after trial completes
+    #[arg(long)]
+    auto_exit: Option<u64>,
 }
 
 impl Args {
@@ -469,11 +477,23 @@ fn main() {
 
     pub const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon_256x256.png");
 
+    let duration = args.duration;
+    let auto_start = args.auto_start;
+    let auto_exit = args.auto_exit;
+
     let icon_data = eframe::icon_data::from_png_bytes(APP_ICON_PNG).ok();
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title(format!("Vulcan's Trials v{} — InfernoEmbedded Auto-Placer & Auto-Router (GPLv3)", env!("CARGO_PKG_VERSION")))
         .with_app_id("com.infernoembedded.vulcans-trials")
-        .with_inner_size([1360.0, 840.0]);
+        .with_inner_size([1920.0, 1080.0]);
+    if auto_start {
+        viewport = viewport
+            .with_decorations(false)
+            .with_position([0.0, 0.0])
+            .with_inner_size([1920.0, 1080.0]);
+    } else {
+        viewport = viewport.with_maximized(true);
+    }
     if let Some(icon) = icon_data {
         viewport = viewport.with_icon(icon);
     }
@@ -487,7 +507,15 @@ fn main() {
     if let Err(e) = eframe::run_native(
         &app_title,
         native_options,
-        Box::new(move |_cc| Ok(Box::new(VulcansTrialsApp::new(input_path, output_path, board, vulkan).with_ipc(ipc_client)))),
+        Box::new(move |_cc| {
+            let mut app = VulcansTrialsApp::new(input_path, output_path, board, vulkan).with_ipc(ipc_client);
+            if duration > 0 {
+                app.place_duration_secs = duration;
+            }
+            app.auto_start = auto_start;
+            app.auto_exit = auto_exit;
+            Ok(Box::new(app))
+        }),
     ) {
         eprintln!("GUI error: {}", e);
     }
@@ -553,6 +581,9 @@ mod tests {
             "--self-test",
             "--ipc",
             "/tmp/test_ipc.sock",
+            "--auto-start",
+            "--auto-exit",
+            "5",
         ])
         .unwrap();
         assert_eq!(custom.input, Some("/tmp/in.kicad_pcb".to_string()));
@@ -565,6 +596,8 @@ mod tests {
         assert_eq!(custom.duration, 2);
         assert_eq!(custom.passes, 4);
         assert_eq!(custom.kicad_ipc, Some("/tmp/test_custom.sock".to_string()));
+        assert!(custom.auto_start);
+        assert_eq!(custom.auto_exit, Some(5));
         let locked = parse_locked_refs(&custom.lock);
         assert_eq!(locked.len(), 3);
         assert!(locked.contains("U1") && locked.contains("J2") && locked.contains("R5"));
@@ -620,6 +653,8 @@ mod tests {
             ipc: None,
             mcp: false,
             mcp_tcp: None,
+            auto_start: false,
+            auto_exit: None,
         };
         assert!(run_headless_trial(&args, &mut board, None, None).is_ok());
         assert!(Path::new(out_pcb).exists());
