@@ -657,6 +657,81 @@ impl RoutingGrid {
         vk.compute_3d_wavefront(&cell_costs, seeds, &params, via_cost, iterations)
     }
 
+    /// Batch-validates a slice of `(net_id, start, end, width, layer, clearance)` track segments
+    /// on the GPU using `GpuDrcContext` alongside 3D grid obstacle and plane-layer clearance checks.
+    pub fn batch_validate_segments_gpu(
+        &self,
+        board: &Board,
+        segments: &[(usize, (f64, f64), (f64, f64), f64, usize, f64)],
+    ) -> Option<Vec<bool>> {
+        if segments.is_empty() {
+            return Some(Vec::new());
+        }
+        let vk = self.vulkan.as_ref()?;
+        let drc_ctx = GpuDrcContext::from_board(board);
+        let cands: Vec<GpuDrcCandidate> = segments
+            .iter()
+            .map(|&(net_id, start, end, width, layer, clearance)| GpuDrcCandidate {
+                x1: start.0 as f32,
+                y1: start.1 as f32,
+                x2: end.0 as f32,
+                y2: end.1 as f32,
+                radius_or_half_width: (width * 0.5) as f32,
+                clearance: clearance as f32,
+                layer: layer as u32,
+                net_id: net_id as u32,
+                kind: 1,
+                ignore_same_net_pads: 1,
+                _pad0: 0,
+                _pad1: 0,
+            })
+            .collect();
+        let gpu_flags = drc_ctx.evaluate(Some(vk), &cands)?;
+        let results = segments
+            .iter()
+            .zip(gpu_flags.into_iter())
+            .map(|(&(net_id, start, end, width, layer, clearance), flag)| {
+                if flag == 0 || layer >= self.num_layers {
+                    return false;
+                }
+                if self.plane_nets.get(&layer).is_some_and(|&pnet| pnet != net_id) {
+                    return false;
+                }
+                let margin = width * 0.5 + clearance;
+                for ko in &board.keepouts {
+                    if ko.layers.contains(&layer) {
+                        let k_min_x = ko.min_x - margin;
+                        let k_max_x = ko.max_x + margin;
+                        let k_min_y = ko.min_y - margin;
+                        let k_max_y = ko.max_y + margin;
+                        if (start.0 >= k_min_x && start.0 <= k_max_x && start.1 >= k_min_y && start.1 <= k_max_y)
+                            || (end.0 >= k_min_x && end.0 <= k_max_x && end.1 >= k_min_y && end.1 <= k_max_y)
+                        {
+                            return false;
+                        }
+                    }
+                }
+                let seg_len = (end.0 - start.0).hypot(end.1 - start.1);
+                let step = (self.res * 0.5).max(0.02);
+                let n_steps = ((seg_len / step).ceil() as usize).max(1);
+                for s in 0..=n_steps {
+                    let t = s as f64 / n_steps as f64;
+                    let wx = start.0 + t * (end.0 - start.0);
+                    let wy = start.1 + t * (end.1 - start.1);
+                    let Some((gx, gy)) = self.world_to_grid(wx, wy) else {
+                        return false;
+                    };
+                    let cell_net = self.obstacle_net_ids[self.idx(gx, gy, layer)];
+                    if cell_net != FREE_NET && cell_net != net_id as i32 {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+        Some(results)
+    }
+
     pub fn compute_distance_field_cpu(
         obstacles: &[u32],
         width: usize,
@@ -1010,8 +1085,8 @@ impl RoutingGrid {
                                 } else {
                                     req_clearance.max(obst_c)
                                 };
-                                let obst_r = if self.smd_pad_cells[c_idx] { self.res * 0.5 } else { obst_half_w };
-                                let eff_c = (via_dia / 2.0) + obst_r + eff_c_val + 0.025;
+                                let obst_r = if self.smd_pad_cells[c_idx] { 0.025 } else { (track_width / 2.0).max(0.075) };
+                                let eff_c = (via_dia / 2.0) + obst_r + eff_c_val;
                                 if d_sq < eff_c.powi(2) + 1e-6 {
                                     via_clearance_violation = true;
                                     break 'via_check;
@@ -1034,7 +1109,7 @@ impl RoutingGrid {
                                     } else {
                                         req_clearance.max(obst_c)
                                     };
-                                    (via_dia / 2.0) + self.res * 0.5 + eff_c_val + 0.025
+                                    (via_dia / 2.0) + 0.025 + eff_c_val
                                 };
                                 if d_sq < eff_c.powi(2) - 1e-6 {
                                     via_clearance_violation = true;
@@ -3153,9 +3228,10 @@ impl AutoRouter {
         live: Option<Arc<Mutex<LiveTrialState>>>,
         stop_flag: Arc<AtomicBool>,
     ) -> (usize, usize) {
-        // Clear out any old unlocked tracks/vias before routing so they don't block stubs or grid
+        // Clear out any old unlocked tracks/vias/arcs before routing so they don't block stubs or grid
         board.tracks.retain(|t| t.is_locked);
         board.vias.retain(|v| v.is_locked);
+        board.arcs.retain(|a| a.is_locked);
 
         if let Some(ref ipc_lock) = self.ipc {
             if let Ok(mut client) = ipc_lock.lock() {
@@ -3278,7 +3354,7 @@ impl AutoRouter {
                 }
                 conn.netclass.diff_pair_width = conn.netclass.diff_pair_width.min(0.20);
                 conn.netclass.diff_pair_gap = conn.netclass.diff_pair_gap.min(0.15);
-                if touches_05mm_ic && !is_power_net {
+                if touches_05mm_ic {
                     conn.netclass.clearance = conn.netclass.clearance.min(0.15);
                 }
                 conn.netclass.via_dia = conn.netclass.via_dia.min(0.60);
@@ -3338,6 +3414,8 @@ impl AutoRouter {
 
         let mut routed_paths: Vec<Option<Vec<GridNode>>> = vec![None; total_conns];
         let mut best_routed_paths: Vec<Option<Vec<GridNode>>> = vec![None; total_conns];
+        let mut best_footprints = board.footprints.clone();
+        let mut best_connections = connections.clone();
         let mut best_routed_count = 0;
         let mut unrouted_history: Vec<usize> = vec![0; total_conns];
         let gpu_done = AtomicBool::new(false);
@@ -5007,6 +5085,8 @@ impl AutoRouter {
                 if done > best_routed_count {
                     best_routed_count = done;
                     best_routed_paths = routed_paths.clone();
+                    best_footprints = board.footprints.clone();
+                    best_connections = connections.clone();
                     stagnant_passes = 0;
                 } else {
                     stagnant_passes += 1;
@@ -5160,6 +5240,8 @@ impl AutoRouter {
 
         if best_routed_count > routed_paths.iter().filter(|p| p.is_some()).count() {
             routed_paths = best_routed_paths;
+            board.footprints = best_footprints;
+            connections = best_connections;
             self.rebuild_grid_state(board, grid, &connections, &routed_paths, &escape_stubs);
         }
 
@@ -5177,6 +5259,16 @@ impl AutoRouter {
             for i in 0..total_conns {
                 if pre_connected[i] && !Self::is_connection_electrically_connected(board, &connections[i]) {
                     broken_nets.insert(connections[i].net_id);
+                }
+                if let Some(leader_idx) = connections[i].diff_pair_leader {
+                    let ln = connections[leader_idx].net_id;
+                    let fn_id = connections[i].net_id;
+                    if board_net_coupling_mm(board, ln, fn_id) > DIFF_PAIR_COUPLED_MM
+                        || board_net_coupling_mm(board, fn_id, ln) > DIFF_PAIR_COUPLED_MM
+                    {
+                        broken_nets.insert(ln);
+                        broken_nets.insert(fn_id);
+                    }
                 }
             }
             if !broken_nets.is_empty() {
@@ -5586,6 +5678,16 @@ impl AutoRouter {
             for i in 0..total_conns {
                 if pre_connected[i] && !Self::is_connection_electrically_connected(board, &connections[i]) {
                     broken_nets.insert(connections[i].net_id);
+                }
+                if let Some(leader_idx) = connections[i].diff_pair_leader {
+                    let ln = connections[leader_idx].net_id;
+                    let fn_id = connections[i].net_id;
+                    if board_net_coupling_mm(board, ln, fn_id) > DIFF_PAIR_COUPLED_MM
+                        || board_net_coupling_mm(board, fn_id, ln) > DIFF_PAIR_COUPLED_MM
+                    {
+                        broken_nets.insert(ln);
+                        broken_nets.insert(fn_id);
+                    }
                 }
             }
             if !broken_nets.is_empty() {
@@ -6692,7 +6794,79 @@ impl AutoRouter {
             }
         }
 
-        let legal_poses: Vec<(usize, f64, f64)> = flat_pose_cands
+        // Phase A (GPU Batch Pad/Clearance Pre-Screen):
+        // Pack all candidate footprint pad coordinates as GpuDrcCandidate probes in one GPU dispatch
+        // to prune poses whose pads violate copper clearance before running `is_placement_valid`.
+        let screened_pose_cands: Vec<(usize, f64, f64)> = if grid.vulkan.is_some() && !flat_pose_cands.is_empty() {
+            let mut drc_ctx = GpuDrcContext::from_board(board);
+            drc_ctx.pads.retain(|gp| {
+                !blocking_candidates.iter().any(|&(b_idx, _, _)| {
+                    board.footprints[b_idx].pads.iter().any(|bp| {
+                        let (bpx, bpy) = board.footprints[b_idx].pad_absolute_position(bp);
+                        (gp.x as f64 - bpx).hypot(gp.y as f64 - bpy) < 1e-3
+                    })
+                })
+            });
+            let mut cand_probes = Vec::with_capacity(flat_pose_cands.len() * 2);
+            let mut pose_ranges = Vec::with_capacity(flat_pose_cands.len());
+            for &(fp_idx, nx, ny) in &flat_pose_cands {
+                let start_idx = cand_probes.len();
+                let fp = &board.footprints[fp_idx];
+                let flipped = fp.layer != fp.orig_layer;
+                for pad in &fp.pads {
+                    if pad.net_id == 0 {
+                        continue;
+                    }
+                    let oy = if flipped { -pad.offset_y } else { pad.offset_y };
+                    let p = Point::new(pad.offset_x, oy).rotate_ccw(fp.rotation);
+                    let px = nx + p.x;
+                    let py = ny + p.y;
+                    let (pw, ph) = fp.pad_world_size(pad);
+                    let pad_min_dim = pw.min(ph);
+                    let min_clearance = board.get_netclass_for_net(pad.net_id).clearance.min(0.15);
+                    cand_probes.push(GpuDrcCandidate {
+                        x1: px as f32,
+                        y1: py as f32,
+                        x2: px as f32,
+                        y2: py as f32,
+                        radius_or_half_width: (pad_min_dim * 0.5) as f32,
+                        clearance: min_clearance as f32,
+                        layer: fp.pad_layer(pad) as u32,
+                        net_id: pad.net_id as u32,
+                        kind: 1,
+                        ignore_same_net_pads: 1,
+                        _pad0: 0,
+                        _pad1: 0,
+                    });
+                }
+                pose_ranges.push((start_idx, cand_probes.len()));
+            }
+            if let Some(flags) = drc_ctx.evaluate(grid.vulkan.as_ref(), &cand_probes) {
+                let filtered: Vec<(usize, f64, f64)> = flat_pose_cands
+                    .iter()
+                    .copied()
+                    .zip(pose_ranges.into_iter())
+                    .filter_map(|(pose, (s, e))| {
+                        if s == e || flags[s..e].iter().all(|&v| v != 0) {
+                            Some(pose)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if filtered.is_empty() {
+                    flat_pose_cands
+                } else {
+                    filtered
+                }
+            } else {
+                flat_pose_cands
+            }
+        } else {
+            flat_pose_cands
+        };
+
+        let mut legal_poses: Vec<(usize, f64, f64)> = screened_pose_cands
             .par_iter()
             .filter_map(|&(fp_idx, nx, ny)| {
                 if self.nudge_engine.is_placement_valid(board, fp_idx, nx, ny) {
@@ -6707,8 +6881,98 @@ impl AutoRouter {
             return false;
         }
 
+        // Phase B (GPU Batch 3D Wavefront Pre-Evaluation):
+        // When Vulkan is present and multiple legal poses remain, evaluate shifted connection endpoints
+        // and corridor segments in parallel on the GPU to rank and pre-verify reachable nudge poses.
+        if grid.vulkan.is_some() && legal_poses.len() > 1 {
+            let mut wf_grid = Self::clone_grid_for_worker(grid);
+            wf_grid.vulkan = grid.vulkan.clone();
+            for cell_i in 0..wf_grid.obstacle_net_ids.len() {
+                if wf_grid
+                    .nudgeable_fp
+                    .get(cell_i)
+                    .and_then(|&v| v)
+                    .is_some_and(|f| blocking_candidates.iter().any(|&(bf, _, _)| bf == f))
+                {
+                    wf_grid.obstacle_net_ids[cell_i] = FREE_NET;
+                }
+            }
+            let r_cells = (((track_width * 0.5) + req_clearance) / wf_grid.res).ceil() as i32;
+            let mut wf_requests = Vec::with_capacity(legal_poses.len());
+            let mut corridor_segs = Vec::with_capacity(legal_poses.len());
+            let mut pose_req_indices = Vec::with_capacity(legal_poses.len());
+
+            for &(fp_idx, nx, ny) in &legal_poses {
+                let fp = &board.footprints[fp_idx];
+                let flipped = fp.layer != fp.orig_layer;
+                let shift_pad = |pad_idx: usize| -> (f64, f64) {
+                    let pad = &fp.pads[pad_idx];
+                    let oy = if flipped { -pad.offset_y } else { pad.offset_y };
+                    let p = Point::new(pad.offset_x, oy).rotate_ccw(fp.rotation);
+                    (nx + p.x, ny + p.y)
+                };
+                let target_conn = connections
+                    .iter()
+                    .find(|c| c.start_fp == fp_idx || c.end_fp == fp_idx)
+                    .unwrap_or(&connections[conn_idx]);
+                let s_pt = if target_conn.start_fp == fp_idx {
+                    let (px, py) = shift_pad(target_conn.start_pad);
+                    (px, py, target_conn.start.2)
+                } else {
+                    target_conn.start
+                };
+                let e_pt = if target_conn.end_fp == fp_idx {
+                    let (px, py) = shift_pad(target_conn.end_pad);
+                    (px, py, target_conn.end.2)
+                } else {
+                    target_conn.end
+                };
+                corridor_segs.push((
+                    target_conn.net_id,
+                    (s_pt.0, s_pt.1),
+                    (e_pt.0, e_pt.1),
+                    target_conn.netclass.track_width,
+                    s_pt.2,
+                    target_conn.netclass.clearance,
+                ));
+                if let (Some((sgx, sgy)), Some((egx, egy))) = (
+                    wf_grid.world_to_grid(s_pt.0, s_pt.1),
+                    wf_grid.world_to_grid(e_pt.0, e_pt.1),
+                ) {
+                    let req_idx = wf_requests.len();
+                    wf_requests.push(((sgx, sgy, s_pt.2), (egx, egy, e_pt.2), target_conn.net_id as u32, 2.0));
+                    pose_req_indices.push(Some(req_idx));
+                } else {
+                    pose_req_indices.push(None);
+                }
+            }
+
+            let wf_paths = wf_grid.solve_batch_3d_wavefront_paths(&wf_requests, r_cells);
+            let seg_flags = wf_grid.batch_validate_segments_gpu(board, &corridor_segs);
+            let mut scored_poses: Vec<((usize, f64, f64), (u8, usize))> = legal_poses
+                .into_iter()
+                .enumerate()
+                .map(|(idx, pose)| {
+                    let wf_len = pose_req_indices[idx]
+                        .and_then(|r_i| wf_paths.get(r_i))
+                        .and_then(|p| p.as_ref())
+                        .map(|p| p.len());
+                    let seg_ok = seg_flags.as_ref().and_then(|f| f.get(idx)).copied().unwrap_or(false);
+                    let rank_tier = match (wf_len.is_some(), seg_ok) {
+                        (true, true) => 0u8,
+                        (true, false) => 1u8,
+                        (false, true) => 2u8,
+                        (false, false) => 3u8,
+                    };
+                    (pose, (rank_tier, idx))
+                })
+                .collect();
+            scored_poses.sort_by_key(|&(_, score)| score);
+            legal_poses = scored_poses.into_iter().map(|(pose, _)| pose).collect();
+        }
+
         // Evaluate A* pathfinding in parallel across all legal footprint poses simultaneously
-        let winning_pose: Option<(usize, (f64, f64), Vec<GridNode>)> = legal_poses
+        let winning_pose: Option<(usize, (f64, f64), Vec<Option<Vec<GridNode>>>)> = legal_poses
             .par_iter()
             .filter_map(|&(fp_idx, nx, ny)| {
                 if stop_flag.load(AtomicOrdering::Relaxed) {
@@ -6720,17 +6984,25 @@ impl AutoRouter {
 
                 let mut local_conns = connections.to_vec();
                 let mut local_paths = routed_paths.to_vec();
+                let mut incident_routed = Vec::new();
                 for (c_i, c) in local_conns.iter_mut().enumerate() {
+                    let mut touched = false;
                     if c.start_fp == fp_idx {
                         let (px, py) = local_board.footprints[fp_idx]
                             .pad_absolute_position(&local_board.footprints[fp_idx].pads[c.start_pad]);
                         c.start = (px, py, c.start.2);
-                        local_paths[c_i] = None;
+                        touched = true;
                     }
                     if c.end_fp == fp_idx {
                         let (px, py) = local_board.footprints[fp_idx]
                             .pad_absolute_position(&local_board.footprints[fp_idx].pads[c.end_pad]);
                         c.end = (px, py, c.end.2);
+                        touched = true;
+                    }
+                    if touched {
+                        if c_i != conn_idx && local_paths[c_i].is_some() {
+                            incident_routed.push(c_i);
+                        }
                         local_paths[c_i] = None;
                     }
                 }
@@ -6749,7 +7021,7 @@ impl AutoRouter {
                 let s_node = GridNode { gx: sgx, gy: sgy, layer: updated_conn.start.2 };
                 let e_node = GridNode { gx: egx, gy: egy, layer: updated_conn.end.2 };
 
-                self.find_path_with_params(
+                let p = self.find_path_with_params(
                     &local_grid,
                     s_node,
                     e_node,
@@ -6761,36 +7033,66 @@ impl AutoRouter {
                     1.05,
                     0.0,
                     stop_flag,
-                )
-                .map(|p| (fp_idx, (nx, ny), p))
+                )?;
+                self.commit_path_to_grid(&mut local_grid, &p, c_net_id, track_width, via_dia);
+                local_paths[conn_idx] = Some(p);
+
+                for inc_idx in incident_routed {
+                    let inc_conn = &local_conns[inc_idx];
+                    let (Some((isgx, isgy)), Some((iegx, iegy))) = (
+                        local_grid.world_to_grid(inc_conn.start.0, inc_conn.start.1),
+                        local_grid.world_to_grid(inc_conn.end.0, inc_conn.end.1),
+                    ) else {
+                        return None;
+                    };
+                    let is_node = GridNode { gx: isgx, gy: isgy, layer: inc_conn.start.2 };
+                    let ie_node = GridNode { gx: iegx, gy: iegy, layer: inc_conn.end.2 };
+                    let inc_tw = inc_conn.netclass.track_width.min(0.25);
+                    let inc_clr = inc_conn.netclass.clearance;
+                    let inc_vd = inc_conn.netclass.min_via_diameter;
+                    let inc_p = self.find_path_with_params(
+                        &local_grid,
+                        is_node,
+                        ie_node,
+                        inc_conn.net_id,
+                        inc_clr,
+                        inc_tw,
+                        inc_vd,
+                        u1_center,
+                        1.05,
+                        0.0,
+                        stop_flag,
+                    )?;
+                    self.commit_path_to_grid(&mut local_grid, &inc_p, inc_conn.net_id, inc_tw, inc_vd);
+                    local_paths[inc_idx] = Some(inc_p);
+                }
+
+                Some((fp_idx, (nx, ny), local_paths))
             })
             .find_first(|_| true);
 
-        if let Some((fp_idx, (nx, ny), p)) = winning_pose {
+        if let Some((fp_idx, (nx, ny), updated_paths)) = winning_pose {
             let orig_fp_x = board.footprints[fp_idx].x;
             let orig_fp_y = board.footprints[fp_idx].y;
             board.footprints[fp_idx].x = nx;
             board.footprints[fp_idx].y = ny;
 
-            for (c_i, c) in connections.iter_mut().enumerate() {
+            for c in connections.iter_mut() {
                 if c.start_fp == fp_idx {
                     let (px, py) = board.footprints[fp_idx]
                         .pad_absolute_position(&board.footprints[fp_idx].pads[c.start_pad]);
                     c.start = (px, py, c.start.2);
-                    routed_paths[c_i] = None;
                 }
                 if c.end_fp == fp_idx {
                     let (px, py) = board.footprints[fp_idx]
                         .pad_absolute_position(&board.footprints[fp_idx].pads[c.end_pad]);
                     c.end = (px, py, c.end.2);
-                    routed_paths[c_i] = None;
                 }
             }
+            routed_paths.clone_from_slice(&updated_paths);
 
             grid.base_snapshot = None;
             self.rebuild_grid_state(board, grid, connections, routed_paths, escape_stubs);
-            self.commit_path_to_grid(grid, &p, c_net_id, track_width, via_dia);
-            routed_paths[conn_idx] = Some(p);
 
             board.rip_up_connected_traces_to_component_at(
                 fp_idx,
@@ -8631,10 +8933,38 @@ pub fn find_choked_pin_bottlenecks(
 
                 let mut prev_stub_len: Option<f64> = None;
                 for (edge_idx, pad) in edge_pads.iter().enumerate() {
-                    let is_staggered = edge_idx % 2 == 1;
+                    let (px, py) = fp.pad_absolute_position(pad);
+                    let has_close_prev = edge_idx > 0 && {
+                        let (ppx, ppy) = fp.pad_absolute_position(edge_pads[edge_idx - 1]);
+                        (ppx - px).hypot(ppy - py) < 0.75
+                    };
+                    let has_close_next = edge_idx + 1 < edge_pads.len() && {
+                        let (npx, npy) = fp.pad_absolute_position(edge_pads[edge_idx + 1]);
+                        (npx - px).hypot(npy - py) < 0.75
+                    };
+                    let next_is_sandwiched = edge_idx + 2 < edge_pads.len() && has_close_next && {
+                        let (npx, npy) = fp.pad_absolute_position(edge_pads[edge_idx + 1]);
+                        let (nnpx, nnpy) = fp.pad_absolute_position(edge_pads[edge_idx + 2]);
+                        (nnpx - npx).hypot(nnpy - npy) < 0.75
+                    };
+                    let next_higher_prio = has_close_next && {
+                        let next_nc = board.get_netclass_for_net(edge_pads[edge_idx + 1].net_id);
+                        let cur_nc = board.get_netclass_for_net(pad.net_id);
+                        next_nc.track_width > cur_nc.track_width + 1e-4
+                            || Self::netclass_priority(&next_nc.name) > Self::netclass_priority(&cur_nc.name)
+                    };
+                    let is_sandwiched = has_close_prev && has_close_next;
+                    let is_staggered = if is_sandwiched {
+                        prev_stub_len.map_or(false, |l| l > 0.70)
+                    } else if !has_close_prev && (next_is_sandwiched || next_higher_prio) {
+                        true
+                    } else if has_close_prev {
+                        prev_stub_len.map_or(true, |l| l > 0.70)
+                    } else {
+                        edge_idx % 2 == 1
+                    };
                     let (norm_lx, norm_ly) = edge.local_normal();
                     let world_norm = Point::new(norm_lx, norm_ly).rotate_ccw(fp.rotation);
-                    let (px, py) = fp.pad_absolute_position(pad);
 
                     let stub_w = board.get_netclass_for_net(pad.net_id).track_width.min(0.15);
                     let eff_clearance = board.get_netclass_for_net(pad.net_id).clearance.min(0.15).max(0.12);
@@ -8795,7 +9125,7 @@ pub fn find_choked_pin_bottlenecks(
                     };
 
                     // Enforce stagger against previous adjacent pad's chosen length (except for paired diff buses)
-                    if !is_diff_pair_pad {
+                    if !is_diff_pair_pad && has_close_prev {
                         if let Some(prev) = prev_stub_len {
                             preferred_lengths.sort_by(|a, b| {
                                 let diff_a = (*a - prev).abs() >= 0.35;
@@ -8888,7 +9218,7 @@ pub fn find_choked_pin_bottlenecks(
             return;
         };
         for pad in &u1.pads {
-            if matches!(pad.number.as_str(), "15" | "18" | "19" | "22") {
+            if pad.net_id == gnd_net_id && !pad.is_through_hole && pad.width < 1.5 && pad.height < 1.5 {
                 let (px, py) = u1.pad_absolute_position(pad);
                 let already_connected = board.tracks.iter().any(|t| {
                     t.net_id == gnd_net_id
@@ -12637,6 +12967,7 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid, config: &Routi
         return false;
     }
 
+    let drc_ctx = GpuDrcContext::from_board(board);
     let num_layers = grid.num_layers.max(2);
     let touches_same_net_pad = |net_id: usize, pt: (f64, f64), layer_opt: Option<usize>, tol: f64| -> bool {
         board.footprints.iter().any(|fp| {
@@ -12890,41 +13221,30 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid, config: &Routi
                         let u_chain = build_l_orig_chain(v1_pos, q2);
                         let w_chain = build_l_orig_chain(v2_pos, q1);
 
-                        let mut winner: Option<(Vec<(f64, f64)>, Vec<usize>)> = None;
-
-                        'hop_search: for (u_pt, rem_u, len_u) in &u_chain {
+                        let mut hop_cands: Vec<(Vec<(f64, f64)>, Vec<usize>)> = Vec::new();
+                        for (u_pt, rem_u, len_u) in &u_chain {
                             for (w_pt, rem_w, len_w) in &w_chain {
-                                if rem_u.iter().any(| idx| rem_w.contains(idx)) {
+                                if rem_u.iter().any(|idx| rem_w.contains(idx)) {
                                     continue;
                                 }
                                 let orig_len = orig_hop_len + len_u + len_w;
                                 let u_pos = *u_pt;
                                 let w_pos = *w_pt;
+                                let mut extra = rem_u.clone();
+                                extra.extend_from_slice(rem_w);
 
                                 // Priority 1: Direct octilinear segment on l_orig
                                 let direct_len = (w_pos.0 - u_pos.0).hypot(w_pos.1 - u_pos.1);
                                 if is_octilinear_segment(u_pos, w_pos)
                                     && direct_len <= orig_len * config.via_hop_max_detour_ratio + 1e-4
                                     && (direct_len - orig_len) <= 5.0 + 1e-4
-                                    && is_segment_clear(board, Some(grid), u_pos, w_pos, l_orig, net_id, track_width)
-                                    && is_track_segment_legal(board, u_pos, w_pos, track_width, l_orig, net_id, clearance)
                                 {
-                                    let mut extra = rem_u.clone();
-                                    extra.extend_from_slice(rem_w);
-                                    winner = Some((vec![u_pos, w_pos], extra));
-                                    break 'hop_search;
+                                    hop_cands.push((vec![u_pos, w_pos], extra.clone()));
                                 }
 
                                 // Priority 2: Exact path projection on l_orig (when at v1_pos and v2_pos)
                                 if rem_u.is_empty() && rem_w.is_empty() {
-                                    let all_clear = chain_pts.windows(2).all(|w| {
-                                        is_segment_clear(board, Some(grid), w[0], w[1], l_orig, net_id, track_width)
-                                            && is_track_segment_legal(board, w[0], w[1], track_width, l_orig, net_id, clearance)
-                                    });
-                                    if all_clear {
-                                        winner = Some((chain_pts.clone(), Vec::new()));
-                                        break 'hop_search;
-                                    }
+                                    hop_cands.push((chain_pts.clone(), Vec::new()));
                                 }
 
                                 // Priority 3: Canonical 45-degree detour on l_orig within length budget
@@ -12941,21 +13261,64 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid, config: &Routi
                                         let d1 = (c.0 - u_pos.0).hypot(c.1 - u_pos.1);
                                         let d2 = (w_pos.0 - c.0).hypot(w_pos.1 - c.1);
                                         let cand_len = d1 + d2;
-                                        let budget_ok = cand_len <= orig_len * config.via_hop_max_detour_ratio + 1e-4
-                                            && (cand_len - orig_len) <= 5.0 + 1e-4;
-                                        if budget_ok
-                                            && is_segment_clear(board, Some(grid), u_pos, c, l_orig, net_id, track_width)
-                                            && is_segment_clear(board, Some(grid), c, w_pos, l_orig, net_id, track_width)
-                                            && is_track_segment_legal(board, u_pos, c, track_width, l_orig, net_id, clearance)
-                                            && is_track_segment_legal(board, c, w_pos, track_width, l_orig, net_id, clearance)
+                                        if cand_len <= orig_len * config.via_hop_max_detour_ratio + 1e-4
+                                            && (cand_len - orig_len) <= 5.0 + 1e-4
                                         {
-                                            let mut extra = rem_u.clone();
-                                            extra.extend_from_slice(rem_w);
-                                            winner = Some((vec![u_pos, c, w_pos], extra));
-                                            break 'hop_search;
+                                            hop_cands.push((vec![u_pos, c, w_pos], extra.clone()));
                                         }
                                     }
                                 }
+                            }
+                        }
+
+                        let gpu_hop_flags: Option<Vec<bool>> = if grid.vulkan.is_some() && !hop_cands.is_empty() {
+                            let mut gpu_cands = Vec::with_capacity(hop_cands.len() * 2);
+                            let mut spans = Vec::with_capacity(hop_cands.len());
+                            for (pts, _) in &hop_cands {
+                                let start_idx = gpu_cands.len();
+                                for w in pts.windows(2) {
+                                    if (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) > 1e-4 {
+                                        gpu_cands.push(GpuDrcCandidate {
+                                            x1: w[0].0 as f32,
+                                            y1: w[0].1 as f32,
+                                            x2: w[1].0 as f32,
+                                            y2: w[1].1 as f32,
+                                            radius_or_half_width: (track_width * 0.5) as f32,
+                                            clearance: clearance as f32,
+                                            layer: l_orig as u32,
+                                            net_id: net_id as u32,
+                                            kind: 1,
+                                            ignore_same_net_pads: 1,
+                                            _pad0: 0,
+                                            _pad1: 0,
+                                        });
+                                    }
+                                }
+                                spans.push((start_idx, gpu_cands.len()));
+                            }
+                            drc_ctx.evaluate(grid.vulkan.as_ref(), &gpu_cands).map(|res| {
+                                spans
+                                    .into_iter()
+                                    .map(|(s, e)| res[s..e].iter().all(|&v| v != 0))
+                                    .collect()
+                            })
+                        } else {
+                            None
+                        };
+
+                        let mut winner: Option<(Vec<(f64, f64)>, Vec<usize>)> = None;
+                        for (idx, (pts, extra)) in hop_cands.into_iter().enumerate() {
+                            if !gpu_hop_flags.as_ref().map_or(true, |f| f[idx]) {
+                                continue;
+                            }
+                            let all_clear = pts.windows(2).all(|w| {
+                                (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) <= 1e-4
+                                    || (is_segment_clear(board, Some(grid), w[0], w[1], l_orig, net_id, track_width)
+                                        && is_track_segment_legal(board, w[0], w[1], track_width, l_orig, net_id, clearance))
+                            });
+                            if all_clear {
+                                winner = Some((pts, extra));
+                                break;
                             }
                         }
 
@@ -13219,7 +13582,7 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid, config: &Routi
                         }
 
                         // Case B: External branch — try connecting keep_pos to pts[r] along the chain
-                        let mut found_branch_repl = false;
+                        let mut branch_cands: Vec<(usize, Vec<(f64, f64)>)> = Vec::new();
                         for r in 1..ch.pts.len() {
                             let target_pt = ch.pts[r];
                             let orig_sub_len: f64 = ch.pts[0..=r]
@@ -13242,25 +13605,71 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid, config: &Routi
                             cand_paths.push(compute_45_dogleg(keep_pos, target_pt, false));
                             cand_paths.push(compute_45_dogleg(keep_pos, target_pt, true));
 
-                            let valid_dl = cand_paths.into_iter().find(|dl| {
+                            for dl in cand_paths {
                                 let cand_len: f64 = dl.windows(2).map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1)).sum();
                                 if cand_len > orig_sub_len + config.via_detour_budget_mm {
-                                    return false;
+                                    continue;
                                 }
                                 if touches_dense_ic_pad && dl.len() >= 2 {
                                     let prev = dl[dl.len() - 2];
                                     if (prev.0 - target_pt.0).abs() > 1e-3 && (prev.1 - target_pt.1).abs() > 1e-3 {
-                                        return false;
+                                        continue;
                                     }
                                 }
-                                dl.windows(2).all(|w| {
-                                    (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) <= 1e-4
-                                        || (is_segment_clear(board, Some(grid), w[0], w[1], ch.layer, net_id, ch.width)
-                                            && is_track_segment_legal(board, w[0], w[1], ch.width, ch.layer, net_id, clearance))
-                                })
-                            });
+                                branch_cands.push((r, dl));
+                            }
 
-                            if let Some(dl) = valid_dl {
+                            if touches_same_net_pad(net_id, target_pt, Some(ch.layer), 0.08) {
+                                break;
+                            }
+                        }
+
+                        let gpu_branch_flags: Option<Vec<bool>> = if grid.vulkan.is_some() && !branch_cands.is_empty() {
+                            let mut gpu_cands = Vec::with_capacity(branch_cands.len() * 2);
+                            let mut spans = Vec::with_capacity(branch_cands.len());
+                            for (_, dl) in &branch_cands {
+                                let start_idx = gpu_cands.len();
+                                for w in dl.windows(2) {
+                                    if (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) > 1e-4 {
+                                        gpu_cands.push(GpuDrcCandidate {
+                                            x1: w[0].0 as f32,
+                                            y1: w[0].1 as f32,
+                                            x2: w[1].0 as f32,
+                                            y2: w[1].1 as f32,
+                                            radius_or_half_width: (ch.width * 0.5) as f32,
+                                            clearance: clearance as f32,
+                                            layer: ch.layer as u32,
+                                            net_id: net_id as u32,
+                                            kind: 1,
+                                            ignore_same_net_pads: 1,
+                                            _pad0: 0,
+                                            _pad1: 0,
+                                        });
+                                    }
+                                }
+                                spans.push((start_idx, gpu_cands.len()));
+                            }
+                            drc_ctx.evaluate(grid.vulkan.as_ref(), &gpu_cands).map(|res| {
+                                spans
+                                    .into_iter()
+                                    .map(|(s, e)| res[s..e].iter().all(|&v| v != 0))
+                                    .collect()
+                            })
+                        } else {
+                            None
+                        };
+
+                        let mut found_branch_repl = false;
+                        for (idx, (r, dl)) in branch_cands.into_iter().enumerate() {
+                            if !gpu_branch_flags.as_ref().map_or(true, |f| f[idx]) {
+                                continue;
+                            }
+                            let cpu_ok = dl.windows(2).all(|w| {
+                                (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) <= 1e-4
+                                    || (is_segment_clear(board, Some(grid), w[0], w[1], ch.layer, net_id, ch.width)
+                                        && is_track_segment_legal(board, w[0], w[1], ch.width, ch.layer, net_id, clearance))
+                            });
+                            if cpu_ok {
                                 rem_track_indices.extend_from_slice(&ch.segs[0..r]);
                                 for w in dl.windows(2) {
                                     if (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) > 1e-4 {
@@ -13275,10 +13684,6 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid, config: &Routi
                                     }
                                 }
                                 found_branch_repl = true;
-                                break;
-                            }
-
-                            if touches_same_net_pad(net_id, target_pt, Some(ch.layer), 0.08) {
                                 break;
                             }
                         }
@@ -13742,7 +14147,18 @@ fn consolidate_single_via_once(
         return false;
     }
 
-    let candidates: Vec<SingleViaConsolidation> = vias_info
+    let drc_ctx = GpuDrcContext::from_board(board);
+
+    struct ViaStubOption {
+        l_prim: usize,
+        track_width: f64,
+        clearance: f64,
+        chain_segs: Vec<usize>,
+        chain_pts: Vec<(f64, f64)>,
+        cand_paths: Vec<Vec<(f64, f64)>>,
+    }
+
+    let via_options: Vec<(usize, (i64, i64), Vec<ViaStubOption>)> = vias_info
         .par_iter()
         .filter_map(|&(v_idx, v_pos, net_id)| {
             if board.arcs.iter().any(|a| {
@@ -13778,6 +14194,7 @@ fn consolidate_single_via_once(
                 return None;
             }
 
+            let mut opts = Vec::new();
             for &l_prim in &layers {
                 let alt_layers: Vec<usize> = layers.iter().copied().filter(|&l| l != l_prim).collect();
                 if alt_layers.len() != 1 {
@@ -13895,69 +14312,133 @@ fn consolidate_single_via_once(
                         .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
                         .sum();
 
-                    let mut winner_path = None;
+                    let mut cand_paths: Vec<Vec<(f64, f64)>> = Vec::with_capacity(4);
 
                     // Priority 1: Direct segment on l_prim (strictly octilinear 0°, 45°, 90°)
                     let direct_len = (curr_pt.0 - v_pos.0).hypot(curr_pt.1 - v_pos.1);
                     if is_octilinear_segment(v_pos, curr_pt)
                         && direct_len <= orig_len * config.via_hop_max_detour_ratio + 1e-4
                         && (direct_len - orig_len) <= 5.0 + 1e-4
-                        && is_segment_clear(board, Some(grid), v_pos, curr_pt, l_prim, net_id, track_width)
-                        && is_track_segment_legal(board, v_pos, curr_pt, track_width, l_prim, net_id, clearance)
                     {
-                        winner_path = Some(vec![v_pos, curr_pt]);
+                        cand_paths.push(vec![v_pos, curr_pt]);
                     }
 
                     // Priority 2: Same path coordinates on l_prim
-                    if winner_path.is_none() {
-                        let all_clear = chain_pts.windows(2).all(|w| {
-                            is_segment_clear(board, Some(grid), w[0], w[1], l_prim, net_id, track_width)
-                                && is_track_segment_legal(board, w[0], w[1], track_width, l_prim, net_id, clearance)
-                        });
-                        if all_clear {
-                            winner_path = Some(chain_pts.clone());
-                        }
-                    }
+                    cand_paths.push(chain_pts.clone());
 
                     // Priority 3: Canonical 45-degree detour on l_prim
-                    if winner_path.is_none() {
-                        let dx = curr_pt.0 - v_pos.0;
-                        let dy = curr_pt.1 - v_pos.1;
-                        let s = dx.abs().min(dy.abs());
-                        if s > 1e-4 {
-                            let sx = s * dx.signum();
-                            let sy = s * dy.signum();
-                            let c_a = (v_pos.0 + sx, v_pos.1 + sy);
-                            let c_b = (curr_pt.0 - sx, curr_pt.1 - sy);
-                            for c in [c_a, c_b] {
-                                let d1 = (c.0 - v_pos.0).hypot(c.1 - v_pos.1);
-                                let d2 = (curr_pt.0 - c.0).hypot(curr_pt.1 - c.1);
-                                let cand_len = d1 + d2;
-                                let budget_ok = cand_len <= orig_len * config.via_hop_max_detour_ratio + 1e-4
-                                    && (cand_len - orig_len) <= 5.0 + 1e-4;
-                                if budget_ok
-                                    && is_segment_clear(board, Some(grid), v_pos, c, l_prim, net_id, track_width)
-                                    && is_segment_clear(board, Some(grid), c, curr_pt, l_prim, net_id, track_width)
-                                    && is_track_segment_legal(board, v_pos, c, track_width, l_prim, net_id, clearance)
-                                    && is_track_segment_legal(board, c, curr_pt, track_width, l_prim, net_id, clearance)
-                                {
-                                    winner_path = Some(vec![v_pos, c, curr_pt]);
-                                    break;
-                                }
+                    let dx = curr_pt.0 - v_pos.0;
+                    let dy = curr_pt.1 - v_pos.1;
+                    let s = dx.abs().min(dy.abs());
+                    if s > 1e-4 {
+                        let sx = s * dx.signum();
+                        let sy = s * dy.signum();
+                        let c_a = (v_pos.0 + sx, v_pos.1 + sy);
+                        let c_b = (curr_pt.0 - sx, curr_pt.1 - sy);
+                        for c in [c_a, c_b] {
+                            let d1 = (c.0 - v_pos.0).hypot(c.1 - v_pos.1);
+                            let d2 = (curr_pt.0 - c.0).hypot(curr_pt.1 - c.1);
+                            let cand_len = d1 + d2;
+                            if cand_len <= orig_len * config.via_hop_max_detour_ratio + 1e-4
+                                && (cand_len - orig_len) <= 5.0 + 1e-4
+                            {
+                                cand_paths.push(vec![v_pos, c, curr_pt]);
                             }
                         }
                     }
 
-                    if let Some(new_pts) = winner_path {
-                        let mut all_pts = chain_pts;
-                        all_pts.extend_from_slice(&new_pts);
+                    if !cand_paths.is_empty() {
+                        opts.push(ViaStubOption {
+                            l_prim,
+                            track_width,
+                            clearance,
+                            chain_segs,
+                            chain_pts,
+                            cand_paths,
+                        });
+                    }
+                }
+            }
+
+            if opts.is_empty() {
+                None
+            } else {
+                Some((net_id, q_v, opts))
+            }
+        })
+        .collect();
+
+    if via_options.is_empty() {
+        return false;
+    }
+
+    let mut opt_spans: Vec<Vec<Vec<(usize, usize)>>> = Vec::with_capacity(via_options.len());
+    let mut gpu_cands: Vec<GpuDrcCandidate> = Vec::new();
+    if grid.vulkan.is_some() {
+        for (net_id, _, opts) in &via_options {
+            let mut via_spans = Vec::with_capacity(opts.len());
+            for opt in opts {
+                let mut path_spans = Vec::with_capacity(opt.cand_paths.len());
+                for path in &opt.cand_paths {
+                    let s_idx = gpu_cands.len();
+                    for w in path.windows(2) {
+                        if (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) > 1e-4 {
+                            gpu_cands.push(GpuDrcCandidate {
+                                x1: w[0].0 as f32,
+                                y1: w[0].1 as f32,
+                                x2: w[1].0 as f32,
+                                y2: w[1].1 as f32,
+                                radius_or_half_width: (opt.track_width * 0.5) as f32,
+                                clearance: opt.clearance as f32,
+                                layer: opt.l_prim as u32,
+                                net_id: *net_id as u32,
+                                kind: 1,
+                                ignore_same_net_pads: 1,
+                                _pad0: 0,
+                                _pad1: 0,
+                            });
+                        }
+                    }
+                    path_spans.push((s_idx, gpu_cands.len()));
+                }
+                via_spans.push(path_spans);
+            }
+            opt_spans.push(via_spans);
+        }
+    }
+    let gpu_res = if !gpu_cands.is_empty() {
+        drc_ctx.evaluate(grid.vulkan.as_ref(), &gpu_cands)
+    } else {
+        None
+    };
+
+    let candidates: Vec<SingleViaConsolidation> = via_options
+        .into_par_iter()
+        .enumerate()
+        .filter_map(|(v_i, (net_id, q_v, opts))| {
+            for (o_i, opt) in opts.into_iter().enumerate() {
+                for (p_i, path) in opt.cand_paths.into_iter().enumerate() {
+                    if let Some(ref res) = gpu_res {
+                        let (s, e) = opt_spans[v_i][o_i][p_i];
+                        if !res[s..e].iter().all(|&v| v != 0) {
+                            continue;
+                        }
+                    }
+                    let all_clear = path.windows(2).all(|w| {
+                        (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1) <= 1e-4
+                            || (is_segment_clear(board, Some(grid), w[0], w[1], opt.l_prim, net_id, opt.track_width)
+                                && is_track_segment_legal(board, w[0], w[1], opt.track_width, opt.l_prim, net_id, opt.clearance))
+                    });
+                    if all_clear {
+                        let mut all_pts = opt.chain_pts;
+                        all_pts.extend_from_slice(&path);
                         let aabb = points_expanded_aabb(&all_pts, 0.60);
                         return Some(SingleViaConsolidation {
                             net_id,
-                            l_prim,
-                            track_width,
-                            chain_segs,
-                            new_pts,
+                            l_prim: opt.l_prim,
+                            track_width: opt.track_width,
+                            chain_segs: opt.chain_segs,
+                            new_pts: path,
                             q_v,
                             aabb,
                         });
@@ -14404,7 +14885,7 @@ pub fn gloss_tracks(board: &mut Board, grid: &RoutingGrid) {
 pub fn gloss_tracks_with_mode(board: &mut Board, grid: &RoutingGrid, any_angle_mode: bool) {
     if any_angle_mode {
         gloss_tracks_standard(board, grid);
-        relax_homotopic_rubber_bands(board);
+        relax_homotopic_rubber_bands_with_grid(board, Some(grid));
         apply_any_angle_tangent_arcs(board);
         fillet_acute_angle_junctions(board, default_acid_trap_fillet_radius());
     } else {
@@ -14412,7 +14893,454 @@ pub fn gloss_tracks_with_mode(board: &mut Board, grid: &RoutingGrid, any_angle_m
     }
 }
 
-fn gloss_single_net_chains(net_id: usize, net_tracks: &[TrackSegment], board_without_net: &Board, grid: &RoutingGrid) -> Vec<TrackSegment> {
+type GpuShortcutKey = ((i64, i64), (i64, i64), usize, usize);
+type GpuShortcutMap = HashMap<GpuShortcutKey, bool>;
+
+#[inline]
+fn canonical_shortcut_key(p1: (f64, f64), p2: (f64, f64), layer: usize, net_id: usize) -> GpuShortcutKey {
+    let q1 = quant_point(p1);
+    let q2 = quant_point(p2);
+    if q1 <= q2 {
+        (q1, q2, layer, net_id)
+    } else {
+        (q2, q1, layer, net_id)
+    }
+}
+
+#[inline]
+fn is_segment_clear_with_gpu(
+    board: &Board,
+    grid: &RoutingGrid,
+    p1: (f64, f64),
+    p2: (f64, f64),
+    layer: usize,
+    net_id: usize,
+    width: f64,
+    gpu_map: Option<&GpuShortcutMap>,
+) -> bool {
+    if let Some(map) = gpu_map {
+        let key = canonical_shortcut_key(p1, p2, layer, net_id);
+        if let Some(&false) = map.get(&key) {
+            return false;
+        }
+    }
+    is_segment_clear(board, Some(grid), p1, p2, layer, net_id, width)
+}
+
+fn collect_chain_shortcut_candidates(
+    chains: &[TrackChain],
+    board: &Board,
+    out_keys: &mut Vec<GpuShortcutKey>,
+    out_cands: &mut Vec<GpuDrcCandidate>,
+    seen: &mut HashSet<GpuShortcutKey>,
+) {
+    for chain in chains {
+        let n = chain.points.len();
+        if n < 3 {
+            continue;
+        }
+        let clearance = board.get_netclass_for_net(chain.net_id).clearance as f32;
+        let half_w = (chain.width * 0.5) as f32;
+        let mut push_seg = |p1: (f64, f64), p2: (f64, f64)| {
+            if (p1.0 - p2.0).hypot(p1.1 - p2.1) <= 1e-4 {
+                return;
+            }
+            let key = canonical_shortcut_key(p1, p2, chain.layer, chain.net_id);
+            if seen.insert(key) {
+                out_keys.push(key);
+                out_cands.push(GpuDrcCandidate {
+                    x1: p1.0 as f32,
+                    y1: p1.1 as f32,
+                    x2: p2.0 as f32,
+                    y2: p2.1 as f32,
+                    radius_or_half_width: half_w,
+                    clearance,
+                    layer: chain.layer as u32,
+                    net_id: chain.net_id as u32,
+                    kind: 1,
+                    ignore_same_net_pads: 1,
+                    _pad0: 0,
+                    _pad1: 0,
+                });
+            }
+        };
+
+        for i in 0..n {
+            for j in (i + 2)..n {
+                let p_i = chain.points[i];
+                let p_j = chain.points[j];
+                if is_octilinear_segment(p_i, p_j) {
+                    push_seg(p_i, p_j);
+                }
+                if j - i <= 16 {
+                    let dx = p_j.0 - p_i.0;
+                    let dy = p_j.1 - p_i.1;
+                    let s = dx.abs().min(dy.abs());
+                    if s > 1e-4 {
+                        let sx = s * dx.signum();
+                        let sy = s * dy.signum();
+                        let c_a = (p_i.0 + sx, p_i.1 + sy);
+                        let c_b = (p_j.0 - sx, p_j.1 - sy);
+                        push_seg(p_i, c_a);
+                        push_seg(c_a, p_j);
+                        push_seg(p_i, c_b);
+                        push_seg(c_b, p_j);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn rubber_band_straighten_gpu(
+    chain: &mut TrackChain,
+    board: &Board,
+    grid: &RoutingGrid,
+    gpu_map: Option<&GpuShortcutMap>,
+) {
+    if gpu_map.is_none() {
+        rubber_band_straighten(chain, board, grid);
+        return;
+    }
+    if chain.points.len() < 3 {
+        return;
+    }
+    let is_pad_center = |pt: (f64, f64)| -> bool {
+        board.footprints.iter().any(|fp| {
+            fp.pads.iter().any(|p| {
+                let (px, py) = fp.pad_absolute_position(p);
+                (px - pt.0).hypot(py - pt.1) < 0.05
+            })
+        })
+    };
+    let is_special_point = |pt: (f64, f64)| -> bool {
+        is_pad_center(pt) || board.vias.iter().any(|v| (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05)
+    };
+    let starts_at_pad = is_pad_center(chain.points[0]);
+    let ends_at_pad = is_pad_center(*chain.points.last().unwrap());
+
+    let mut changed = true;
+    let mut pass = 0;
+    while changed && pass < 4 {
+        changed = false;
+        pass += 1;
+        let mut new_points = Vec::with_capacity(chain.points.len());
+        let mut i = 0;
+        new_points.push(chain.points[0]);
+
+        while i + 1 < chain.points.len() {
+            if i == 0 && starts_at_pad {
+                i += 1;
+                new_points.push(chain.points[i]);
+                continue;
+            }
+            let max_j = if ends_at_pad {
+                chain.points.len().saturating_sub(2)
+            } else {
+                chain.points.len().saturating_sub(1)
+            };
+            let mut best_j = None;
+            for j in (i + 2..=max_j).rev() {
+                let p1 = chain.points[i];
+                let p2 = chain.points[j];
+                if (i + 1..j).any(|k| {
+                    let pk = chain.points[k];
+                    is_special_point(pk)
+                        && (pk.0 - p1.0).hypot(pk.1 - p1.1) > 0.15
+                        && (pk.0 - p2.0).hypot(pk.1 - p2.1) > 0.15
+                }) {
+                    continue;
+                }
+                if is_octilinear_segment(p1, p2)
+                    && is_segment_clear_with_gpu(board, grid, p1, p2, chain.layer, chain.net_id, chain.width, gpu_map)
+                {
+                    best_j = Some(j);
+                    break;
+                }
+            }
+
+            if let Some(j) = best_j {
+                new_points.push(chain.points[j]);
+                i = j;
+                changed = true;
+            } else {
+                i += 1;
+                new_points.push(chain.points[i]);
+            }
+        }
+        chain.points = new_points;
+        merge_collinear_points(&mut chain.points);
+    }
+}
+
+fn eliminate_stair_steps_gpu(
+    chain: &mut TrackChain,
+    board: &Board,
+    grid: &RoutingGrid,
+    gpu_map: Option<&GpuShortcutMap>,
+) {
+    if gpu_map.is_none() {
+        eliminate_stair_steps(chain, board, grid);
+        return;
+    }
+    if chain.points.len() < 3 {
+        return;
+    }
+    let is_special_point = |pt: (f64, f64)| -> bool {
+        board.footprints.iter().any(|fp| {
+            fp.pads.iter().any(|p| {
+                let (px, py) = fp.pad_absolute_position(p);
+                (px - pt.0).hypot(py - pt.1) < 0.05
+            })
+        }) || board.vias.iter().any(|v| (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05)
+    };
+    let mut changed = true;
+    let mut pass = 0;
+    while changed && pass < 4 {
+        changed = false;
+        pass += 1;
+        let mut i = 0;
+        while i + 2 < chain.points.len() {
+            let max_j = (i + 16).min(chain.points.len() - 1);
+            let mut best_replacement = None;
+
+            for j in (i + 2..=max_j).rev() {
+                let p_i = chain.points[i];
+                let p_j = chain.points[j];
+                if (i + 1..j).any(|k| {
+                    let pk = chain.points[k];
+                    is_special_point(pk)
+                        && (pk.0 - p_i.0).hypot(pk.1 - p_i.1) > 0.15
+                        && (pk.0 - p_j.0).hypot(pk.1 - p_j.1) > 0.15
+                }) {
+                    continue;
+                }
+                let dx = p_j.0 - p_i.0;
+                let dy = p_j.1 - p_i.1;
+                let s = dx.abs().min(dy.abs());
+                let canon_len = s * std::f64::consts::SQRT_2 + (dx.abs() - dy.abs()).abs();
+                let orig_len: f64 = chain.points[i..=j]
+                    .windows(2)
+                    .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+                    .sum();
+
+                let existing_bends = count_chain_bends(&chain.points[i..=j]);
+                if existing_bends < 2 && j - i < 3 && orig_len <= canon_len + 0.02 {
+                    continue;
+                }
+
+                if dx.abs() < 1e-4 || dy.abs() < 1e-4 || (dx.abs() - dy.abs()).abs() < 1e-4 {
+                    if is_segment_clear_with_gpu(board, grid, p_i, p_j, chain.layer, chain.net_id, chain.width, gpu_map) {
+                        best_replacement = Some((j, vec![p_i, p_j]));
+                        break;
+                    }
+                }
+
+                if s > 1e-4 {
+                    let sx = s * dx.signum();
+                    let sy = s * dy.signum();
+
+                    let c_a = (p_i.0 + sx, p_i.1 + sy);
+                    let clear_a = is_segment_clear_with_gpu(board, grid, p_i, c_a, chain.layer, chain.net_id, chain.width, gpu_map)
+                        && is_segment_clear_with_gpu(board, grid, c_a, p_j, chain.layer, chain.net_id, chain.width, gpu_map);
+
+                    let c_b = (p_j.0 - sx, p_j.1 - sy);
+                    let clear_b = is_segment_clear_with_gpu(board, grid, p_i, c_b, chain.layer, chain.net_id, chain.width, gpu_map)
+                        && is_segment_clear_with_gpu(board, grid, c_b, p_j, chain.layer, chain.net_id, chain.width, gpu_map);
+
+                    if clear_a && clear_b {
+                        let orig_cx: f64 = chain.points[i..=j].iter().map(|p| p.0).sum::<f64>() / (j - i + 1) as f64;
+                        let orig_cy: f64 = chain.points[i..=j].iter().map(|p| p.1).sum::<f64>() / (j - i + 1) as f64;
+                        let dist_a = (c_a.0 - orig_cx).hypot(c_a.1 - orig_cy);
+                        let dist_b = (c_b.0 - orig_cx).hypot(c_b.1 - orig_cy);
+                        let chosen_c = if dist_a <= dist_b { c_a } else { c_b };
+                        best_replacement = Some((j, vec![p_i, chosen_c, p_j]));
+                        break;
+                    } else if clear_a {
+                        best_replacement = Some((j, vec![p_i, c_a, p_j]));
+                        break;
+                    } else if clear_b {
+                        best_replacement = Some((j, vec![p_i, c_b, p_j]));
+                        break;
+                    }
+                }
+            }
+
+            if let Some((j, repl)) = best_replacement {
+                let mut new_points = Vec::with_capacity(chain.points.len());
+                new_points.extend_from_slice(&chain.points[..i]);
+                new_points.extend(repl);
+                new_points.extend_from_slice(&chain.points[j + 1..]);
+                chain.points = new_points;
+                merge_collinear_points(&mut chain.points);
+                changed = true;
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+fn reduce_jogs_gpu(
+    chain: &mut TrackChain,
+    board: &Board,
+    grid: &RoutingGrid,
+    gpu_map: Option<&GpuShortcutMap>,
+) {
+    if gpu_map.is_none() {
+        reduce_jogs(chain, board, grid);
+        return;
+    }
+    if chain.points.len() < 4 {
+        return;
+    }
+    let mut changed = true;
+    let mut pass = 0;
+    let max_jog_offset = (2.0 * chain.width).max(0.30);
+    let is_oct = is_octilinear_segment;
+    let is_special_point = |pt: (f64, f64)| -> bool {
+        board.footprints.iter().any(|fp| {
+            fp.pads.iter().any(|p| {
+                let (px, py) = fp.pad_absolute_position(p);
+                (px - pt.0).hypot(py - pt.1) < 0.05
+            })
+        }) || board.vias.iter().any(|v| (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05)
+    };
+
+    while changed && pass < 4 {
+        changed = false;
+        pass += 1;
+        let mut i = 0;
+        while i + 3 < chain.points.len() {
+            let p0 = chain.points[i];
+            let p1 = chain.points[i + 1];
+            let p2 = chain.points[i + 2];
+            let p3 = chain.points[i + 3];
+
+            let jog_len = (p2.0 - p1.0).hypot(p2.1 - p1.1);
+            let lat_offset = dist_to_segment(p2.0, p2.1, p0.0, p0.1, p1.0, p1.1);
+            let is_micro_jog = jog_len <= max_jog_offset || lat_offset <= max_jog_offset;
+
+            if is_micro_jog {
+                if !is_special_point(p1)
+                    && !is_special_point(p2)
+                    && is_oct(p0, p3)
+                    && is_segment_clear_with_gpu(board, grid, p0, p3, chain.layer, chain.net_id, chain.width, gpu_map)
+                {
+                    chain.points.remove(i + 2);
+                    chain.points.remove(i + 1);
+                    merge_collinear_points(&mut chain.points);
+                    changed = true;
+                    continue;
+                }
+
+                if !is_special_point(p1)
+                    && is_oct(p0, p2)
+                    && is_segment_clear_with_gpu(board, grid, p0, p2, chain.layer, chain.net_id, chain.width, gpu_map)
+                {
+                    chain.points.remove(i + 1);
+                    merge_collinear_points(&mut chain.points);
+                    changed = true;
+                    continue;
+                }
+
+                if !is_special_point(p2)
+                    && is_oct(p1, p3)
+                    && is_segment_clear_with_gpu(board, grid, p1, p3, chain.layer, chain.net_id, chain.width, gpu_map)
+                {
+                    chain.points.remove(i + 2);
+                    merge_collinear_points(&mut chain.points);
+                    changed = true;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
+fn reduce_corners_gpu(
+    chain: &mut TrackChain,
+    board: &Board,
+    grid: &RoutingGrid,
+    gpu_map: Option<&GpuShortcutMap>,
+) {
+    if gpu_map.is_none() {
+        reduce_corners(chain, board, grid);
+        return;
+    }
+    if chain.points.len() < 4 {
+        return;
+    }
+    let is_pad_center = |pt: (f64, f64)| -> bool {
+        board.footprints.iter().any(|fp| {
+            fp.pads.iter().any(|p| {
+                let (px, py) = fp.pad_absolute_position(p);
+                (px - pt.0).hypot(py - pt.1) < 0.05
+            })
+        })
+    };
+    let is_special_point = |pt: (f64, f64)| -> bool {
+        is_pad_center(pt) || board.vias.iter().any(|v| (v.position.0 - pt.0).hypot(v.position.1 - pt.1) < 0.05)
+    };
+    let is_oct = is_octilinear_segment;
+
+    let mut changed = true;
+    let mut pass = 0;
+    while changed && pass < 4 {
+        changed = false;
+        pass += 1;
+        let mut i = 0;
+        while i + 3 < chain.points.len() {
+            let p0 = chain.points[i];
+            let p1 = chain.points[i + 1];
+            let p2 = chain.points[i + 2];
+            let p3 = chain.points[i + 3];
+
+            if !is_special_point(p1)
+                && !is_special_point(p2)
+                && is_oct(p0, p3)
+                && is_segment_clear_with_gpu(board, grid, p0, p3, chain.layer, chain.net_id, chain.width, gpu_map)
+            {
+                chain.points.remove(i + 2);
+                chain.points.remove(i + 1);
+                merge_collinear_points(&mut chain.points);
+                changed = true;
+                continue;
+            }
+
+            if !is_special_point(p1)
+                && is_oct(p0, p2)
+                && is_segment_clear_with_gpu(board, grid, p0, p2, chain.layer, chain.net_id, chain.width, gpu_map)
+            {
+                chain.points.remove(i + 1);
+                merge_collinear_points(&mut chain.points);
+                changed = true;
+                continue;
+            }
+
+            if !is_special_point(p2)
+                && is_oct(p1, p3)
+                && is_segment_clear_with_gpu(board, grid, p1, p3, chain.layer, chain.net_id, chain.width, gpu_map)
+            {
+                chain.points.remove(i + 2);
+                merge_collinear_points(&mut chain.points);
+                changed = true;
+                continue;
+            }
+
+            i += 1;
+        }
+    }
+}
+
+fn prepare_net_chains_for_gloss(
+    net_id: usize,
+    net_tracks: &[TrackSegment],
+    board_without_net: &Board,
+    grid: &RoutingGrid,
+) -> Vec<TrackChain> {
     crate::memlog::set_phase_fast(&format!("gloss_net_{}::extract_chains(in={})", net_id, net_tracks.len()));
     let mut chains = extract_track_chains(net_tracks, board_without_net);
     for (ci, chain) in chains.iter_mut().enumerate() {
@@ -14422,14 +15350,26 @@ fn gloss_single_net_chains(net_id: usize, net_tracks: &[TrackSegment], board_wit
         crate::memlog::set_phase_fast(&format!("gloss_net_{}_c{}::avoid_acid_traps_1(pts={})", net_id, ci, chain.points.len()));
         avoid_acid_traps(chain, board_without_net, grid);
         merge_collinear_points(&mut chain.points);
+    }
+    chains
+}
+
+fn finish_gloss_net_chains(
+    net_id: usize,
+    mut chains: Vec<TrackChain>,
+    board_without_net: &Board,
+    grid: &RoutingGrid,
+    gpu_map: Option<&GpuShortcutMap>,
+) -> Vec<TrackSegment> {
+    for (ci, chain) in chains.iter_mut().enumerate() {
         crate::memlog::set_phase_fast(&format!("gloss_net_{}_c{}::rubber_band_straighten(pts={})", net_id, ci, chain.points.len()));
-        rubber_band_straighten(chain, board_without_net, grid);
+        rubber_band_straighten_gpu(chain, board_without_net, grid, gpu_map);
         crate::memlog::set_phase_fast(&format!("gloss_net_{}_c{}::eliminate_stair_steps(pts={})", net_id, ci, chain.points.len()));
-        eliminate_stair_steps(chain, board_without_net, grid);
+        eliminate_stair_steps_gpu(chain, board_without_net, grid, gpu_map);
         crate::memlog::set_phase_fast(&format!("gloss_net_{}_c{}::reduce_jogs(pts={})", net_id, ci, chain.points.len()));
-        reduce_jogs(chain, board_without_net, grid);
+        reduce_jogs_gpu(chain, board_without_net, grid, gpu_map);
         crate::memlog::set_phase_fast(&format!("gloss_net_{}_c{}::reduce_corners(pts={})", net_id, ci, chain.points.len()));
-        reduce_corners(chain, board_without_net, grid);
+        reduce_corners_gpu(chain, board_without_net, grid, gpu_map);
         merge_collinear_points(&mut chain.points);
         crate::memlog::set_phase_fast(&format!("gloss_net_{}_c{}::reposition_lines(pts={})", net_id, ci, chain.points.len()));
         reposition_lines(chain, board_without_net, grid);
@@ -14460,6 +15400,27 @@ fn gloss_single_net_chains(net_id: usize, net_tracks: &[TrackSegment], board_wit
         }
     }
     out
+}
+
+fn gloss_single_net_chains(net_id: usize, net_tracks: &[TrackSegment], board_without_net: &Board, grid: &RoutingGrid) -> Vec<TrackSegment> {
+    let chains = prepare_net_chains_for_gloss(net_id, net_tracks, board_without_net, grid);
+    let gpu_map: Option<GpuShortcutMap> = if grid.vulkan.is_some() {
+        let mut keys = Vec::new();
+        let mut cands = Vec::new();
+        let mut seen = HashSet::new();
+        collect_chain_shortcut_candidates(&chains, board_without_net, &mut keys, &mut cands, &mut seen);
+        if !cands.is_empty() {
+            let drc_ctx = GpuDrcContext::from_board(board_without_net);
+            drc_ctx.evaluate(grid.vulkan.as_ref(), &cands).map(|res| {
+                keys.into_iter().zip(res.into_iter()).map(|(k, v)| (k, v != 0)).collect()
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    finish_gloss_net_chains(net_id, chains, board_without_net, grid, gpu_map.as_ref())
 }
 
 pub fn gloss_tracks_standard(board: &mut Board, grid: &RoutingGrid) {
@@ -14535,28 +15496,55 @@ pub fn gloss_tracks_standard(board: &mut Board, grid: &RoutingGrid) {
             let glossed = gloss_single_net_chains(net_id, &net_tracks, board, grid);
             board.tracks.extend(glossed);
         } else {
-            let wave_results: Vec<(usize, Vec<TrackSegment>)> = wave
+            let wave_set: HashSet<usize> = wave.iter().copied().collect();
+            let mut tracks_by_net: HashMap<usize, Vec<TrackSegment>> = HashMap::with_capacity(wave.len());
+            for t in board.tracks.iter().filter(|t| !t.is_locked && wave_set.contains(&t.net_id)) {
+                tracks_by_net.entry(t.net_id).or_default().push(t.clone());
+            }
+            // All nets in a wave have disjoint 0.60mm-expanded AABBs, so removing all unlocked tracks
+            // in the wave yields the exact obstacle board for every net in the wave.
+            board.tracks.retain(|t| !wave_set.contains(&t.net_id) || t.is_locked);
+
+            let prepared_wave: Vec<(usize, Vec<TrackChain>)> = wave
                 .par_iter()
-                .map(|&net_id| {
-                    let net_tracks: Vec<TrackSegment> = board
-                        .tracks
-                        .iter()
-                        .filter(|t| t.net_id == net_id && !t.is_locked)
-                        .cloned()
-                        .collect();
+                .filter_map(|&net_id| {
+                    let net_tracks = tracks_by_net.get(&net_id)?;
                     if net_tracks.is_empty() {
-                        return (net_id, Vec::new());
+                        return None;
                     }
-                    let mut local_board = board.clone();
-                    local_board.tracks.retain(|t| t.net_id != net_id || t.is_locked);
-                    let glossed = gloss_single_net_chains(net_id, &net_tracks, &local_board, grid);
-                    (net_id, glossed)
+                    let chains = prepare_net_chains_for_gloss(net_id, net_tracks, board, grid);
+                    Some((net_id, chains))
                 })
                 .collect();
 
-            let wave_set: HashSet<usize> = wave.into_iter().collect();
-            board.tracks.retain(|t| !wave_set.contains(&t.net_id) || t.is_locked);
-            for (_, glossed) in wave_results {
+            // Pre-generate all candidate shortcut segments across all chains in the wave and evaluate in a single GPU batch dispatch
+            let gpu_map: Option<GpuShortcutMap> = if grid.vulkan.is_some() {
+                let mut keys = Vec::new();
+                let mut shortcut_cands = Vec::new();
+                let mut seen = HashSet::new();
+                for (_, chains) in &prepared_wave {
+                    collect_chain_shortcut_candidates(chains, board, &mut keys, &mut shortcut_cands, &mut seen);
+                }
+                if !shortcut_cands.is_empty() {
+                    let drc_ctx = GpuDrcContext::from_board(board);
+                    drc_ctx.evaluate(grid.vulkan.as_ref(), &shortcut_cands).map(|res| {
+                        keys.into_iter().zip(res.into_iter()).map(|(k, v)| (k, v != 0)).collect()
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let wave_results: Vec<Vec<TrackSegment>> = prepared_wave
+                .into_par_iter()
+                .map(|(net_id, chains)| {
+                    finish_gloss_net_chains(net_id, chains, board, grid, gpu_map.as_ref())
+                })
+                .collect();
+
+            for glossed in wave_results {
                 board.tracks.extend(glossed);
             }
         }
@@ -14650,6 +15638,10 @@ pub fn subdivide_long_segments(points: &mut Vec<(f64, f64)>, max_seg_len: f64) {
 }
 
 pub fn relax_homotopic_rubber_bands(board: &mut Board) {
+    relax_homotopic_rubber_bands_with_grid(board, None);
+}
+
+pub fn relax_homotopic_rubber_bands_with_grid(board: &mut Board, grid: Option<&RoutingGrid>) {
     let mut net_ids: Vec<usize> = board
         .tracks
         .iter()
@@ -14658,6 +15650,8 @@ pub fn relax_homotopic_rubber_bands(board: &mut Board) {
         .collect();
     net_ids.sort_unstable();
     net_ids.dedup();
+
+    let has_vulkan = grid.and_then(|g| g.vulkan.as_ref()).is_some();
 
     for net_id in net_ids {
         let net_tracks: Vec<TrackSegment> = board
@@ -14679,10 +15673,15 @@ pub fn relax_homotopic_rubber_bands(board: &mut Board) {
             || board.nets.iter().enumerate().any(|(other_id, other_name)| {
                 other_id != net_id && AutoRouter::are_diff_pair_mates(net_name, other_name)
             });
+        let drc_ctx = if has_vulkan && !is_coupled_diff_pair {
+            Some(GpuDrcContext::from_board(board))
+        } else {
+            None
+        };
         let mut chains = extract_track_chains_for_organic(&net_tracks, board);
         for chain in &mut chains {
             if !is_coupled_diff_pair {
-                relax_chain_homotopic(chain, board);
+                relax_chain_homotopic_with_gpu(chain, board, grid, drc_ctx.as_ref());
             }
             if nc_w > chain.width + 1e-3 && chain.points.len() >= 2 {
                 for &cand_w in &[nc_w, 0.50, 0.45, 0.40, 0.35, 0.30, 0.25, 0.20] {
@@ -14720,6 +15719,15 @@ pub fn relax_homotopic_rubber_bands(board: &mut Board) {
 }
 
 pub fn relax_chain_homotopic(chain: &mut TrackChain, board: &Board) {
+    relax_chain_homotopic_with_gpu(chain, board, None, None);
+}
+
+fn relax_chain_homotopic_with_gpu(
+    chain: &mut TrackChain,
+    board: &Board,
+    grid: Option<&RoutingGrid>,
+    drc_ctx: Option<&GpuDrcContext>,
+) {
     if chain.points.len() < 3 {
         return;
     }
@@ -14762,6 +15770,7 @@ pub fn relax_chain_homotopic(chain: &mut TrackChain, board: &Board) {
     }
 
     let obstacles = collect_obstacles_for_net(board, chain.layer, chain.net_id, nc_w);
+    let clearance = board.get_netclass_for_net(chain.net_id).clearance as f32;
 
     // Iterative rubber-band string pulling passes with early convergence exit
     for pass in 0..4 {
@@ -14774,6 +15783,64 @@ pub fn relax_chain_homotopic(chain: &mut TrackChain, board: &Board) {
         }
         let mut changed = false;
 
+        let gpu_shortcut_map: Option<GpuShortcutMap> = if let (Some(g), Some(ctx)) = (grid, drc_ctx) {
+            if g.vulkan.is_some() {
+                let n = chain.points.len();
+                let mut keys = Vec::with_capacity(n * (n.saturating_sub(2)) / 2);
+                let mut shortcut_cands = Vec::with_capacity(keys.capacity());
+                let mut seen = HashSet::new();
+                let half_w = (relax_w * 0.5) as f32;
+                for a in 0..n {
+                    for b in (a + 2)..n {
+                        let p1 = chain.points[a];
+                        let p2 = chain.points[b];
+                        if (p1.0 - p2.0).hypot(p1.1 - p2.1) <= 1e-4 {
+                            continue;
+                        }
+                        let key = canonical_shortcut_key(p1, p2, chain.layer, chain.net_id);
+                        if seen.insert(key) {
+                            keys.push(key);
+                            shortcut_cands.push(GpuDrcCandidate {
+                                x1: p1.0 as f32,
+                                y1: p1.1 as f32,
+                                x2: p2.0 as f32,
+                                y2: p2.1 as f32,
+                                radius_or_half_width: half_w,
+                                clearance,
+                                layer: chain.layer as u32,
+                                net_id: chain.net_id as u32,
+                                kind: 1,
+                                ignore_same_net_pads: 1,
+                                _pad0: 0,
+                                _pad1: 0,
+                            });
+                        }
+                    }
+                }
+                if !shortcut_cands.is_empty() {
+                    ctx.evaluate(g.vulkan.as_ref(), &shortcut_cands).map(|res| {
+                        keys.into_iter().zip(res.into_iter()).map(|(k, v)| (k, v != 0)).collect()
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let gpu_allows = |p1: (f64, f64), p2: (f64, f64)| -> bool {
+            if let Some(ref map) = gpu_shortcut_map {
+                let key = canonical_shortcut_key(p1, p2, chain.layer, chain.net_id);
+                if let Some(&false) = map.get(&key) {
+                    return false;
+                }
+            }
+            true
+        };
+
         // 1. Homotopic Triangle Shortcutting
         let mut i = 1;
         while i + 1 < chain.points.len() {
@@ -14781,14 +15848,16 @@ pub fn relax_chain_homotopic(chain: &mut TrackChain, board: &Board) {
             let p_curr = chain.points[i];
             let p_next = chain.points[i + 1];
 
-            let tri = [p_prev, p_curr, p_next];
-            let homotopy_ok = obstacles.iter().all(|obs| !point_in_polygon(obs.center, &tri));
-            if homotopy_ok && is_segment_clear(board, None, p_prev, p_next, chain.layer, chain.net_id, relax_w) {
-                chain.points.remove(i);
-                changed = true;
-            } else {
-                i += 1;
+            if gpu_allows(p_prev, p_next) {
+                let tri = [p_prev, p_curr, p_next];
+                let homotopy_ok = obstacles.iter().all(|obs| !point_in_polygon(obs.center, &tri));
+                if homotopy_ok && is_segment_clear(board, None, p_prev, p_next, chain.layer, chain.net_id, relax_w) {
+                    chain.points.remove(i);
+                    changed = true;
+                    continue;
+                }
             }
+            i += 1;
         }
 
         // 2. Multi-point Chord Shortcutting
@@ -14798,6 +15867,9 @@ pub fn relax_chain_homotopic(chain: &mut TrackChain, board: &Board) {
             for j in ((start_idx + 2)..chain.points.len()).rev() {
                 let p_start = chain.points[start_idx];
                 let p_end = chain.points[j];
+                if !gpu_allows(p_start, p_end) {
+                    continue;
+                }
                 let poly = &chain.points[start_idx..=j];
                 let homotopy_ok = obstacles.iter().all(|obs| !point_in_polygon(obs.center, poly));
                 if homotopy_ok && is_segment_clear(board, None, p_start, p_end, chain.layer, chain.net_id, relax_w) {
@@ -23676,6 +24748,100 @@ mod tests {
     }
 
     #[test]
+    fn test_nudge_gpu_accelerated_and_batch_segment_validation() {
+        let Some(vk) = VulkanEngine::new() else {
+            return;
+        };
+
+        let nets = vec!["".to_string(), "GND".to_string(), "SIG1".to_string(), "BLOCK".to_string()];
+        let mut net_name_to_id = HashMap::new();
+        for (i, n) in nets.iter().enumerate() {
+            net_name_to_id.insert(n.clone(), i);
+        }
+        let mut netclasses = HashMap::new();
+        netclasses.insert("Default".to_string(), NetClass::default());
+        let mut net_to_class = HashMap::new();
+        for n in &nets {
+            net_to_class.insert(n.clone(), "Default".to_string());
+        }
+
+        let j1 = make_fp("J1", 105.0, 110.0, true, vec![Pad::new("1", 0.0, 0.0, 0.4, 0.4, 2, "SIG1", false)]);
+        let j2 = make_fp("J_END", 125.0, 110.0, true, vec![Pad::new("1", 0.0, 0.0, 0.4, 0.4, 2, "SIG1", false)]);
+        let mut c1 = make_fp("C1", 107.0, 110.0, false, vec![Pad::new("1", 0.0, 0.0, 0.6, 0.6, 3, "BLOCK", false)]);
+        c1.courtyards = vec![Polygon::new(vec![
+            Point::new(-0.35, -0.35),
+            Point::new(0.35, -0.35),
+            Point::new(0.35, 0.35),
+            Point::new(-0.35, 0.35),
+        ])];
+
+        let mut board = Board {
+            file_path: String::new(),
+            raw_content: "()".to_string(),
+            min_x: 104.0,
+            min_y: 100.0,
+            max_x: 130.0,
+            max_y: 120.0,
+            footprints: vec![j1, j2, c1],
+            holding_palette: Vec::new(),
+            nets,
+            net_name_to_id,
+            netclasses,
+            net_to_class,
+            keepouts: vec![
+                KeepoutZone {
+                    min_x: 104.0,
+                    min_y: 110.5,
+                    max_x: 108.0,
+                    max_y: 120.0,
+                    layers: vec![0, 1],
+                },
+                KeepoutZone {
+                    min_x: 104.0,
+                    min_y: 100.0,
+                    max_x: 108.0,
+                    max_y: 109.5,
+                    layers: vec![0, 1],
+                },
+            ],
+            tracks: Vec::new(),
+            vias: Vec::new(),
+            arcs: Vec::new(),
+            clusters: Vec::new(),
+            schematic_positions: HashMap::new(),
+            outline_polygon: None,
+            pin_swap_history: Vec::new(),
+            bundles: Vec::new(),
+            texts: Vec::new(),
+        };
+
+        let mut grid = RoutingGrid::new(&board, 0.20, Some(vk));
+
+        // 1. Verify RoutingGrid::batch_validate_segments_gpu detects C1 pad collision vs clear segment
+        let segs = vec![
+            (2usize, (105.0, 110.0), (110.0, 110.0), 0.25, 0usize, 0.20), // Collides with C1 at (107.0, 110.0) on L0
+            (2usize, (112.0, 110.0), (120.0, 110.0), 0.25, 0usize, 0.20), // Clear corridor on L0
+        ];
+        let seg_res = grid
+            .batch_validate_segments_gpu(&board, &segs)
+            .expect("GPU batch segment validation must return Some when Vulkan is present");
+        assert_eq!(seg_res, vec![false, true]);
+
+        // 2. Verify GPU-accelerated NudgeEngine (Phase A pad pre-screen + Phase B 3D wavefront ranking)
+        let router = AutoRouter::new(3).with_allow_component_nudge(true);
+        let stop = Arc::new(AtomicBool::new(false));
+        let orig_c1_pos = (board.footprints[2].x, board.footprints[2].y);
+        let (routed, total) = router.route_all(&mut board, &mut grid, None, stop);
+
+        assert_eq!(total, 1);
+        assert_eq!(routed, 1, "GPU-accelerated component nudge must route the blocked connection");
+        assert!(
+            (board.footprints[2].x - orig_c1_pos.0).hypot(board.footprints[2].y - orig_c1_pos.1) > 0.1,
+            "Unlocked C1 must be nudged away from the corridor"
+        );
+    }
+
+    #[test]
     fn test_multi_track_corridor_shove_and_non_diff_pair_suffixes() {
         // Non-differential nets like Net-(U1-HPA) / Net-(U1-HNA) must not be falsely matched
         assert!(!AutoRouter::are_diff_pair_mates("Net-(U1-HPA)", "Net-(U1-HNA)"));
@@ -27459,5 +28625,103 @@ mod tests {
         prune_dangling_tracks_and_vias(&mut board);
         assert_eq!(board.vias.len(), 1, "Orphan single-plane via must be pruned");
         assert_eq!(board.vias[0].position, (25.0, 25.0), "Connected via must be retained");
+    }
+
+    #[test]
+    fn test_gpu_via_reduction_and_track_glossing_drc_clean() {
+        let vulkan = VulkanEngine::new();
+        let mut board = Board {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 60.0,
+            max_y: 60.0,
+            nets: vec![
+                String::new(),
+                "NET_HOP_CLEAR".to_string(),
+                "NET_HOP_BLOCKED".to_string(),
+                "NET_SINGLE_VIA".to_string(),
+                "NET_OBSTACLE".to_string(),
+            ],
+            footprints: vec![
+                Footprint {
+                    reference: "U1".to_string(),
+                    x: 10.0,
+                    y: 10.0,
+                    layer: 0,
+                    pads: vec![
+                        Pad::new("1", -5.0, 0.0, 0.8, 0.8, 1, "NET_HOP_CLEAR", false),
+                        Pad::new("2", 15.0, 0.0, 0.8, 0.8, 1, "NET_HOP_CLEAR", false),
+                        Pad::new("3", -5.0, 10.0, 0.8, 0.8, 2, "NET_HOP_BLOCKED", false),
+                        Pad::new("4", 15.0, 10.0, 0.8, 0.8, 2, "NET_HOP_BLOCKED", false),
+                        // Foreign obstacle pad on L0 blocking NET_HOP_BLOCKED between x=10 and x=20 at y=20
+                        Pad::new("5", 5.0, 10.0, 1.2, 1.2, 4, "NET_OBSTACLE", false),
+                    ],
+                    ..Footprint::default()
+                },
+                Footprint {
+                    reference: "J1".to_string(),
+                    x: 10.0,
+                    y: 40.0,
+                    layer: 0,
+                    pads: vec![
+                        Pad::new("1", -5.0, 0.0, 1.0, 1.0, 3, "NET_SINGLE_VIA", true),
+                        Pad::new("2", 15.0, 0.0, 1.0, 1.0, 3, "NET_SINGLE_VIA", true),
+                    ],
+                    ..Footprint::default()
+                },
+            ],
+            vias: vec![
+                // NET_HOP_CLEAR redundant via pair at (10,10) and (20,10)
+                Via { position: (10.0, 10.0), size: 0.6, drill: 0.3, net_id: 1, is_locked: false },
+                Via { position: (20.0, 10.0), size: 0.6, drill: 0.3, net_id: 1, is_locked: false },
+                // NET_HOP_BLOCKED necessary via pair around obstacle at (15,20)
+                Via { position: (10.0, 20.0), size: 0.6, drill: 0.3, net_id: 2, is_locked: false },
+                Via { position: (20.0, 20.0), size: 0.6, drill: 0.3, net_id: 2, is_locked: false },
+                // NET_SINGLE_VIA solitary via at (15,40) between PTH pads at (5,40) and (25,40)
+                Via { position: (15.0, 40.0), size: 0.6, drill: 0.3, net_id: 3, is_locked: false },
+            ],
+            tracks: vec![
+                // NET_HOP_CLEAR: (5,10)->(10,10) on L0, (10,10)->(20,10) on L1, (20,10)->(25,10) on L0 with a stair-step
+                TrackSegment { start: (5.0, 10.0), end: (10.0, 10.0), width: 0.25, layer: 0, net_id: 1, is_locked: false },
+                TrackSegment { start: (10.0, 10.0), end: (20.0, 10.0), width: 0.25, layer: 1, net_id: 1, is_locked: false },
+                TrackSegment { start: (20.0, 10.0), end: (22.0, 12.0), width: 0.25, layer: 0, net_id: 1, is_locked: false },
+                TrackSegment { start: (22.0, 12.0), end: (23.0, 12.0), width: 0.25, layer: 0, net_id: 1, is_locked: false },
+                TrackSegment { start: (23.0, 12.0), end: (25.0, 10.0), width: 0.25, layer: 0, net_id: 1, is_locked: false },
+                // NET_HOP_BLOCKED: (5,20)->(10,20) on L0, (10,20)->(20,20) on L1, (20,20)->(25,20) on L0
+                TrackSegment { start: (5.0, 20.0), end: (10.0, 20.0), width: 0.25, layer: 0, net_id: 2, is_locked: false },
+                TrackSegment { start: (10.0, 20.0), end: (20.0, 20.0), width: 0.25, layer: 1, net_id: 2, is_locked: false },
+                TrackSegment { start: (20.0, 20.0), end: (25.0, 20.0), width: 0.25, layer: 0, net_id: 2, is_locked: false },
+                // NET_SINGLE_VIA: (5,40)->(15,40) on L0, (15,40)->(25,40) on L1
+                TrackSegment { start: (5.0, 40.0), end: (15.0, 40.0), width: 0.25, layer: 0, net_id: 3, is_locked: false },
+                TrackSegment { start: (15.0, 40.0), end: (25.0, 40.0), width: 0.25, layer: 1, net_id: 3, is_locked: false },
+            ],
+            ..Board::default()
+        };
+
+        let mut grid = RoutingGrid::new(&board, 0.2, vulkan);
+        reduce_vias(&mut board, &mut grid);
+
+        // NET_HOP_CLEAR (net 1) and NET_SINGLE_VIA (net 3) vias should be eliminated; NET_HOP_BLOCKED (net 2) vias remain
+        assert_eq!(board.vias.iter().filter(|v| v.net_id == 1).count(), 0);
+        assert_eq!(board.vias.iter().filter(|v| v.net_id == 3).count(), 0);
+        assert_eq!(board.vias.iter().filter(|v| v.net_id == 2).count(), 2);
+
+        gloss_tracks_with_mode(&mut board, &grid, false);
+        gloss_tracks_with_mode(&mut board, &grid, true);
+
+        // Verify all resulting tracks respect clearance to the foreign obstacle pad at (15.0, 20.0)
+        let obs_fp = &board.footprints[0];
+        let obs_pad = &obs_fp.pads[4];
+        for t in &board.tracks {
+            if t.net_id != 4 && t.layer == 0 {
+                let d = dist_segment_to_pad(t.start, t.end, obs_fp, obs_pad);
+                assert!(
+                    d >= t.width * 0.5 + 0.20 - 1e-3,
+                    "Track {:?} violated clearance to obstacle pad (d={:.4})",
+                    t,
+                    d
+                );
+            }
+        }
     }
 }

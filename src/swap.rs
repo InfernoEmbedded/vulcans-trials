@@ -2,9 +2,12 @@
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use crate::board::{Board, PinSwapRecord, Point, Segment};
 use crate::placer::PlacementConfig;
-use crate::vulkan::{build_gpu_lbvh, ray_aabb_intersects_cpu, GpuBvhNode};
+use crate::vulkan::{
+    build_gpu_lbvh, ray_aabb_intersects_cpu, segments_cross_cpu, GpuBvhNode, VulkanEngine,
+};
 
 /// Solves the linear sum assignment problem (minimum cost bipartite matching)
 /// for an N x M cost matrix (where N <= M) using the Kuhn-Munkres (Hungarian) algorithm.
@@ -271,6 +274,19 @@ pub fn compute_swap_cost_matrix_accelerated(
     airwires: &[Segment],
     crossing_weight: f64,
 ) -> Vec<Vec<f64>> {
+    compute_swap_cost_matrix_with_gpu(targets, pads, airwires, crossing_weight, None)
+}
+
+/// Computes the $M \times K$ pin-swap cost matrix using $16 \times 16$ tiled Gram matrix expansion
+/// for Euclidean wirelength and GPU-accelerated 2D Morton LBVH ray-cast traversal
+/// (`VulkanEngine::evaluate_corridor_cuts_rt_bvh`, with CPU LBVH fallback) for airwire crossings.
+pub fn compute_swap_cost_matrix_with_gpu(
+    targets: &[(Point, usize)],
+    pads: &[Point],
+    airwires: &[Segment],
+    crossing_weight: f64,
+    vulkan: Option<&Arc<VulkanEngine>>,
+) -> Vec<Vec<f64>> {
     let m = targets.len();
     let k = pads.len();
     let mut cost_matrix = vec![vec![0.0; k]; m];
@@ -337,15 +353,16 @@ pub fn compute_swap_cost_matrix_accelerated(
 
     // 2. LBVH ray-cast crossing evaluation in O(M * K * log E) when airwires are provided
     if crossing_weight > 0.0 && !airwires.is_empty() {
+        let eps = 1e-3f32;
         let prims: Vec<([f32; 4], u32, u32)> = airwires
             .iter()
             .map(|aw| {
                 (
                     [
-                        aw.p1.x.min(aw.p2.x) as f32,
-                        aw.p1.y.min(aw.p2.y) as f32,
-                        aw.p1.x.max(aw.p2.x) as f32,
-                        aw.p1.y.max(aw.p2.y) as f32,
+                        (aw.p1.x.min(aw.p2.x) as f32) - eps,
+                        (aw.p1.y.min(aw.p2.y) as f32) - eps,
+                        (aw.p1.x.max(aw.p2.x) as f32) + eps,
+                        (aw.p1.y.max(aw.p2.y) as f32) + eps,
                     ],
                     1u32,
                     aw.net_id as u32,
@@ -354,16 +371,62 @@ pub fn compute_swap_cost_matrix_accelerated(
             .collect();
         let bvh_nodes = build_gpu_lbvh(&prims);
 
-        for (r, &(target_pt, net_id)) in targets.iter().enumerate() {
-            for (c, &pad_pt) in pads.iter().enumerate() {
-                let cand = Segment {
-                    p1: pad_pt,
-                    p2: target_pt,
-                    net_id,
-                };
-                let crossings = query_airwire_crossings_lbvh(&cand, airwires, &bvh_nodes);
-                if crossings > 0 {
-                    cost_matrix[r][c] += (crossings as f64) * crossing_weight;
+        let mut handled_on_gpu = false;
+        if let Some(vk) = vulkan {
+            let segs: Vec<[f32; 4]> = airwires
+                .iter()
+                .map(|aw| [aw.p1.x as f32, aw.p1.y as f32, aw.p2.x as f32, aw.p2.y as f32])
+                .collect();
+            let mut cuts = Vec::with_capacity(m * k);
+            for &(target_pt, _) in targets {
+                let tx = target_pt.x as f32;
+                let ty = target_pt.y as f32;
+                for &pad_pt in pads {
+                    cuts.push([pad_pt.x as f32, pad_pt.y as f32, tx, ty]);
+                }
+            }
+
+            if let Some(gpu_counts) = vk.evaluate_corridor_cuts_rt_bvh(&segs, &bvh_nodes, &cuts) {
+                if gpu_counts.len() == m * k {
+                    for (r, &(_target_pt, net_id)) in targets.iter().enumerate() {
+                        let same_net_segs: Vec<[f32; 4]> = airwires
+                            .iter()
+                            .zip(segs.iter())
+                            .filter_map(|(aw, &s)| if aw.net_id == net_id { Some(s) } else { None })
+                            .collect();
+                        for c in 0..k {
+                            let idx = r * k + c;
+                            let mut crossings = gpu_counts[idx] as usize;
+                            if crossings > 0 && !same_net_segs.is_empty() {
+                                let cut = cuts[idx];
+                                let same_net_hits = same_net_segs
+                                    .iter()
+                                    .filter(|&&s| segments_cross_cpu(cut, s))
+                                    .count();
+                                crossings = crossings.saturating_sub(same_net_hits);
+                            }
+                            if crossings > 0 {
+                                cost_matrix[r][c] += (crossings as f64) * crossing_weight;
+                            }
+                        }
+                    }
+                    handled_on_gpu = true;
+                }
+            }
+        }
+
+        if !handled_on_gpu {
+            for (r, &(target_pt, net_id)) in targets.iter().enumerate() {
+                for (c, &pad_pt) in pads.iter().enumerate() {
+                    let cand = Segment {
+                        p1: pad_pt,
+                        p2: target_pt,
+                        net_id,
+                    };
+                    let crossings = query_airwire_crossings_lbvh(&cand, airwires, &bvh_nodes);
+                    if crossings > 0 {
+                        cost_matrix[r][c] += (crossings as f64) * crossing_weight;
+                    }
                 }
             }
         }
@@ -511,7 +574,7 @@ fn optimize_gate_swapping_internal(board: &mut Board, _config: &PlacementConfig)
 }
 
 /// Internal helper to perform pin swapping within swappable pin groups.
-fn optimize_pin_swapping_internal(board: &mut Board, _config: &PlacementConfig) -> usize {
+fn optimize_pin_swapping_internal(board: &mut Board, config: &PlacementConfig) -> usize {
     let mut total_swaps = 0;
     let pad_positions: Vec<Vec<Point>> = board
         .footprints
@@ -592,7 +655,13 @@ fn optimize_pin_swapping_internal(board: &mut Board, _config: &PlacementConfig) 
                 .iter()
                 .map(|&pi| pad_positions[fp_idx][pi])
                 .collect();
-            let cost_matrix = compute_swap_cost_matrix_accelerated(&targets_with_nets, &group_pads, &[], 0.0);
+            let cost_matrix = compute_swap_cost_matrix_with_gpu(
+                &targets_with_nets,
+                &group_pads,
+                &[],
+                0.0,
+                config.vulkan.as_ref(),
+            );
 
             let mut assignment = hungarian_min_assignment(&cost_matrix);
 
@@ -1239,6 +1308,73 @@ mod tests {
             exact_internal,
             "LBVH internal crossing count must match exact O(E^2) reference"
         );
+    }
+
+    #[test]
+    fn test_swap_cost_matrix_gpu_rt_bvh_equivalence() {
+        let vk = match VulkanEngine::new() {
+            Some(v) => v,
+            None => return,
+        };
+
+        let m = 24usize;
+        let pads: Vec<Point> = (0..m)
+            .map(|i| Point::new(15.0 + (i % 4) as f64 * 0.65, 10.0 + i as f64 * 1.27))
+            .collect();
+        let targets: Vec<(Point, usize)> = (0..m)
+            .map(|i| {
+                let rev = m - 1 - i;
+                (
+                    Point::new(55.0 + ((i * 7) % 11) as f64 * 1.5, 8.0 + rev as f64 * 1.35),
+                    i + 1,
+                )
+            })
+            .collect();
+
+        // 160 board airwire segments across the routing channel, including same-net branches
+        let mut airwires = Vec::new();
+        for e in 0..160usize {
+            let y1 = 5.0 + ((e * 13) % 45) as f64 * 0.9;
+            let y2 = 5.0 + ((e * 29 + 7) % 45) as f64 * 0.9;
+            let x1 = 18.0 + ((e * 5) % 15) as f64 * 1.1;
+            let x2 = 38.0 + ((e * 11) % 15) as f64 * 1.1;
+            airwires.push(Segment {
+                p1: Point::new(x1, y1),
+                p2: Point::new(x2, y2),
+                net_id: (e % m) + 1,
+            });
+        }
+
+        let crossing_weight = 12.5;
+        let ref_mat = compute_swap_cost_matrix_reference(&targets, &pads, &airwires, crossing_weight);
+        let cpu_mat = compute_swap_cost_matrix_with_gpu(&targets, &pads, &airwires, crossing_weight, None);
+        let gpu_mat = compute_swap_cost_matrix_with_gpu(&targets, &pads, &airwires, crossing_weight, Some(&vk));
+
+        assert_eq!(gpu_mat.len(), m);
+        for r in 0..m {
+            for c in 0..m {
+                assert!(
+                    (ref_mat[r][c] - gpu_mat[r][c]).abs() < 1e-9,
+                    "GPU vs Reference mismatch at ({}, {}): ref={} vs gpu={}",
+                    r,
+                    c,
+                    ref_mat[r][c],
+                    gpu_mat[r][c]
+                );
+                assert!(
+                    (cpu_mat[r][c] - gpu_mat[r][c]).abs() < 1e-9,
+                    "GPU vs CPU LBVH mismatch at ({}, {}): cpu={} vs gpu={}",
+                    r,
+                    c,
+                    cpu_mat[r][c],
+                    gpu_mat[r][c]
+                );
+            }
+        }
+
+        let ref_assign = hungarian_min_assignment(&ref_mat);
+        let gpu_assign = hungarian_min_assignment(&gpu_mat);
+        assert_eq!(ref_assign, gpu_assign, "GPU Hungarian optimal assignment must match reference 100%");
     }
 }
 

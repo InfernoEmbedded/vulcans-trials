@@ -3,7 +3,10 @@
 
 use crate::board::{Board, LiveTrialState, Point, Polygon, Segment, TrialPhase, AABB};
 use crate::ipc::KiCadIpcClient;
-use crate::vulkan::{build_gpu_lbvh, query_lbvh_crossing_segments, GpuBvhNode, GpuCourtyardBuffers, GpuSaParams, VulkanEngine};
+use crate::vulkan::{
+    build_gpu_lbvh, query_lbvh_crossing_segments, GpuBvhNode, GpuCourtyardBuffers, GpuSaParams,
+    PlacementBatchParams, VulkanEngine,
+};
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
@@ -1120,6 +1123,64 @@ fn build_gpu_sa_descriptors(
         ]);
     }
 
+    if config.corridor_congestion_weight > 0.0 {
+        let locked_indices: Vec<usize> = board
+            .footprints
+            .iter()
+            .enumerate()
+            .filter(|(_, fp)| fp.is_locked)
+            .map(|(i, _)| i)
+            .collect();
+        let mut corr_count = 0usize;
+        for i in 0..locked_indices.len() {
+            for j in (i + 1)..locked_indices.len() {
+                if corr_count >= 16 {
+                    break;
+                }
+                edges.push([locked_indices[i] as f32, 0.0, 0.0, 3.0]);
+                edges.push([locked_indices[j] as f32, 0.0, 0.0, 3.0]);
+                corr_count += 1;
+            }
+        }
+        if corr_count == 0 {
+            for link in base.cached_connectivity.1.iter().take(8) {
+                edges.push([link.comp_a as f32, 0.0, 0.0, 3.0]);
+                edges.push([link.comp_b as f32, 0.0, 0.0, 3.0]);
+            }
+        }
+    }
+
+    if config.flow_alignment_weight > 0.0 {
+        for link in base.cached_connectivity.1.iter().take(12) {
+            for &(pa_idx, pb_idx) in link.shared_pads.iter().take(4) {
+                let pad_a = &board.footprints[link.comp_a].pads[pa_idx];
+                let pad_b = &board.footprints[link.comp_b].pads[pb_idx];
+                edges.push([
+                    link.comp_a as f32,
+                    pad_a.offset_x as f32,
+                    pad_a.offset_y as f32,
+                    4.0,
+                ]);
+                edges.push([
+                    link.comp_b as f32,
+                    pad_b.offset_x as f32,
+                    pad_b.offset_y as f32,
+                    4.0,
+                ]);
+            }
+        }
+        for cl in &board.clusters {
+            if let Some(a_idx) = cl.anchor_idx {
+                for &m_idx in cl.member_indices.iter().take(8) {
+                    if m_idx != a_idx && !board.footprints[m_idx].is_locked {
+                        edges.push([m_idx as f32, 0.0, 0.0, 4.0]);
+                        edges.push([a_idx as f32, 0.0, 0.0, 4.0]);
+                    }
+                }
+            }
+        }
+    }
+
     let courtyards = GpuCourtyardBuffers {
         fp_poly_ranges,
         courtyard_polys,
@@ -1162,7 +1223,7 @@ fn run_gpu_placement_batch(
                 base.positions[i].x as f32,
                 base.positions[i].y as f32,
                 base.rotations[i] as f32,
-                0.0,
+                base.layers[i] as f32,
             ]);
         }
     }
@@ -1175,8 +1236,8 @@ fn run_gpu_placement_batch(
         steps_per_pass,
         seed,
         _pad0: 0,
-        _pad1: 0,
-        _pad2: 0,
+        corridor_congestion_weight: config.corridor_congestion_weight as f32,
+        flow_alignment_weight: config.flow_alignment_weight as f32,
         board_min_x: boundary.min_x as f32,
         board_min_y: boundary.min_y as f32,
         board_max_x: boundary.max_x as f32,
@@ -1320,6 +1381,130 @@ pub fn legalize_placement(
         initial.update_component(*i, board, config);
     }
     initial.evaluate(board, config, &ties);
+    if initial.overlaps == 0 && initial.boundary_violations == 0 {
+        return initial;
+    }
+
+    if let Some(ref vk) = config.vulkan {
+        let (fp_descs, edges, courtyards) =
+            build_gpu_sa_descriptors(board, config, &ties, &initial);
+        let nf = board.footprints.len();
+        let ne = edges.len() / 2;
+        let (num_chains, steps_per_pass, num_passes): (u32, u32, u32) = if nf > 8 {
+            (1024, 24, 4)
+        } else {
+            (128, 12, 3)
+        };
+        let mut init_poses = Vec::with_capacity((num_chains as usize) * nf);
+        for _ in 0..num_chains {
+            for i in 0..nf {
+                init_poses.push([
+                    initial.positions[i].x as f32,
+                    initial.positions[i].y as f32,
+                    initial.rotations[i] as f32,
+                    initial.layers[i] as f32,
+                ]);
+            }
+        }
+        let sa_params = GpuSaParams {
+            num_chains,
+            num_footprints: nf as u32,
+            num_edges: ne as u32,
+            steps_per_pass,
+            seed: 0x517C_C1B7u32,
+            _pad0: 0,
+            corridor_congestion_weight: config.corridor_congestion_weight as f32,
+            flow_alignment_weight: config.flow_alignment_weight as f32,
+            board_min_x: boundary.min_x as f32,
+            board_min_y: boundary.min_y as f32,
+            board_max_x: boundary.max_x as f32,
+            board_max_y: boundary.max_y as f32,
+            grid_step: config.grid_step_mm as f32,
+            wirelength_weight: config.wirelength_weight as f32,
+            crossing_weight: config.crossing_weight as f32,
+            overlap_penalty: (config.overlap_penalty * 4.0).max(100_000.0) as f32,
+            boundary_penalty: (config.boundary_penalty * 4.0).max(200_000.0) as f32,
+            passive_affinity_weight: config.passive_affinity_weight as f32,
+            passive_max_dist: config.passive_max_dist as f32,
+            base_temp: 12.0,
+        };
+        if let Some((best_poses, best_scores)) = vk.run_gpu_sa_placer_chains(
+            &fp_descs,
+            &edges,
+            &init_poses,
+            &sa_params,
+            num_passes,
+            Some(&courtyards),
+        ) {
+            let mut ranked: Vec<(usize, f32, f32)> = best_scores
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (i, s[2], s[1]))
+                .collect();
+            ranked.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+            });
+            let mut best_gpu: Option<PlacementState> = None;
+            for &(chain_idx, _, _) in ranked.iter().take(8) {
+                let mut cand = initial.clone();
+                let c_base = chain_idx * nf;
+                for i in 0..nf {
+                    if !board.footprints[i].is_locked {
+                        let p = best_poses[c_base + i];
+                        let rot = p[2] as f64;
+                        let (cx_min, cx_max, cy_min, cy_max) =
+                            board.footprints[i].origin_clamp_range(
+                                rot,
+                                cand.layers[i],
+                                config.min_spacing_mm,
+                                &boundary,
+                            );
+                        cand.positions[i] = Point::new(
+                            snap_to_grid((p[0] as f64).clamp(cx_min, cx_max), config.grid_step_mm),
+                            snap_to_grid((p[1] as f64).clamp(cy_min, cy_max), config.grid_step_mm),
+                        );
+                        cand.rotations[i] = rot;
+                        cand.update_component(i, board, config);
+                    }
+                }
+                cand.evaluate(board, config, &ties);
+                if cand.overlaps == 0 && cand.boundary_violations == 0 {
+                    if let Some(st) = live {
+                        if let Ok(mut g) = st.lock() {
+                            g.push_log(format!(
+                                "[Legalizer] GPU SA pre-pass resolved all overlaps across {} chains",
+                                num_chains
+                            ));
+                        }
+                    }
+                    return cand;
+                }
+                if best_gpu.as_ref().is_none_or(|b| {
+                    cand.boundary_violations < b.boundary_violations
+                        || (cand.boundary_violations == b.boundary_violations
+                            && cand.overlaps < b.overlaps)
+                        || (cand.boundary_violations == b.boundary_violations
+                            && cand.overlaps == b.overlaps
+                            && cand.cost < b.cost)
+                }) {
+                    best_gpu = Some(cand);
+                }
+            }
+            if let Some(gpu_cand) = best_gpu {
+                if gpu_cand.boundary_violations < initial.boundary_violations
+                    || (gpu_cand.boundary_violations == initial.boundary_violations
+                        && gpu_cand.overlaps < initial.overlaps)
+                    || (gpu_cand.boundary_violations == initial.boundary_violations
+                        && gpu_cand.overlaps == initial.overlaps
+                        && gpu_cand.cost < initial.cost)
+                {
+                    initial = gpu_cand;
+                }
+            }
+        }
+    }
 
     let solved = AtomicBool::new(false);
     let steps_per_thread = (10000 / num_threads).max(2500);
@@ -1666,11 +1851,13 @@ pub fn prioritize_and_position_initial_components(
             0.0
         };
 
-        'search: for &d in &dist_steps {
+        let mut legal_cands: Vec<(Point, f64, usize)> = Vec::new();
+        for &d in &dist_steps {
             for &da in &angle_deltas {
                 let angle = base_angle + da;
                 for &rot in &rotations {
-                    let (cx_min, cx_max, cy_min, cy_max) = cap.origin_clamp_range(rot, cap.layer, config.min_spacing_mm, &boundary);
+                    let (cx_min, cx_max, cy_min, cy_max) =
+                        cap.origin_clamp_range(rot, cap.layer, config.min_spacing_mm, &boundary);
                     let cx = snap_to_grid(
                         (pin_x + d * angle.cos()).clamp(cx_min, cx_max),
                         config.grid_step_mm,
@@ -1685,7 +1872,8 @@ pub fn prioritize_and_position_initial_components(
                         continue;
                     }
 
-                    let polys = cap.transformed_courtyards_layered(c_pos, rot, cap.layer, cap_spacing);
+                    let polys =
+                        cap.transformed_courtyards_layered(c_pos, rot, cap.layer, cap_spacing);
                     let mut collides = false;
                     'check: for (group_aabb, group) in &placed_courtyards {
                         for p_cand in &polys {
@@ -1701,15 +1889,35 @@ pub fn prioritize_and_position_initial_components(
                         }
                     }
                     if !collides {
-                        let cap_pad_world = cap.pad_world_point_layered(cap_pad_idx, c_pos, rot, cap.layer);
-                        let pad_dist = cap_pad_world.distance_to(&pin_pt);
-                        if best_cand.is_none_or(|b| pad_dist < b.0) {
-                            best_cand = Some((pad_dist, cx, cy, rot));
-                            if pad_dist <= 1.0 + anchor_escape {
-                                break 'search;
-                            }
-                        }
+                        legal_cands.push((c_pos, rot, cap.layer));
                     }
+                }
+            }
+        }
+
+        let gpu_scores = config.vulkan.as_ref().and_then(|vk| {
+            score_candidate_poses_gpu(
+                vk,
+                board,
+                cap,
+                &legal_cands,
+                &[(cap_pad_idx, pin_pt, 1.0)],
+                config,
+            )
+        });
+
+        for (i, &(c_pos, rot, _)) in legal_cands.iter().enumerate() {
+            let cap_pad_world = cap.pad_world_point_layered(cap_pad_idx, c_pos, rot, cap.layer);
+            let pad_dist = cap_pad_world.distance_to(&pin_pt);
+            let score = gpu_scores
+                .as_ref()
+                .and_then(|s| s.get(i).copied())
+                .map(|gs| (gs as f64) * 0.01 + pad_dist)
+                .unwrap_or(pad_dist);
+            if best_cand.is_none_or(|b| score < b.0) {
+                best_cand = Some((score, c_pos.x, c_pos.y, rot));
+                if pad_dist <= 1.0 + anchor_escape {
+                    break;
                 }
             }
         }
@@ -2221,6 +2429,66 @@ pub fn shove_overlapping_components(
 }
 
 
+/// Batch-evaluates candidate `(pos, rot, layer)` poses for `fp` on the GPU using `vk.evaluate_placement_batch`.
+pub fn score_candidate_poses_gpu(
+    vk: &VulkanEngine,
+    board: &Board,
+    fp: &crate::board::Footprint,
+    candidates: &[(Point, f64, usize)],
+    targets: &[(usize, Point, f64)],
+    config: &PlacementConfig,
+) -> Option<Vec<f32>> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let nc = candidates.len();
+    let ns = targets.len().min(16);
+    let spacing = fp.effective_spacing(config);
+    let base_polys = fp.transformed_courtyards(Point::new(0.0, 0.0), 0.0, spacing);
+    let b0 = union_aabb(&base_polys, Point::new(0.0, 0.0));
+    let hw = ((b0.max_x - b0.min_x) * 0.5).max(0.4) as f32;
+    let hh = ((b0.max_y - b0.min_y) * 0.5).max(0.4) as f32;
+
+    let mut boxes = Vec::with_capacity(nc);
+    let mut segs = Vec::with_capacity(nc * ns);
+    for &(pos, rot, layer) in candidates {
+        let rad = (rot as f32).to_radians();
+        let c = rad.cos().abs();
+        let s = rad.sin().abs();
+        let r_hw = hw * c + hh * s;
+        let r_hh = hw * s + hh * c;
+        let px = pos.x as f32;
+        let py = pos.y as f32;
+        boxes.push([px - r_hw, py - r_hh, px + r_hw, py + r_hh]);
+        for &(pidx, target_pt, _) in targets.iter().take(ns) {
+            let pad_pt = fp.pad_world_point_layered(pidx, pos, rot, layer);
+            segs.push([
+                pad_pt.x as f32,
+                pad_pt.y as f32,
+                target_pt.x as f32,
+                target_pt.y as f32,
+            ]);
+        }
+    }
+
+    let boundary = board.boundary_aabb();
+    let params = PlacementBatchParams {
+        num_candidates: nc as u32,
+        num_footprints: 1,
+        num_segments: ns as u32,
+        _pad: 0,
+        board_min_x: boundary.min_x as f32,
+        board_min_y: boundary.min_y as f32,
+        board_max_x: boundary.max_x as f32,
+        board_max_y: boundary.max_y as f32,
+        wirelength_weight: config.wirelength_weight as f32,
+        crossing_weight: config.crossing_weight as f32,
+        overlap_penalty: config.overlap_penalty as f32,
+        boundary_penalty: config.boundary_penalty as f32,
+    };
+    vk.evaluate_placement_batch(&boxes, &segs, &params)
+}
+
 /// Finds the most favourable location (x, y), orientation (rotation in degrees), and layer for `fp` on `board`.
 /// - Decoupling capacitors are placed directly adjacent to their connected IC's non-ground power pin, oriented with their power pad facing the IC pin.
 /// - Differential pairs and connected passives/ICs are placed adjacent to their connected pins, minimizing Euclidean wirelength and crossings.
@@ -2329,11 +2597,13 @@ pub fn find_most_favourable_placement_with_index(
 
             let mut best_cand: Option<(f64, f64, f64, f64, usize)> = None;
 
+            let mut legal_cands: Vec<(Point, f64, usize)> = Vec::new();
             for &d in &dist_steps {
                 for &da in &angle_deltas {
                     let angle = base_angle + da;
                     for &rot in &rotations {
-                        let (cx_min, cx_max, cy_min, cy_max) = fp.origin_clamp_range(rot, fp.layer, min_spacing, &boundary);
+                        let (cx_min, cx_max, cy_min, cy_max) =
+                            fp.origin_clamp_range(rot, fp.layer, min_spacing, &boundary);
                         let cx = snap_to_grid(
                             (pin_x + d * angle.cos()).clamp(cx_min, cx_max),
                             grid_step,
@@ -2345,15 +2615,35 @@ pub fn find_most_favourable_placement_with_index(
                         let c_pos = Point::new(cx, cy);
 
                         if spatial_index.is_placement_legal(board, fp, c_pos, rot, fp.layer) {
-                            let pwr_pad_world = fp.pad_world_point_layered(pwr_idx, c_pos, rot, fp.layer);
-                            let pad_dist = pwr_pad_world.distance_to(&pin_pt);
-                            if best_cand.as_ref().map_or(true, |b| pad_dist < b.0) {
-                                best_cand = Some((pad_dist, cx, cy, rot, fp.layer));
-                                if pad_dist <= 1.0 {
-                                    return (cx, cy, rot, fp.layer);
-                                }
-                            }
+                            legal_cands.push((c_pos, rot, fp.layer));
                         }
+                    }
+                }
+            }
+
+            let gpu_scores = config.vulkan.as_ref().and_then(|vk| {
+                score_candidate_poses_gpu(
+                    vk,
+                    board,
+                    fp,
+                    &legal_cands,
+                    &[(pwr_idx, pin_pt, 1.0)],
+                    config,
+                )
+            });
+
+            for (i, &(c_pos, rot, layer)) in legal_cands.iter().enumerate() {
+                let pwr_pad_world = fp.pad_world_point_layered(pwr_idx, c_pos, rot, layer);
+                let pad_dist = pwr_pad_world.distance_to(&pin_pt);
+                let score = gpu_scores
+                    .as_ref()
+                    .and_then(|s| s.get(i).copied())
+                    .map(|gs| (gs as f64) * 0.01 + pad_dist)
+                    .unwrap_or(pad_dist);
+                if best_cand.as_ref().map_or(true, |b| score < b.0) {
+                    best_cand = Some((score, c_pos.x, c_pos.y, rot, layer));
+                    if pad_dist <= 1.0 {
+                        return (c_pos.x, c_pos.y, rot, layer);
                     }
                 }
             }
@@ -2400,6 +2690,7 @@ pub fn find_most_favourable_placement_with_index(
     ];
     let mut best_cand: Option<(f64, f64, f64, f64, usize)> = None;
 
+    let mut legal_cands: Vec<(Point, f64, usize, f64)> = Vec::new();
     for &r in &radii {
         let steps = if r == 0.0 {
             1
@@ -2410,7 +2701,8 @@ pub fn find_most_favourable_placement_with_index(
         for s in 0..steps {
             let theta = (s as f64) * (2.0 * std::f64::consts::PI / steps as f64);
             for &rot in &rotations {
-                let (cx_min, cx_max, cy_min, cy_max) = fp.origin_clamp_range(rot, fp.layer, min_spacing, &boundary);
+                let (cx_min, cx_max, cy_min, cy_max) =
+                    fp.origin_clamp_range(rot, fp.layer, min_spacing, &boundary);
                 let cx = snap_to_grid(
                     (target_center.x + r * theta.cos()).clamp(cx_min, cx_max),
                     grid_step,
@@ -2422,19 +2714,34 @@ pub fn find_most_favourable_placement_with_index(
                 let c_pos = Point::new(cx, cy);
 
                 if spatial_index.is_placement_legal(board, fp, c_pos, rot, fp.layer) {
-                    let mut cost = 0.1 * r;
-                    for &(pidx, target_pt, w) in &targets {
-                        let pad_pt = fp.pad_world_point_layered(pidx, c_pos, rot, fp.layer);
-                        cost += w * pad_pt.distance_to(&target_pt);
-                    }
-                    if best_cand.as_ref().map_or(true, |b| cost < b.0) {
-                        best_cand = Some((cost, cx, cy, rot, fp.layer));
-                    }
+                    legal_cands.push((c_pos, rot, fp.layer, r));
                 }
             }
         }
-        if r >= 6.0 && best_cand.is_some() {
+        if r >= 6.0 && !legal_cands.is_empty() {
             break;
+        }
+    }
+
+    let gpu_poses: Vec<(Point, f64, usize)> = legal_cands
+        .iter()
+        .map(|&(p, rot, layer, _)| (p, rot, layer))
+        .collect();
+    let gpu_scores = config.vulkan.as_ref().and_then(|vk| {
+        score_candidate_poses_gpu(vk, board, fp, &gpu_poses, &targets, config)
+    });
+
+    for (i, &(c_pos, rot, layer, r)) in legal_cands.iter().enumerate() {
+        let mut cost = 0.1 * r;
+        for &(pidx, target_pt, w) in &targets {
+            let pad_pt = fp.pad_world_point_layered(pidx, c_pos, rot, layer);
+            cost += w * pad_pt.distance_to(&target_pt);
+        }
+        if let Some(gs) = gpu_scores.as_ref().and_then(|s| s.get(i).copied()) {
+            cost += (gs as f64) * 0.01;
+        }
+        if best_cand.as_ref().map_or(true, |b| cost < b.0) {
+            best_cand = Some((cost, c_pos.x, c_pos.y, rot, layer));
         }
     }
 
@@ -5449,6 +5756,269 @@ mod tests {
             st.corridor_congestion, ref_corridor_overflow,
             "LBVH corridor congestion overflow must exactly match brute-force loop"
         );
+    }
+
+    #[test]
+    fn test_gpu_legalize_placement_prepass() {
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 30.0;
+        board.max_y = 30.0;
+        board.nets = vec!["".to_string(), "NET_1".to_string(), "NET_2".to_string()];
+
+        let j1 = make_test_fp(
+            "J1",
+            4.0,
+            15.0,
+            true,
+            vec![Pad::new("1", 0.0, 0.0, 0.5, 0.5, 1, "NET_1", false)],
+        );
+        let u1 = make_test_fp(
+            "U1",
+            15.0,
+            15.0,
+            false,
+            vec![
+                Pad::new("1", -0.5, 0.0, 0.4, 0.4, 1, "NET_1", false),
+                Pad::new("2", 0.5, 0.0, 0.4, 0.4, 2, "NET_2", false),
+            ],
+        );
+        let u2 = make_test_fp(
+            "U2",
+            15.2,
+            15.1,
+            false,
+            vec![Pad::new("1", -0.5, 0.0, 0.4, 0.4, 2, "NET_2", false)],
+        );
+        let u3 = make_test_fp(
+            "U3",
+            14.9,
+            15.0,
+            false,
+            vec![Pad::new("1", 0.5, 0.0, 0.4, 0.4, 1, "NET_1", false)],
+        );
+        board.footprints = vec![j1, u1, u2, u3];
+
+        let mut cfg = PlacementConfig::default();
+        cfg.vulkan = VulkanEngine::new();
+        let initial = PlacementState::from_board(&board, &cfg);
+        assert!(initial.overlaps > 0, "Expected initial overlaps before legalization");
+
+        let legalized = legalize_placement(&board, &cfg, initial, None);
+        assert_eq!(legalized.overlaps, 0, "Expected 0 overlaps after GPU+CPU legalization");
+        assert_eq!(
+            legalized.boundary_violations, 0,
+            "Expected 0 boundary violations after legalization"
+        );
+    }
+
+    #[test]
+    fn test_gpu_sa_corridor_and_flow_alignment_terms() {
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 40.0;
+        board.max_y = 30.0;
+        board.nets = vec![
+            "".to_string(),
+            "BUS_1".to_string(),
+            "BUS_2".to_string(),
+            "CROSS_NET".to_string(),
+        ];
+
+        let j1 = make_test_fp(
+            "J1",
+            10.0,
+            15.0,
+            true,
+            vec![
+                Pad::new("1", 0.0, -0.8, 0.4, 0.4, 1, "BUS_1", false),
+                Pad::new("2", 0.0, 0.8, 0.4, 0.4, 2, "BUS_2", false),
+            ],
+        );
+        let j2 = make_test_fp(
+            "J2",
+            30.0,
+            15.0,
+            true,
+            vec![Pad::new("1", 0.0, 0.0, 0.4, 0.4, 1, "BUS_1", false)],
+        );
+        let u1 = make_test_fp(
+            "U1",
+            20.0,
+            8.0,
+            false,
+            vec![
+                Pad::new("1", 0.0, -0.8, 0.4, 0.4, 1, "BUS_1", false),
+                Pad::new("2", 0.0, 0.8, 0.4, 0.4, 2, "BUS_2", false),
+                Pad::new("3", 0.5, 0.0, 0.4, 0.4, 3, "CROSS_NET", false),
+            ],
+        );
+        let u2 = make_test_fp(
+            "U2",
+            20.0,
+            22.0,
+            false,
+            vec![Pad::new("1", 0.0, 0.0, 0.4, 0.4, 3, "CROSS_NET", false)],
+        );
+        board.footprints = vec![j1, j2, u1, u2];
+
+        let cfg = PlacementConfig {
+            corridor_congestion_weight: 500.0,
+            flow_alignment_weight: 400.0,
+            ..PlacementConfig::default()
+        };
+        let ties = build_passive_ties(&board);
+        let base = PlacementState::from_board(&board, &cfg);
+        let (fp_descs, edges, courtyards) = build_gpu_sa_descriptors(&board, &cfg, &ties, &base);
+
+        // Verify virtual corridor edges (tag == 3.0) and flow alignment edges (tag == 4.0) are emitted
+        let has_corridor_edge = edges.iter().any(|e| (e[3] - 3.0).abs() < 1e-4);
+        let has_flow_edge = edges.iter().any(|e| (e[3] - 4.0).abs() < 1e-4);
+        assert!(has_corridor_edge, "Expected virtual corridor edge (tag 3.0) in GPU SA descriptors");
+        assert!(has_flow_edge, "Expected virtual flow alignment edge (tag 4.0) in GPU SA descriptors");
+
+        if let Some(vk) = VulkanEngine::new() {
+            let nf = board.footprints.len();
+            let ne = edges.len() / 2;
+            let num_chains = 64u32;
+            let mut poses = Vec::with_capacity((num_chains as usize) * nf);
+            for _ in 0..num_chains {
+                for i in 0..nf {
+                    poses.push([
+                        base.positions[i].x as f32,
+                        base.positions[i].y as f32,
+                        base.rotations[i] as f32,
+                        base.layers[i] as f32,
+                    ]);
+                }
+            }
+            let mut params_zero = GpuSaParams {
+                num_chains,
+                num_footprints: nf as u32,
+                num_edges: ne as u32,
+                steps_per_pass: 0,
+                seed: 42,
+                _pad0: 0,
+                corridor_congestion_weight: 0.0,
+                flow_alignment_weight: 0.0,
+                board_min_x: 0.0,
+                board_min_y: 0.0,
+                board_max_x: 40.0,
+                board_max_y: 30.0,
+                grid_step: 0.5,
+                wirelength_weight: 1.0,
+                crossing_weight: 200.0,
+                overlap_penalty: 25000.0,
+                boundary_penalty: 50000.0,
+                passive_affinity_weight: 80.0,
+                passive_max_dist: 3.5,
+                base_temp: 5.0,
+            };
+            let (_, scores_zero) = vk
+                .run_gpu_sa_placer_chains(&fp_descs, &edges, &poses, &params_zero, 1, Some(&courtyards))
+                .expect("GPU SA zero weights eval");
+
+            params_zero.corridor_congestion_weight = 500.0;
+            params_zero.flow_alignment_weight = 400.0;
+            let (_, scores_active) = vk
+                .run_gpu_sa_placer_chains(&fp_descs, &edges, &poses, &params_zero, 1, Some(&courtyards))
+                .expect("GPU SA active weights eval");
+
+            assert!(
+                scores_active[0][0] > scores_zero[0][0] + 500.0,
+                "Expected GPU SA cost with corridor & flow weights ({}) to exceed zero-weight cost ({})",
+                scores_active[0][0],
+                scores_zero[0][0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_holding_palette_batch_evaluation() {
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 40.0;
+        board.max_y = 40.0;
+        board.nets = vec![
+            "".to_string(),
+            "GND".to_string(),
+            "+3V3".to_string(),
+            "SIG_A".to_string(),
+        ];
+
+        let u1 = make_test_fp(
+            "U1",
+            20.0,
+            20.0,
+            true,
+            vec![
+                Pad::new("1", -1.0, 0.0, 0.4, 0.4, 2, "+3V3", false),
+                Pad::new("2", 1.0, 0.0, 0.4, 0.4, 3, "SIG_A", false),
+                Pad::new("3", 0.0, 1.0, 0.4, 0.4, 1, "GND", false),
+            ],
+        );
+        board.footprints = vec![u1];
+
+        let c1 = make_test_fp(
+            "C1",
+            -10.0,
+            -10.0,
+            false,
+            vec![
+                Pad::new("1", -0.5, 0.0, 0.4, 0.4, 2, "+3V3", false),
+                Pad::new("2", 0.5, 0.0, 0.4, 0.4, 1, "GND", false),
+            ],
+        );
+        let r1 = make_test_fp(
+            "R1",
+            -10.0,
+            -15.0,
+            false,
+            vec![
+                Pad::new("1", -0.5, 0.0, 0.4, 0.4, 3, "SIG_A", false),
+                Pad::new("2", 0.5, 0.0, 0.4, 0.4, 1, "GND", false),
+            ],
+        );
+        board.holding_palette = vec![c1, r1];
+
+        let mut cfg = PlacementConfig::default();
+        cfg.vulkan = VulkanEngine::new();
+
+        if let Some(ref vk) = cfg.vulkan {
+            let candidates = vec![
+                (Point::new(17.5, 20.0), 0.0, 0),
+                (Point::new(35.0, 35.0), 0.0, 0),
+            ];
+            let targets = vec![(0usize, Point::new(19.0, 20.0), 1.0)];
+            let scores = score_candidate_poses_gpu(
+                vk,
+                &board,
+                &board.holding_palette[0],
+                &candidates,
+                &targets,
+                &cfg,
+            )
+            .expect("GPU batch candidate scores");
+            assert_eq!(scores.len(), 2);
+            assert!(
+                scores[0] < scores[1],
+                "Closer pose must have lower GPU batch cost ({} vs {})",
+                scores[0],
+                scores[1]
+            );
+        }
+
+        let placed_count = place_all_holding_components_at_best_locations(&mut board, &cfg);
+        assert_eq!(placed_count, 2);
+        assert!(board.holding_palette.is_empty());
+        assert_eq!(board.footprints.len(), 3);
+
+        let st = PlacementState::from_board(&board, &cfg);
+        assert_eq!(st.overlaps, 0);
+        assert_eq!(st.boundary_violations, 0);
     }
 }
 

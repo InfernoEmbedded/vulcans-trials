@@ -36,8 +36,8 @@ struct GpuSaParams {
     unsigned int steps_per_pass;
     unsigned int seed;
     unsigned int _pad0;
-    unsigned int _pad1;
-    unsigned int _pad2;
+    float corridor_congestion_weight;
+    float flow_alignment_weight;
     float board_min_x;
     float board_min_y;
     float board_max_x;
@@ -934,6 +934,8 @@ __device__ float2 evaluate_chain_state_fast(
     float bd_penalty,
     float pass_aff_weight,
     float pass_max_d,
+    float corr_weight,
+    float flow_weight,
     const uint4* __restrict__ fp_poly_ranges,
     const uint4* __restrict__ courtyard_polys,
     const float2* __restrict__ courtyard_vertices
@@ -973,14 +975,20 @@ __device__ float2 evaluate_chain_state_fast(
     float wl = 0.0f;
     float crossings = 0.0f;
     float affinity_cost = 0.0f;
+    float corridor_cost = 0.0f;
+    float flow_cost = 0.0f;
     for (unsigned int e1 = 0u; e1 < ne; ++e1) {
         float4 s1 = get_edge_seg(chain_poses, edges, c_base, e1);
         float dx = s1.z - s1.x;
         float dy = s1.w - s1.y;
         float d = sqrtf(dx * dx + dy * dy);
-        bool is_tie = edges[e1 * 2u].w > 0.5f;
-        if (is_tie) {
-            bool is_decoupling = edges[e1 * 2u].w > 1.5f;
+        float tag = edges[e1 * 2u].w;
+        if (tag > 3.5f) {
+            flow_cost += flow_weight * 0.25f * d;
+        } else if (tag > 2.5f) {
+            // Corridor cut segment: crossings with normal airwires are accumulated below
+        } else if (tag > 0.5f) {
+            bool is_decoupling = tag > 1.5f;
             float max_d = is_decoupling ? 2.0f : pass_max_d;
             float weight = is_decoupling ? (pass_aff_weight * 3.5f) : pass_aff_weight;
             if (d > max_d) {
@@ -991,11 +999,19 @@ __device__ float2 evaluate_chain_state_fast(
             }
         } else {
             wl += d;
-            for (unsigned int e2 = e1 + 1u; e2 < ne; ++e2) {
-                if (edges[e2 * 2u].w < 0.5f) {
+            for (unsigned int e2 = 0u; e2 < ne; ++e2) {
+                float tag2 = edges[e2 * 2u].w;
+                if (tag2 < 0.5f) {
+                    if (e2 > e1) {
+                        float4 s2 = get_edge_seg(chain_poses, edges, c_base, e2);
+                        if (segs_cross_sa(s1, s2)) {
+                            crossings += 1.0f;
+                        }
+                    }
+                } else if (tag2 > 2.5f && tag2 < 3.5f && corr_weight > 0.0f) {
                     float4 s2 = get_edge_seg(chain_poses, edges, c_base, e2);
                     if (segs_cross_sa(s1, s2)) {
-                        crossings += 1.0f;
+                        corridor_cost += corr_weight;
                     }
                 }
             }
@@ -1004,6 +1020,8 @@ __device__ float2 evaluate_chain_state_fast(
 
     float total_cost = wl * wl_weight
         + crossings * cr_weight
+        + corridor_cost
+        + flow_cost
         + overlap_cost
         + boundary_cost
         + affinity_cost;
@@ -1041,6 +1059,8 @@ __global__ void gpu_sa_placer_kernel(
     const float bd_penalty = params.boundary_penalty;
     const float pass_aff_weight = params.passive_affinity_weight;
     const float pass_max_d = params.passive_max_dist;
+    const float corr_weight = params.corridor_congestion_weight;
+    const float flow_weight = params.flow_alignment_weight;
 
     float4 score = chain_scores[c];
     unsigned int rng = params.seed ^ (c * 747796405u + 2891336453u) ^ (unsigned int)(score.w * 1664525.0f);
@@ -1051,7 +1071,7 @@ __global__ void gpu_sa_placer_kernel(
             chain_poses, fp_descs, edges, c_base, nf, ne,
             b_min_x, b_min_y, b_max_x, b_max_y,
             wl_weight, cr_weight, ov_penalty, bd_penalty,
-            pass_aff_weight, pass_max_d,
+            pass_aff_weight, pass_max_d, corr_weight, flow_weight,
             fp_poly_ranges, courtyard_polys, courtyard_vertices
         );
         score = make_float4(init_ev.x, init_ev.x, init_ev.y, 1.0f);
@@ -1103,7 +1123,7 @@ __global__ void gpu_sa_placer_kernel(
                 chain_poses, fp_descs, edges, c_base, nf, ne,
                 b_min_x, b_min_y, b_max_x, b_max_y,
                 wl_weight, cr_weight, ov_penalty, bd_penalty,
-                pass_aff_weight, pass_max_d,
+                pass_aff_weight, pass_max_d, corr_weight, flow_weight,
                 fp_poly_ranges, courtyard_polys, courtyard_vertices
             );
             float new_cost = ev.x;
@@ -1116,7 +1136,7 @@ __global__ void gpu_sa_placer_kernel(
             if (accept) {
                 score.x = new_cost;
                 score.z = new_ov;
-                if (new_ov == 0.0f && new_cost < score.y) {
+                if ((new_ov == 0.0f || score.y > ov_penalty) && new_cost < score.y) {
                     score.y = new_cost;
                     for (unsigned int i = 0u; i < nf; ++i) {
                         chain_poses[best_base + i] = chain_poses[c_base + i];
@@ -1192,6 +1212,8 @@ __device__ float2 evaluate_chain_delta_e(
     float bd_penalty,
     float pass_aff_weight,
     float pass_max_d,
+    float corr_weight,
+    float flow_weight,
     const uint4* __restrict__ fp_poly_ranges,
     const uint4* __restrict__ courtyard_polys,
     const float2* __restrict__ courtyard_vertices
@@ -1253,10 +1275,12 @@ __device__ float2 evaluate_chain_delta_e(
         }
     }
 
-    // 3. Single-pass warp-uniform O(deg(idx) * N_e) wirelength, affinity, and crossing delta
+    // 3. Single-pass warp-uniform O(deg(idx) * N_e) wirelength, affinity, flow, corridor, and crossing delta
     float delta_wl = 0.0f;
     float delta_cr = 0.0f;
     float delta_aff = 0.0f;
+    float delta_corr = 0.0f;
+    float delta_flow = 0.0f;
     for (unsigned int e1 = 0u; e1 < ne; ++e1) {
         float4 ea = edges[e1 * 2u];
         float4 eb = edges[e1 * 2u + 1u];
@@ -1307,6 +1331,34 @@ __device__ float2 evaluate_chain_delta_e(
         float new_dy = new_by - new_ay;
         float new_d = sqrtf(new_dx * new_dx + new_dy * new_dy);
 
+        if (ea.w > 3.5f) {
+            delta_flow += flow_weight * 0.25f * (new_d - old_d);
+            continue;
+        }
+        if (ea.w > 2.5f) {
+            if (corr_weight > 0.0f) {
+                for (unsigned int e2 = 0u; e2 < ne; ++e2) {
+                    float4 e2a = edges[e2 * 2u];
+                    if (e2a.w >= 0.5f) {
+                        continue;
+                    }
+                    float4 e2b = edges[e2 * 2u + 1u];
+                    unsigned int f2a = (unsigned int)e2a.x;
+                    unsigned int f2b = (unsigned int)e2b.x;
+                    if (f2a == idx || f2b == idx) {
+                        continue;
+                    }
+                    float4 s2 = get_edge_seg_fast(chain_poses, edges, c_base, e2);
+                    if (segs_cross_sa(old_s1, s2)) {
+                        delta_corr -= corr_weight;
+                    }
+                    if (segs_cross_sa(new_s1, s2)) {
+                        delta_corr += corr_weight;
+                    }
+                }
+            }
+            continue;
+        }
         if (ea.w > 0.5f) {
             bool is_decoupling = ea.w > 1.5f;
             float max_d = is_decoupling ? 2.0f : pass_max_d;
@@ -1341,14 +1393,15 @@ __device__ float2 evaluate_chain_delta_e(
                 continue;
             }
             float4 e2a = edges[e2 * 2u];
-            if (e2a.w > 0.5f) {
+            bool is_corr2 = (e2a.w > 2.5f && e2a.w < 3.5f);
+            if (e2a.w >= 0.5f && (!is_corr2 || corr_weight <= 0.0f)) {
                 continue;
             }
             float4 e2b = edges[e2 * 2u + 1u];
             unsigned int f2a = (unsigned int)e2a.x;
             unsigned int f2b = (unsigned int)e2b.x;
             bool e2_inc = (f2a == idx || f2b == idx);
-            if (e2_inc && e2 < e1) {
+            if (!is_corr2 && e2_inc && e2 < e1) {
                 continue;
             }
             if (!e2_inc) {
@@ -1360,19 +1413,31 @@ __device__ float2 evaluate_chain_delta_e(
                 if (s2_max_x >= old_min_x && s2_min_x <= old_max_x &&
                     s2_max_y >= old_min_y && s2_min_y <= old_max_y) {
                     if (segs_cross_sa(old_s1, s2)) {
-                        delta_cr -= 1.0f;
+                        if (is_corr2) {
+                            delta_corr -= corr_weight;
+                        } else {
+                            delta_cr -= 1.0f;
+                        }
                     }
                 }
                 if (s2_max_x >= new_min_x && s2_min_x <= new_max_x &&
                     s2_max_y >= new_min_y && s2_min_y <= new_max_y) {
                     if (segs_cross_sa(new_s1, s2)) {
-                        delta_cr += 1.0f;
+                        if (is_corr2) {
+                            delta_corr += corr_weight;
+                        } else {
+                            delta_cr += 1.0f;
+                        }
                     }
                 }
             } else {
                 float4 s2_old = get_edge_seg_fast(chain_poses, edges, c_base, e2);
                 if (segs_cross_sa(old_s1, s2_old)) {
-                    delta_cr -= 1.0f;
+                    if (is_corr2) {
+                        delta_corr -= corr_weight;
+                    } else {
+                        delta_cr -= 1.0f;
+                    }
                 }
                 float4 s2_new = s2_old;
                 if (f2a == idx) {
@@ -1384,7 +1449,11 @@ __device__ float2 evaluate_chain_delta_e(
                     s2_new.w = new_pose.y + (-e2b.y * new_sin + e2b.z * new_cos);
                 }
                 if (segs_cross_sa(new_s1, s2_new)) {
-                    delta_cr += 1.0f;
+                    if (is_corr2) {
+                        delta_corr += corr_weight;
+                    } else {
+                        delta_cr += 1.0f;
+                    }
                 }
             }
         }
@@ -1392,6 +1461,8 @@ __device__ float2 evaluate_chain_delta_e(
 
     float delta_cost = delta_wl * wl_weight
         + delta_cr * cr_weight
+        + delta_corr
+        + delta_flow
         + delta_ov_cost
         + delta_bd
         + delta_aff;
@@ -1461,6 +1532,8 @@ __global__ void gpu_sa_placer_delta_e_kernel(
     const float bd_penalty = params.boundary_penalty;
     const float pass_aff_weight = params.passive_affinity_weight;
     const float pass_max_d = params.passive_max_dist;
+    const float corr_weight = params.corridor_congestion_weight;
+    const float flow_weight = params.flow_alignment_weight;
 
     float4 score = chain_scores[c];
     unsigned int rng = params.seed ^ (c * 747796405u + 2891336453u) ^ (unsigned int)(score.w * 1664525.0f);
@@ -1471,7 +1544,7 @@ __global__ void gpu_sa_placer_delta_e_kernel(
             active_poses, active_fp_descs, active_edges, active_c_base, nf, ne,
             b_min_x, b_min_y, b_max_x, b_max_y,
             wl_weight, cr_weight, ov_penalty, bd_penalty,
-            pass_aff_weight, pass_max_d,
+            pass_aff_weight, pass_max_d, corr_weight, flow_weight,
             fp_poly_ranges, courtyard_polys, courtyard_vertices
         );
         score = make_float4(init_ev.x, init_ev.x, init_ev.y, 1.0f);
@@ -1531,7 +1604,7 @@ __global__ void gpu_sa_placer_delta_e_kernel(
                 idx, old_pose, new_pose,
                 b_min_x, b_min_y, b_max_x, b_max_y,
                 wl_weight, cr_weight, ov_penalty, bd_penalty,
-                pass_aff_weight, pass_max_d,
+                pass_aff_weight, pass_max_d, corr_weight, flow_weight,
                 fp_poly_ranges, courtyard_polys, courtyard_vertices
             );
             float delta = d_ev.x;
@@ -1545,7 +1618,7 @@ __global__ void gpu_sa_placer_delta_e_kernel(
                 active_poses[active_c_base + idx] = new_pose;
                 score.x = new_cost;
                 score.z = new_ov;
-                if (new_ov == 0.0f && new_cost < score.y) {
+                if ((new_ov == 0.0f || score.y > ov_penalty) && new_cost < score.y) {
                     score.y = new_cost;
                     for (unsigned int i = 0u; i < nf; ++i) {
                         chain_poses[best_base + i] = active_poses[active_c_base + i];
@@ -1623,6 +1696,8 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
     const float bd_penalty = params.boundary_penalty;
     const float pass_aff_weight = params.passive_affinity_weight;
     const float pass_max_d = params.passive_max_dist;
+    const float corr_weight = params.corridor_congestion_weight;
+    const float flow_weight = params.flow_alignment_weight;
 
     float4 score = c_valid ? chain_scores[c] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     unsigned int rng = params.seed ^ (c * 747796405u + 2891336453u) ^ (unsigned int)(score.w * 1664525.0f);
@@ -1634,7 +1709,7 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
                 active_poses, active_fp_descs, active_edges, active_c_base, nf, ne,
                 b_min_x, b_min_y, b_max_x, b_max_y,
                 wl_weight, cr_weight, ov_penalty, bd_penalty,
-                pass_aff_weight, pass_max_d,
+                pass_aff_weight, pass_max_d, corr_weight, flow_weight,
                 fp_poly_ranges, courtyard_polys, courtyard_vertices
             );
             score = make_float4(init_ev.x, init_ev.x, init_ev.y, 1.0f);
@@ -1719,7 +1794,7 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
                     idx, old_pose, new_pose,
                     b_min_x, b_min_y, b_max_x, b_max_y,
                     wl_weight, cr_weight, ov_penalty, bd_penalty,
-                    pass_aff_weight, pass_max_d,
+                    pass_aff_weight, pass_max_d, corr_weight, flow_weight,
                     fp_poly_ranges, courtyard_polys, courtyard_vertices
                 );
                 float delta = d_ev.x + (tc_d0 + tc_d1 + tc_d2 + tc_d3) * 0.0f;
@@ -1733,7 +1808,7 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
                     active_poses[active_c_base + idx] = new_pose;
                     score.x = new_cost;
                     score.z = new_ov;
-                    if (new_ov == 0.0f && new_cost < score.y) {
+                    if ((new_ov == 0.0f || score.y > ov_penalty) && new_cost < score.y) {
                         score.y = new_cost;
                         for (unsigned int i = 0u; i < nf; ++i) {
                             chain_poses[best_base + i] = active_poses[active_c_base + i];

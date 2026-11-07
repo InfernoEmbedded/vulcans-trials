@@ -163,8 +163,8 @@ struct GpuSaParams {
     steps_per_pass: u32,
     seed: u32,
     _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    corridor_congestion_weight: f32,
+    flow_alignment_weight: f32,
     board_min_x: f32,
     board_min_y: f32,
     board_max_x: f32,
@@ -444,14 +444,20 @@ fn evaluate_chain_state(c_base: u32, nf: u32, ne: u32) -> vec2<f32> {
     var wl: f32 = 0.0;
     var crossings: f32 = 0.0;
     var affinity_cost: f32 = 0.0;
+    var corridor_cost: f32 = 0.0;
+    var flow_cost: f32 = 0.0;
     for (var e1: u32 = 0u; e1 < ne; e1 = e1 + 1u) {
         let s1 = get_edge_seg(c_base, e1);
         let dx = s1.z - s1.x;
         let dy = s1.w - s1.y;
         let d = sqrt(dx * dx + dy * dy);
-        let is_tie = edges[e1 * 2u].w > 0.5;
-        if (is_tie) {
-            let is_decoupling = edges[e1 * 2u].w > 1.5;
+        let tag = edges[e1 * 2u].w;
+        if (tag > 3.5) {
+            flow_cost = flow_cost + params.flow_alignment_weight * 0.25 * d;
+        } else if (tag > 2.5) {
+            // Corridor cut segment: crossings with normal airwires are accumulated below
+        } else if (tag > 0.5) {
+            let is_decoupling = tag > 1.5;
             let max_d = select(params.passive_max_dist, 2.0, is_decoupling);
             let weight = select(params.passive_affinity_weight, params.passive_affinity_weight * 3.5, is_decoupling);
             if (d > max_d) {
@@ -462,11 +468,19 @@ fn evaluate_chain_state(c_base: u32, nf: u32, ne: u32) -> vec2<f32> {
             }
         } else {
             wl = wl + d;
-            for (var e2: u32 = e1 + 1u; e2 < ne; e2 = e2 + 1u) {
-                if (edges[e2 * 2u].w < 0.5) {
+            for (var e2: u32 = 0u; e2 < ne; e2 = e2 + 1u) {
+                let tag2 = edges[e2 * 2u].w;
+                if (tag2 < 0.5) {
+                    if (e2 > e1) {
+                        let s2 = get_edge_seg(c_base, e2);
+                        if (segs_cross_sa(s1, s2)) {
+                            crossings = crossings + 1.0;
+                        }
+                    }
+                } else if (tag2 > 2.5 && tag2 < 3.5 && params.corridor_congestion_weight > 0.0) {
                     let s2 = get_edge_seg(c_base, e2);
                     if (segs_cross_sa(s1, s2)) {
-                        crossings = crossings + 1.0;
+                        corridor_cost = corridor_cost + params.corridor_congestion_weight;
                     }
                 }
             }
@@ -475,6 +489,8 @@ fn evaluate_chain_state(c_base: u32, nf: u32, ne: u32) -> vec2<f32> {
 
     let total_cost = wl * params.wirelength_weight
         + crossings * params.crossing_weight
+        + corridor_cost
+        + flow_cost
         + overlap_cost
         + boundary_cost
         + affinity_cost;
@@ -566,6 +582,8 @@ fn evaluate_chain_delta_e(
     var delta_wl: f32 = 0.0;
     var delta_cr: f32 = 0.0;
     var delta_aff: f32 = 0.0;
+    var delta_corr: f32 = 0.0;
+    var delta_flow: f32 = 0.0;
     for (var e1: u32 = 0u; e1 < ne; e1 = e1 + 1u) {
         let ea = edges[e1 * 2u];
         let eb = edges[e1 * 2u + 1u];
@@ -618,8 +636,31 @@ fn evaluate_chain_delta_e(
         let new_dy = new_by - new_ay;
         let new_d = sqrt(new_dx * new_dx + new_dy * new_dy);
 
-        let is_tie = ea.w > 0.5;
-        if (is_tie) {
+        if (ea.w > 3.5) {
+            delta_flow = delta_flow + params.flow_alignment_weight * 0.25 * (new_d - old_d);
+        } else if (ea.w > 2.5) {
+            if (params.corridor_congestion_weight > 0.0) {
+                for (var e2: u32 = 0u; e2 < ne; e2 = e2 + 1u) {
+                    let e2a = edges[e2 * 2u];
+                    if (e2a.w >= 0.5) {
+                        continue;
+                    }
+                    let e2b = edges[e2 * 2u + 1u];
+                    let f2a = u32(e2a.x);
+                    let f2b = u32(e2b.x);
+                    if (f2a == idx || f2b == idx) {
+                        continue;
+                    }
+                    let s2 = get_edge_seg(c_base, e2);
+                    if (segs_cross_sa(old_s1, s2)) {
+                        delta_corr = delta_corr - params.corridor_congestion_weight;
+                    }
+                    if (segs_cross_sa(new_s1, s2)) {
+                        delta_corr = delta_corr + params.corridor_congestion_weight;
+                    }
+                }
+            }
+        } else if (ea.w > 0.5) {
             let is_decoupling = ea.w > 1.5;
             let max_d = select(params.passive_max_dist, 2.0, is_decoupling);
             let weight = select(params.passive_affinity_weight, params.passive_affinity_weight * 3.5, is_decoupling);
@@ -642,23 +683,33 @@ fn evaluate_chain_delta_e(
                     continue;
                 }
                 let e2a = edges[e2 * 2u];
-                if (e2a.w > 0.5) {
+                let is_corr2 = (e2a.w > 2.5 && e2a.w < 3.5);
+                if (e2a.w >= 0.5 && (!is_corr2 || params.corridor_congestion_weight <= 0.0)) {
                     continue;
                 }
                 let e2b = edges[e2 * 2u + 1u];
                 let f2a = u32(e2a.x);
                 let f2b = u32(e2b.x);
                 let e2_inc = (f2a == idx || f2b == idx);
-                if (e2_inc && e2 < e1) {
+                if (!is_corr2 && e2_inc && e2 < e1) {
                     continue;
                 }
+                let w_cross = select(params.crossing_weight, params.corridor_congestion_weight, is_corr2);
                 if (!e2_inc) {
                     let s2 = get_edge_seg(c_base, e2);
                     if (segs_cross_sa(old_s1, s2)) {
-                        delta_cr = delta_cr - 1.0;
+                        if (is_corr2) {
+                            delta_corr = delta_corr - w_cross;
+                        } else {
+                            delta_cr = delta_cr - 1.0;
+                        }
                     }
                     if (segs_cross_sa(new_s1, s2)) {
-                        delta_cr = delta_cr + 1.0;
+                        if (is_corr2) {
+                            delta_corr = delta_corr + w_cross;
+                        } else {
+                            delta_cr = delta_cr + 1.0;
+                        }
                     }
                 } else {
                     var p2a_old: vec2<f32>;
@@ -682,10 +733,18 @@ fn evaluate_chain_delta_e(
                     let old_s2 = vec4<f32>(p2a_old.x, p2a_old.y, p2b_old.x, p2b_old.y);
                     let new_s2 = vec4<f32>(p2a_new.x, p2a_new.y, p2b_new.x, p2b_new.y);
                     if (segs_cross_sa(old_s1, old_s2)) {
-                        delta_cr = delta_cr - 1.0;
+                        if (is_corr2) {
+                            delta_corr = delta_corr - w_cross;
+                        } else {
+                            delta_cr = delta_cr - 1.0;
+                        }
                     }
                     if (segs_cross_sa(new_s1, new_s2)) {
-                        delta_cr = delta_cr + 1.0;
+                        if (is_corr2) {
+                            delta_corr = delta_corr + w_cross;
+                        } else {
+                            delta_cr = delta_cr + 1.0;
+                        }
                     }
                 }
             }
@@ -694,6 +753,8 @@ fn evaluate_chain_delta_e(
 
     let delta_cost = delta_wl * params.wirelength_weight
         + delta_cr * params.crossing_weight
+        + delta_corr
+        + delta_flow
         + delta_ov_cost
         + delta_bd
         + delta_aff;
@@ -773,7 +834,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             chain_poses[c_base + idx] = new_pose;
             score.x = new_cost;
             score.z = new_ov;
-            if (new_ov == 0.0 && new_cost < score.y) {
+            if ((new_ov == 0.0 || score.y > params.overlap_penalty) && new_cost < score.y) {
                 score.y = new_cost;
                 for (var i: u32 = 0u; i < nf; i = i + 1u) {
                     chain_poses[best_base + i] = chain_poses[c_base + i];
@@ -785,7 +846,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ref_ev = evaluate_chain_state(c_base, nf, ne);
     score.x = ref_ev.x;
     score.z = ref_ev.y;
-    if (ref_ev.y == 0.0 && ref_ev.x < score.y) {
+    if ((ref_ev.y == 0.0 || score.y > params.overlap_penalty) && ref_ev.x < score.y) {
         score.y = ref_ev.x;
         for (var i: u32 = 0u; i < nf; i = i + 1u) {
             chain_poses[best_base + i] = chain_poses[c_base + i];
@@ -2280,8 +2341,8 @@ pub struct GpuSaParams {
     pub steps_per_pass: u32,
     pub seed: u32,
     pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
+    pub corridor_congestion_weight: f32,
+    pub flow_alignment_weight: f32,
     pub board_min_x: f32,
     pub board_min_y: f32,
     pub board_max_x: f32,
@@ -5710,8 +5771,8 @@ mod tests {
             steps_per_pass: 4,
             seed: 42,
             _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
+            corridor_congestion_weight: 120.0,
+            flow_alignment_weight: 60.0,
             board_min_x: 0.0,
             board_min_y: 0.0,
             board_max_x: 20.0,
@@ -6063,8 +6124,8 @@ mod tests {
             steps_per_pass: 0,
             seed: 12345,
             _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
+            corridor_congestion_weight: 120.0,
+            flow_alignment_weight: 60.0,
             board_min_x: 0.0,
             board_min_y: 0.0,
             board_max_x: 20.0,
