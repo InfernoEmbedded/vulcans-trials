@@ -657,14 +657,85 @@ impl RoutingGrid {
         vk.compute_3d_wavefront(&cell_costs, seeds, &params, via_cost, iterations)
     }
 
+    pub fn compute_distance_field_cpu(
+        obstacles: &[u32],
+        width: usize,
+        height: usize,
+        radius: i32,
+    ) -> Vec<f32> {
+        let total = width * height;
+        if obstacles.len() != total || total == 0 {
+            return vec![0.0; total];
+        }
+        let r2 = (radius * radius + 1) as f32;
+        let inf = 1e9f32;
+
+        // 1D squared distance transform along columns
+        let mut d1 = vec![inf; total];
+        for x in 0..width {
+            let mut d = inf;
+            for y in 0..height {
+                let idx = y * width + x;
+                if obstacles[idx] != 0 {
+                    d = 0.0;
+                } else if d < inf {
+                    d += 1.0;
+                }
+                d1[idx] = if d < inf { d * d } else { inf };
+            }
+            let mut d = inf;
+            for y in (0..height).rev() {
+                let idx = y * width + x;
+                if obstacles[idx] != 0 {
+                    d = 0.0;
+                } else if d < inf {
+                    d += 1.0;
+                }
+                let d_sq = if d < inf { d * d } else { inf };
+                if d_sq < d1[idx] {
+                    d1[idx] = d_sq;
+                }
+            }
+        }
+
+        // Along rows, evaluate min_{|dx| <= radius} (dx*dx + d1[x+dx, y])
+        let mut out = vec![0.0f32; total];
+        let rad = radius.max(1);
+        for y in 0..height {
+            let row_off = y * width;
+            for x in 0..width {
+                let idx = row_off + x;
+                if obstacles[idx] != 0 {
+                    out[idx] = 0.0;
+                    continue;
+                }
+                let mut min_val = r2;
+                let x_min = (x as i32 - rad).max(0) as usize;
+                let x_max = (x as i32 + rad).min(width as i32 - 1) as usize;
+                for nx in x_min..=x_max {
+                    let dx = x as i32 - nx as i32;
+                    let val = (dx * dx) as f32 + d1[row_off + nx];
+                    if val < min_val {
+                        min_val = val;
+                    }
+                }
+                out[idx] = min_val.sqrt();
+            }
+        }
+        out
+    }
+
     pub fn update_distance_fields(&mut self) {
         let layer_cells = self.width * self.height;
+        let w = self.width;
+        let h = self.height;
+        let res = self.res as f32;
+        let num_layers = self.num_layers;
+
         if let Some(ref vk) = self.vulkan {
             let engines = vk.all_engines();
-            let w = self.width as u32;
-            let h = self.height as u32;
-            let res = self.res as f32;
-            let num_layers = self.num_layers;
+            let w_u32 = w as u32;
+            let h_u32 = h as u32;
 
             if engines.len() > 1 && num_layers > 1 {
                 let num_engines = engines.len();
@@ -697,7 +768,7 @@ impl RoutingGrid {
                         handles.push(scope.spawn(move || {
                             let mut results = Vec::new();
                             let sub_layers = assigned_layers.len() as u32;
-                            if let Some(batch_df) = eng_ref.compute_distance_field_layers(&flat_obs, w, h, sub_layers, 12) {
+                            if let Some(batch_df) = eng_ref.compute_distance_field_layers(&flat_obs, w_u32, h_u32, sub_layers, 12) {
                                 for (i, &l) in assigned_layers.iter().enumerate() {
                                     let off = i * layer_cells;
                                     results.push((l, batch_df[off..off + layer_cells].to_vec()));
@@ -715,13 +786,19 @@ impl RoutingGrid {
                     }
                 });
 
+                let mut all_ok = true;
                 for (layer, df_opt) in layer_dfs.into_iter().enumerate() {
                     if let Some(df) = df_opt {
                         let offset = layer * layer_cells;
                         for (dst, &val) in self.dist_field[offset..offset + layer_cells].iter_mut().zip(df.iter()) {
                             *dst = val * res;
                         }
+                    } else {
+                        all_ok = false;
                     }
+                }
+                if all_ok {
+                    return;
                 }
             } else if num_layers > 0 {
                 let total_cells = num_layers * layer_cells;
@@ -729,11 +806,34 @@ impl RoutingGrid {
                     .iter()
                     .map(|&n| if n != FREE_NET { 1u32 } else { 0u32 })
                     .collect();
-                if let Some(batch_df) = vk.compute_distance_field_layers(&obs_flat, w, h, num_layers as u32, 12) {
+                if let Some(batch_df) = vk.compute_distance_field_layers(&obs_flat, w_u32, h_u32, num_layers as u32, 12) {
                     for (dst, &val) in self.dist_field[..total_cells].iter_mut().zip(batch_df.iter()) {
                         *dst = val * res;
                     }
+                    return;
                 }
+            }
+        }
+
+        // Multi-core CPU fallback: evaluate exact 2D Euclidean Distance Field transforms
+        // when Vulkan GPU compute is absent (e.g. headless CI environments or systems without hardware GPUs).
+        let layer_results: Vec<Vec<f32>> = (0..num_layers)
+            .into_par_iter()
+            .map(|layer| {
+                let offset = layer * layer_cells;
+                let obs_slice = &self.obstacle_net_ids[offset..offset + layer_cells];
+                let obs_u32: Vec<u32> = obs_slice
+                    .iter()
+                    .map(|&n| if n != FREE_NET { 1u32 } else { 0u32 })
+                    .collect();
+                Self::compute_distance_field_cpu(&obs_u32, w, h, 12)
+            })
+            .collect();
+
+        for (layer, df) in layer_results.into_iter().enumerate() {
+            let offset = layer * layer_cells;
+            for (dst, &val) in self.dist_field[offset..offset + layer_cells].iter_mut().zip(df.iter()) {
+                *dst = val * res;
             }
         }
     }
@@ -19883,6 +19983,40 @@ pub fn route_bundle_along_guide(
 mod tests {
     use super::*;
     use crate::board::{Footprint, KeepoutZone, Pad, Polygon};
+
+    #[test]
+    fn test_cpu_distance_field_evaluation() {
+        assert!(RoutingGrid::compute_distance_field_cpu(&[], 0, 0, 5).is_empty());
+        assert_eq!(RoutingGrid::compute_distance_field_cpu(&[0u32; 10], 4, 4, 5).len(), 16);
+
+        let mut obs = vec![0u32; 16 * 16];
+        obs[4 * 16 + 4] = 1;
+        let df = RoutingGrid::compute_distance_field_cpu(&obs, 16, 16, 10);
+        assert!((df[4 * 16 + 4] - 0.0).abs() < 1e-4);
+        assert!((df[4 * 16 + 8] - 4.0).abs() < 1e-3);
+        assert!((df[7 * 16 + 8] - 5.0).abs() < 1e-3); // 3-4-5 right triangle
+
+        let board = make_router_test_board();
+        let grid = RoutingGrid::new(&board, 0.20, None);
+        let layer_cells = grid.width * grid.height;
+        let mut obstacle_count = 0usize;
+        let mut positive_count = 0usize;
+        for idx in 0..layer_cells {
+            if grid.obstacle_net_ids[idx] != FREE_NET {
+                obstacle_count += 1;
+                assert!(
+                    grid.dist_field[idx].abs() < 1e-4,
+                    "Obstacle cell {} must have distance field 0.0, got {}",
+                    idx,
+                    grid.dist_field[idx]
+                );
+            } else if grid.dist_field[idx] > 0.15 {
+                positive_count += 1;
+            }
+        }
+        assert!(obstacle_count > 0, "Grid must have obstacle cells from pads");
+        assert!(positive_count > 10, "Grid must have positive distance field free cells");
+    }
 
     fn make_fp(reference: &str, x: f64, y: f64, is_locked: bool, pads: Vec<Pad>) -> Footprint {
         Footprint {
