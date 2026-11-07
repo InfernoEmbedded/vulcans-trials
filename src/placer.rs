@@ -3,7 +3,7 @@
 
 use crate::board::{Board, LiveTrialState, Point, Polygon, Segment, TrialPhase, AABB};
 use crate::ipc::KiCadIpcClient;
-use crate::vulkan::{build_gpu_lbvh, query_lbvh_crossing_segments, GpuBvhNode, GpuSaParams, VulkanEngine};
+use crate::vulkan::{build_gpu_lbvh, query_lbvh_crossing_segments, GpuBvhNode, GpuCourtyardBuffers, GpuSaParams, VulkanEngine};
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
@@ -1003,9 +1003,13 @@ fn build_gpu_sa_descriptors(
     config: &PlacementConfig,
     ties: &[PassiveTie],
     base: &PlacementState,
-) -> (Vec<[f32; 4]>, Vec<[f32; 4]>) {
+) -> (Vec<[f32; 4]>, Vec<[f32; 4]>, GpuCourtyardBuffers) {
     let mut fp_descs = Vec::with_capacity(board.footprints.len());
-    for fp in &board.footprints {
+    let mut fp_poly_ranges = Vec::with_capacity(board.footprints.len());
+    let mut courtyard_polys = Vec::new();
+    let mut courtyard_vertices = Vec::new();
+
+    for (i, fp) in board.footprints.iter().enumerate() {
         let spacing = fp.effective_spacing(config);
         let polys = fp.transformed_courtyards(Point::new(0.0, 0.0), 0.0, spacing);
         let b = union_aabb(&polys, Point::new(0.0, 0.0));
@@ -1013,6 +1017,35 @@ fn build_gpu_sa_descriptors(
         let hh = ((b.max_y - b.min_y) * 0.5).max(0.4) as f32;
         let locked = if fp.is_locked { 1.0 } else { 0.0 };
         fp_descs.push([hw, hh, locked, 0.0]);
+
+        let is_smd = if fp.is_smd_only() { 1u32 } else { 0u32 };
+        let orig_layer = fp.orig_layer as u32;
+        let poly_start = courtyard_polys.len() as u32;
+
+        let mut valid_poly_count = 0u32;
+        for poly in polys {
+            if poly.vertices.len() >= 3 {
+                let v_start = courtyard_vertices.len() as u32;
+                let v_count = (poly.vertices.len() as u32).min(16);
+                for v in &poly.vertices[..v_count as usize] {
+                    courtyard_vertices.push([v.x as f32, v.y as f32]);
+                }
+                courtyard_polys.push([v_start, v_count, i as u32, 0]);
+                valid_poly_count += 1;
+            }
+        }
+
+        if valid_poly_count == 0 {
+            let v_start = courtyard_vertices.len() as u32;
+            courtyard_vertices.push([-hw, -hh]);
+            courtyard_vertices.push([hw, -hh]);
+            courtyard_vertices.push([hw, hh]);
+            courtyard_vertices.push([-hw, hh]);
+            courtyard_polys.push([v_start, 4, i as u32, 0]);
+            valid_poly_count = 1;
+        }
+
+        fp_poly_ranges.push([poly_start, valid_poly_count, is_smd, orig_layer]);
     }
 
     let mut net_pads: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
@@ -1087,7 +1120,13 @@ fn build_gpu_sa_descriptors(
         ]);
     }
 
-    (fp_descs, edges)
+    let courtyards = GpuCourtyardBuffers {
+        fp_poly_ranges,
+        courtyard_polys,
+        courtyard_vertices,
+    };
+
+    (fp_descs, edges, courtyards)
 }
 
 fn run_gpu_placement_batch(
@@ -1099,6 +1138,7 @@ fn run_gpu_placement_batch(
     base: &PlacementState,
     fp_descs: &[[f32; 4]],
     edges: &[[f32; 4]],
+    courtyards: &GpuCourtyardBuffers,
     seed_offset: u64,
     cooling: f64,
 ) -> Option<(PlacementState, usize)> {
@@ -1152,7 +1192,7 @@ fn run_gpu_placement_batch(
     };
 
     let (best_poses, best_scores) =
-        vk.run_gpu_sa_placer_chains(fp_descs, edges, &init_poses, &sa_params, num_passes)?;
+        vk.run_gpu_sa_placer_chains(fp_descs, edges, &init_poses, &sa_params, num_passes, Some(courtyards))?;
 
     let mut ranked: Vec<(usize, f32)> = best_scores
         .iter()
@@ -2732,9 +2772,10 @@ pub fn run_auto_placer(
 
     std::thread::scope(|scope| {
         if let Some(ref vk) = active_vulkan {
-            let (fp_descs, edges) = build_gpu_sa_descriptors(board, config, &ties, &legalized);
+            let (fp_descs, edges, courtyards) = build_gpu_sa_descriptors(board, config, &ties, &legalized);
             let fp_descs = Arc::new(fp_descs);
             let edges = Arc::new(edges);
+            let courtyards = Arc::new(courtyards);
             for (gpu_idx, vk_dev) in vk.all_engines().into_iter().enumerate() {
                 let board_ref = &*board;
                 let ties_ref = Arc::clone(&ties);
@@ -2745,6 +2786,7 @@ pub fn run_auto_placer(
                 let gpu_done_ref = &gpu_done;
                 let fp_descs_ref = Arc::clone(&fp_descs);
                 let edges_ref = Arc::clone(&edges);
+                let courtyards_ref = Arc::clone(&courtyards);
 
                 scope.spawn(move || {
                     let mut batch_idx = (gpu_idx as u64).wrapping_mul(10_000);
@@ -2764,6 +2806,7 @@ pub fn run_auto_placer(
                             &base,
                             &fp_descs_ref,
                             &edges_ref,
+                            &courtyards_ref,
                             batch_idx,
                             cooling,
                         ) {

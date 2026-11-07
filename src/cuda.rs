@@ -12,9 +12,9 @@ pub use crate::vulkan::{
     build_gpu_lbvh, build_gpu_lbvh_from_segments, evaluate_corridor_cuts_brute_force_cpu,
     evaluate_corridor_cuts_lbvh_cpu, evaluate_drc_brute_force_cpu,
     evaluate_segment_crossings_brute_force_cpu, morton2d_encode, query_lbvh_crossing_segments,
-    ray_aabb_intersects_cpu, segments_cross_cpu, DrcBatchParams, GpuBvhNode, GpuDrcCandidate,
-    GpuDrcPad, GpuDrcRayQuery, GpuDrcTrack, GpuDrcVia, GpuRouteCostParams, GpuSaParams,
-    PlacementBatchParams, RtBvhBenchmarkResult,
+    ray_aabb_intersects_cpu, segments_cross_cpu, DrcBatchParams, GpuBvhNode, GpuCourtyardBuffers,
+    GpuDrcCandidate, GpuDrcPad, GpuDrcRayQuery, GpuDrcTrack, GpuDrcVia, GpuRouteCostParams,
+    GpuSaParams, PlacementBatchParams, RtBvhBenchmarkResult,
 };
 
 static ALL_CUDA_ENGINES: OnceLock<Vec<Arc<CudaEngine>>> = OnceLock::new();
@@ -999,6 +999,7 @@ impl CudaEngine {
                 &sa_params,
                 2,
                 variant,
+                None,
             ) {
                 let valid = poses.len() == (sa_nc * sa_nf) as usize
                     && scores.len() == sa_nc as usize
@@ -1015,6 +1016,7 @@ impl CudaEngine {
                             &sa_params,
                             2,
                             variant,
+                            None,
                         );
                         samples.push(t0.elapsed().as_secs_f64() * 1e6);
                     }
@@ -1498,6 +1500,7 @@ impl CudaEngine {
         init_poses: &[[f32; 4]],
         params: &GpuSaParams,
         num_passes: u32,
+        courtyards: Option<&GpuCourtyardBuffers>,
     ) -> Option<(Vec<[f32; 4]>, Vec<[f32; 4]>)> {
         self.run_gpu_sa_placer_chains_variant(
             fp_descs,
@@ -1506,6 +1509,7 @@ impl CudaEngine {
             params,
             num_passes,
             self.dispatch_profile.best_sa_placer,
+            courtyards,
         )
         .or_else(|| {
             self.run_gpu_sa_placer_chains_variant(
@@ -1515,6 +1519,7 @@ impl CudaEngine {
                 params,
                 num_passes,
                 SaPlacerVariant::SimtFullEval,
+                courtyards,
             )
         })
     }
@@ -1527,6 +1532,7 @@ impl CudaEngine {
         params: &GpuSaParams,
         num_passes: u32,
         variant: SaPlacerVariant,
+        courtyards: Option<&GpuCourtyardBuffers>,
     ) -> Option<(Vec<[f32; 4]>, Vec<[f32; 4]>)> {
         let nc = params.num_chains as usize;
         let nf = params.num_footprints as usize;
@@ -1534,6 +1540,15 @@ impl CudaEngine {
         if nc == 0 || nf == 0 || fp_descs.len() != nf || edges.len() != ne * 2 || init_poses.len() != nc * nf {
             return None;
         }
+
+        let default_courtyards;
+        let cyd = match courtyards {
+            Some(c) if c.fp_poly_ranges.len() == nf && !c.courtyard_polys.is_empty() && !c.courtyard_vertices.is_empty() => c,
+            _ => {
+                default_courtyards = GpuCourtyardBuffers::from_fp_descs(fp_descs);
+                &default_courtyards
+            }
+        };
 
         let kernel = match variant {
             SaPlacerVariant::SimtFullEval => self.fn_gpu_sa_placer,
@@ -1557,10 +1572,17 @@ impl CudaEngine {
             let init_scores = vec![[0.0f32; 4]; nc];
             let scores_bytes = init_scores.len() * std::mem::size_of::<[f32; 4]>();
 
+            let ranges_bytes = cyd.fp_poly_ranges.len() * std::mem::size_of::<[u32; 4]>();
+            let polys_bytes = cyd.courtyard_polys.len() * std::mem::size_of::<[u32; 4]>();
+            let verts_bytes = cyd.courtyard_vertices.len() * std::mem::size_of::<[f32; 2]>();
+
             let mut d_fp: CUdeviceptr = 0;
             let mut d_edges: CUdeviceptr = 0;
             let mut d_poses: CUdeviceptr = 0;
             let mut d_scores: CUdeviceptr = 0;
+            let mut d_ranges: CUdeviceptr = 0;
+            let mut d_polys: CUdeviceptr = 0;
+            let mut d_verts: CUdeviceptr = 0;
 
             if (self.cuda.cuMemAlloc_v2)(&mut d_fp, fp_bytes) != CUDA_SUCCESS {
                 return None;
@@ -1580,6 +1602,30 @@ impl CudaEngine {
                 let _ = (self.cuda.cuMemFree_v2)(d_poses);
                 return None;
             }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_ranges, ranges_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_fp);
+                let _ = (self.cuda.cuMemFree_v2)(d_edges);
+                let _ = (self.cuda.cuMemFree_v2)(d_poses);
+                let _ = (self.cuda.cuMemFree_v2)(d_scores);
+                return None;
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_polys, polys_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_fp);
+                let _ = (self.cuda.cuMemFree_v2)(d_edges);
+                let _ = (self.cuda.cuMemFree_v2)(d_poses);
+                let _ = (self.cuda.cuMemFree_v2)(d_scores);
+                let _ = (self.cuda.cuMemFree_v2)(d_ranges);
+                return None;
+            }
+            if (self.cuda.cuMemAlloc_v2)(&mut d_verts, verts_bytes) != CUDA_SUCCESS {
+                let _ = (self.cuda.cuMemFree_v2)(d_fp);
+                let _ = (self.cuda.cuMemFree_v2)(d_edges);
+                let _ = (self.cuda.cuMemFree_v2)(d_poses);
+                let _ = (self.cuda.cuMemFree_v2)(d_scores);
+                let _ = (self.cuda.cuMemFree_v2)(d_ranges);
+                let _ = (self.cuda.cuMemFree_v2)(d_polys);
+                return None;
+            }
 
             let start_t = Instant::now();
 
@@ -1587,11 +1633,17 @@ impl CudaEngine {
                 || (self.cuda.cuMemcpyHtoD_v2)(d_edges, edge_slice.as_ptr() as *const c_void, edges_bytes) != CUDA_SUCCESS
                 || (self.cuda.cuMemcpyHtoD_v2)(d_poses, full_poses.as_ptr() as *const c_void, poses_bytes) != CUDA_SUCCESS
                 || (self.cuda.cuMemcpyHtoD_v2)(d_scores, init_scores.as_ptr() as *const c_void, scores_bytes) != CUDA_SUCCESS
+                || (self.cuda.cuMemcpyHtoD_v2)(d_ranges, cyd.fp_poly_ranges.as_ptr() as *const c_void, ranges_bytes) != CUDA_SUCCESS
+                || (self.cuda.cuMemcpyHtoD_v2)(d_polys, cyd.courtyard_polys.as_ptr() as *const c_void, polys_bytes) != CUDA_SUCCESS
+                || (self.cuda.cuMemcpyHtoD_v2)(d_verts, cyd.courtyard_vertices.as_ptr() as *const c_void, verts_bytes) != CUDA_SUCCESS
             {
                 let _ = (self.cuda.cuMemFree_v2)(d_fp);
                 let _ = (self.cuda.cuMemFree_v2)(d_edges);
                 let _ = (self.cuda.cuMemFree_v2)(d_poses);
                 let _ = (self.cuda.cuMemFree_v2)(d_scores);
+                let _ = (self.cuda.cuMemFree_v2)(d_ranges);
+                let _ = (self.cuda.cuMemFree_v2)(d_polys);
+                let _ = (self.cuda.cuMemFree_v2)(d_verts);
                 return None;
             }
 
@@ -1608,6 +1660,9 @@ impl CudaEngine {
                 &mut d_scores as *mut _ as *mut c_void,
                 &mut params_copy as *mut _ as *mut c_void,
                 &mut passes_arg as *mut _ as *mut c_void,
+                &mut d_ranges as *mut _ as *mut c_void,
+                &mut d_polys as *mut _ as *mut c_void,
+                &mut d_verts as *mut _ as *mut c_void,
             ];
 
             if (self.cuda.cuLaunchKernel)(
@@ -1628,6 +1683,9 @@ impl CudaEngine {
                 let _ = (self.cuda.cuMemFree_v2)(d_edges);
                 let _ = (self.cuda.cuMemFree_v2)(d_poses);
                 let _ = (self.cuda.cuMemFree_v2)(d_scores);
+                let _ = (self.cuda.cuMemFree_v2)(d_ranges);
+                let _ = (self.cuda.cuMemFree_v2)(d_polys);
+                let _ = (self.cuda.cuMemFree_v2)(d_verts);
                 return None;
             }
 
@@ -1643,6 +1701,9 @@ impl CudaEngine {
                 let _ = (self.cuda.cuMemFree_v2)(d_edges);
                 let _ = (self.cuda.cuMemFree_v2)(d_poses);
                 let _ = (self.cuda.cuMemFree_v2)(d_scores);
+                let _ = (self.cuda.cuMemFree_v2)(d_ranges);
+                let _ = (self.cuda.cuMemFree_v2)(d_polys);
+                let _ = (self.cuda.cuMemFree_v2)(d_verts);
                 return None;
             }
 
@@ -1654,6 +1715,9 @@ impl CudaEngine {
             let _ = (self.cuda.cuMemFree_v2)(d_edges);
             let _ = (self.cuda.cuMemFree_v2)(d_poses);
             let _ = (self.cuda.cuMemFree_v2)(d_scores);
+            let _ = (self.cuda.cuMemFree_v2)(d_ranges);
+            let _ = (self.cuda.cuMemFree_v2)(d_polys);
+            let _ = (self.cuda.cuMemFree_v2)(d_verts);
 
             Some((best_poses, final_scores))
         }
@@ -4137,13 +4201,13 @@ mod tests {
             let mut zero_params = sa_params;
             zero_params.steps_per_pass = 0;
             let (_, scores_full_0) = dev
-                .run_gpu_sa_placer_chains_variant(&sa_fp_descs, &sa_edges, &sa_poses, &zero_params, 1, SaPlacerVariant::SimtFullEval)
+                .run_gpu_sa_placer_chains_variant(&sa_fp_descs, &sa_edges, &sa_poses, &zero_params, 1, SaPlacerVariant::SimtFullEval, None)
                 .expect("SimtFullEval 0-step");
             let (_, scores_de_0) = dev
-                .run_gpu_sa_placer_chains_variant(&sa_fp_descs, &sa_edges, &sa_poses, &zero_params, 1, SaPlacerVariant::SimtIncrementalDeltaE)
+                .run_gpu_sa_placer_chains_variant(&sa_fp_descs, &sa_edges, &sa_poses, &zero_params, 1, SaPlacerVariant::SimtIncrementalDeltaE, None)
                 .expect("SimtIncrementalDeltaE 0-step");
             let (_, scores_tc_0) = dev
-                .run_gpu_sa_placer_chains_variant(&sa_fp_descs, &sa_edges, &sa_poses, &zero_params, 1, SaPlacerVariant::TensorCore)
+                .run_gpu_sa_placer_chains_variant(&sa_fp_descs, &sa_edges, &sa_poses, &zero_params, 1, SaPlacerVariant::TensorCore, None)
                 .expect("TensorCore 0-step");
 
             for c in 0..(sa_nc as usize) {
@@ -4173,7 +4237,7 @@ mod tests {
             ] {
                 let t0 = std::time::Instant::now();
                 let (poses_out, scores_out) = dev
-                    .run_gpu_sa_placer_chains_variant(&sa_fp_descs, &sa_edges, &sa_poses, &sa_params, 4, variant)
+                    .run_gpu_sa_placer_chains_variant(&sa_fp_descs, &sa_edges, &sa_poses, &sa_params, 4, variant, None)
                     .expect("SA placer variant execution failed");
                 let elapsed_us = t0.elapsed().as_secs_f64() * 1e6;
 
@@ -4584,6 +4648,191 @@ mod tests {
         }
 
         assert!(batch_paths[2].is_none(), "Destination on foreign obstacle must return None");
+    }
+
+    #[test]
+    fn test_cuda_gpu_sat_courtyard_overlap_exact_equivalence() {
+        use crate::board::{Point, Polygon};
+
+        let devs = CudaEngine::all_devices();
+        if devs.is_empty() {
+            return;
+        }
+
+        // Scenario 1: Rotated 45-degree squares
+        let poly_a_local = Polygon::new(vec![
+            Point::new(-1.0, -1.0),
+            Point::new(1.0, -1.0),
+            Point::new(1.0, 1.0),
+            Point::new(-1.0, 1.0),
+        ]);
+        let poly_b_local = poly_a_local.clone();
+
+        let poly_a_world = poly_a_local.transform(Point::new(5.0, 5.0), 45.0);
+        let poly_b_world_sep = poly_b_local.transform(Point::new(7.0, 7.0), 45.0);
+        let poly_b_world_int = poly_b_local.transform(Point::new(6.0, 6.0), 45.0);
+
+        // Verify CPU baseline
+        assert!(poly_a_world.aabb().overlaps(&poly_b_world_sep.aabb()), "AABB must overlap");
+        assert!(!poly_a_world.intersects_convex(&poly_b_world_sep), "CPU SAT must report no collision");
+        assert!(poly_a_world.intersects_convex(&poly_b_world_int), "CPU SAT must report collision");
+
+        let fp_descs = vec![[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0]];
+        let edges = vec![];
+
+        let courtyards = GpuCourtyardBuffers {
+            fp_poly_ranges: vec![
+                [0, 1, 0, 0],
+                [1, 1, 0, 0],
+            ],
+            courtyard_polys: vec![
+                [0, 4, 0, 0],
+                [4, 4, 1, 0],
+            ],
+            courtyard_vertices: vec![
+                [-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0],
+                [-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0],
+            ],
+        };
+
+        let sa_params = GpuSaParams {
+            num_chains: 64,
+            num_footprints: 2,
+            num_edges: 0,
+            steps_per_pass: 0,
+            seed: 42,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+            board_min_x: 0.0,
+            board_min_y: 0.0,
+            board_max_x: 20.0,
+            board_max_y: 20.0,
+            grid_step: 0.5,
+            wirelength_weight: 1.0,
+            crossing_weight: 200.0,
+            overlap_penalty: 25000.0,
+            boundary_penalty: 50000.0,
+            passive_affinity_weight: 80.0,
+            passive_max_dist: 3.5,
+            base_temp: 5.0,
+        };
+
+        let mut poses_sep = Vec::with_capacity(64 * 2);
+        for _ in 0..64 {
+            poses_sep.push([5.0, 5.0, 45.0, 0.0]);
+            poses_sep.push([7.0, 7.0, 45.0, 0.0]);
+        }
+
+        let mut poses_int = Vec::with_capacity(64 * 2);
+        for _ in 0..64 {
+            poses_int.push([5.0, 5.0, 45.0, 0.0]);
+            poses_int.push([6.0, 6.0, 45.0, 0.0]);
+        }
+
+        // Scenario 2: Multi-polygon L-shape
+        let l_courtyards = GpuCourtyardBuffers {
+            fp_poly_ranges: vec![
+                [0, 2, 0, 0],
+                [2, 1, 0, 0],
+            ],
+            courtyard_polys: vec![
+                [0, 4, 0, 0],
+                [4, 4, 0, 0],
+                [8, 4, 1, 0],
+            ],
+            courtyard_vertices: vec![
+                [-2.0, -2.0], [2.0, -2.0], [2.0, 0.0], [-2.0, 0.0],
+                [-2.0, 0.0], [0.0, 0.0], [0.0, 2.0], [-2.0, 2.0],
+                [-0.4, -0.4], [0.4, -0.4], [0.4, 0.4], [-0.4, 0.4],
+            ],
+        };
+        let l_fp_descs = vec![[2.0, 2.0, 0.0, 0.0], [0.4, 0.4, 0.0, 0.0]];
+        let mut l_poses_sep = Vec::with_capacity(64 * 2);
+        for _ in 0..64 {
+            l_poses_sep.push([10.0, 10.0, 0.0, 0.0]);
+            l_poses_sep.push([11.0, 11.0, 0.0, 0.0]);
+        }
+        let mut l_poses_int = Vec::with_capacity(64 * 2);
+        for _ in 0..64 {
+            l_poses_int.push([10.0, 10.0, 0.0, 0.0]);
+            l_poses_int.push([9.0, 11.0, 0.0, 0.0]);
+        }
+
+        // Scenario 3: SMD-only layer isolation
+        let smd_courtyards = GpuCourtyardBuffers {
+            fp_poly_ranges: vec![
+                [0, 1, 1, 0],
+                [1, 1, 1, 1],
+            ],
+            courtyard_polys: vec![
+                [0, 4, 0, 0],
+                [4, 4, 1, 0],
+            ],
+            courtyard_vertices: vec![
+                [-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0],
+                [-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0],
+            ],
+        };
+        let mut smd_poses = Vec::with_capacity(64 * 2);
+        for _ in 0..64 {
+            smd_poses.push([10.0, 10.0, 0.0, 0.0]);
+            smd_poses.push([10.0, 10.0, 0.0, 1.0]);
+        }
+        let th_courtyards = GpuCourtyardBuffers {
+            fp_poly_ranges: vec![
+                [0, 1, 0, 0], // Through-Hole
+                [1, 1, 1, 1], // SMD Bottom
+            ],
+            courtyard_polys: smd_courtyards.courtyard_polys.clone(),
+            courtyard_vertices: smd_courtyards.courtyard_vertices.clone(),
+        };
+
+        let variants = [
+            SaPlacerVariant::SimtFullEval,
+            SaPlacerVariant::SimtIncrementalDeltaE,
+            SaPlacerVariant::TensorCore,
+        ];
+
+        for dev in &devs {
+            for &v in &variants {
+                // Rotated squares: Separated
+                let (_, s_sep) = dev
+                    .run_gpu_sa_placer_chains_variant(&fp_descs, &edges, &poses_sep, &sa_params, 1, v, Some(&courtyards))
+                    .expect("CUDA run_gpu_sa_placer_chains_variant");
+                assert_eq!(s_sep[0][2], 0.0, "[{}] {:?} must report 0 overlaps for separated 45-deg squares", dev.device_name, v);
+
+                // Rotated squares: Intersecting
+                let (_, s_int) = dev
+                    .run_gpu_sa_placer_chains_variant(&fp_descs, &edges, &poses_int, &sa_params, 1, v, Some(&courtyards))
+                    .expect("CUDA run_gpu_sa_placer_chains_variant");
+                assert_eq!(s_int[0][2], 1.0, "[{}] {:?} must report 1 overlap for intersecting 45-deg squares", dev.device_name, v);
+
+                // Multi-poly L-shape: Separated
+                let (_, l_sep) = dev
+                    .run_gpu_sa_placer_chains_variant(&l_fp_descs, &edges, &l_poses_sep, &sa_params, 1, v, Some(&l_courtyards))
+                    .expect("CUDA multi-poly");
+                assert_eq!(l_sep[0][2], 0.0, "[{}] {:?} must report 0 overlaps in L-corner concavity", dev.device_name, v);
+
+                // Multi-poly L-shape: Intersecting
+                let (_, l_int) = dev
+                    .run_gpu_sa_placer_chains_variant(&l_fp_descs, &edges, &l_poses_int, &sa_params, 1, v, Some(&l_courtyards))
+                    .expect("CUDA multi-poly");
+                assert_eq!(l_int[0][2], 1.0, "[{}] {:?} must report 1 overlap when hitting L-arm", dev.device_name, v);
+
+                // SMD layer isolation
+                let (_, smd_s) = dev
+                    .run_gpu_sa_placer_chains_variant(&fp_descs, &edges, &smd_poses, &sa_params, 1, v, Some(&smd_courtyards))
+                    .expect("CUDA SMD layer");
+                assert_eq!(smd_s[0][2], 0.0, "[{}] {:?} must report 0 overlaps for opposite-layer SMD", dev.device_name, v);
+
+                // Through-Hole collision
+                let (_, th_s) = dev
+                    .run_gpu_sa_placer_chains_variant(&fp_descs, &edges, &smd_poses, &sa_params, 1, v, Some(&th_courtyards))
+                    .expect("CUDA TH layer");
+                assert_eq!(th_s[0][2], 1.0, "[{}] {:?} must report 1 overlap for TH through opposite layer", dev.device_name, v);
+            }
+        }
     }
 }
 

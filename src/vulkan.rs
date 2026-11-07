@@ -184,6 +184,9 @@ struct GpuSaParams {
 @group(0) @binding(2) var<storage, read_write> chain_poses: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> chain_scores: array<vec4<f32>>;
 @group(0) @binding(4) var<uniform> params: GpuSaParams;
+@group(0) @binding(5) var<storage, read> fp_poly_ranges: array<vec4<u32>>;
+@group(0) @binding(6) var<storage, read> courtyard_polys: array<vec4<u32>>;
+@group(0) @binding(7) var<storage, read> courtyard_vertices: array<vec2<f32>>;
 
 fn pcg_next(state: ptr<function, u32>) -> u32 {
     let old = *state;
@@ -255,6 +258,156 @@ fn fp_aabb(c_base: u32, fp_idx: u32) -> vec4<f32> {
     return vec4<f32>(pose.x - hw, pose.y - hh, pose.x + hw, pose.y + hh);
 }
 
+fn sat_polys_intersect(
+    poly_a_idx: u32,
+    pose_a: vec4<f32>,
+    orig_layer_a: u32,
+    poly_b_idx: u32,
+    pose_b: vec4<f32>,
+    orig_layer_b: u32
+) -> bool {
+    let pa = courtyard_polys[poly_a_idx];
+    let pb = courtyard_polys[poly_b_idx];
+    let na = min(pa.y, 16u);
+    let nb = min(pb.y, 16u);
+    if (na < 3u || nb < 3u) {
+        return false;
+    }
+
+    let rad_a = pose_a.z * 0.0174532925;
+    let sa = sin(rad_a);
+    let ca = cos(rad_a);
+    let flip_a = (u32(round(pose_a.w)) != orig_layer_a);
+
+    var va: array<vec2<f32>, 16>;
+    var min_ax: f32 = 1e30;
+    var max_ax: f32 = -1e30;
+    var min_ay: f32 = 1e30;
+    var max_ay: f32 = -1e30;
+    for (var k: u32 = 0u; k < na; k = k + 1u) {
+        let lv = courtyard_vertices[pa.x + k];
+        let ly = select(lv.y, -lv.y, flip_a);
+        let wx = pose_a.x + (lv.x * ca + ly * sa);
+        let wy = pose_a.y + (-lv.x * sa + ly * ca);
+        va[k] = vec2<f32>(wx, wy);
+        min_ax = min(min_ax, wx);
+        max_ax = max(max_ax, wx);
+        min_ay = min(min_ay, wy);
+        max_ay = max(max_ay, wy);
+    }
+
+    let rad_b = pose_b.z * 0.0174532925;
+    let sb = sin(rad_b);
+    let cb = cos(rad_b);
+    let flip_b = (u32(round(pose_b.w)) != orig_layer_b);
+
+    var vb: array<vec2<f32>, 16>;
+    var min_bx: f32 = 1e30;
+    var max_bx: f32 = -1e30;
+    var min_by: f32 = 1e30;
+    var max_by: f32 = -1e30;
+    for (var k: u32 = 0u; k < nb; k = k + 1u) {
+        let lv = courtyard_vertices[pb.x + k];
+        let ly = select(lv.y, -lv.y, flip_b);
+        let wx = pose_b.x + (lv.x * cb + ly * sb);
+        let wy = pose_b.y + (-lv.x * sb + ly * cb);
+        vb[k] = vec2<f32>(wx, wy);
+        min_bx = min(min_bx, wx);
+        max_bx = max(max_bx, wx);
+        min_by = min(min_by, wy);
+        max_by = max(max_by, wy);
+    }
+
+    if (max_ax <= min_bx || max_bx <= min_ax || max_ay <= min_by || max_by <= min_ay) {
+        return false;
+    }
+
+    for (var i: u32 = 0u; i < na; i = i + 1u) {
+        let p1 = va[i];
+        let p2 = va[(i + 1u) % na];
+        let axis = vec2<f32>(-(p2.y - p1.y), p2.x - p1.x);
+        let axis_len_sq = dot(axis, axis);
+        if (axis_len_sq < 1e-10) {
+            continue;
+        }
+
+        var min_a = dot(va[0], axis);
+        var max_a = min_a;
+        for (var k: u32 = 1u; k < na; k = k + 1u) {
+            let d = dot(va[k], axis);
+            min_a = min(min_a, d);
+            max_a = max(max_a, d);
+        }
+
+        var min_b = dot(vb[0], axis);
+        var max_b = min_b;
+        for (var k: u32 = 1u; k < nb; k = k + 1u) {
+            let d = dot(vb[k], axis);
+            min_b = min(min_b, d);
+            max_b = max(max_b, d);
+        }
+
+        if (max_a <= min_b || max_b <= min_a) {
+            return false;
+        }
+    }
+
+    for (var i: u32 = 0u; i < nb; i = i + 1u) {
+        let p1 = vb[i];
+        let p2 = vb[(i + 1u) % nb];
+        let axis = vec2<f32>(-(p2.y - p1.y), p2.x - p1.x);
+        let axis_len_sq = dot(axis, axis);
+        if (axis_len_sq < 1e-10) {
+            continue;
+        }
+
+        var min_a = dot(va[0], axis);
+        var max_a = min_a;
+        for (var k: u32 = 1u; k < na; k = k + 1u) {
+            let d = dot(va[k], axis);
+            min_a = min(min_a, d);
+            max_a = max(max_a, d);
+        }
+
+        var min_b = dot(vb[0], axis);
+        var max_b = min_b;
+        for (var k: u32 = 1u; k < nb; k = k + 1u) {
+            let d = dot(vb[k], axis);
+            min_b = min(min_b, d);
+            max_b = max(max_b, d);
+        }
+
+        if (max_a <= min_b || max_b <= min_a) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+fn footprints_courtyards_intersect(
+    i: u32,
+    pose_i: vec4<f32>,
+    j: u32,
+    pose_j: vec4<f32>
+) -> bool {
+    let ri = fp_poly_ranges[i];
+    let rj = fp_poly_ranges[j];
+
+    if (ri.z > 0u && rj.z > 0u && u32(round(pose_i.w)) != u32(round(pose_j.w))) {
+        return false;
+    }
+
+    for (var pi: u32 = ri.x; pi < ri.x + ri.y; pi = pi + 1u) {
+        for (var pj: u32 = rj.x; pj < rj.x + rj.y; pj = pj + 1u) {
+            if (sat_polys_intersect(pi, pose_i, ri.w, pj, pose_j, rj.w)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 fn evaluate_chain_state(c_base: u32, nf: u32, ne: u32) -> vec2<f32> {
     var overlap_cost: f32 = 0.0;
     var boundary_cost: f32 = 0.0;
@@ -276,10 +429,14 @@ fn evaluate_chain_state(c_base: u32, nf: u32, ne: u32) -> vec2<f32> {
             }
             let bj = fp_aabb(c_base, j);
             if (bi.z > bj.x && bi.x < bj.z && bi.w > bj.y && bi.y < bj.w) {
-                overlaps = overlaps + 1.0;
-                let ox = max(min(bi.z, bj.z) - max(bi.x, bj.x), 0.1);
-                let oy = max(min(bi.w, bj.w) - max(bi.y, bj.y), 0.1);
-                overlap_cost = overlap_cost + params.overlap_penalty * (1.0 + ox * oy);
+                let pose_i = chain_poses[c_base + i];
+                let pose_j = chain_poses[c_base + j];
+                if (footprints_courtyards_intersect(i, pose_i, j, pose_j)) {
+                    overlaps = overlaps + 1.0;
+                    let ox = max(min(bi.z, bj.z) - max(bi.x, bj.x), 0.1);
+                    let oy = max(min(bi.w, bj.w) - max(bi.y, bj.y), 0.1);
+                    overlap_cost = overlap_cost + params.overlap_penalty * (1.0 + ox * oy);
+                }
             }
         }
     }
@@ -387,17 +544,22 @@ fn evaluate_chain_delta_e(
             continue;
         }
         let bj = fp_aabb(c_base, j);
+        let pose_j = chain_poses[c_base + j];
         if (old_bi.z > bj.x && old_bi.x < bj.z && old_bi.w > bj.y && old_bi.y < bj.w) {
-            delta_ov = delta_ov - 1.0;
-            let ox = max(min(old_bi.z, bj.z) - max(old_bi.x, bj.x), 0.1);
-            let oy = max(min(old_bi.w, bj.w) - max(old_bi.y, bj.y), 0.1);
-            delta_ov_cost = delta_ov_cost - params.overlap_penalty * (1.0 + ox * oy);
+            if (footprints_courtyards_intersect(idx, old_pose, j, pose_j)) {
+                delta_ov = delta_ov - 1.0;
+                let ox = max(min(old_bi.z, bj.z) - max(old_bi.x, bj.x), 0.1);
+                let oy = max(min(old_bi.w, bj.w) - max(old_bi.y, bj.y), 0.1);
+                delta_ov_cost = delta_ov_cost - params.overlap_penalty * (1.0 + ox * oy);
+            }
         }
         if (new_bi.z > bj.x && new_bi.x < bj.z && new_bi.w > bj.y && new_bi.y < bj.w) {
-            delta_ov = delta_ov + 1.0;
-            let ox = max(min(new_bi.z, bj.z) - max(new_bi.x, bj.x), 0.1);
-            let oy = max(min(new_bi.w, bj.w) - max(new_bi.y, bj.y), 0.1);
-            delta_ov_cost = delta_ov_cost + params.overlap_penalty * (1.0 + ox * oy);
+            if (footprints_courtyards_intersect(idx, new_pose, j, pose_j)) {
+                delta_ov = delta_ov + 1.0;
+                let ox = max(min(new_bi.z, bj.z) - max(new_bi.x, bj.x), 0.1);
+                let oy = max(min(new_bi.w, bj.w) - max(new_bi.y, bj.y), 0.1);
+                delta_ov_cost = delta_ov_cost + params.overlap_penalty * (1.0 + ox * oy);
+            }
         }
     }
 
@@ -2134,6 +2296,43 @@ pub struct GpuSaParams {
     pub base_temp: f32,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct GpuCourtyardBuffers {
+    /// Per-footprint polygon ranges: [poly_start, poly_count, is_smd_only, orig_layer]
+    pub fp_poly_ranges: Vec<[u32; 4]>,
+    /// Courtyard polygon headers: [vertex_start, vertex_count, fp_idx, 0]
+    pub courtyard_polys: Vec<[u32; 4]>,
+    /// Local vertex coordinates [x, y] in mm (pre-expanded by clearance/spacing)
+    pub courtyard_vertices: Vec<[f32; 2]>,
+}
+
+impl GpuCourtyardBuffers {
+    pub fn from_fp_descs(fp_descs: &[[f32; 4]]) -> Self {
+        let mut fp_poly_ranges = Vec::with_capacity(fp_descs.len());
+        let mut courtyard_polys = Vec::with_capacity(fp_descs.len());
+        let mut courtyard_vertices = Vec::with_capacity(fp_descs.len() * 4);
+
+        for (i, d) in fp_descs.iter().enumerate() {
+            let poly_start = courtyard_polys.len() as u32;
+            let v_start = courtyard_vertices.len() as u32;
+            let hw = d[0].max(0.1);
+            let hh = d[1].max(0.1);
+            courtyard_vertices.push([-hw, -hh]);
+            courtyard_vertices.push([hw, -hh]);
+            courtyard_vertices.push([hw, hh]);
+            courtyard_vertices.push([-hw, hh]);
+            courtyard_polys.push([v_start, 4, i as u32, 0]);
+            fp_poly_ranges.push([poly_start, 1, 0, 0]);
+        }
+
+        Self {
+            fp_poly_ranges,
+            courtyard_polys,
+            courtyard_vertices,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuBackendKind {
     Vulkan,
@@ -2545,6 +2744,36 @@ impl VulkanEngine {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -3453,6 +3682,7 @@ impl VulkanEngine {
         init_poses: &[[f32; 4]],
         params: &GpuSaParams,
         num_passes: u32,
+        courtyards: Option<&GpuCourtyardBuffers>,
     ) -> Option<(Vec<[f32; 4]>, Vec<[f32; 4]>)> {
         let nc = params.num_chains as usize;
         let nf = params.num_footprints as usize;
@@ -3461,9 +3691,18 @@ impl VulkanEngine {
             return None;
         }
 
+        let default_courtyards;
+        let cyd = match courtyards {
+            Some(c) if c.fp_poly_ranges.len() == nf && !c.courtyard_polys.is_empty() && !c.courtyard_vertices.is_empty() => c,
+            _ => {
+                default_courtyards = GpuCourtyardBuffers::from_fp_descs(fp_descs);
+                &default_courtyards
+            }
+        };
+
         if self.backend_kind == GpuBackendKind::CudaPtx {
             if let Some(cuda) = &self.cuda_engine {
-                if let Some(res) = cuda.run_gpu_sa_placer_chains(fp_descs, edges, init_poses, params, num_passes) {
+                if let Some(res) = cuda.run_gpu_sa_placer_chains(fp_descs, edges, init_poses, params, num_passes, Some(cyd)) {
                     self.compute_busy_ns.fetch_add(cuda.compute_busy_ns.load(Ordering::Relaxed), Ordering::Relaxed);
                     return Some(res);
                 }
@@ -3509,6 +3748,24 @@ impl VulkanEngine {
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
+        let poly_ranges_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("SA FP Poly Ranges Buffer"),
+            contents: bytemuck::cast_slice(&cyd.fp_poly_ranges),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let polys_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("SA Courtyard Polys Buffer"),
+            contents: bytemuck::cast_slice(&cyd.courtyard_polys),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let verts_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("SA Courtyard Vertices Buffer"),
+            contents: bytemuck::cast_slice(&cyd.courtyard_vertices),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
         let best_poses_bytes = (nc * nf * std::mem::size_of::<[f32; 4]>()) as u64;
         let scores_bytes = (nc * std::mem::size_of::<[f32; 4]>()) as u64;
 
@@ -3549,6 +3806,18 @@ impl VulkanEngine {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: param_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: poly_ranges_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: polys_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: verts_buf.as_entire_binding(),
                 },
             ],
         });
@@ -3611,6 +3880,9 @@ impl VulkanEngine {
         fp_buf.destroy();
         edges_buf.destroy();
         param_buf.destroy();
+        poly_ranges_buf.destroy();
+        polys_buf.destroy();
+        verts_buf.destroy();
 
         result
     }
@@ -5453,7 +5725,7 @@ mod tests {
             passive_max_dist: 3.5,
             base_temp: 5.0,
         };
-        assert!(vk.run_gpu_sa_placer_chains(&[], &[], &[], &sa_params, 1).is_none());
+        assert!(vk.run_gpu_sa_placer_chains(&[], &[], &[], &sa_params, 1, None).is_none());
         let fp_descs = vec![[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 0.0, 0.0]];
         let edges = vec![[0.0, 0.5, 0.0, 0.0], [1.0, -0.5, 0.0, 0.0]];
         let mut init_poses = Vec::with_capacity(64 * 2);
@@ -5462,7 +5734,7 @@ mod tests {
             init_poses.push([12.0, 12.0, 0.0, 0.0]);
         }
         let (best_poses, best_scores) = vk
-            .run_gpu_sa_placer_chains(&fp_descs, &edges, &init_poses, &sa_params, 2)
+            .run_gpu_sa_placer_chains(&fp_descs, &edges, &init_poses, &sa_params, 2, None)
             .expect("GPU SA placer chains output");
         assert_eq!(best_poses.len(), 64 * 2);
         assert_eq!(best_scores.len(), 64);
@@ -5736,6 +6008,184 @@ mod tests {
             }
         }
         assert_eq!(path_wgsl.len(), path_dispatch.len());
+    }
+
+    #[test]
+    fn test_vulkan_gpu_sat_courtyard_overlap_exact_equivalence() {
+        use crate::board::{Point, Polygon};
+
+        let vk = match VulkanEngine::new() {
+            Some(v) => v,
+            None => return,
+        };
+
+        // Scenario 1: Rotated 45-degree squares
+        let poly_a_local = Polygon::new(vec![
+            Point::new(-1.0, -1.0),
+            Point::new(1.0, -1.0),
+            Point::new(1.0, 1.0),
+            Point::new(-1.0, 1.0),
+        ]);
+        let poly_b_local = poly_a_local.clone();
+
+        let poly_a_world = poly_a_local.transform(Point::new(5.0, 5.0), 45.0);
+        let poly_b_world_sep = poly_b_local.transform(Point::new(7.0, 7.0), 45.0);
+        let poly_b_world_int = poly_b_local.transform(Point::new(6.0, 6.0), 45.0);
+
+        // Verify CPU SAT baseline
+        assert!(poly_a_world.aabb().overlaps(&poly_b_world_sep.aabb()), "Broadphase AABB must overlap for test validity");
+        assert!(!poly_a_world.intersects_convex(&poly_b_world_sep), "CPU SAT must find separation along 45-deg edge normals");
+        assert!(poly_a_world.intersects_convex(&poly_b_world_int), "CPU SAT must detect collision when moved closer");
+
+        // Construct GPU courtyard buffers
+        let fp_descs = vec![[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0]];
+        let edges = vec![];
+
+        let courtyards = GpuCourtyardBuffers {
+            fp_poly_ranges: vec![
+                [0, 1, 0, 0],
+                [1, 1, 0, 0],
+            ],
+            courtyard_polys: vec![
+                [0, 4, 0, 0],
+                [4, 4, 1, 0],
+            ],
+            courtyard_vertices: vec![
+                [-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0],
+                [-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0],
+            ],
+        };
+
+        let sa_params = GpuSaParams {
+            num_chains: 64,
+            num_footprints: 2,
+            num_edges: 0,
+            steps_per_pass: 0,
+            seed: 12345,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+            board_min_x: 0.0,
+            board_min_y: 0.0,
+            board_max_x: 20.0,
+            board_max_y: 20.0,
+            grid_step: 0.5,
+            wirelength_weight: 1.0,
+            crossing_weight: 200.0,
+            overlap_penalty: 25000.0,
+            boundary_penalty: 50000.0,
+            passive_affinity_weight: 80.0,
+            passive_max_dist: 3.5,
+            base_temp: 5.0,
+        };
+
+        // Test Separated rotated squares on GPU
+        let mut poses_sep = Vec::with_capacity(64 * 2);
+        for _ in 0..64 {
+            poses_sep.push([5.0, 5.0, 45.0, 0.0]);
+            poses_sep.push([7.0, 7.0, 45.0, 0.0]);
+        }
+        let (_, scores_sep) = vk
+            .run_gpu_sa_placer_chains(&fp_descs, &edges, &poses_sep, &sa_params, 1, Some(&courtyards))
+            .expect("GPU SA placer chains output");
+        assert_eq!(scores_sep[0][2], 0.0, "GPU exact SAT must report 0 overlaps for separated 45-deg squares despite AABB overlap");
+
+        // Test Intersecting rotated squares on GPU
+        let mut poses_int = Vec::with_capacity(64 * 2);
+        for _ in 0..64 {
+            poses_int.push([5.0, 5.0, 45.0, 0.0]);
+            poses_int.push([6.0, 6.0, 45.0, 0.0]);
+        }
+        let (_, scores_int) = vk
+            .run_gpu_sa_placer_chains(&fp_descs, &edges, &poses_int, &sa_params, 1, Some(&courtyards))
+            .expect("GPU SA placer chains output");
+        assert_eq!(scores_int[0][2], 1.0, "GPU exact SAT must report 1 overlap for intersecting 45-deg squares");
+
+        // Scenario 2: Multi-polygon L-shape footprint
+        let l_poly0 = Polygon::new(vec![Point::new(-2.0, -2.0), Point::new(2.0, -2.0), Point::new(2.0, 0.0), Point::new(-2.0, 0.0)]);
+        let l_poly1 = Polygon::new(vec![Point::new(-2.0, 0.0), Point::new(0.0, 0.0), Point::new(0.0, 2.0), Point::new(-2.0, 2.0)]);
+        let box_sep = Polygon::new(vec![Point::new(0.6, 0.6), Point::new(1.4, 0.6), Point::new(1.4, 1.4), Point::new(0.6, 1.4)]);
+        let box_int = Polygon::new(vec![Point::new(-1.0, 0.6), Point::new(-0.2, 0.6), Point::new(-0.2, 1.4), Point::new(-1.0, 1.4)]);
+
+        assert!(!l_poly0.intersects_convex(&box_sep) && !l_poly1.intersects_convex(&box_sep), "CPU: box in empty corner must not collide");
+        assert!(l_poly1.intersects_convex(&box_int), "CPU: box overlapping arm must collide");
+
+        let l_courtyards = GpuCourtyardBuffers {
+            fp_poly_ranges: vec![
+                [0, 2, 0, 0],
+                [2, 1, 0, 0],
+            ],
+            courtyard_polys: vec![
+                [0, 4, 0, 0],
+                [4, 4, 0, 0],
+                [8, 4, 1, 0],
+            ],
+            courtyard_vertices: vec![
+                [-2.0, -2.0], [2.0, -2.0], [2.0, 0.0], [-2.0, 0.0],
+                [-2.0, 0.0], [0.0, 0.0], [0.0, 2.0], [-2.0, 2.0],
+                [-0.4, -0.4], [0.4, -0.4], [0.4, 0.4], [-0.4, 0.4],
+            ],
+        };
+
+        let l_fp_descs = vec![[2.0, 2.0, 0.0, 0.0], [0.4, 0.4, 0.0, 0.0]];
+        let mut l_poses_sep = Vec::with_capacity(64 * 2);
+        for _ in 0..64 {
+            l_poses_sep.push([10.0, 10.0, 0.0, 0.0]);
+            l_poses_sep.push([11.0, 11.0, 0.0, 0.0]);
+        }
+        let (_, l_scores_sep) = vk
+            .run_gpu_sa_placer_chains(&l_fp_descs, &edges, &l_poses_sep, &sa_params, 1, Some(&l_courtyards))
+            .expect("Multi-polygon GPU test");
+        assert_eq!(l_scores_sep[0][2], 0.0, "Multi-polygon GPU SAT must not report overlap for component placed in L-corner concavity");
+
+        let mut l_poses_int = Vec::with_capacity(64 * 2);
+        for _ in 0..64 {
+            l_poses_int.push([10.0, 10.0, 0.0, 0.0]);
+            l_poses_int.push([9.0, 11.0, 0.0, 0.0]);
+        }
+        let (_, l_scores_int) = vk
+            .run_gpu_sa_placer_chains(&l_fp_descs, &edges, &l_poses_int, &sa_params, 1, Some(&l_courtyards))
+            .expect("Multi-polygon GPU test");
+        assert_eq!(l_scores_int[0][2], 1.0, "Multi-polygon GPU SAT must report overlap when hitting L-arm");
+
+        // Scenario 3: SMD-only layer isolation
+        let smd_courtyards = GpuCourtyardBuffers {
+            fp_poly_ranges: vec![
+                [0, 1, 1, 0],
+                [1, 1, 1, 1],
+            ],
+            courtyard_polys: vec![
+                [0, 4, 0, 0],
+                [4, 4, 1, 0],
+            ],
+            courtyard_vertices: vec![
+                [-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0],
+                [-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0],
+            ],
+        };
+        let mut smd_poses = Vec::with_capacity(64 * 2);
+        for _ in 0..64 {
+            smd_poses.push([10.0, 10.0, 0.0, 0.0]);
+            smd_poses.push([10.0, 10.0, 0.0, 1.0]);
+        }
+        let (_, smd_scores) = vk
+            .run_gpu_sa_placer_chains(&fp_descs, &edges, &smd_poses, &sa_params, 1, Some(&smd_courtyards))
+            .expect("SMD layer test");
+        assert_eq!(smd_scores[0][2], 0.0, "SMD components on opposite layers must not collide");
+
+        // If FP 0 is Through-Hole (is_smd_only = 0), it penetrates both layers and MUST collide!
+        let th_courtyards = GpuCourtyardBuffers {
+            fp_poly_ranges: vec![
+                [0, 1, 0, 0],
+                [1, 1, 1, 1],
+            ],
+            courtyard_polys: smd_courtyards.courtyard_polys.clone(),
+            courtyard_vertices: smd_courtyards.courtyard_vertices.clone(),
+        };
+        let (_, th_scores) = vk
+            .run_gpu_sa_placer_chains(&fp_descs, &edges, &smd_poses, &sa_params, 1, Some(&th_courtyards))
+            .expect("Through-Hole layer test");
+        assert_eq!(th_scores[0][2], 1.0, "Through-Hole component must collide with bottom-layer SMD component");
     }
 }
 

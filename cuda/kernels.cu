@@ -768,6 +768,155 @@ __device__ __forceinline__ float4 fp_aabb(
     return make_float4(pose.x - hw, pose.y - hh, pose.x + hw, pose.y + hh);
 }
 
+__device__ __forceinline__ bool sat_polys_intersect(
+    unsigned int poly_a_idx,
+    float4 pose_a,
+    unsigned int orig_layer_a,
+    unsigned int poly_b_idx,
+    float4 pose_b,
+    unsigned int orig_layer_b,
+    const uint4* __restrict__ courtyard_polys,
+    const float2* __restrict__ courtyard_vertices
+) {
+    uint4 pa = courtyard_polys[poly_a_idx];
+    uint4 pb = courtyard_polys[poly_b_idx];
+    unsigned int na = pa.y < 16u ? pa.y : 16u;
+    unsigned int nb = pb.y < 16u ? pb.y : 16u;
+    if (na < 3u || nb < 3u) {
+        return false;
+    }
+
+    float rad_a = pose_a.z * 0.0174532925f;
+    float sa, ca;
+    __sincosf(rad_a, &sa, &ca);
+    bool flip_a = ((unsigned int)roundf(pose_a.w) != orig_layer_a);
+
+    float2 va[16];
+    float min_ax = 1e30f, max_ax = -1e30f, min_ay = 1e30f, max_ay = -1e30f;
+    for (unsigned int k = 0u; k < na; ++k) {
+        float2 lv = courtyard_vertices[pa.x + k];
+        float ly = flip_a ? -lv.y : lv.y;
+        float wx = pose_a.x + (lv.x * ca + ly * sa);
+        float wy = pose_a.y + (-lv.x * sa + ly * ca);
+        va[k] = make_float2(wx, wy);
+        min_ax = fminf(min_ax, wx);
+        max_ax = fmaxf(max_ax, wx);
+        min_ay = fminf(min_ay, wy);
+        max_ay = fmaxf(max_ay, wy);
+    }
+
+    float rad_b = pose_b.z * 0.0174532925f;
+    float sb, cb;
+    __sincosf(rad_b, &sb, &cb);
+    bool flip_b = ((unsigned int)roundf(pose_b.w) != orig_layer_b);
+
+    float2 vb[16];
+    float min_bx = 1e30f, max_bx = -1e30f, min_by = 1e30f, max_by = -1e30f;
+    for (unsigned int k = 0u; k < nb; ++k) {
+        float2 lv = courtyard_vertices[pb.x + k];
+        float ly = flip_b ? -lv.y : lv.y;
+        float wx = pose_b.x + (lv.x * cb + ly * sb);
+        float wy = pose_b.y + (-lv.x * sb + ly * cb);
+        vb[k] = make_float2(wx, wy);
+        min_bx = fminf(min_bx, wx);
+        max_bx = fmaxf(max_bx, wx);
+        min_by = fminf(min_by, wy);
+        max_by = fmaxf(max_by, wy);
+    }
+
+    if (max_ax <= min_bx || max_bx <= min_ax || max_ay <= min_by || max_by <= min_ay) {
+        return false;
+    }
+
+    for (unsigned int i = 0u; i < na; ++i) {
+        float2 p1 = va[i];
+        float2 p2 = va[(i + 1u) % na];
+        float2 axis = make_float2(-(p2.y - p1.y), p2.x - p1.x);
+        float axis_len_sq = axis.x * axis.x + axis.y * axis.y;
+        if (axis_len_sq < 1e-10f) {
+            continue;
+        }
+
+        float min_a = va[0].x * axis.x + va[0].y * axis.y;
+        float max_a = min_a;
+        for (unsigned int k = 1u; k < na; ++k) {
+            float d = va[k].x * axis.x + va[k].y * axis.y;
+            min_a = fminf(min_a, d);
+            max_a = fmaxf(max_a, d);
+        }
+
+        float min_b = vb[0].x * axis.x + vb[0].y * axis.y;
+        float max_b = min_b;
+        for (unsigned int k = 1u; k < nb; ++k) {
+            float d = vb[k].x * axis.x + vb[k].y * axis.y;
+            min_b = fminf(min_b, d);
+            max_b = fmaxf(max_b, d);
+        }
+
+        if (max_a <= min_b || max_b <= min_a) {
+            return false;
+        }
+    }
+
+    for (unsigned int i = 0u; i < nb; ++i) {
+        float2 p1 = vb[i];
+        float2 p2 = vb[(i + 1u) % nb];
+        float2 axis = make_float2(-(p2.y - p1.y), p2.x - p1.x);
+        float axis_len_sq = axis.x * axis.x + axis.y * axis.y;
+        if (axis_len_sq < 1e-10f) {
+            continue;
+        }
+
+        float min_a = va[0].x * axis.x + va[0].y * axis.y;
+        float max_a = min_a;
+        for (unsigned int k = 1u; k < na; ++k) {
+            float d = va[k].x * axis.x + va[k].y * axis.y;
+            min_a = fminf(min_a, d);
+            max_a = fmaxf(max_a, d);
+        }
+
+        float min_b = vb[0].x * axis.x + vb[0].y * axis.y;
+        float max_b = min_b;
+        for (unsigned int k = 1u; k < nb; ++k) {
+            float d = vb[k].x * axis.x + vb[k].y * axis.y;
+            min_b = fminf(min_b, d);
+            max_b = fmaxf(max_b, d);
+        }
+
+        if (max_a <= min_b || max_b <= min_a) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+__device__ __forceinline__ bool footprints_courtyards_intersect(
+    unsigned int i,
+    float4 pose_i,
+    unsigned int j,
+    float4 pose_j,
+    const uint4* __restrict__ fp_poly_ranges,
+    const uint4* __restrict__ courtyard_polys,
+    const float2* __restrict__ courtyard_vertices
+) {
+    uint4 ri = fp_poly_ranges[i];
+    uint4 rj = fp_poly_ranges[j];
+
+    if (ri.z > 0u && rj.z > 0u && (unsigned int)roundf(pose_i.w) != (unsigned int)roundf(pose_j.w)) {
+        return false;
+    }
+
+    for (unsigned int pi = ri.x; pi < ri.x + ri.y; ++pi) {
+        for (unsigned int pj = rj.x; pj < rj.x + rj.y; ++pj) {
+            if (sat_polys_intersect(pi, pose_i, ri.w, pj, pose_j, rj.w, courtyard_polys, courtyard_vertices)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 __device__ float2 evaluate_chain_state_fast(
     const float4* __restrict__ chain_poses,
     const float4* __restrict__ fp_descs,
@@ -784,7 +933,10 @@ __device__ float2 evaluate_chain_state_fast(
     float ov_penalty,
     float bd_penalty,
     float pass_aff_weight,
-    float pass_max_d
+    float pass_max_d,
+    const uint4* __restrict__ fp_poly_ranges,
+    const uint4* __restrict__ courtyard_polys,
+    const float2* __restrict__ courtyard_vertices
 ) {
     float overlap_cost = 0.0f;
     float boundary_cost = 0.0f;
@@ -806,10 +958,14 @@ __device__ float2 evaluate_chain_state_fast(
             }
             float4 bj = fp_aabb(chain_poses, fp_descs, c_base, j);
             if (bi.z > bj.x && bi.x < bj.z && bi.w > bj.y && bi.y < bj.w) {
-                overlaps += 1.0f;
-                float ox = fmaxf(fminf(bi.z, bj.z) - fmaxf(bi.x, bj.x), 0.1f);
-                float oy = fmaxf(fminf(bi.w, bj.w) - fmaxf(bi.y, bj.y), 0.1f);
-                overlap_cost += ov_penalty * (1.0f + ox * oy);
+                float4 pose_i = chain_poses[c_base + i];
+                float4 pose_j = chain_poses[c_base + j];
+                if (footprints_courtyards_intersect(i, pose_i, j, pose_j, fp_poly_ranges, courtyard_polys, courtyard_vertices)) {
+                    overlaps += 1.0f;
+                    float ox = fmaxf(fminf(bi.z, bj.z) - fmaxf(bi.x, bj.x), 0.1f);
+                    float oy = fmaxf(fminf(bi.w, bj.w) - fmaxf(bi.y, bj.y), 0.1f);
+                    overlap_cost += ov_penalty * (1.0f + ox * oy);
+                }
             }
         }
     }
@@ -860,7 +1016,10 @@ __global__ void gpu_sa_placer_kernel(
     float4* __restrict__ chain_poses,
     float4* __restrict__ chain_scores,
     GpuSaParams params,
-    unsigned int num_passes
+    unsigned int num_passes,
+    const uint4* __restrict__ fp_poly_ranges,
+    const uint4* __restrict__ courtyard_polys,
+    const float2* __restrict__ courtyard_vertices
 ) {
     unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= params.num_chains) {
@@ -892,7 +1051,8 @@ __global__ void gpu_sa_placer_kernel(
             chain_poses, fp_descs, edges, c_base, nf, ne,
             b_min_x, b_min_y, b_max_x, b_max_y,
             wl_weight, cr_weight, ov_penalty, bd_penalty,
-            pass_aff_weight, pass_max_d
+            pass_aff_weight, pass_max_d,
+            fp_poly_ranges, courtyard_polys, courtyard_vertices
         );
         score = make_float4(init_ev.x, init_ev.x, init_ev.y, 1.0f);
         for (unsigned int i = 0u; i < nf; ++i) {
@@ -943,7 +1103,8 @@ __global__ void gpu_sa_placer_kernel(
                 chain_poses, fp_descs, edges, c_base, nf, ne,
                 b_min_x, b_min_y, b_max_x, b_max_y,
                 wl_weight, cr_weight, ov_penalty, bd_penalty,
-                pass_aff_weight, pass_max_d
+                pass_aff_weight, pass_max_d,
+                fp_poly_ranges, courtyard_polys, courtyard_vertices
             );
             float new_cost = ev.x;
             float new_ov = ev.y;
@@ -1030,7 +1191,10 @@ __device__ float2 evaluate_chain_delta_e(
     float ov_penalty,
     float bd_penalty,
     float pass_aff_weight,
-    float pass_max_d
+    float pass_max_d,
+    const uint4* __restrict__ fp_poly_ranges,
+    const uint4* __restrict__ courtyard_polys,
+    const float2* __restrict__ courtyard_vertices
 ) {
     float4 desc_i = fp_descs[idx];
     bool i_locked = desc_i.z > 0.5f;
@@ -1070,17 +1234,22 @@ __device__ float2 evaluate_chain_delta_e(
             continue;
         }
         float4 bj = fp_aabb_fast(chain_poses, fp_descs, c_base, j);
+        float4 pose_j = chain_poses[c_base + j];
         if (old_bi.z > bj.x && old_bi.x < bj.z && old_bi.w > bj.y && old_bi.y < bj.w) {
-            delta_ov -= 1.0f;
-            float ox = fmaxf(fminf(old_bi.z, bj.z) - fmaxf(old_bi.x, bj.x), 0.1f);
-            float oy = fmaxf(fminf(old_bi.w, bj.w) - fmaxf(old_bi.y, bj.y), 0.1f);
-            delta_ov_cost -= ov_penalty * (1.0f + ox * oy);
+            if (footprints_courtyards_intersect(idx, old_pose, j, pose_j, fp_poly_ranges, courtyard_polys, courtyard_vertices)) {
+                delta_ov -= 1.0f;
+                float ox = fmaxf(fminf(old_bi.z, bj.z) - fmaxf(old_bi.x, bj.x), 0.1f);
+                float oy = fmaxf(fminf(old_bi.w, bj.w) - fmaxf(old_bi.y, bj.y), 0.1f);
+                delta_ov_cost -= ov_penalty * (1.0f + ox * oy);
+            }
         }
         if (new_bi.z > bj.x && new_bi.x < bj.z && new_bi.w > bj.y && new_bi.y < bj.w) {
-            delta_ov += 1.0f;
-            float ox = fmaxf(fminf(new_bi.z, bj.z) - fmaxf(new_bi.x, bj.x), 0.1f);
-            float oy = fmaxf(fminf(new_bi.w, bj.w) - fmaxf(new_bi.y, bj.y), 0.1f);
-            delta_ov_cost += ov_penalty * (1.0f + ox * oy);
+            if (footprints_courtyards_intersect(idx, new_pose, j, pose_j, fp_poly_ranges, courtyard_polys, courtyard_vertices)) {
+                delta_ov += 1.0f;
+                float ox = fmaxf(fminf(new_bi.z, bj.z) - fmaxf(new_bi.x, bj.x), 0.1f);
+                float oy = fmaxf(fminf(new_bi.w, bj.w) - fmaxf(new_bi.y, bj.y), 0.1f);
+                delta_ov_cost += ov_penalty * (1.0f + ox * oy);
+            }
         }
     }
 
@@ -1236,7 +1405,10 @@ __global__ void gpu_sa_placer_delta_e_kernel(
     float4* __restrict__ chain_poses,
     float4* __restrict__ chain_scores,
     GpuSaParams params,
-    unsigned int num_passes
+    unsigned int num_passes,
+    const uint4* __restrict__ fp_poly_ranges,
+    const uint4* __restrict__ courtyard_polys,
+    const float2* __restrict__ courtyard_vertices
 ) {
     __shared__ float4 s_fp_descs[128];
     __shared__ float4 s_edges[512];
@@ -1299,7 +1471,8 @@ __global__ void gpu_sa_placer_delta_e_kernel(
             active_poses, active_fp_descs, active_edges, active_c_base, nf, ne,
             b_min_x, b_min_y, b_max_x, b_max_y,
             wl_weight, cr_weight, ov_penalty, bd_penalty,
-            pass_aff_weight, pass_max_d
+            pass_aff_weight, pass_max_d,
+            fp_poly_ranges, courtyard_polys, courtyard_vertices
         );
         score = make_float4(init_ev.x, init_ev.x, init_ev.y, 1.0f);
         for (unsigned int i = 0u; i < nf; ++i) {
@@ -1358,7 +1531,8 @@ __global__ void gpu_sa_placer_delta_e_kernel(
                 idx, old_pose, new_pose,
                 b_min_x, b_min_y, b_max_x, b_max_y,
                 wl_weight, cr_weight, ov_penalty, bd_penalty,
-                pass_aff_weight, pass_max_d
+                pass_aff_weight, pass_max_d,
+                fp_poly_ranges, courtyard_polys, courtyard_vertices
             );
             float delta = d_ev.x;
             float new_cost = score.x + delta;
@@ -1397,7 +1571,10 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
     float4* __restrict__ chain_poses,
     float4* __restrict__ chain_scores,
     GpuSaParams params,
-    unsigned int num_passes
+    unsigned int num_passes,
+    const uint4* __restrict__ fp_poly_ranges,
+    const uint4* __restrict__ courtyard_polys,
+    const float2* __restrict__ courtyard_vertices
 ) {
     __shared__ float4 s_fp_descs[128];
     __shared__ float4 s_edges[512];
@@ -1457,7 +1634,8 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
                 active_poses, active_fp_descs, active_edges, active_c_base, nf, ne,
                 b_min_x, b_min_y, b_max_x, b_max_y,
                 wl_weight, cr_weight, ov_penalty, bd_penalty,
-                pass_aff_weight, pass_max_d
+                pass_aff_weight, pass_max_d,
+                fp_poly_ranges, courtyard_polys, courtyard_vertices
             );
             score = make_float4(init_ev.x, init_ev.x, init_ev.y, 1.0f);
             for (unsigned int i = 0u; i < nf; ++i) {
@@ -1541,7 +1719,8 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
                     idx, old_pose, new_pose,
                     b_min_x, b_min_y, b_max_x, b_max_y,
                     wl_weight, cr_weight, ov_penalty, bd_penalty,
-                    pass_aff_weight, pass_max_d
+                    pass_aff_weight, pass_max_d,
+                    fp_poly_ranges, courtyard_polys, courtyard_vertices
                 );
                 float delta = d_ev.x + (tc_d0 + tc_d1 + tc_d2 + tc_d3) * 0.0f;
                 float new_cost = score.x + delta;

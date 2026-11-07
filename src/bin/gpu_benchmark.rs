@@ -264,10 +264,10 @@ fn main() {
     println!("--- 5. GPU SA Placer Chains Throughput (64 chains, 60 footprints, 150 edges) ---");
     let (fp_descs, edges, init_poses, sa_params) = generate_sa_chains_data(64, 60, 150);
     let vk_sa = measure_fn(|| {
-        let _ = vk.run_gpu_sa_placer_chains(&fp_descs, &edges, &init_poses, &sa_params, 4);
+        let _ = vk.run_gpu_sa_placer_chains(&fp_descs, &edges, &init_poses, &sa_params, 4, None);
     }, 2, 10);
     let cu_sa = measure_fn(|| {
-        let _ = cuda.run_gpu_sa_placer_chains(&fp_descs, &edges, &init_poses, &sa_params, 4);
+        let _ = cuda.run_gpu_sa_placer_chains(&fp_descs, &edges, &init_poses, &sa_params, 4, None);
     }, 2, 10);
     let sa_speedup = vk_sa.mean_ms / cu_sa.mean_ms;
     println!("  Vulkan SA Chains:   {:.3} ms", vk_sa.mean_ms);
