@@ -3920,57 +3920,284 @@ impl Board {
 
     pub fn load_schematic_clusters(&mut self, sch_path: &Path) {
         let Ok(content) = fs::read_to_string(sch_path) else { return };
-        let mut headers: Vec<(String, f64, f64)> = Vec::new();
+
+        // Helper to skip lib_symbols block (contains symbol graphic drawings rather than placed schematic instances)
+        let sch_body = if let Some(start) = content.find("(lib_symbols") {
+            let mut depth = 0;
+            let mut end = start;
+            for (i, b) in content[start..].bytes().enumerate() {
+                if b == b'(' {
+                    depth += 1;
+                } else if b == b')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i + 1;
+                        break;
+                    }
+                }
+            }
+            &content[end..]
+        } else {
+            &content[..]
+        };
+
+        // 1. Parse placed symbols on root schematic
+        let mut placed_symbols = Vec::new();
+        let mut s_idx = 0;
+        while let Some(pos) = sch_body[s_idx..].find("(symbol") {
+            let actual = s_idx + pos;
+            let after = actual + 7;
+            if after < sch_body.len() && sch_body.as_bytes()[after].is_ascii_whitespace() {
+                let win = &sch_body[actual..(actual + 1500).min(sch_body.len())];
+                if win.contains("(lib_id ") {
+                    if let (Some((sx, sy, _)), Some(r)) = (parse_at_xy_rot(win), extract_property(win, "Reference")) {
+                        if !r.starts_with('#') {
+                            self.schematic_positions.insert(r.clone(), (sx, sy));
+                            placed_symbols.push((r, sx, sy));
+                        }
+                    }
+                }
+            }
+            s_idx = actual + 7;
+        }
+
+        // 2. Parse candidate functional boxes: hierarchical sheets, polylines, and rectangles
+        struct CandidateBox {
+            name: Option<String>,
+            min_x: f64,
+            min_y: f64,
+            max_x: f64,
+            max_y: f64,
+            members: Vec<String>,
+        }
+        let mut boxes: Vec<CandidateBox> = Vec::new();
+
+        // 2a. Hierarchical sub-sheets: (sheet (at X Y) (size W H) ... (property "Sheetname" "...") (property "Sheetfile" "..."))
+        let mut sh_idx = 0;
+        while let Some(pos) = sch_body[sh_idx..].find("(sheet") {
+            let actual = sh_idx + pos;
+            let after = actual + 6;
+            if after < sch_body.len() && sch_body.as_bytes()[after].is_ascii_whitespace() {
+                let win = &sch_body[actual..(actual + 2000).min(sch_body.len())];
+                let name = extract_property(win, "Sheetname").or_else(|| extract_property(win, "Sheetfile"));
+                let mut members = Vec::new();
+                if let Some(sheetfile) = extract_property(win, "Sheetfile") {
+                    let subsheet_path = sch_path.parent().unwrap_or_else(|| Path::new("")).join(&sheetfile);
+                    if let Ok(sub_content) = fs::read_to_string(&subsheet_path) {
+                        let mut sub_s_idx = 0;
+                        while let Some(sub_pos) = sub_content[sub_s_idx..].find("(symbol") {
+                            let sub_act = sub_s_idx + sub_pos;
+                            let sub_win = &sub_content[sub_act..(sub_act + 1500).min(sub_content.len())];
+                            if sub_win.contains("(lib_id ") {
+                                if let (Some((sx, sy, _)), Some(r)) = (parse_at_xy_rot(sub_win), extract_property(sub_win, "Reference")) {
+                                    if !r.starts_with('#') {
+                                        self.schematic_positions.insert(r.clone(), (sx, sy));
+                                        members.push(r);
+                                    }
+                                }
+                            }
+                            sub_s_idx = sub_act + 7;
+                        }
+                    }
+                }
+                let (at_x, at_y) = extract_point(win, "at").unwrap_or((0.0, 0.0));
+                let (size_w, size_h) = extract_point(win, "size").unwrap_or((0.0, 0.0));
+                boxes.push(CandidateBox {
+                    name,
+                    min_x: at_x,
+                    min_y: at_y,
+                    max_x: at_x + size_w,
+                    max_y: at_y + size_h,
+                    members,
+                });
+            }
+            sh_idx = actual + 6;
+        }
+
+        // 2b. Closed polylines (pts (xy ...) ...) forming bounding boxes (width >= 5.0, height >= 5.0)
+        let mut p_idx = 0;
+        while let Some(pos) = sch_body[p_idx..].find("(polyline") {
+            let actual = p_idx + pos;
+            let win = &sch_body[actual..(actual + 2000).min(sch_body.len())];
+            if let Some(pts_start) = win.find("(pts") {
+                let mut depth = 0;
+                let mut pts_end = pts_start;
+                for (i, b) in win[pts_start..].bytes().enumerate() {
+                    if b == b'(' {
+                        depth += 1;
+                    } else if b == b')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            pts_end = pts_start + i + 1;
+                            break;
+                        }
+                    }
+                }
+                let pts_str = &win[pts_start..pts_end];
+                let mut xs = Vec::new();
+                let mut ys = Vec::new();
+                let mut xy_idx = 0;
+                while let Some(xy_pos) = pts_str[xy_idx..].find("(xy ") {
+                    let start = xy_idx + xy_pos + 4;
+                    let close = pts_str[start..].find(')').map(|i| start + i).unwrap_or(pts_str.len());
+                    let parts: Vec<&str> = pts_str[start..close].split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        if let (Ok(x), Ok(y)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
+                            xs.push(x);
+                            ys.push(y);
+                        }
+                    }
+                    xy_idx = close;
+                }
+                if xs.len() >= 4 {
+                    let min_x = xs.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let max_x = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let min_y = ys.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let max_y = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    if (max_x - min_x) >= 5.0 && (max_y - min_y) >= 5.0 {
+                        boxes.push(CandidateBox {
+                            name: None,
+                            min_x,
+                            min_y,
+                            max_x,
+                            max_y,
+                            members: Vec::new(),
+                        });
+                    }
+                }
+            }
+            p_idx = actual + 9;
+        }
+
+        // 2c. Rectangles (rectangle (start ...) (end ...)) (width >= 5.0, height >= 5.0)
+        let mut r_idx = 0;
+        while let Some(pos) = sch_body[r_idx..].find("(rectangle") {
+            let actual = r_idx + pos;
+            let win = &sch_body[actual..(actual + 500).min(sch_body.len())];
+            if let (Some((x1, y1)), Some((x2, y2))) = (extract_point(win, "start"), extract_point(win, "end")) {
+                let min_x = x1.min(x2);
+                let max_x = x1.max(x2);
+                let min_y = y1.min(y2);
+                let max_y = y1.max(y2);
+                if (max_x - min_x) >= 5.0 && (max_y - min_y) >= 5.0 {
+                    boxes.push(CandidateBox {
+                        name: None,
+                        min_x,
+                        min_y,
+                        max_x,
+                        max_y,
+                        members: Vec::new(),
+                    });
+                }
+            }
+            r_idx = actual + 10;
+        }
+
+        // 3. Extract schematic text annotations (to name boxes or as fallback)
+        let mut texts: Vec<(String, f64, f64)> = Vec::new();
         let text_tag = "(text \"";
         let mut idx = 0;
-        while let Some(pos) = content[idx..].find(text_tag) {
+        while let Some(pos) = sch_body[idx..].find(text_tag) {
             let start = idx + pos + text_tag.len();
-            if let Some(q_end) = content[start..].find('"') {
-                let title = content[start..start + q_end].trim().to_string();
-                if title.chars().next().is_some_and(|c| c.is_ascii_digit()) && title.contains('.') {
-                    let rest = &content[start + q_end..];
-                    if let Some((x, y, _)) = parse_at_xy_rot(&rest[..rest.len().min(200)]) {
-                        headers.push((title, x, y));
-                    }
+            if let Some(q_end) = sch_body[start..].find('"') {
+                let title = sch_body[start..start + q_end].trim().to_string();
+                let rest = &sch_body[start + q_end..];
+                if let Some((x, y, _)) = parse_at_xy_rot(&rest[..rest.len().min(200)]) {
+                    texts.push((title, x, y));
                 }
                 idx = start + q_end + 1;
             } else {
                 break;
             }
         }
-        let mut members: HashMap<String, Vec<String>> = headers.iter().map(|h| (h.0.clone(), Vec::new())).collect();
-        let mut s_idx = 0;
-        while let Some(pos) = content[s_idx..].find("(symbol") {
-            let actual = s_idx + pos;
-            let after = actual + 7;
-            if after < content.len() && content.as_bytes()[after].is_ascii_whitespace() {
-                let win = &content[actual..(actual + 1500).min(content.len())];
-                if win.contains("(lib_id ") {
-                    if let (Some((sx, sy, _)), Some(r)) = (parse_at_xy_rot(win), extract_property(win, "Reference")) {
-                        if !r.starts_with('#') {
-                            self.schematic_positions.insert(r.clone(), (sx, sy));
-                            let mut best = None;
-                            let mut min_d = f64::INFINITY;
-                            for (ht, hx, hy) in &headers {
-                                let dx = sx - hx;
-                                let dy = sy - hy;
-                                if dx >= -15.0 && dy >= -15.0 && dx * dx + dy * dy < min_d {
-                                    min_d = dx * dx + dy * dy;
-                                    best = Some(ht.clone());
-                                }
-                            }
-                            if let Some(bh) = best {
-                                if let Some(list) = members.get_mut(&bh) {
-                                    if !list.contains(&r) {
-                                        list.push(r);
-                                    }
-                                }
-                            }
+
+        // 4. Resolve cluster definitions
+        let mut cluster_defs: Vec<(String, Vec<String>)> = Vec::new();
+
+        if !boxes.is_empty() {
+            // Assign texts to boxes to name them
+            for b in &mut boxes {
+                if b.name.is_none() {
+                    let in_box_texts: Vec<&(String, f64, f64)> = texts
+                        .iter()
+                        .filter(|(_, tx, ty)| *tx >= b.min_x && *tx <= b.max_x && *ty >= b.min_y && *ty <= b.max_y)
+                        .collect();
+                    let title = in_box_texts
+                        .iter()
+                        .find(|(t, _, _)| !t.contains('\n') && t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains('.'))
+                        .or_else(|| in_box_texts.iter().find(|(t, _, _)| !t.contains('\n')))
+                        .or_else(|| in_box_texts.first())
+                        .map(|(t, _, _)| t.lines().next().unwrap_or(t).trim().to_string());
+                    b.name = title;
+                }
+            }
+
+            // Assign root placed symbols to containing boxes (smallest bounding box wins for nested boxes)
+            for (r, sx, sy) in placed_symbols {
+                let mut best_idx = None;
+                let mut best_area = f64::INFINITY;
+                for (i, b) in boxes.iter().enumerate() {
+                    if sx >= b.min_x - 1.0 && sx <= b.max_x + 1.0 && sy >= b.min_y - 1.0 && sy <= b.max_y + 1.0 {
+                        let area = (b.max_x - b.min_x) * (b.max_y - b.min_y);
+                        if area < best_area {
+                            best_area = area;
+                            best_idx = Some(i);
+                        }
+                    }
+                }
+                if let Some(i) = best_idx {
+                    if !boxes[i].members.contains(&r) {
+                        boxes[i].members.push(r);
+                    }
+                }
+            }
+
+            for (i, b) in boxes.into_iter().enumerate() {
+                if b.members.is_empty() {
+                    continue;
+                }
+                let title = b.name.unwrap_or_else(|| {
+                    if let Some(u) = b.members.iter().find(|r| r.starts_with('U')) {
+                        format!("{} Cluster", u)
+                    } else if let Some(j) = b.members.iter().find(|r| r.starts_with('J')) {
+                        format!("{} Cluster", j)
+                    } else {
+                        format!("Cluster {}", i + 1)
+                    }
+                });
+                cluster_defs.push((title, b.members));
+            }
+        } else {
+            // Fallback: proximity-based text header grouping if no boxes or sub-sheets exist
+            let headers: Vec<(String, f64, f64)> = texts
+                .into_iter()
+                .filter(|(t, _, _)| t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains('.'))
+                .collect();
+            let mut members: HashMap<String, Vec<String>> = headers.iter().map(|h| (h.0.clone(), Vec::new())).collect();
+            for (r, sx, sy) in placed_symbols {
+                let mut best = None;
+                let mut min_d = f64::INFINITY;
+                for (ht, hx, hy) in &headers {
+                    let dx = sx - hx;
+                    let dy = sy - hy;
+                    if dx >= -15.0 && dy >= -15.0 && dx * dx + dy * dy < min_d {
+                        min_d = dx * dx + dy * dy;
+                        best = Some(ht.clone());
+                    }
+                }
+                if let Some(bh) = best {
+                    if let Some(list) = members.get_mut(&bh) {
+                        if !list.contains(&r) {
+                            list.push(r);
                         }
                     }
                 }
             }
-            s_idx = actual + 7;
+            for (title, m_refs) in members {
+                if !m_refs.is_empty() {
+                    cluster_defs.push((title, m_refs));
+                }
+            }
         }
 
         let ref_to_idx: HashMap<&str, usize> = self
@@ -3980,7 +4207,7 @@ impl Board {
             .map(|(i, fp)| (fp.reference.as_str(), i))
             .collect();
 
-        for (title, m_refs) in members {
+        for (title, m_refs) in cluster_defs {
             let m_indices: Vec<usize> = m_refs.iter().filter_map(|r| ref_to_idx.get(r.as_str()).copied()).collect();
             if m_indices.is_empty() {
                 continue;
@@ -4003,12 +4230,21 @@ impl Board {
                 } else {
                     (None, 7.0, 60.0)
                 };
-            let anchor_idx = anchor_prefix.and_then(|pref| {
-                m_refs
-                    .iter()
-                    .find(|r| r.starts_with(pref))
-                    .and_then(|r| ref_to_idx.get(r.as_str()).copied())
-            });
+            let anchor_idx = anchor_prefix
+                .and_then(|pref| {
+                    m_refs
+                        .iter()
+                        .find(|r| r.starts_with(pref))
+                        .and_then(|r| ref_to_idx.get(r.as_str()).copied())
+                })
+                .or_else(|| {
+                    m_refs
+                        .iter()
+                        .find(|r| r.starts_with('U'))
+                        .or_else(|| m_refs.iter().find(|r| r.starts_with('J')))
+                        .or_else(|| m_refs.first())
+                        .and_then(|r| ref_to_idx.get(r.as_str()).copied())
+                });
             self.clusters.push(CompiledCluster {
                 name: title,
                 anchor_idx,
@@ -5969,6 +6205,87 @@ mod tests {
         assert_eq!(live.log_lines.len(), 250);
         assert_eq!(live.status_text, "Log entry 259");
         let _ = fs::remove_file(pcb_path);
+    }
+
+    #[test]
+    fn test_schematic_clusters_bounding_boxes_polylines_rectangles_and_subsheets() {
+        let dir = std::env::temp_dir().join(format!("vulcan_test_clusters_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let pcb_path = dir.join("test_board.kicad_pcb");
+        let sch_path = dir.join("test_board.kicad_sch");
+        let sub_sch_path = dir.join("sensor.kicad_sch");
+
+        let pcb_content = r#"(kicad_pcb (version 20240108)
+  (net 0 "")
+  (footprint "U" (at 20 20) (property "Reference" "U1"))
+  (footprint "R" (at 25 25) (property "Reference" "R1"))
+  (footprint "J" (at 110 20) (property "Reference" "J1"))
+  (footprint "D" (at 120 20) (property "Reference" "D1"))
+  (footprint "U" (at 210 20) (property "Reference" "U2"))
+  (footprint "C" (at 215 20) (property "Reference" "C1"))
+)"#;
+
+        // Sub-sheet file with U2 and C1
+        let sub_sch_content = r#"(kicad_sch
+  (symbol (lib_id "IC:U") (at 210.0 20.0 0) (property "Reference" "U2"))
+  (symbol (lib_id "Device:C") (at 215.0 20.0 0) (property "Reference" "C1"))
+)"#;
+
+        // Root schematic with:
+        // 1. Closed polyline box [10..50, 10..50] enclosing U1 and R1, with unnumbered text "Power Stage"
+        // 2. Rectangle box [100..140, 10..50] enclosing J1 and D1, with no text (auto-named "J1 Cluster")
+        // 3. Hierarchical sheet pointing to sensor.kicad_sch (named "SensorSheet")
+        let sch_content = r#"(kicad_sch
+  (polyline
+    (pts (xy 10.0 10.0) (xy 50.0 10.0) (xy 50.0 50.0) (xy 10.0 50.0) (xy 10.0 10.0))
+    (stroke (width 0.254) (type dash))
+    (fill (type none))
+  )
+  (text "Power Stage" (at 15.0 15.0 0))
+  (symbol (lib_id "IC:U") (at 20.0 20.0 0) (property "Reference" "U1"))
+  (symbol (lib_id "Device:R") (at 25.0 25.0 0) (property "Reference" "R1"))
+
+  (rectangle (start 100.0 10.0) (end 140.0 50.0) (stroke (width 0.254) (type default)) (fill (type none)))
+  (symbol (lib_id "Connector:J") (at 110.0 20.0 0) (property "Reference" "J1"))
+  (symbol (lib_id "Device:D") (at 120.0 20.0 0) (property "Reference" "D1"))
+
+  (sheet (at 200.0 10.0) (size 40.0 40.0)
+    (property "Sheetname" "SensorSheet")
+    (property "Sheetfile" "sensor.kicad_sch")
+  )
+)"#;
+
+        fs::write(&pcb_path, pcb_content).unwrap();
+        fs::write(&sub_sch_path, sub_sch_content).unwrap();
+        fs::write(&sch_path, sch_content).unwrap();
+
+        let board = Board::load(pcb_path.to_str().unwrap(), &HashSet::new()).unwrap();
+        assert_eq!(board.clusters.len(), 3, "Expected 3 clusters from polyline box, rectangle box, and sub-sheet");
+
+        // Cluster 1: Power Stage (polyline box)
+        let c1 = board.clusters.iter().find(|c| c.name.contains("Power Stage")).expect("Power Stage cluster");
+        assert_eq!(c1.member_refs.len(), 2);
+        assert!(c1.member_refs.contains(&"U1".to_string()));
+        assert!(c1.member_refs.contains(&"R1".to_string()));
+        assert_eq!(c1.anchor_idx, board.footprints.iter().position(|f| f.reference == "U1"));
+
+        // Cluster 2: Auto-named J1 Cluster (rectangle box with no text)
+        let c2 = board.clusters.iter().find(|c| c.name.contains("J1")).expect("J1 cluster");
+        assert_eq!(c2.member_refs.len(), 2);
+        assert!(c2.member_refs.contains(&"J1".to_string()));
+        assert!(c2.member_refs.contains(&"D1".to_string()));
+        assert_eq!(c2.anchor_idx, board.footprints.iter().position(|f| f.reference == "J1"));
+
+        // Cluster 3: SensorSheet (hierarchical sub-sheet)
+        let c3 = board.clusters.iter().find(|c| c.name == "SensorSheet").expect("SensorSheet cluster");
+        assert_eq!(c3.member_refs.len(), 2);
+        assert!(c3.member_refs.contains(&"U2".to_string()));
+        assert!(c3.member_refs.contains(&"C1".to_string()));
+        assert_eq!(c3.anchor_idx, board.footprints.iter().position(|f| f.reference == "U2"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -12,8 +12,11 @@ We will build the included sample project in [`examples/esphome_1wire_sensor/`](
 
 Vulcan's Trials reads your `.kicad_sch` schematic alongside your `.kicad_pcb` board file to extract **functional placement clusters** and **decoupling capacitor affinity**. Structuring your schematic cleanly allows the auto-placer to keep functional sub-circuits tight and place decoupling capacitors right next to the IC power pins they protect.
 
-### Rule 1: Numbered Functional Section Headers
-When `Board::load_schematic_clusters` parses the `.kicad_sch` file, it scans for schematic text annotations (`Add Text` in KiCad Schematic Editor) whose first line starts with a digit and contains a period (`1. ...`, `2. ...`, `3. ...`).
+### Rule 1: Functional Clusters via Bounding Boxes or Sub-Sheets
+When `Board::load_schematic_clusters` parses the `.kicad_sch` file, it identifies functional clusters from:
+1. **Bounding Boxes:** Graphical rectangles (`rectangle`) or closed dashed outlines (`polyline`) drawn around related groups of components in KiCad Schematic Editor. Any text placed inside the box automatically names the cluster (or it is auto-named after the primary IC/connector).
+2. **Hierarchical Sub-Sheets:** Schematic sheets (`sheet`) representing sub-circuits (e.g. power supply, transceiver, sensors).
+3. **Section Text Headers (Fallback):** In simple flat schematics without bounding boxes, text annotations whose first line starts with a digit and contains a period (`1. ...`, `2. ...`, `3. ...`) group components located in that region.
 
 ```mermaid
 flowchart LR

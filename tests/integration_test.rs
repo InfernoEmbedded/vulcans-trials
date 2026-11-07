@@ -136,8 +136,11 @@ fn write_synthetic_project(dir: &Path, with_overlap: bool) -> (PathBuf, PathBuf)
     );
 
     let sch_content = r#"(kicad_sch (version 20231120) (generator "vulcans_trials_test")
+  (rectangle (start 35.0 35.0) (end 65.0 60.0) (stroke (width 0.254) (type default)) (fill (type none)))
   (text "1. BUCK POWER SUPPLY" (at 40.0 40.0 0))
+  (rectangle (start 175.0 35.0) (end 205.0 65.0) (stroke (width 0.254) (type default)) (fill (type none)))
   (text "2. MAX22088 TRANSCEIVER" (at 180.0 40.0 0))
+  (rectangle (start 35.0 155.0) (end 65.0 185.0) (stroke (width 0.254) (type default)) (fill (type none)))
   (text "3. USB INPUT & SURGE" (at 40.0 160.0 0))
   (symbol (lib_id "Regulator_Switching:BUCK") (at 48.0 48.0 0)
     (property "Reference" "U2" (at 48.0 45.0 0))
