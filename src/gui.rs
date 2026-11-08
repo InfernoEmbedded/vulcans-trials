@@ -1,6 +1,32 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
+//! Interactive `eframe`/`egui` 2D PCB layout, placement, and routing GUI (`VulcansTrialsApp`).
+//!
+//! This module implements the real-time graphical user interface for **Vulcan's Trials**,
+//! providing:
+//! - **Coordinate Transformations:** Bidirectional affine mapping between KiCad board world
+//!   coordinates (`mm`) and screen viewport pixels (`Pos2`) via [`VulcansTrialsApp::board_to_screen`]
+//!   and [`VulcansTrialsApp::screen_to_board`], supporting smooth pan (`pan_offset`) and scroll-wheel
+//!   zoom (`zoom`).
+//! - **Layer Visibility & Theme Rendering:** KiCad 8/9/10 default colour scheme (`pcbnew` builtin
+//!   palette) with bottom-to-top copper layer stacking (`B.Cu`, internal layers descending, `F.Cu`),
+//!   interactive net highlighting (pads, tracks, arcs, vias, and ratsnest airwires), courtyard
+//!   collision overlays, and a holding palette for unplaced footprints.
+//! - **Interactive Editing & Manual Routing:** Pick-and-place component movement with 90° rotation,
+//!   layer flipping, and automatic courtyard shoving; interactive 45° dogleg track routing with
+//!   magnetic pad snapping and through-hole via insertion; and multi-net Bus Bundle river-routing
+//!   sketching.
+//! - **Background Trial Orchestration:** Asynchronous worker thread management for multi-core
+//!   Parallel Tempering Simulated Annealing auto-placement (`run_auto_placer`) and 3D A* / PathFinder
+//!   negotiated-congestion auto-routing (`AutoRouter`), sharing live progress and board snapshots
+//!   through `Arc<Mutex<LiveTrialState>>`.
+//! - **KiCad 10 IPC Live Sync:** Automatic socket discovery, periodic reconnection, and real-time
+//!   streaming of component placements, copper tracks, vias, and Specctra `.ses` sessions into an
+//!   open KiCad PCB editor instance.
+//! - **System Telemetry Sparklines:** Live CPU (`/proc/stat`) and Vulkan GPU compute utilization
+//!   sparkline badges rendered in the top status bar.
+
 use crate::board::{Board, LiveTrialState, Point, Polygon, TrackSegment, TrialPhase, Via};
 use crate::ipc::KiCadIpcClient;
 use crate::placer::{run_auto_placer, PlacementConfig};
@@ -18,28 +44,54 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 // KiCad default colour theme (KiCad 8/9/10 "default"; pcbnew builtin scheme).
+/// KiCad default colour for the top copper layer (`F.Cu`: `#C83434`).
 pub const COL_F_CU: Color32 = Color32::from_rgb(0xC8, 0x34, 0x34);
+/// KiCad default colour for the bottom copper layer (`B.Cu`: `#4D7FC4`).
 pub const COL_B_CU: Color32 = Color32::from_rgb(0x4D, 0x7F, 0xC4);
+/// KiCad default colour for the first inner copper layer (`In1.Cu`: `#7FC87F`).
 pub const COL_IN1_CU: Color32 = Color32::from_rgb(0x7F, 0xC8, 0x7F);
+/// KiCad default colour for the second inner copper layer (`In2.Cu`: `#CE7D2C`).
 pub const COL_IN2_CU: Color32 = Color32::from_rgb(0xCE, 0x7D, 0x2C);
+/// KiCad default colour for plated through-hole pads (`#E3B72E`).
 pub const COL_PAD_TH: Color32 = Color32::from_rgb(0xE3, 0xB7, 0x2E);
+/// KiCad default colour for through-hole and blind/buried via annular rings (`#ECECEC`).
 pub const COL_VIA: Color32 = Color32::from_rgb(0xEC, 0xEC, 0xEC);
+/// KiCad default colour for top-side component courtyard outlines (`F.CrtYd`: `#FF26E2`).
 pub const COL_F_CRTYD: Color32 = Color32::from_rgb(0xFF, 0x26, 0xE2);
+/// KiCad default colour for bottom-side component courtyard outlines (`B.CrtYd`: `#26E2FF`).
 pub const COL_B_CRTYD: Color32 = Color32::from_rgb(0x26, 0xE2, 0xFF);
+/// Highlight colour for courtyards belonging to the same schematic cluster or passive-tie group as the hovered footprint.
 pub const COL_GROUP_CRTYD: Color32 = Color32::from_rgb(80, 255, 120);
+/// KiCad default colour for the board outline layer (`Edge.Cuts`: `#D0D2CD`).
 pub const COL_EDGE_CUTS: Color32 = Color32::from_rgb(0xD0, 0xD2, 0xCD);
+/// KiCad default colour for unrouted Euclidean MST ratsnest airwires (`#00F8FF`).
 pub const COL_RATSNEST: Color32 = Color32::from_rgb(0x00, 0xF8, 0xFF);
 // Keepout: Color32::from_rgba_unmultiplied(255, 0, 5, 128) (#FF000580)
+/// Translucent red stroke/fill colour for copper and courtyard keepout zones (`#FF000580`).
 pub const COL_KEEPOUT: Color32 = Color32::from_rgba_premultiplied(0xBC, 0x00, 0x03, 0x80);
+/// Dark navy canvas background colour matching KiCad's default PCB editor backdrop (`#001023`).
 pub const COL_CANVAS_BG: Color32 = Color32::from_rgb(0x00, 0x10, 0x23);
+/// Bright yellow inner fill colour for highlighted pads, vias, tracks, and ratsnest segments.
 pub const COL_HIGHLIGHT_FILL: Color32 = Color32::from_rgb(255, 245, 140);
+/// Translucent golden-amber outer glow halo colour for highlighted net elements.
 pub const COL_HIGHLIGHT_HALO: Color32 = Color32::from_rgba_premultiplied(160, 138, 25, 160);
+/// High-contrast white outline ring colour drawn around highlighted pads, vias, and traces.
 pub const COL_HIGHLIGHT_RING: Color32 = Color32::WHITE;
 
-/// Canvas copper draw order for standard 4-layer boards (KiCad: B.Cu, inner layers, F.Cu).
+/// Canvas copper draw order for standard 4-layer boards (KiCad: `B.Cu`, inner layers, `F.Cu`).
 pub const COPPER_DRAW_ORDER: [&str; 4] = ["B.Cu", "In2.Cu", "In1.Cu", "F.Cu"];
 
-/// KiCad default layer color lookup.
+/// Looks up the default KiCad display colour for a named copper layer.
+///
+/// Maps `"F.Cu"`, `"B.Cu"`, and `"In1.Cu"`..`"In9.Cu"` to their standard KiCad palette colours,
+/// cycles through a 7-colour palette for `"In10.Cu"`..`"In30.Cu"`, and falls back to neutral grey
+/// for unrecognized layer names.
+///
+/// # Arguments
+/// * `layer_name` - KiCad copper layer identifier (e.g., `"F.Cu"`, `"In1.Cu"`, `"B.Cu"`).
+///
+/// # Returns
+/// The [`Color32`] swatch used to render tracks, arcs, and layer labels for `layer_name`.
 pub fn copper_layer_color(layer_name: &str) -> Color32 {
     match layer_name {
         "F.Cu" => COL_F_CU,
@@ -75,8 +127,22 @@ pub fn copper_layer_color(layer_name: &str) -> Color32 {
     }
 }
 
-/// Invokes native OS file picker to select a KiCad PCB file to open.
-/// Returns Ok(Some(path)) on selection, Ok(None) on cancel, or Err(()) if external picker unavailable.
+/// Invokes a native OS file picker (`zenity` on Linux) to select a KiCad PCB file (`.kicad_pcb`) to open.
+///
+/// # Arguments
+/// * `initial_path` - Current board file path used to seed the file picker's starting directory.
+///
+/// # Returns
+/// * `Ok(Some(path))` if the user selected a file.
+/// * `Ok(None)` if the user cancelled or closed the dialog without selecting a file.
+/// * `Err(())` if the external OS file picker process could not be spawned (e.g., `zenity` not installed).
+///
+/// # Side Effects
+/// Spawns a blocking `zenity --file-selection` subprocess on Linux.
+///
+/// # Errors
+/// Returns `Err(())` when `zenity` is unavailable or on non-Linux platforms, signalling the caller
+/// to fall back to the built-in `egui` modal path dialog.
 pub fn pick_open_file(initial_path: &str) -> Result<Option<String>, ()> {
     #[cfg(target_os = "linux")]
     {
@@ -111,8 +177,24 @@ pub fn pick_open_file(initial_path: &str) -> Result<Option<String>, ()> {
     Err(())
 }
 
-/// Invokes native OS file picker to select a destination path for saving a KiCad PCB.
-/// Returns Ok(Some(path)) on selection, Ok(None) on cancel, or Err(()) if external picker unavailable.
+/// Invokes a native OS file picker (`zenity` on Linux) to select a destination path for saving a KiCad PCB.
+///
+/// Automatically appends the `.kicad_pcb` extension if the chosen filename does not already end with it.
+///
+/// # Arguments
+/// * `initial_path` - Suggested default file path pre-populated in the save dialog.
+///
+/// # Returns
+/// * `Ok(Some(path))` if the user confirmed a destination path.
+/// * `Ok(None)` if the user cancelled the save dialog.
+/// * `Err(())` if the external OS file picker could not be executed.
+///
+/// # Side Effects
+/// Spawns a blocking `zenity --file-selection --save` subprocess on Linux.
+///
+/// # Errors
+/// Returns `Err(())` when `zenity` fails to launch or on non-Linux targets, allowing the GUI to
+/// open its internal `egui` Save-As modal instead.
 pub fn pick_save_file(initial_path: &str) -> Result<Option<String>, ()> {
     #[cfg(target_os = "linux")]
     {
@@ -150,7 +232,13 @@ pub fn pick_save_file(initial_path: &str) -> Result<Option<String>, ()> {
     Err(())
 }
 
-/// Returns active copper layers in KiCad display/legend order: F.Cu, internal layers, B.Cu.
+/// Returns active copper layers in KiCad UI display and colour-legend order (`F.Cu`, internal layers, `B.Cu`).
+///
+/// # Arguments
+/// * `active_layers` - Slice of active copper layer names from the loaded [`Board`].
+///
+/// # Returns
+/// A [`Vec`] of layer name slices ordered top-to-bottom for UI checkboxes and legend display.
 pub fn kicad_layer_display_order<'a>(active_layers: &[&'a str]) -> Vec<&'a str> {
     let mut order = Vec::new();
     if active_layers.contains(&"F.Cu") {
@@ -167,7 +255,16 @@ pub fn kicad_layer_display_order<'a>(active_layers: &[&'a str]) -> Vec<&'a str> 
     order
 }
 
-/// Returns active copper layers in canvas draw order (bottom to top): B.Cu, internal layers descending, F.Cu.
+/// Returns active copper layers in canvas painter draw order (`B.Cu`, internal layers descending, `F.Cu`).
+///
+/// Drawing bottom-to-top ensures that front copper (`F.Cu`) renders above inner layers and back copper (`B.Cu`),
+/// matching KiCad's standard viewport compositing order.
+///
+/// # Arguments
+/// * `active_layers` - Slice of active copper layer names from the loaded [`Board`].
+///
+/// # Returns
+/// A [`Vec`] of layer name slices ordered from back-most layer to front-most layer.
 pub fn copper_layers_draw_order<'a>(active_layers: &[&'a str]) -> Vec<&'a str> {
     let mut order = Vec::new();
     if active_layers.contains(&"B.Cu") {
@@ -190,155 +287,243 @@ pub use crate::router::{compute_45_dogleg, generate_bundle_tracks, is_octilinear
 pub use crate::board::BusBundle;
 
 
+/// State of an in-progress interactive manual track routing session on the 2D canvas.
 #[derive(Clone, Debug)]
 pub struct ActiveRoute {
+    /// Numeric KiCad net ID (`> 0`) being routed.
     pub net_id: usize,
+    /// Electrical net name (e.g., `"GND"`, `"+3.3V"`, `"SPI_CLK"`).
     pub net_name: String,
+    /// Index of the active copper layer on which new segments are currently being drawn.
     pub current_layer: usize,
+    /// Nominal copper track width in millimeters derived from the net's netclass.
     pub track_width: f64,
+    /// Plated through-hole via outer annular diameter in millimeters for layer transitions.
     pub via_dia: f64,
+    /// Via drill hole diameter in millimeters for layer transitions.
     pub via_drill: f64,
+    /// Sequence of committed `(x_mm, y_mm, layer_idx)` vertices anchored along the route so far.
     pub anchor_points: Vec<(f64, f64, usize)>, // (x, y, layer)
+    /// Whether the live 45° dogleg preview bends diagonally first (`true`) or orthogonally first (`false`), toggleable via `'/'`.
     pub posture_diagonal_first: bool,          // toggleable via '/'
+    /// Uncommitted layer-transition vias placed during this interactive routing session.
     pub vias_placed: Vec<Via>,
 }
 
+/// Metadata describing a copper pad, via, or track segment located under the cursor during hit-testing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HoveredCopperItem {
+    /// Numeric KiCad net ID (`> 0`) of the hovered copper feature.
     pub net_id: usize,
+    /// Resolved electrical net name of the hovered copper feature.
     pub net_name: String,
+    /// Copper layer index of the item (`0` for through-hole pads and vias).
     pub layer: usize,
+    /// Board world coordinates `(x_mm, y_mm)` to snap to when starting or finishing a route on this item.
     pub snap_pos: (f64, f64),
+    /// `true` if the hovered item is a component pad.
     pub is_pad: bool,
+    /// `true` if the hovered item is a plated through-hole via.
     pub is_via: bool,
+    /// `true` if the hovered item is a straight or curved copper trace segment.
     pub is_track: bool,
 }
 
 /// User-configurable application preferences persisted across sessions in `~/.config/vulcans-trials/preferences.json`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AppPreferences {
+    /// Wall-clock time budget in seconds for Simulated Annealing auto-placement.
     #[serde(default = "default_place_duration")]
     pub place_duration_secs: u64,
+    /// Minimum courtyard-to-courtyard clearance in millimeters between components on the same layer.
     #[serde(default = "default_min_spacing")]
     pub min_spacing_mm: f64,
+    /// Uniform 2D/3D routing grid resolution in millimeters.
     #[serde(default = "default_grid_res")]
     pub grid_res_mm: f64,
+    /// Maximum number of PathFinder negotiated-congestion rip-up and reroute passes.
     #[serde(default = "default_max_ripup")]
     pub max_ripup_passes: usize,
+    /// Whether the auto-placer is permitted to flip unlocked SMD footprints between `F.Cu` and `B.Cu`.
     #[serde(default)]
     pub allow_layer_flip: bool,
+    /// Cost multiplier penalizing signal routing on dedicated inner reference planes (`In1.Cu` / `In2.Cu`).
     #[serde(default = "default_inner_plane_penalty")]
     pub inner_plane_penalty: f64,
+    /// Whether the router's `NudgeEngine` may shift unlocked 2-pad passives to open blocked escape channels.
     #[serde(default)]
     pub allow_component_nudge: bool,
+    /// Whether any-angle Euclidean routing and TopoR-style tangent arc fillets are enabled.
     #[serde(default)]
     pub any_angle_mode: bool,
 
     // Advanced autoplacer exploration & weights
+    /// Maximum single-component translation radius in millimeters at peak annealing temperature.
     #[serde(default = "default_max_jump_radius")]
     pub max_jump_radius_mm: f64,
+    /// Probability (`0.0..=0.50`) of proposing a pairwise swap between two unlocked footprints during annealing.
     #[serde(default = "default_pair_swap_prob")]
     pub pair_swap_prob: f64,
+    /// Probability (`0.0..=0.60`) of biasing a move toward the connected ratsnest centroid.
     #[serde(default = "default_centroid_pull_prob")]
     pub centroid_pull_prob: f64,
+    /// Multiplier applied to the Parallel Tempering replica temperature schedule.
     #[serde(default = "default_temp_scale")]
     pub temp_scale: f64,
+    /// Multiplier expanding virtual escape-corridor halos around high-pin-count ICs and connectors.
     #[serde(default = "default_escape_margin_mult")]
     pub escape_margin_mult: f64,
+    /// Objective cost penalty weight per topological MST ratsnest airwire intersection.
     #[serde(default = "default_crossing_weight")]
     pub crossing_weight: f64,
 
     // Advanced autorouter thresholds & distances
+    /// Maximum search radius in millimeters for merging redundant same-net vias post-route.
     #[serde(default = "default_via_merge_radius")]
     pub via_merge_radius_mm: f64,
+    /// Maximum additional trace detour length in millimeters allowed when consolidating two same-net vias.
     #[serde(default = "default_via_detour_budget")]
     pub via_detour_budget_mm: f64,
+    /// Maximum detour ratio (`rerouted_len / direct_len`) allowed when eliminating a dual-via layer hop.
     #[serde(default = "default_via_hop_max_detour_ratio")]
     pub via_hop_max_detour_ratio: f64,
+    /// Maximum distance in millimeters within which nearby power/ground pads can share a reference-plane fanout via.
     #[serde(default = "default_plane_via_share_radius")]
     pub plane_via_share_radius_mm: f64,
+    /// Maximum distance in millimeters from a signal layer-transition via to a ground return via before stitching adds one.
     #[serde(default = "default_return_via_max_dist")]
     pub return_via_max_dist_mm: f64,
+    /// Maximum distance in millimeters within which post-route cleanup snaps nearly aligned vias onto pad X/Y axes.
     #[serde(default = "default_via_pad_snap_dist")]
     pub via_pad_snap_dist_mm: f64,
+    /// PathFinder historical congestion penalty escalation factor across rip-up iterations.
     #[serde(default = "default_congestion_factor")]
     pub congestion_factor: f64,
+    /// Soft proximity cost weight penalizing parallel coupled trace runs to reduce crosstalk.
     #[serde(default = "default_crosstalk_penalty")]
     pub crosstalk_penalty: f64,
+    /// Step size in millimeters used when nudging unlocked passives away from congested pads.
     #[serde(default = "default_nudge_step")]
     pub nudge_step_mm: f64,
+    /// Number of post-route trace rubber-banding and corner-shortening glossing passes.
     #[serde(default = "default_gloss_passes")]
     pub gloss_passes: usize,
+    /// Tangent arc fillet radius in millimeters applied to sharp trace corners (`< 90°`) and organic bends.
     #[serde(default = "default_acid_trap_fillet_radius")]
     pub acid_trap_fillet_radius: f64,
+    /// Whether vias are permitted to be placed directly inside SMD component pads.
     #[serde(default)]
     pub allow_via_in_pad: bool,
 
     // Layer visibility & display toggles
+    /// Whether component courtyard polygons (`F.CrtYd` / `B.CrtYd`) are rendered on the canvas.
     #[serde(default = "default_true")]
     pub show_courtyards: bool,
+    /// Whether unrouted Euclidean MST ratsnest airwires are rendered on the canvas.
     #[serde(default = "default_true")]
     pub show_ratsnest: bool,
+    /// Whether the top copper layer (`F.Cu`) is visible.
     #[serde(default = "default_true")]
     pub show_f_cu: bool,
+    /// Whether the bottom copper layer (`B.Cu`) is visible.
     #[serde(default = "default_true")]
     pub show_b_cu: bool,
+    /// Whether the first inner copper layer (`In1.Cu`) is visible.
     #[serde(default = "default_true")]
     pub show_in1_cu: bool,
+    /// Whether the second inner copper layer (`In2.Cu`) is visible.
     #[serde(default = "default_true")]
     pub show_in2_cu: bool,
+    /// Whether plated through-hole vias are rendered and hit-tested on the canvas.
     #[serde(default = "default_true")]
     pub show_vias: bool,
+    /// Whether footprint reference designator text labels (e.g., `U1`, `R10`) are drawn.
     #[serde(default = "default_true")]
     pub show_refs: bool,
+    /// Whether the side panel for the unplaced component Holding Palette is shown when non-empty.
     #[serde(default = "default_true")]
     pub show_holding_palette: bool,
 
     // KiCad IPC Live Sync
+    /// Whether live synchronization with a running KiCad 10 instance over IPC is enabled.
     #[serde(default = "default_true")]
     pub kicad_ipc_enabled: bool,
+    /// Configured UNIX domain socket URI or path for the KiCad 10 IPC server.
     #[serde(default)]
     pub kicad_ipc_socket_path: String,
 
     // Bundle river routing
+    /// Nominal copper trace width in millimeters for sketched Bus Bundle river routes.
     #[serde(default = "default_bundle_dim")]
     pub bundle_track_width: f64,
+    /// Edge-to-edge copper spacing in millimeters between parallel traces in a Bus Bundle.
     #[serde(default = "default_bundle_dim")]
     pub bundle_track_spacing: f64,
 
     // Optional last opened board paths
+    /// Most recently opened input `.kicad_pcb` path persisted across sessions.
     #[serde(default)]
     pub last_input_path: Option<String>,
+    /// Most recently configured output `.kicad_pcb` path persisted across sessions.
     #[serde(default)]
     pub last_output_path: Option<String>,
 }
 
+/// Returns the default auto-placement duration in seconds (`120`).
 fn default_place_duration() -> u64 { 120 }
+/// Returns the default minimum courtyard spacing in millimeters (`0.25`).
 fn default_min_spacing() -> f64 { 0.25 }
+/// Returns the default routing grid resolution in millimeters (`0.10`).
 fn default_grid_res() -> f64 { 0.10 }
+/// Returns the default maximum number of PathFinder rip-up passes (`15`).
 fn default_max_ripup() -> usize { 15 }
+/// Returns the default routing cost penalty on inner reference planes (`8.0`).
 fn default_inner_plane_penalty() -> f64 { 8.0 }
+/// Returns the default maximum Simulated Annealing jump radius in millimeters (`20.0`).
 fn default_max_jump_radius() -> f64 { 20.0 }
+/// Returns the default pairwise component swap probability (`0.15`).
 fn default_pair_swap_prob() -> f64 { 0.15 }
+/// Returns the default ratsnest centroid pull probability (`0.20`).
 fn default_centroid_pull_prob() -> f64 { 0.20 }
+/// Returns the default Simulated Annealing temperature scale multiplier (`1.0`).
 fn default_temp_scale() -> f64 { 1.0 }
+/// Returns the default IC escape corridor margin multiplier (`1.0`).
 fn default_escape_margin_mult() -> f64 { 1.0 }
+/// Returns the default topological ratsnest crossing cost weight (`200.0`).
 fn default_crossing_weight() -> f64 { 200.0 }
+/// Returns the default post-route via merge search radius in millimeters (`4.00`).
 fn default_via_merge_radius() -> f64 { 4.00 }
+/// Returns the default maximum trace detour budget in millimeters for via merging (`3.50`).
 fn default_via_detour_budget() -> f64 { 3.50 }
+/// Returns the default maximum detour ratio for eliminating dual-via layer hops (`1.25`).
 fn default_via_hop_max_detour_ratio() -> f64 { 1.25 }
+/// Returns the default plane via sharing radius in millimeters (`3.50`).
 fn default_plane_via_share_radius() -> f64 { 3.50 }
+/// Returns the default maximum distance in millimeters for return-current ground via stitching (`1.40`).
 fn default_return_via_max_dist() -> f64 { 1.40 }
+/// Returns the default via-to-pad axis alignment snap threshold in millimeters (`0.50`).
 fn default_via_pad_snap_dist() -> f64 { 0.50 }
+/// Returns the default PathFinder historical congestion escalation factor (`1.50`).
 fn default_congestion_factor() -> f64 { 1.50 }
+/// Returns the default parallel-trace crosstalk penalty weight (`4.0`).
 fn default_crosstalk_penalty() -> f64 { 4.0 }
+/// Returns the default passive component nudge step size in millimeters (`0.25`).
 fn default_nudge_step() -> f64 { 0.25 }
+/// Returns the default number of post-route trace glossing passes (`2`).
 fn default_gloss_passes() -> usize { 2 }
+/// Returns the default tangent arc fillet radius in millimeters for sharp corners (`0.35`).
 fn default_acid_trap_fillet_radius() -> f64 { 0.35 }
+/// Serde default helper returning `true` for boolean visibility and sync flags.
 fn default_true() -> bool { true }
+/// Returns the default Bus Bundle track width and spacing in millimeters (`0.25`).
 fn default_bundle_dim() -> f64 { 0.25 }
 
 impl Default for AppPreferences {
+    /// Creates an [`AppPreferences`] instance populated with standard production placement,
+    /// routing, layer visibility, and KiCad IPC settings.
+    ///
+    /// # Returns
+    /// A default-initialized [`AppPreferences`] struct.
     fn default() -> Self {
         Self {
             place_duration_secs: default_place_duration(),
@@ -386,6 +571,13 @@ impl Default for AppPreferences {
     }
 }
 
+/// Detects whether the current process is executing inside a `cargo test` runner binary.
+///
+/// Used to prevent unit and integration tests from reading or overwriting the user's real
+/// `~/.config/vulcans-trials/preferences.json` or initiating unsolicited background IPC polls.
+///
+/// # Returns
+/// `true` when compiled with `cfg(test)` or when the executable resides in Cargo's `target/*/deps` directory.
 fn is_running_under_cargo_test() -> bool {
     if cfg!(test) {
         return true;
@@ -396,7 +588,17 @@ fn is_running_under_cargo_test() -> bool {
 }
 
 impl AppPreferences {
-    /// Returns the default platform-specific configuration path for `preferences.json`.
+    /// Resolves the platform-specific filesystem path for `preferences.json`.
+    ///
+    /// Checks environment variables in priority order:
+    /// 1. `VULCANS_TRIALS_CONFIG` (explicit file override)
+    /// 2. `XDG_CONFIG_HOME/vulcans-trials/preferences.json`
+    /// 3. `HOME/.config/vulcans-trials/preferences.json`
+    /// 4. `APPDATA/vulcans-trials/preferences.json`
+    /// 5. `"preferences.json"` in the current working directory.
+    ///
+    /// # Returns
+    /// The resolved [`PathBuf`] where application preferences should be loaded from and saved to.
     pub fn config_path() -> PathBuf {
         if let Ok(p) = env::var("VULCANS_TRIALS_CONFIG") {
             if !p.trim().is_empty() {
@@ -421,7 +623,14 @@ impl AppPreferences {
         PathBuf::from("preferences.json")
     }
 
-    /// Loads preferences from the default config path, or returns default preferences if absent/invalid.
+    /// Loads preferences from [`Self::config_path`], sanitizing any test-polluted values, or returns
+    /// [`AppPreferences::default`] if the file does not exist or cannot be parsed.
+    ///
+    /// # Returns
+    /// The loaded (or default) [`AppPreferences`] instance.
+    ///
+    /// # Side Effects
+    /// Reads the JSON configuration file at [`Self::config_path`] from disk if present.
     pub fn load() -> Self {
         let mut prefs = Self::load_from_path(&Self::config_path()).unwrap_or_default();
         let test_polluted = prefs
@@ -439,18 +648,49 @@ impl AppPreferences {
         prefs
     }
 
-    /// Loads preferences from a specific filesystem path.
+    /// Loads and deserializes [`AppPreferences`] from a specific JSON file path.
+    ///
+    /// # Arguments
+    /// * `path` - Filesystem path to the JSON preferences file.
+    ///
+    /// # Returns
+    /// `Some(AppPreferences)` if the file was read and parsed successfully, or `None` on I/O or JSON error.
+    ///
+    /// # Side Effects
+    /// Performs a synchronous file read of `path`.
     pub fn load_from_path(path: &Path) -> Option<Self> {
         let content = fs::read_to_string(path).ok()?;
         serde_json::from_str(&content).ok()
     }
 
-    /// Saves preferences to the default config path.
+    /// Serializes and writes these preferences to the default [`Self::config_path`].
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an [`std::io::Error`] if serialization or file writing fails.
+    ///
+    /// # Side Effects
+    /// Creates parent directories if missing and overwrites the default `preferences.json` file on disk.
+    ///
+    /// # Errors
+    /// Returns [`std::io::Error`] if the target file cannot be written.
     pub fn save(&self) -> std::io::Result<()> {
         self.save_to_path(&Self::config_path())
     }
 
-    /// Saves preferences to a specific path, creating parent directories if necessary.
+    /// Serializes and writes these preferences as pretty-printed JSON to `path`, creating parent
+    /// directories if necessary.
+    ///
+    /// # Arguments
+    /// * `path` - Destination filesystem path for the JSON preferences file.
+    ///
+    /// # Returns
+    /// `Ok(())` when the file is written, or an [`std::io::Error`] on failure.
+    ///
+    /// # Side Effects
+    /// Creates parent directories via [`fs::create_dir_all`] and writes `path` to disk.
+    ///
+    /// # Errors
+    /// Returns [`std::io::Error`] if JSON serialization fails or [`fs::write`] encounters an I/O error.
     pub fn save_to_path(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -464,105 +704,202 @@ impl AppPreferences {
     }
 }
 
+/// Main `eframe`/`egui` application state for **Vulcan's Trials**.
+///
+/// Owns the shared [`LiveTrialState`] (board geometry, ratsnest, metrics, and log buffer),
+/// optional [`VulkanEngine`] GPU compute handle, background [`SystemTelemetry`] sampler,
+/// interactive 2D viewport camera and tool state, and KiCad 10 IPC synchronization client.
 pub struct VulcansTrialsApp {
+    /// Source filesystem path to the loaded `.kicad_pcb` board file.
     pub input_path: String,
+    /// Destination filesystem path where `.kicad_pcb` and `.ses` outputs are written.
     pub output_path: String,
+    /// Thread-safe shared board and trial progress state updated by background placement/routing workers.
     pub live: Arc<Mutex<LiveTrialState>>,
+    /// Optional Vulkan GPU compute engine used to accelerate 2D Euclidean Distance Field obstacle maps.
     pub vulkan: Option<Arc<VulkanEngine>>,
+    /// Background system telemetry sampler tracking live CPU (`/proc/stat`) and GPU utilization histories.
     pub telemetry: SystemTelemetry,
+    /// Atomic cancellation flag signalled when the user clicks "Stop" to halt a running worker thread.
     pub stop_flag: Arc<AtomicBool>,
+    /// Atomic flag indicating whether a background placement or routing worker thread is currently executing.
     pub worker_running: Arc<AtomicBool>,
 
     // Configurable parameters
+    /// Wall-clock duration in seconds for Parallel Tempering Simulated Annealing auto-placement.
     pub place_duration_secs: u64,
+    /// Minimum physical courtyard-to-courtyard clearance in millimeters between components on the same side.
     pub min_spacing_mm: f64,
+    /// Uniform spatial grid resolution in millimeters for the 3D A* / PathFinder router and GPU distance field.
     pub grid_res_mm: f64,
+    /// Maximum number of PathFinder negotiated-congestion rip-up and reroute passes.
     pub max_ripup_passes: usize,
+    /// Whether the auto-placer is allowed to flip unlocked SMD footprints between `F.Cu` and `B.Cu`.
     pub allow_layer_flip: bool,
+    /// Routing cost multiplier penalizing signal tracks on inner reference planes (`In1.Cu` / `In2.Cu`).
     pub inner_plane_penalty: f64,
+    /// Whether the router's `NudgeEngine` may shift unlocked 2-pad passives to open blocked escape corridors.
     pub allow_component_nudge: bool,
+    /// Whether any-angle Euclidean rubber-band routing and organic TopoR tangent arc fillets are enabled.
     pub any_angle_mode: bool,
 
     // Advanced autoplacer exploration & weights
+    /// Maximum single-component translation jump radius in millimeters at peak annealing temperature.
     pub max_jump_radius_mm: f64,
+    /// Probability (`0.0..=0.50`) of proposing a pairwise swap between two unlocked footprints during annealing.
     pub pair_swap_prob: f64,
+    /// Probability (`0.0..=0.60`) of biasing a perturbation move toward the connected ratsnest centroid.
     pub centroid_pull_prob: f64,
+    /// Scaling multiplier applied to the Parallel Tempering replica temperature ladder.
     pub temp_scale: f64,
+    /// Multiplier expanding virtual pin-density escape halos around high-pin-count ICs and connectors.
     pub escape_margin_mult: f64,
+    /// Cost penalty weight per topological MST ratsnest airwire intersection.
     pub crossing_weight: f64,
 
     // Advanced autorouter thresholds & distances
+    /// Maximum search radius in millimeters for consolidating redundant same-net vias post-route.
     pub via_merge_radius_mm: f64,
+    /// Maximum extra trace detour length in millimeters allowed when merging two same-net vias.
     pub via_detour_budget_mm: f64,
+    /// Maximum ratio of single-layer rerouted path length to direct distance when eliminating a dual-via hop.
     pub via_hop_max_detour_ratio: f64,
+    /// Maximum distance in millimeters within which nearby power/ground pads can share a plane fanout via.
     pub plane_via_share_radius_mm: f64,
+    /// Maximum distance in millimeters from a layer-transition signal via to a ground via before return stitching adds one.
     pub return_via_max_dist_mm: f64,
+    /// Threshold distance in millimeters within which post-route cleanup snaps nearly aligned vias onto pad X/Y axes.
     pub via_pad_snap_dist_mm: f64,
+    /// PathFinder historical congestion penalty escalation rate across rip-up passes.
     pub congestion_factor: f64,
+    /// Soft proximity cost weight discouraging parallel coupled trace runs to reduce electromagnetic crosstalk.
     pub crosstalk_penalty: f64,
+    /// Incremental step distance in millimeters used when nudging unlocked passives away from congested pads.
     pub nudge_step_mm: f64,
+    /// Number of post-route trace rubber-banding and corner-shortening glossing passes.
     pub gloss_passes: usize,
+    /// Tangent arc fillet radius in millimeters applied to sharp corners (`< 90°`) and organic bends.
     pub acid_trap_fillet_radius: f64,
+    /// Whether vias are permitted to be placed directly inside SMD component pads.
     pub allow_via_in_pad: bool,
 
     // Canvas viewport controls
+    /// Screen-space camera pan offset in pixels relative to the centered board viewport.
     pub pan_offset: Vec2,
+    /// Viewport zoom multiplier (`0.25..=12.0`, default `1.0`).
     pub zoom: f32,
+    /// Whether component courtyard collision outlines (`F.CrtYd` / `B.CrtYd`) are rendered.
     pub show_courtyards: bool,
+    /// Whether unrouted Euclidean MST ratsnest airwire lines are rendered.
     pub show_ratsnest: bool,
+    /// Whether the top copper layer (`F.Cu`) is visible.
     pub show_f_cu: bool,
+    /// Whether the bottom copper layer (`B.Cu`) is visible.
     pub show_b_cu: bool,
+    /// Whether the first inner copper layer (`In1.Cu`) is visible.
     pub show_in1_cu: bool,
+    /// Whether the second inner copper layer (`In2.Cu`) is visible.
     pub show_in2_cu: bool,
+    /// Set of all copper layer names (including `In3.Cu`..`In30.Cu`) currently enabled for display and hit-testing.
     pub visible_layers: HashSet<String>,
+    /// Whether plated through-hole vias are rendered and hit-tested on the canvas.
     pub show_vias: bool,
+    /// Whether component reference designator labels (e.g., `U1`, `R10`) are rendered on footprints.
     pub show_refs: bool,
+    /// Whether the side panel for the Holding Palette is enabled when unplaced components exist.
     pub show_holding_palette: bool,
+    /// Name of the currently highlighted electrical net (if any) selected by clicking a pad, via, or track.
     pub selected_net: Option<String>,
+    /// Numeric KiCad net ID (`> 0`) of the currently highlighted electrical net.
     pub selected_net_id: Option<usize>,
+    /// Snapshot of the unlocked footprint currently being dragged/moved interactively by the user.
     pub moving_footprint: Option<MovingFootprint>,
+    /// Index into `board.footprints` of the footprint currently hovered under the mouse cursor.
     pub hovered_footprint: Option<usize>,
+    /// State of an in-progress interactive manual track route on the canvas.
     pub active_route: Option<ActiveRoute>,
+    /// Whether the interactive manual track routing tool (`'X'`) is currently armed.
     pub route_tool_active: bool,
+    /// Whether the multi-net Bus Bundle river-routing sketch tool (`'B'`) is currently active.
     pub bundle_sketch_active: bool,
+    /// Sequence of `(x_mm, y_mm)` guide spine waypoints clicked during an active Bus Bundle sketch.
     pub bundle_guide_points: Vec<(f64, f64)>,
+    /// Explicit list of numeric net IDs selected for Bus Bundle routing (falls back to auto-selected nets when empty).
     pub bundle_selected_nets: Vec<usize>,
+    /// Copper trace width in millimeters for sketched Bus Bundle tracks.
     pub bundle_track_width: f64,
+    /// Edge-to-edge clearance spacing in millimeters between parallel tracks in a Bus Bundle.
     pub bundle_track_spacing: f64,
+    /// Optional thread-safe handle to the active KiCad 10 IPC client socket.
     pub ipc: Option<Arc<Mutex<KiCadIpcClient>>>,
+    /// Whether live synchronization with KiCad 10 over IPC is enabled.
     pub kicad_ipc_enabled: bool,
+    /// UNIX domain socket URI or filesystem path for the KiCad 10 IPC server.
     pub kicad_ipc_socket_path: String,
+    /// Timestamp of the most recent automatic KiCad IPC connection attempt.
     pub last_ipc_retry: Instant,
+    /// Minimum time interval between automatic KiCad IPC reconnection attempts.
     pub ipc_retry_interval: Duration,
 
     // Automation & Framing
+    /// Cached initial board world bounding box `(min_x, max_x, min_y, max_y)` in millimeters used for camera framing.
     pub view_bounds: (f64, f64, f64, f64),
+    /// Whether the GUI should automatically start a full placement + routing trial after initial warmup frames.
     pub auto_start: bool,
+    /// Optional delay in seconds after trial completion before automatically closing the GUI window.
     pub auto_exit: Option<u64>,
+    /// Total number of UI frames rendered since application launch.
     pub frame_count: u64,
+    /// Timestamp recorded when the active trial transitioned to [`TrialPhase::Completed`].
     pub completed_time: Option<Instant>,
 
     // Persistence
+    /// Optional custom filesystem path for loading/saving [`AppPreferences`] (used by tests and isolated profiles).
     pub preferences_path: Option<PathBuf>,
+    /// Snapshot of the last saved [`AppPreferences`] used to detect dirty configuration changes across frames.
     pub last_saved_prefs: AppPreferences,
 
     // File dialog state
+    /// Whether the fallback in-app modal dialog for opening a `.kicad_pcb` file is currently visible.
     pub open_dialog_open: bool,
+    /// Whether the fallback in-app modal dialog for saving a `.kicad_pcb` file ("Save As") is currently visible.
     pub save_as_dialog_open: bool,
+    /// Text buffer holding the editable file path inside the in-app Open / Save-As modal dialogs.
     pub file_dialog_path_buffer: String,
+    /// Screen rectangle of the central 2D PCB canvas from the most recently rendered frame.
     pub last_canvas_rect: Option<Rect>,
 }
 
+/// Snapshot of a footprint's original placement state captured when the user picks it up (`'M'`) for interactive movement.
+///
+/// Allows restoring the component to its exact pre-move coordinates, rotation, and layer if the user cancels (`Esc`),
+/// or ripping up traces connected to its original pad positions when committed at a new location.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MovingFootprint {
+    /// Index of the footprint in `board.footprints`.
     pub fp_index: usize,
+    /// Component reference designator (e.g., `"U1"`, `"R10"`).
     pub reference: String,
+    /// Original X coordinate in millimeters before interactive movement began.
     pub original_x: f64,
+    /// Original Y coordinate in millimeters before interactive movement began.
     pub original_y: f64,
+    /// Original rotation angle in degrees before interactive movement began.
     pub original_rotation: f64,
+    /// Original board side layer index (`0` for `F.Cu`, `1` for `B.Cu`) before interactive movement began.
     pub original_layer: usize,
 }
 
+/// Computes the initial world-space camera bounding box `(min_x, max_x, min_y, max_y)` in millimeters
+/// encompassing the board outline and all placed footprints (padded by `3.0 mm`).
+///
+/// Falls back to a `0.0..=100.0 mm` box on any degenerate axis where `min >= max`.
+///
+/// # Arguments
+/// * `board` - The loaded [`Board`] whose outline and footprint coordinates define the view extents.
+///
+/// # Returns
+/// A 4-tuple `(min_x, max_x, min_y, max_y)` in millimeters.
 pub fn compute_initial_view_bounds(board: &Board) -> (f64, f64, f64, f64) {
     let mut min_x = board.min_x;
     let mut max_x = board.max_x;
@@ -586,6 +923,24 @@ pub fn compute_initial_view_bounds(board: &Board) -> (f64, f64, f64, f64) {
 }
 
 impl VulcansTrialsApp {
+    /// Constructs a new [`VulcansTrialsApp`] instance for the given board and optional Vulkan compute engine.
+    ///
+    /// Initializes the background [`SystemTelemetry`] sampler, populates the default visible copper layers,
+    /// wraps `board` in [`LiveTrialState`], and—when not running inside `cargo test`—loads user preferences
+    /// from disk and attempts an initial quiet connection to the KiCad 10 IPC socket.
+    ///
+    /// # Arguments
+    /// * `input_path` - Source `.kicad_pcb` file path.
+    /// * `output_path` - Destination `.kicad_pcb` file path for saving placement/routing results.
+    /// * `board` - Parsed initial [`Board`] model.
+    /// * `vulkan` - Optional shared [`VulkanEngine`] GPU compute context.
+    ///
+    /// # Returns
+    /// A fully initialized [`VulcansTrialsApp`] ready to be passed to `eframe::run_native` or headless tests.
+    ///
+    /// # Side Effects
+    /// Spawns a background [`SystemTelemetry`] sampling thread and (outside `cargo test`) reads
+    /// `preferences.json` and probes the local KiCad IPC UNIX domain socket.
     pub fn new(input_path: String, output_path: String, board: Board, vulkan: Option<Arc<VulkanEngine>>) -> Self {
         let view_bounds = compute_initial_view_bounds(&board);
         let busy_counter = vulkan.as_ref().map(|v| Arc::clone(&v.compute_busy_ns));
@@ -688,7 +1043,19 @@ impl VulcansTrialsApp {
         app
     }
 
-    /// Sets a custom path for preferences storage (useful for unit testing and isolated profiles).
+    /// Builder method that configures a custom filesystem path for loading and saving [`AppPreferences`].
+    ///
+    /// If a valid preferences JSON file already exists at `path`, its settings are immediately loaded
+    /// and applied to `self`.
+    ///
+    /// # Arguments
+    /// * `path` - Custom filesystem path for `preferences.json`.
+    ///
+    /// # Returns
+    /// The updated [`VulcansTrialsApp`] instance (`self`).
+    ///
+    /// # Side Effects
+    /// Reads `path` from disk if present and updates `self.preferences_path` and live configuration fields.
     pub fn with_preferences_path(mut self, path: PathBuf) -> Self {
         if let Some(prefs) = AppPreferences::load_from_path(&path) {
             self.apply_preferences(&prefs);
@@ -698,7 +1065,15 @@ impl VulcansTrialsApp {
         self
     }
 
-    /// Applies stored preferences to live application configuration fields.
+    /// Applies stored [`AppPreferences`] values to all live placement, routing, layer visibility,
+    /// and KiCad IPC configuration fields on `self` and synchronizes shared [`LiveTrialState`] flags.
+    ///
+    /// # Arguments
+    /// * `prefs` - Reference to the [`AppPreferences`] to apply.
+    ///
+    /// # Side Effects
+    /// Mutates configuration fields on `self` and locks `self.live` to update `acid_trap_fillet_radius`
+    /// and `allow_via_in_pad` on the underlying [`Board`].
     pub fn apply_preferences(&mut self, prefs: &AppPreferences) {
         self.place_duration_secs = prefs.place_duration_secs;
         self.min_spacing_mm = prefs.min_spacing_mm;
@@ -753,7 +1128,10 @@ impl VulcansTrialsApp {
         self.bundle_track_spacing = prefs.bundle_track_spacing;
     }
 
-    /// Extracts current application configuration as an `AppPreferences` instance.
+    /// Snapshots the current application configuration fields into a serializable [`AppPreferences`] struct.
+    ///
+    /// # Returns
+    /// An [`AppPreferences`] instance reflecting `self`'s current settings and board file paths.
     pub fn to_preferences(&self) -> AppPreferences {
         AppPreferences {
             place_duration_secs: self.place_duration_secs,
@@ -806,7 +1184,11 @@ impl VulcansTrialsApp {
         }
     }
 
-    /// Saves the current preferences to disk if configured or default path.
+    /// Persists the current application preferences to `self.preferences_path` (if set) or to
+    /// [`AppPreferences::config_path`] (when not running under `cargo test`), and updates `self.last_saved_prefs`.
+    ///
+    /// # Side Effects
+    /// Writes the serialized JSON preferences file to disk and updates `self.last_saved_prefs`.
     pub fn save_preferences(&mut self) {
         let prefs = self.to_preferences();
         if let Some(ref target) = self.preferences_path {
@@ -818,6 +1200,18 @@ impl VulcansTrialsApp {
         self.last_saved_prefs = prefs;
     }
 
+    /// Builder method that attaches an existing [`KiCadIpcClient`] handle to the application.
+    ///
+    /// Enables `kicad_ipc_enabled` and synchronizes `kicad_ipc_socket_path` from the client's socket path.
+    ///
+    /// # Arguments
+    /// * `ipc` - Optional thread-safe [`KiCadIpcClient`] instance to attach.
+    ///
+    /// # Returns
+    /// The updated [`VulcansTrialsApp`] instance (`self`).
+    ///
+    /// # Side Effects
+    /// Mutates `self.ipc`, `self.kicad_ipc_enabled`, `self.kicad_ipc_socket_path`, and `self.last_saved_prefs`.
     pub fn with_ipc(mut self, ipc: Option<Arc<Mutex<KiCadIpcClient>>>) -> Self {
         if let Some(ref client_arc) = ipc {
             self.kicad_ipc_enabled = true;
@@ -832,14 +1226,27 @@ impl VulcansTrialsApp {
         self
     }
 
-    /// Returns true if an active, connected KiCad IPC client is currently attached.
+    /// Checks whether a [`KiCadIpcClient`] is currently attached and has an active socket connection.
+    ///
+    /// # Returns
+    /// `true` if `self.ipc` is `Some` and [`KiCadIpcClient::is_connected`] returns `true`.
     pub fn is_ipc_connected(&self) -> bool {
         self.ipc
             .as_ref()
             .is_some_and(|c| c.lock().is_ok_and(|g| g.is_connected()))
     }
 
-    /// Attempts to connect (or reconnect) to the KiCad IPC socket.
+    /// Attempts to connect (or reconnect) to the configured or auto-discovered KiCad 10 IPC socket.
+    ///
+    /// # Arguments
+    /// * `quiet` - When `true`, suppresses stderr diagnostic warnings if the socket is unavailable.
+    ///
+    /// # Returns
+    /// `true` if a connection was established, or `false` if no active KiCad IPC server was reachable.
+    ///
+    /// # Side Effects
+    /// Updates `self.last_ipc_retry`, `self.ipc`, `self.kicad_ipc_socket_path`, and appends a connection
+    /// message to the [`LiveTrialState`] activity log on success.
     pub fn try_connect_ipc(&mut self, quiet: bool) -> bool {
         let custom = if self.kicad_ipc_socket_path.trim().is_empty() {
             None
@@ -871,7 +1278,14 @@ impl VulcansTrialsApp {
         }
     }
 
-    /// Periodically retries connecting to the KiCad IPC socket when `kicad_ipc_enabled` is true and disconnected.
+    /// Periodically retries connecting to the KiCad IPC socket when `kicad_ipc_enabled` is `true`
+    /// and at least `self.ipc_retry_interval` has elapsed since `self.last_ipc_retry`.
+    ///
+    /// # Returns
+    /// `true` if already connected or if a reconnection attempt succeeded; `false` otherwise.
+    ///
+    /// # Side Effects
+    /// May invoke [`Self::try_connect_ipc`] and update `self.ipc` and `self.last_ipc_retry`.
     pub fn poll_ipc_auto_reconnect(&mut self) -> bool {
         if !self.kicad_ipc_enabled {
             return false;
@@ -885,8 +1299,15 @@ impl VulcansTrialsApp {
         false
     }
 
-    /// Saves the board to `.kicad_pcb` and `.ses`, and if the KiCad IPC socket is connected,
-    /// pulls the updated board into KiCad.
+    /// Writes the current board state to `self.output_path` (`.kicad_pcb` and Specctra `.ses`),
+    /// refills copper zones on disk, and synchronizes the updated layout into KiCad over IPC.
+    ///
+    /// # Returns
+    /// `true` if the `.kicad_pcb` file was saved to disk, or `false` if saving failed.
+    ///
+    /// # Side Effects
+    /// Backs up any existing `.kicad_pcb` file with a timestamp suffix, writes `.kicad_pcb` and `.ses`
+    /// files, runs zone refill, streams updates over [`KiCadIpcClient`], and logs status messages to [`LiveTrialState`].
     pub fn save_output_and_pull_to_kicad(&mut self) -> bool {
         let pcb_path = PathBuf::from(&self.output_path);
         let ses_path = pcb_path.with_extension("ses");
@@ -956,19 +1377,40 @@ impl VulcansTrialsApp {
         true
     }
 
-    /// Sets both input and output paths to point to the single unified board file.
+    /// Sets both `self.input_path` and `self.output_path` to the specified `.kicad_pcb` path.
+    ///
+    /// # Arguments
+    /// * `path` - Unified filesystem path for reading and writing the board.
+    ///
+    /// # Side Effects
+    /// Updates `self.input_path` and `self.output_path`.
     pub fn set_board_path(&mut self, path: String) {
         self.input_path = path.clone();
         self.output_path = path;
     }
 
-    /// Resets viewport camera pan offset to origin (0, 0) and zoom scale to 1.0.
+    /// Resets the 2D canvas camera pan offset to `(0.0, 0.0)` and zoom multiplier to `1.0`.
+    ///
+    /// # Side Effects
+    /// Mutates `self.pan_offset` and `self.zoom`.
     pub fn reset_view(&mut self) {
         self.pan_offset = Vec2::ZERO;
         self.zoom = 1.0;
     }
 
-    /// Opens and parses a KiCad board from the specified filesystem path, replacing current state.
+    /// Loads and parses a KiCad `.kicad_pcb` board from `path`, replacing the current board state,
+    /// visible copper layer set, and viewport bounds.
+    ///
+    /// # Arguments
+    /// * `path` - Filesystem path to the `.kicad_pcb` file to load.
+    ///
+    /// # Returns
+    /// `true` if the board was parsed and loaded successfully, or `false` on I/O or parse error.
+    ///
+    /// # Side Effects
+    /// Reads `path` (and companion `.kicad_sch` / `.kicad_pro` files if present), replaces the
+    /// [`LiveTrialState`] inside `self.live`, updates `self.visible_layers`, `self.view_bounds`,
+    /// `self.input_path`, `self.output_path`, and resets the camera view.
     pub fn open_pcb_from_path(&mut self, path: &str) -> bool {
         match Board::load(path, &HashSet::new()) {
             Ok(board) => {
@@ -998,13 +1440,24 @@ impl VulcansTrialsApp {
         }
     }
 
-    /// Reloads the current PCB file from disk, discarding unsaved in-memory placement/routing edits.
+    /// Reloads the current `.kicad_pcb` file (`self.input_path`) from disk, discarding any unsaved
+    /// in-memory placement or routing modifications.
+    ///
+    /// # Returns
+    /// `true` if reloading succeeded, or `false` if the file could not be read or parsed.
+    ///
+    /// # Side Effects
+    /// Delegates to [`Self::open_pcb_from_path`], resetting [`LiveTrialState`] and viewport camera state.
     pub fn reload_pcb(&mut self) -> bool {
         let path = self.input_path.clone();
         self.open_pcb_from_path(&path)
     }
 
-    /// Prompts the user to select a KiCad PCB file to open (via OS file dialog or in-app modal).
+    /// Prompts the user to select a `.kicad_pcb` file to open via the native OS file picker
+    /// ([`pick_open_file`]) or opens the fallback in-app modal dialog if unavailable.
+    ///
+    /// # Side Effects
+    /// Spawns `zenity` on Linux (or sets `self.open_dialog_open = true`) and loads the chosen board.
     pub fn trigger_open_file(&mut self) {
         match pick_open_file(&self.input_path) {
             Ok(Some(path)) => {
@@ -1018,7 +1471,12 @@ impl VulcansTrialsApp {
         }
     }
 
-    /// Prompts the user for a new PCB destination path and saves the current board state.
+    /// Prompts the user to select a destination `.kicad_pcb` path via the native OS file picker
+    /// ([`pick_save_file`]) and saves the board, or opens the fallback in-app Save-As modal dialog.
+    ///
+    /// # Side Effects
+    /// Spawns `zenity` on Linux (or sets `self.save_as_dialog_open = true`), updates board paths,
+    /// writes `.kicad_pcb` and `.ses` files, and syncs to KiCad over IPC.
     pub fn trigger_save_as_file(&mut self) {
         match pick_save_file(&self.output_path) {
             Ok(Some(path)) => {
@@ -1033,6 +1491,13 @@ impl VulcansTrialsApp {
         }
     }
 
+    /// Returns whether the specified copper layer is currently enabled for rendering and click hit-testing.
+    ///
+    /// # Arguments
+    /// * `layer_name` - KiCad copper layer name (e.g., `"F.Cu"`, `"B.Cu"`, `"In1.Cu"`).
+    ///
+    /// # Returns
+    /// `true` if the layer toggle is enabled on `self`, `false` otherwise.
     pub fn is_layer_visible(&self, layer_name: &str) -> bool {
         match layer_name {
             "F.Cu" => self.show_f_cu && self.visible_layers.contains("F.Cu"),
@@ -1043,6 +1508,15 @@ impl VulcansTrialsApp {
         }
     }
 
+    /// Sets the visibility state of a named copper layer for both boolean shortcuts (`show_f_cu`, etc.)
+    /// and the general `self.visible_layers` set.
+    ///
+    /// # Arguments
+    /// * `layer_name` - KiCad copper layer name (e.g., `"F.Cu"`, `"B.Cu"`, `"In1.Cu"`).
+    /// * `visible` - `true` to show and hit-test the layer, `false` to hide it.
+    ///
+    /// # Side Effects
+    /// Updates `self.show_f_cu` / `self.show_b_cu` / `self.show_in1_cu` / `self.show_in2_cu` and `self.visible_layers`.
     pub fn set_layer_visible(&mut self, layer_name: &str, visible: bool) {
         match layer_name {
             "F.Cu" => self.show_f_cu = visible,
@@ -1058,10 +1532,28 @@ impl VulcansTrialsApp {
         }
     }
 
+    /// Returns `true` if the Holding Palette panel is enabled (`self.show_holding_palette`) and
+    /// at least one component currently resides in `board.holding_palette`.
+    ///
+    /// # Returns
+    /// `true` when the Holding Palette side panel should be rendered.
     pub fn is_holding_palette_visible(&self) -> bool {
         self.show_holding_palette && !self.live.lock().unwrap().board.holding_palette.is_empty()
     }
 
+    /// Spawns a background worker thread to execute auto-placement (`do_place`), auto-routing (`do_route`),
+    /// or both in sequence, followed by automatic `.kicad_pcb` / `.ses` saving and KiCad IPC synchronization.
+    ///
+    /// Does nothing if a worker thread is already running (`self.worker_running` is `true`).
+    ///
+    /// # Arguments
+    /// * `do_place` - When `true`, places any components from the Holding Palette and runs Parallel Tempering Simulated Annealing auto-placement.
+    /// * `do_route` - When `true`, builds a [`RoutingGrid`] and runs multi-layer [`AutoRouter::route_all`].
+    ///
+    /// # Side Effects
+    /// Sets `self.worker_running = true`, resets `self.stop_flag = false`, spawns a detached OS thread
+    /// that continuously mutates `self.live`, streams live updates over KiCad IPC, and writes output files
+    /// when `self.output_path` is non-empty.
     fn start_trial(&mut self, do_place: bool, do_route: bool) {
         if self.worker_running.load(Ordering::Relaxed) {
             return;
@@ -1209,6 +1701,21 @@ impl VulcansTrialsApp {
         });
     }
 
+    /// Transforms a 2D board world coordinate `(wx, wy)` in millimeters into screen pixel coordinates
+    /// (`Pos2`) and returns the effective pixels-per-millimeter scale factor.
+    ///
+    /// Applies uniform aspect-ratio-preserving scaling based on `self.view_bounds`, `self.zoom`, and
+    /// `self.pan_offset` relative to the center of `rect`.
+    ///
+    /// # Arguments
+    /// * `_board` - Reference to the loaded [`Board`] (retained for signature symmetry with [`Self::screen_to_board`]).
+    /// * `rect` - Screen-space bounding rectangle of the 2D PCB canvas.
+    /// * `wx` - Board world X coordinate in millimeters.
+    /// * `wy` - Board world Y coordinate in millimeters.
+    ///
+    /// # Returns
+    /// A tuple `(screen_pos, scale)` where `screen_pos` is the projected [`Pos2`] in screen pixels and
+    /// `scale` is the current zoom-adjusted pixels-per-millimeter factor.
     pub fn board_to_screen(&self, _board: &Board, rect: Rect, wx: f64, wy: f64) -> (Pos2, f32) {
         let (min_x, max_x, min_y, max_y) = self.view_bounds;
         let bw = (max_x - min_x).max(10.0) as f32;
@@ -1225,6 +1732,16 @@ impl VulcansTrialsApp {
         (pos, scale)
     }
 
+    /// Inverse transformation mapping a screen pixel position (`pos`) inside `rect` back into
+    /// board world coordinates ([`Point`] in millimeters).
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the loaded [`Board`].
+    /// * `rect` - Screen-space bounding rectangle of the 2D PCB canvas.
+    /// * `pos` - Cursor or click position in screen pixels.
+    ///
+    /// # Returns
+    /// The corresponding board world [`Point`] `(x_mm, y_mm)`.
     pub fn screen_to_board(&self, board: &Board, rect: Rect, pos: Pos2) -> Point {
         let (min_x, max_x, min_y, max_y) = self.view_bounds;
         let (_, scale) = self.board_to_screen(board, rect, min_x, min_y);
@@ -1236,6 +1753,19 @@ impl VulcansTrialsApp {
         Point::new(wx as f64, wy as f64)
     }
 
+    /// Computes the axis-aligned screen-space bounding [`Rect`] enclosing all transformed courtyard/perimeter
+    /// polygons of a footprint `fp`.
+    ///
+    /// Falls back to a minimum `6.0 x 6.0` pixel square centered on the footprint origin if no perimeter
+    /// vertices exist.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the loaded [`Board`].
+    /// * `rect` - Screen-space bounding rectangle of the 2D PCB canvas.
+    /// * `fp` - Footprint whose screen bounding box is being computed.
+    ///
+    /// # Returns
+    /// The screen-space [`Rect`] covering the footprint.
     pub fn footprint_screen_rect(&self, board: &Board, rect: Rect, fp: &crate::board::Footprint) -> Rect {
         let polys = fp.transformed_perimeters_layered(Point::new(fp.x, fp.y), fp.rotation, fp.layer, 0.0);
         let mut min_x = f32::INFINITY;
@@ -1259,6 +1789,21 @@ impl VulcansTrialsApp {
         }
     }
 
+    /// Tests whether a screen-space cursor position (`click_pos`) lies inside the projected geometry
+    /// of a component `pad` belonging to footprint `fp`.
+    ///
+    /// Uses radial distance for circular pads and a 2D ray-casting point-in-polygon test on the
+    /// rotated world corners for rectangular, oval, or polygonal pads.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the loaded [`Board`].
+    /// * `rect` - Screen-space bounding rectangle of the 2D PCB canvas.
+    /// * `fp` - Parent [`crate::board::Footprint`] owning `pad`.
+    /// * `pad` - Target [`crate::board::Pad`] to hit-test.
+    /// * `click_pos` - Screen pixel coordinates of the pointer or click.
+    ///
+    /// # Returns
+    /// `true` if `click_pos` falls within the pad's screen boundary, `false` otherwise.
     pub fn is_point_in_pad(&self, board: &Board, rect: Rect, fp: &crate::board::Footprint, pad: &crate::board::Pad, click_pos: Pos2) -> bool {
         let (px, py) = fp.pad_absolute_position(pad);
         let (center, scale) = self.board_to_screen(board, rect, px, py);
@@ -1289,6 +1834,17 @@ impl VulcansTrialsApp {
         }
     }
 
+    /// Resolves a human-readable electrical net name for a numeric KiCad `net_id`.
+    ///
+    /// Searches `board.nets`, `board.net_name_to_id`, and footprint pad net names, falling back
+    /// to `"Net#<net_id>"` if no string name is registered (or returning `""` for `net_id == 0`).
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the [`Board`] containing net tables and pads.
+    /// * `net_id` - Numeric KiCad net identifier (`0` indicates unconnected/no-net).
+    ///
+    /// # Returns
+    /// The resolved net name string.
     pub fn resolve_net_name(board: &Board, net_id: usize) -> String {
         if net_id == 0 {
             return String::new();
@@ -1313,6 +1869,14 @@ impl VulcansTrialsApp {
         format!("Net#{}", net_id)
     }
 
+    /// Resolves the numeric KiCad net ID (`> 0`) corresponding to the currently highlighted net
+    /// (`self.selected_net` or `self.selected_net_id`).
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the loaded [`Board`].
+    ///
+    /// # Returns
+    /// `Some(net_id)` if a valid net (`net_id > 0`) is currently selected, or `None` otherwise.
     pub fn selected_net_id(&self, board: &Board) -> Option<usize> {
         if let Some(ref name) = self.selected_net {
             if name.is_empty() {
@@ -1347,10 +1911,27 @@ impl VulcansTrialsApp {
         self.selected_net_id.filter(|&id| id > 0)
     }
 
+    /// Returns `true` if `net_id` is non-zero and matches the currently selected/highlighted net.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the loaded [`Board`].
+    /// * `net_id` - Numeric KiCad net ID to check.
+    ///
+    /// # Returns
+    /// `true` when `net_id` is highlighted on the canvas.
     pub fn is_net_id_highlighted(&self, board: &Board, net_id: usize) -> bool {
         net_id > 0 && self.selected_net_id(board) == Some(net_id)
     }
 
+    /// Returns `true` if the given component `pad` belongs to the currently highlighted net
+    /// (by numeric `net_id` or string `net_name`).
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the loaded [`Board`].
+    /// * `pad` - Component [`crate::board::Pad`] to check.
+    ///
+    /// # Returns
+    /// `true` when `pad` should be rendered with highlight halo and fill colours.
     pub fn is_pad_highlighted(&self, board: &Board, pad: &crate::board::Pad) -> bool {
         if self.is_net_id_highlighted(board, pad.net_id) {
             return true;
@@ -1360,21 +1941,58 @@ impl VulcansTrialsApp {
             .is_some_and(|sn| !sn.is_empty() && sn == &pad.net_name)
     }
 
+    /// Returns `true` if track segment `tr` belongs to the highlighted net and its copper layer is visible.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the loaded [`Board`].
+    /// * `tr` - Routed [`TrackSegment`] to check.
+    ///
+    /// # Returns
+    /// `true` when `tr` should be drawn with the highlight halo overlay.
     pub fn is_track_highlighted(&self, board: &Board, tr: &TrackSegment) -> bool {
         self.is_net_id_highlighted(board, tr.net_id)
             && self.is_layer_visible(board.layer_name(tr.layer))
     }
 
+    /// Returns `true` if vias are visible (`self.show_vias`) and `via` belongs to the highlighted net.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the loaded [`Board`].
+    /// * `via` - Plated through-hole [`Via`] to check.
+    ///
+    /// # Returns
+    /// `true` when `via` should be rendered with highlight colours.
     pub fn is_via_highlighted(&self, board: &Board, via: &Via) -> bool {
         self.show_vias && self.is_net_id_highlighted(board, via.net_id)
     }
 
+    /// Returns `true` if the ratsnest is visible (`self.show_ratsnest`) and airwire segment `seg`
+    /// belongs to the highlighted net.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the loaded [`Board`].
+    /// * `seg` - Ratsnest [`crate::board::Segment`] airwire to check.
+    ///
+    /// # Returns
+    /// `true` when `seg` should be drawn with a highlighted stroke.
     pub fn is_ratsnest_highlighted(&self, board: &Board, seg: &crate::board::Segment) -> bool {
         self.show_ratsnest && self.is_net_id_highlighted(board, seg.net_id)
     }
 
-    /// Hit-tests pads, vias, and routed trace segments at `world_pos` (mm) on visible layers,
-    /// returning `Some((net_id, net_name))` for the clicked net element.
+    /// Hit-tests pads, vias, and routed trace segments (straight tracks and arcs) at `world_pos` (`mm`)
+    /// across all currently visible layers.
+    ///
+    /// Evaluates candidates in priority order:
+    /// 1. Component pads (through-hole or on a visible copper layer).
+    /// 2. Plated vias (when `self.show_vias` is enabled).
+    /// 3. Straight [`TrackSegment`]s and curved [`crate::board::ArcSegment`]s on visible copper layers.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the loaded [`Board`].
+    /// * `world_pos` - Query position in board world coordinates (`mm`).
+    ///
+    /// # Returns
+    /// `Some((net_id, net_name))` for the closest hit copper element with an assigned net, or `None` if no net was hit.
     pub fn hit_test_net_at_world(&self, board: &Board, world_pos: Point) -> Option<(usize, String)> {
         // 1. Pads
         for fp in &board.footprints {
@@ -1450,6 +2068,24 @@ impl VulcansTrialsApp {
         None
     }
 
+    /// Handles a primary (left) mouse click at `click_pos` on the 2D PCB canvas when no modal tool is active.
+    ///
+    /// Dispatches in priority order:
+    /// 1. Clicking a pad, via, or routed trace toggles net highlighting for that electrical net.
+    /// 2. Clicking a footprint body (outside its pads, while no worker is running) toggles `fp.is_locked`.
+    /// 3. Clicking empty canvas space clears any active net highlight.
+    ///
+    /// # Arguments
+    /// * `rect` - Screen-space bounding rectangle of the 2D PCB canvas.
+    /// * `click_pos` - Screen pixel coordinates of the left click.
+    ///
+    /// # Returns
+    /// `Some(summary)` describing the highlighted net, unassigned pad, or toggled footprint lock state,
+    /// or `None` if empty space was clicked.
+    ///
+    /// # Side Effects
+    /// Mutates `self.selected_net`, `self.selected_net_id`, or `board.footprints[idx].is_locked`,
+    /// and appends an entry to the [`LiveTrialState`] activity log.
     pub fn handle_canvas_click_at(&mut self, rect: Rect, click_pos: Pos2) -> Option<String> {
         let (clicked_pad, clicked_copper_net, clicked_fp_body) = {
             let g = self.live.lock().unwrap();
@@ -1600,6 +2236,20 @@ impl VulcansTrialsApp {
         }
     }
 
+    /// Handles a secondary (right) mouse click at `click_pos` on the 2D PCB canvas by moving the
+    /// closest unlocked footprint under the cursor into the Holding Palette.
+    ///
+    /// # Arguments
+    /// * `rect` - Screen-space bounding rectangle of the 2D PCB canvas.
+    /// * `click_pos` - Screen pixel coordinates of the right click.
+    ///
+    /// # Returns
+    /// `Some(reference)` of the footprint moved to `board.holding_palette`, or `None` if no unlocked
+    /// footprint was hit or if a background worker is running.
+    ///
+    /// # Side Effects
+    /// Removes the footprint from `board.footprints`, inserts and sorts it into `board.holding_palette`,
+    /// enables `self.show_holding_palette`, refreshes the ratsnest, and logs the action.
     pub fn handle_canvas_secondary_click_at(&mut self, rect: Rect, click_pos: Pos2) -> Option<String> {
         if self.worker_running.load(Ordering::Relaxed) {
             return None;
@@ -1639,6 +2289,19 @@ impl VulcansTrialsApp {
         }
     }
 
+    /// Toggles the `is_locked` state of the smallest/closest footprint containing `click_pos`,
+    /// provided `click_pos` does not fall inside any component pad.
+    ///
+    /// # Arguments
+    /// * `rect` - Screen-space bounding rectangle of the 2D PCB canvas.
+    /// * `click_pos` - Screen pixel coordinates of the click.
+    ///
+    /// # Returns
+    /// `Some((reference, is_locked))` when a footprint lock state was toggled, or `None` if a pad
+    /// was clicked, no footprint was hit, or a worker thread is active.
+    ///
+    /// # Side Effects
+    /// Flips `fp.is_locked` on the matched footprint and pushes an entry to the activity log.
     pub fn toggle_footprint_lock_at(&mut self, rect: Rect, click_pos: Pos2) -> Option<(String, bool)> {
         if self.worker_running.load(Ordering::Relaxed) {
             return None;
@@ -1682,7 +2345,19 @@ impl VulcansTrialsApp {
         }
     }
 
-    /// Picks up an unlocked component at `pos` to begin manual movement.
+    /// Picks up an unlocked footprint at screen position `pos` (`'M'` shortcut) to begin interactive
+    /// mouse-following movement.
+    ///
+    /// # Arguments
+    /// * `rect` - Screen-space bounding rectangle of the 2D PCB canvas.
+    /// * `pos` - Cursor position in screen pixels.
+    ///
+    /// # Returns
+    /// `true` if an unlocked footprint was picked up into `self.moving_footprint`, or `false` if
+    /// no footprint was under the cursor, the footprint was locked, or a worker thread is running.
+    ///
+    /// # Side Effects
+    /// Stores a [`MovingFootprint`] snapshot in `self.moving_footprint` and logs a message to [`LiveTrialState`].
     pub fn pick_up_component_at(&mut self, rect: Rect, pos: Pos2) -> bool {
         if self.worker_running.load(Ordering::Relaxed) {
             return false;
@@ -1728,7 +2403,15 @@ impl VulcansTrialsApp {
         }
     }
 
-    /// Updates the position of the currently moving component to track cursor position.
+    /// Updates the board world coordinates `(x, y)` of the currently moving footprint (`self.moving_footprint`)
+    /// to follow the screen cursor `pos` and recomputes the live ratsnest.
+    ///
+    /// # Arguments
+    /// * `rect` - Screen-space bounding rectangle of the 2D PCB canvas.
+    /// * `pos` - Current cursor position in screen pixels.
+    ///
+    /// # Side Effects
+    /// Mutates `board.footprints[mf.fp_index].x` and `.y` and calls [`LiveTrialState::refresh_ratsnest`].
     pub fn update_moving_component_pos(&mut self, rect: Rect, pos: Pos2) {
         if let Some(ref mf) = self.moving_footprint {
             let mut g = self.live.lock().unwrap();
@@ -1741,7 +2424,18 @@ impl VulcansTrialsApp {
         }
     }
 
-    /// Rotates the active component (moving component or hovered component) by 90 degrees.
+    /// Rotates the active component (`self.moving_footprint` or unlocked `self.hovered_footprint`)
+    /// by `90°` (`'R'` shortcut).
+    ///
+    /// When rotating a stationary hovered footprint directly on the board, any routed copper tracks
+    /// and vias connected to its pads are automatically ripped up first.
+    ///
+    /// # Returns
+    /// `true` if a component was rotated, or `false` if no unlocked component was active or a worker is running.
+    ///
+    /// # Side Effects
+    /// Advances `fp.rotation` by `90° (mod 360°)`, optionally rips up connected traces/vias, refreshes
+    /// the ratsnest, and logs the rotation.
     pub fn rotate_active_component(&mut self) -> bool {
         if self.worker_running.load(Ordering::Relaxed) {
             return false;
@@ -1785,7 +2479,18 @@ impl VulcansTrialsApp {
         false
     }
 
-    /// Flips the active component (moving component or hovered component) to the other board side.
+    /// Flips the active component (`self.moving_footprint` or unlocked `self.hovered_footprint`)
+    /// between the Top (`F.Cu`, `0`) and Bottom (`B.Cu`, `1`) board sides (`'F'` shortcut).
+    ///
+    /// When flipping a stationary hovered footprint directly, any routed copper tracks and vias
+    /// connected to its pads are ripped up first.
+    ///
+    /// # Returns
+    /// `true` if a component was flipped, or `false` if no unlocked component was active or a worker is running.
+    ///
+    /// # Side Effects
+    /// Toggles `fp.layer` (`1 - fp.layer`), optionally rips up connected traces/vias, refreshes the
+    /// ratsnest, and logs the layer flip.
     pub fn flip_active_component(&mut self) -> bool {
         if self.worker_running.load(Ordering::Relaxed) {
             return false;
@@ -1829,7 +2534,17 @@ impl VulcansTrialsApp {
         false
     }
 
-    /// Places the moving component at its current position, shoving other unlocked components if needed.
+    /// Commits the placement of `self.moving_footprint` at its current coordinates, ripping up stale
+    /// connected traces if it moved and shoving any overlapping unlocked components out of the way.
+    ///
+    /// # Returns
+    /// `Some(shoved_count)` indicating how many overlapping unlocked footprints were displaced to
+    /// legalize courtyards, or `None` if no component was being moved or a worker is running.
+    ///
+    /// # Side Effects
+    /// Clears `self.moving_footprint`, rips up traces connected to the footprint's original pad
+    /// positions, invokes [`crate::placer::shove_overlapping_components`], refreshes the ratsnest,
+    /// and logs the placement.
     pub fn place_moving_component(&mut self) -> Option<usize> {
         if self.worker_running.load(Ordering::Relaxed) {
             return None;
@@ -1880,7 +2595,15 @@ impl VulcansTrialsApp {
         Some(shoved_count)
     }
 
-    /// Cancels moving the active component and restores its original coordinates, rotation, and layer.
+    /// Cancels an interactive component move (`Esc` or right-click) and restores the footprint's
+    /// original coordinates, rotation, and board layer from [`MovingFootprint`].
+    ///
+    /// # Returns
+    /// `true` if an active move was cancelled and restored, or `false` if no move was in progress.
+    ///
+    /// # Side Effects
+    /// Clears `self.moving_footprint`, restores the footprint fields on `board.footprints`, refreshes
+    /// the ratsnest, and logs the cancellation.
     pub fn cancel_moving_component(&mut self) -> bool {
         if let Some(mf) = self.moving_footprint.take() {
             let mut g = self.live.lock().unwrap();
@@ -1899,7 +2622,17 @@ impl VulcansTrialsApp {
         false
     }
 
-    /// Locates any pad, via, or track at the given screen `pos`.
+    /// Locates any net-assigned copper pad, via, straight track segment, or curved arc at screen
+    /// position `pos` for interactive routing start/finish snapping.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the loaded [`Board`].
+    /// * `rect` - Screen-space bounding rectangle of the 2D PCB canvas.
+    /// * `pos` - Cursor position in screen pixels.
+    ///
+    /// # Returns
+    /// `Some(HoveredCopperItem)` describing the matched pad, via, or trace and its snap point in `mm`,
+    /// or `None` if no net-assigned copper item lies at `pos`.
     pub fn find_copper_item_at(&self, board: &Board, rect: Rect, pos: Pos2) -> Option<HoveredCopperItem> {
         // 1. Check pads
         for fp in &board.footprints {
@@ -2019,7 +2752,21 @@ impl VulcansTrialsApp {
         None
     }
 
-    /// Initiates interactive track routing at `pos`.
+    /// Initiates an interactive 45° dogleg track routing session at screen position `pos` (`'X'` shortcut).
+    ///
+    /// Looks up the copper item under `pos`, resolves its netclass track width and via dimensions,
+    /// and initializes `self.active_route` anchored at the item's snap coordinates.
+    ///
+    /// # Arguments
+    /// * `rect` - Screen-space bounding rectangle of the 2D PCB canvas.
+    /// * `pos` - Cursor or click position in screen pixels.
+    ///
+    /// # Returns
+    /// `true` if a valid copper item was hit and an [`ActiveRoute`] was started, or `false` if only
+    /// `self.route_tool_active` was armed (or if a background worker is running).
+    ///
+    /// # Side Effects
+    /// Sets `self.route_tool_active = true`, populates `self.active_route`, and logs the route start.
     pub fn start_route_at(&mut self, rect: Rect, pos: Pos2) -> bool {
         if self.worker_running.load(Ordering::Relaxed) {
             return false;
@@ -2065,7 +2812,15 @@ impl VulcansTrialsApp {
         false
     }
 
-    /// Places a through-hole via at `via_pt`, anchors segment to the via, and transitions layer.
+    /// Places a plated through-hole via at board coordinates `via_pt` (`'V'` shortcut during active routing),
+    /// anchors the current 45° dogleg segment up to `via_pt`, and cycles `route.current_layer` to the next copper layer.
+    ///
+    /// # Arguments
+    /// * `via_pt` - Board world coordinates `(x_mm, y_mm)` where the via is placed.
+    ///
+    /// # Side Effects
+    /// Appends dogleg anchor points and a [`Via`] to `self.active_route`, switches `current_layer`,
+    /// ensures the new copper layer is marked visible, and logs the via placement.
     pub fn place_via_and_switch_layer(&mut self, via_pt: (f64, f64)) {
         if let Some(ref mut route) = self.active_route {
             let p0 = *route.anchor_points.last().unwrap();
@@ -2108,7 +2863,13 @@ impl VulcansTrialsApp {
         }
     }
 
-    /// Anchors the intermediate dogleg corner and current point to `anchor_points`.
+    /// Anchors the intermediate 45° dogleg knee and endpoint `pt` onto `self.active_route.anchor_points`.
+    ///
+    /// # Arguments
+    /// * `pt` - Snapped board world coordinates `(x_mm, y_mm)` to anchor.
+    ///
+    /// # Side Effects
+    /// Appends 1 or 2 vertices on `route.current_layer` to `self.active_route.anchor_points`.
     pub fn anchor_route_at(&mut self, pt: (f64, f64)) {
         if let Some(ref mut route) = self.active_route {
             let p0 = *route.anchor_points.last().unwrap();
@@ -2122,7 +2883,18 @@ impl VulcansTrialsApp {
         }
     }
 
-    /// Commits an in-progress route ending at `target_pt` to the board tracks and vias.
+    /// Completes and commits `self.active_route` ending at `target_pt`, appending all generated
+    /// [`TrackSegment`]s and [`Via`]s to the live [`Board`] and updating the unrouted ratsnest.
+    ///
+    /// # Arguments
+    /// * `target_pt` - Final destination board world coordinates `(x_mm, y_mm)`.
+    ///
+    /// # Returns
+    /// `true` if an active route was committed, or `false` if `self.active_route` was `None`.
+    ///
+    /// # Side Effects
+    /// Consumes `self.active_route`, pushes new tracks and vias to `board.tracks` and `board.vias`,
+    /// refreshes and filters `live.ratsnest`, and logs the committed route.
     pub fn finish_route_at(&mut self, target_pt: (f64, f64)) -> bool {
         if let Some(route) = self.active_route.take() {
             let p0 = *route.anchor_points.last().unwrap();
@@ -2166,7 +2938,14 @@ impl VulcansTrialsApp {
         }
     }
 
-    /// Cancels in-progress route or exits route mode.
+    /// Cancels an in-progress interactive route (`self.active_route`), or exits interactive routing
+    /// mode (`self.route_tool_active`) if no route is currently anchored.
+    ///
+    /// # Returns
+    /// `true` if an active route or routing mode was cancelled, or `false` if neither was active.
+    ///
+    /// # Side Effects
+    /// Clears `self.active_route` or sets `self.route_tool_active = false` and logs the cancellation.
     pub fn cancel_route(&mut self) -> bool {
         if self.active_route.is_some() {
             self.active_route = None;
@@ -2183,7 +2962,18 @@ impl VulcansTrialsApp {
         }
     }
 
-    /// Handles a left click when routing is active.
+    /// Processes a primary (left) canvas click at `click_pos` while `self.active_route` is in progress.
+    ///
+    /// - If `click_pos` hits a pad, via, or track on the **same** net, snaps to it and commits the route ([`Self::finish_route_at`]).
+    /// - If `click_pos` hits a **foreign** net (`net_id != 0`), rejects the click and logs a DRC warning.
+    /// - Otherwise, snaps `click_pos` to `self.grid_res_mm` and anchors a new dogleg vertex ([`Self::anchor_route_at`]).
+    ///
+    /// # Arguments
+    /// * `rect` - Screen-space bounding rectangle of the 2D PCB canvas.
+    /// * `click_pos` - Screen pixel coordinates of the click.
+    ///
+    /// # Side Effects
+    /// Finishes or extends `self.active_route`, mutating board tracks/vias on completion or logging a rejection.
     pub fn handle_active_route_click(&mut self, rect: Rect, click_pos: Pos2) {
         let snap = self.live.lock().unwrap().clone();
         let b = &snap.board;
@@ -2217,6 +3007,16 @@ impl VulcansTrialsApp {
         }
     }
 
+    /// Returns the list of numeric KiCad net IDs to pack and route together during Bus Bundle sketch mode.
+    ///
+    /// Uses `self.bundle_selected_nets` if explicitly populated; otherwise seeds with `self.selected_net`
+    /// (plus up to 3 additional nets from `board.net_name_to_id`) or falls back to the first 4 valid nets.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the loaded [`Board`].
+    ///
+    /// # Returns
+    /// A non-empty [`Vec<usize>`] of numeric net IDs for bundle routing.
     pub fn get_effective_bundle_nets(&self, board: &Board) -> Vec<usize> {
         if !self.bundle_selected_nets.is_empty() {
             return self.bundle_selected_nets.clone();
@@ -2250,6 +3050,16 @@ impl VulcansTrialsApp {
         nets
     }
 
+    /// Commits the sketched Bus Bundle guide spine (`self.bundle_guide_points`), packs parallel bus
+    /// tracks along the guide via [`route_bundle_along_guide`], and appends them to the board if DRC-clean.
+    ///
+    /// # Returns
+    /// `true` if at least 2 guide points were present and the bundle routed without clearance conflicts;
+    /// `false` otherwise.
+    ///
+    /// # Side Effects
+    /// Constructs a [`RoutingGrid`], mutates `board.tracks` and `board.bundles` via [`route_bundle_along_guide`],
+    /// refreshes `live.ratsnest`, clears `self.bundle_guide_points` on success, and logs the outcome.
     pub fn commit_bundle_sketch(&mut self) -> bool {
         if self.bundle_guide_points.len() < 2 {
             return false;
@@ -2288,6 +3098,14 @@ impl VulcansTrialsApp {
         }
     }
 
+    /// Clears in-progress Bus Bundle guide waypoints (`self.bundle_guide_points`), or exits Bus Bundle
+    /// sketch mode (`self.bundle_sketch_active`) if no waypoints are currently placed.
+    ///
+    /// # Returns
+    /// `true` if waypoints were cleared or sketch mode was exited, or `false` if bundle sketch mode was inactive.
+    ///
+    /// # Side Effects
+    /// Clears `self.bundle_guide_points` or sets `self.bundle_sketch_active = false` and logs the action.
     pub fn cancel_bundle_sketch(&mut self) -> bool {
         if !self.bundle_guide_points.is_empty() {
             self.bundle_guide_points.clear();
@@ -2304,6 +3122,15 @@ impl VulcansTrialsApp {
         }
     }
 
+    /// Snaps a canvas left-click (`click_pos`) to the routing grid (`self.grid_res_mm`) and appends
+    /// the resulting `(x_mm, y_mm)` waypoint to `self.bundle_guide_points`.
+    ///
+    /// # Arguments
+    /// * `rect` - Screen-space bounding rectangle of the 2D PCB canvas.
+    /// * `click_pos` - Screen pixel coordinates of the waypoint click.
+    ///
+    /// # Side Effects
+    /// Appends a grid-snapped world coordinate pair to `self.bundle_guide_points`.
     pub fn handle_bundle_sketch_click(&mut self, rect: Rect, click_pos: Pos2) {
         let snap = self.live.lock().unwrap();
         let b = &snap.board;
@@ -2313,7 +3140,21 @@ impl VulcansTrialsApp {
         self.bundle_guide_points.push(snapped_pt);
     }
 
-    /// Post-route swap between straight octilinear (45°/90°) tracks and hand-drawn-like organic curved tracks.
+    /// Swaps existing routed copper traces between straight octilinear (`45°`/`90°`) segments and
+    /// smooth, hand-drawn TopoR-style organic tangent arcs while preserving DRC clearances.
+    ///
+    /// Caches a snapshot of the original straight tracks (`live.straight_copper_snapshot`) before
+    /// converting to organic arcs so toggling back restores the exact straight geometry losslessly.
+    ///
+    /// # Arguments
+    /// * `enable_organic` - `true` to convert straight tracks into organic tangent arcs; `false` to restore or convert back to straight 45° tracks.
+    ///
+    /// # Returns
+    /// `true` if the board contained copper tracks/arcs and the conversion was applied; `false` if the board has no routed copper.
+    ///
+    /// # Side Effects
+    /// Mutates `self.any_angle_mode`, `board.tracks`, `board.arcs`, and `live.straight_copper_snapshot`,
+    /// streams the updated copper over KiCad IPC if connected, and logs the conversion.
     pub fn swap_organic_tracks(&mut self, enable_organic: bool) -> bool {
         let mut g = self.live.lock().unwrap();
         if g.board.tracks.is_empty() && g.board.arcs.is_empty() {
@@ -2362,6 +3203,20 @@ impl VulcansTrialsApp {
         true
     }
 
+    /// Renders a complete frame of the **Vulcan's Trials** `egui` user interface into `ctx`.
+    ///
+    /// Separated from [`eframe::App::update`] so the full UI (menus, top telemetry bar, left control
+    /// panel, Holding Palette side panel, interactive 2D PCB canvas, and modal file dialogs) can be
+    /// driven and verified deterministically in headless unit tests without an OS window.
+    ///
+    /// # Arguments
+    /// * `ctx` - The active [`egui::Context`] for laying out panels, handling keyboard/mouse input, and painting the 2D canvas.
+    ///
+    /// # Side Effects
+    /// Schedules a 50 ms repaint timer, polls KiCad IPC auto-reconnection, processes global and canvas
+    /// keyboard shortcuts (`Ctrl+O`, `Ctrl+S`, `Ctrl+Shift+S`, `Ctrl+R`, `Ctrl+Q`, `X`, `V`, `/`, `B`,
+    /// `M`, `R`, `F`, `Esc`, `Enter`), renders all UI panels and 2D PCB geometry onto `ctx`, spawns
+    /// background trials when triggered, and auto-saves dirty [`AppPreferences`] to disk.
     pub fn render_ui(&mut self, ctx: &egui::Context) {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
 
@@ -3987,11 +4842,29 @@ impl VulcansTrialsApp {
 }
 
 impl Drop for VulcansTrialsApp {
+    /// Persists the current [`AppPreferences`] to disk when [`VulcansTrialsApp`] is dropped on exit.
+    ///
+    /// # Side Effects
+    /// Invokes [`VulcansTrialsApp::save_preferences`] to flush configuration settings to `preferences.json`.
     fn drop(&mut self) {
         self.save_preferences();
     }
 }
 
+/// Renders a copper track segment with rounded end-caps onto `painter`.
+///
+/// Draws a straight line stroke of `width` pixels from `p1` to `p2` and fills circles of radius
+/// `width * 0.5` at both endpoints so adjacent segments and 45° corners join seamlessly without notches.
+///
+/// # Arguments
+/// * `painter` - The [`egui::Painter`] surface to draw onto.
+/// * `p1` - Start point of the track segment in screen pixels.
+/// * `p2` - End point of the track segment in screen pixels.
+/// * `width` - Stroke width in screen pixels.
+/// * `color` - Layer or highlight [`Color32`] fill/stroke colour.
+///
+/// # Side Effects
+/// Emits a line segment and two filled circles into `painter`'s command list.
 #[inline]
 pub fn draw_track_segment(painter: &egui::Painter, p1: Pos2, p2: Pos2, width: f32, color: Color32) {
     painter.line_segment([p1, p2], Stroke::new(width, color));
@@ -4000,7 +4873,19 @@ pub fn draw_track_segment(painter: &egui::Painter, p1: Pos2, p2: Pos2, width: f3
     painter.circle_filled(p2, r, color);
 }
 
-/// Point-in-pad hit test in board world coordinates (mm).
+/// Tests whether a board world point (`world_pos`, in millimeters) lies inside the physical copper
+/// boundary of `pad` on footprint `fp`.
+///
+/// Evaluates radial distance for circular pads (with a minimum `0.10 mm` pick radius) and convex
+/// polygon containment on the rotated world corners for rectangular/oval pads.
+///
+/// # Arguments
+/// * `fp` - Parent [`crate::board::Footprint`] owning `pad`.
+/// * `pad` - Target [`crate::board::Pad`] to hit-test.
+/// * `world_pos` - Query coordinate [`Point`] in board millimeters.
+///
+/// # Returns
+/// `true` if `world_pos` is inside `pad`, `false` otherwise.
 pub fn is_world_point_in_pad(fp: &crate::board::Footprint, pad: &crate::board::Pad, world_pos: Point) -> bool {
     let (px, py) = fp.pad_absolute_position(pad);
     if pad.shape == "circle" {
@@ -4012,7 +4897,16 @@ pub fn is_world_point_in_pad(fp: &crate::board::Footprint, pad: &crate::board::P
     }
 }
 
-/// Point-to-via hit test in board world coordinates (mm).
+/// Hit-tests a plated [`Via`] against `world_pos` in board world coordinates (`mm`).
+///
+/// # Arguments
+/// * `via` - Target [`Via`] to test.
+/// * `world_pos` - Query coordinate [`Point`] in board millimeters.
+/// * `min_pick_radius_mm` - Minimum selection tolerance radius in millimeters (scaled inversely with zoom).
+///
+/// # Returns
+/// `Some(distance_mm)` from `world_pos` to the via center if within `max(via.size * 0.5, min_pick_radius_mm)`,
+/// or `None` if outside the pick radius.
 pub fn hit_test_via_world(via: &Via, world_pos: Point, min_pick_radius_mm: f64) -> Option<f64> {
     let dist = world_pos.distance_to(&Point::new(via.position.0, via.position.1));
     let radius = (via.size * 0.5).max(min_pick_radius_mm);
@@ -4023,7 +4917,17 @@ pub fn hit_test_via_world(via: &Via, world_pos: Point, min_pick_radius_mm: f64) 
     }
 }
 
-/// Point-to-trace segment hit test in board world coordinates (mm).
+/// Hit-tests a straight copper [`TrackSegment`] against `world_pos` in board world coordinates (`mm`).
+///
+/// Uses the perpendicular point-to-segment distance and compares against `max(seg.width * 0.5, 0.25 / zoom)`.
+///
+/// # Arguments
+/// * `seg` - Target [`TrackSegment`] to test.
+/// * `world_pos` - Query coordinate [`Point`] in board millimeters.
+/// * `zoom` - Current viewport zoom factor used to scale the minimum pick tolerance.
+///
+/// # Returns
+/// `Some(distance_mm)` from `world_pos` to `seg` if within the hit tolerance, or `None` otherwise.
 pub fn hit_test_track_world(seg: &TrackSegment, world_pos: Point, zoom: f32) -> Option<f64> {
     let dist = world_pos.distance_to_segment(
         &Point::new(seg.start.0, seg.start.1),
@@ -4037,7 +4941,19 @@ pub fn hit_test_track_world(seg: &TrackSegment, world_pos: Point, zoom: f32) -> 
     }
 }
 
-/// Renders a miniature scaled preview of a footprint's courtyards and pads inside a fixed-size rect.
+/// Renders a miniature auto-scaled 2D preview card of a footprint's courtyard outline, SMD/through-hole
+/// pads, and drill holes inside a fixed `size` widget allocation (used in the Holding Palette panel).
+///
+/// # Arguments
+/// * `ui` - Target [`egui::Ui`] region in which to allocate and paint the preview card.
+/// * `fp` - The [`crate::board::Footprint`] to preview in its local coordinate frame.
+/// * `size` - Desired widget dimensions in screen pixels (e.g., `Vec2::new(44.0, 44.0)`).
+///
+/// # Returns
+/// The [`egui::Response`] for the allocated preview rectangle (allowing callers to attach hover tooltips).
+///
+/// # Side Effects
+/// Allocates `size` layout space in `ui` and paints the card background, courtyard polygon, and rotated pads.
 pub fn draw_mini_footprint(ui: &mut egui::Ui, fp: &crate::board::Footprint, size: Vec2) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter_at(rect);
@@ -4171,13 +5087,33 @@ impl eframe::App for VulcansTrialsApp {
     // Non-testable directly in a headless test runner because `eframe::Frame` has private fields
     // that can only be instantiated by an active OS window via `eframe::run_native`; all UI logic
     // is delegated to `VulcansTrialsApp::render_ui`, which is unit-tested headlessly below.
+    /// `eframe::App` frame callback invoked by the native window event loop.
+    ///
+    /// Delegates all UI layout, input handling, and canvas painting to [`VulcansTrialsApp::render_ui`].
+    ///
+    /// # Arguments
+    /// * `ctx` - Active [`egui::Context`] for the current frame.
+    /// * `_frame` - Native window [`eframe::Frame`] handle (unused).
+    ///
+    /// # Side Effects
+    /// Calls [`VulcansTrialsApp::render_ui`].
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.render_ui(ctx);
     }
 }
 
 /// Returns the set of footprint indices (`!= hovered_idx`) that belong to the same schematic
-/// functional cluster (`board.clusters`) or passive-tie group as `hovered_idx`.
+/// functional cluster (`board.clusters`) or passive-tie decoupling group as `hovered_idx`.
+///
+/// Used when hovering over a component on the 2D canvas to highlight companion footprints in
+/// [`COL_GROUP_CRTYD`] green.
+///
+/// # Arguments
+/// * `board` - Reference to the loaded [`Board`].
+/// * `hovered_idx` - Index in `board.footprints` of the currently hovered footprint.
+///
+/// # Returns
+/// A [`HashSet<usize>`] of companion footprint indices sharing a cluster or anchor passive tie with `hovered_idx`.
 pub fn same_group_footprint_indices(board: &Board, hovered_idx: usize) -> HashSet<usize> {
     let mut group = HashSet::new();
     let Some(hovered_fp) = board.footprints.get(hovered_idx) else {
@@ -4223,6 +5159,16 @@ pub fn same_group_footprint_indices(board: &Board, hovered_idx: usize) -> HashSe
     group
 }
 
+/// Draws a scaled gold padlock icon centered inside `fp_rect` to indicate that a footprint is locked (`fp.is_locked`).
+///
+/// Skips rendering if `fp_rect`'s smaller dimension is less than `2.0` pixels.
+///
+/// # Arguments
+/// * `painter` - The [`egui::Painter`] surface to draw onto.
+/// * `fp_rect` - Screen-space bounding rectangle of the locked footprint.
+///
+/// # Side Effects
+/// Paints padlock shackle lines, rounded body rectangle, and keyhole shapes onto `painter`.
 pub fn draw_lock_icon(painter: &egui::Painter, fp_rect: Rect) {
     let min_dim = fp_rect.width().min(fp_rect.height());
     if min_dim < 2.0 {
@@ -4272,6 +5218,18 @@ pub fn draw_lock_icon(painter: &egui::Painter, fp_rect: Rect) {
     );
 }
 
+/// Renders the translucent "Colour Legend" overlay card in the top-right corner of `canvas_rect`.
+///
+/// Dynamically lists all active copper layers on `board` in KiCad display order (including any assigned
+/// reference plane net names), followed by `Edge.Cuts`, keepouts, ratsnest, courtyards, pads, and vias.
+///
+/// # Arguments
+/// * `painter` - The [`egui::Painter`] surface of the 2D PCB canvas.
+/// * `canvas_rect` - Screen-space bounding rectangle of the canvas used to anchor the top-right legend box.
+/// * `board` - Reference to the loaded [`Board`] used to query active copper layers and plane net names.
+///
+/// # Side Effects
+/// Paints the legend card backdrop, border, colour swatches, and text labels onto `painter`.
 pub fn draw_color_legend(painter: &egui::Painter, canvas_rect: Rect, board: &Board) {
     let active_layers = board.copper_layers();
     let display_layers = kicad_layer_display_order(&active_layers);
@@ -4356,6 +5314,21 @@ pub fn draw_color_legend(painter: &egui::Painter, canvas_rect: Rect, board: &Boa
     );
 }
 
+/// Renders a fixed-width CPU or GPU utilization sparkline badge and percentage readout in the top status bar.
+///
+/// Uses anchored widget allocations (`65.0` px label, `72.0` px sparkline plot, `42.0` px monospace percentage)
+/// so the sparkline never jitters horizontally as utilization numbers fluctuate.
+///
+/// # Arguments
+/// * `ui` - Target [`egui::Ui`] horizontal bar region.
+/// * `label` - Short metric label (e.g., `"CPU Load"` or `"GPU Load"`).
+/// * `pct` - Current utilization percentage (`0.0..=100.0`).
+/// * `history` - Rolling window of historical utilization percentages (`0.0..=100.0`) plotted left-to-right.
+/// * `color` - Stroke and text [`Color32`] for the sparkline and percentage label.
+/// * `tooltip` - Explanatory hover tooltip text attached to the label, sparkline, and percentage readout.
+///
+/// # Side Effects
+/// Allocates widgets and paints the sparkline time-series graph onto `ui`.
 fn draw_load_badge(ui: &mut egui::Ui, label: &str, pct: f32, history: &[f32], color: Color32, tooltip: &str) {
     ui.horizontal(|ui| {
         // 1. Anchored constant-width label so the graph start position is anchored

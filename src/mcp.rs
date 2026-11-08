@@ -1,6 +1,30 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
+//! # Model Context Protocol (MCP) Server (`mcp`)
+//!
+//! Implements a JSON-RPC 2.0 Model Context Protocol (`protocolVersion = "2024-11-05"`) server
+//! over both standard I/O (`stdio`, via [`run_mcp_stdio`]) and multi-client TCP sockets
+//! (via [`run_mcp_tcp`]), enabling AI agents and external automation clients to inspect, place,
+//! route, and verify KiCad PCBs programmatically.
+//!
+//! ## Architecture & Primary Workflows
+//!
+//! - **Dual Framing Parser ([`read_next_json_rpc_frame`]):** Seamlessly accepts both newline-delimited
+//!   JSON (NDJSON) and LSP-style `Content-Length: <bytes>\r\n\r\n` framed payloads on any [`BufRead`] stream.
+//! - **Stateful Session Management ([`McpServer`] & [`McpServerState`]):** Holds a thread-safe
+//!   `Arc<Mutex<McpServerState>>` encapsulating the active [`Board`], optional [`VulkanEngine`] GPU
+//!   context, and background [`SystemTelemetry`] sampler.
+//! - **22 Specialized EDA Tools ([`get_all_tool_definitions`]):**
+//!   1. *Board Management:* `load_board`, `save_board`, `export_specctra_ses`, `get_board_info`
+//!   2. *Placement:* `run_autoplacer`, `legalize_placement`, `pin_and_gate_swap`, `cluster_components`
+//!   3. *Routing & Post-Route DFM:* `route_all`, `route_bus_bundle`, `escape_bga`, `escape_dense_ics`,
+//!      `topor_any_angle`, `tune_length`, `stitch_ground_vias`, `add_teardrops`, `gloss_tracks`,
+//!      `optimize_vias`, `shove_tracks`
+//!   4. *DRC & Signal Integrity Analysis:* `run_drc`, `check_signal_integrity`, `get_telemetry`
+//! - **MCP Resources:** Exposes `kicad://board/current` and `kicad://system/telemetry` via `resources/list`
+//!   and `resources/read`.
+
 use crate::board::{Board, Point, TrackSegment};
 use crate::placer::{
     build_component_clusters, build_passive_ties, legalize_placement,
@@ -27,39 +51,60 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-/// JSON-RPC 2.0 Request representation
+/// JSON-RPC 2.0 Request representation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JsonRpcRequest {
+    /// Protocol version string (expected to be `"2.0"`).
     pub jsonrpc: String,
+    /// Optional request identifier (`Number` or `String`). `None` indicates a JSON-RPC notification.
     #[serde(default)]
     pub id: Option<Value>,
+    /// Name of the JSON-RPC / MCP method being invoked (e.g., `"initialize"`, `"tools/call"`).
     pub method: String,
+    /// Optional structured method parameters object or array.
     #[serde(default)]
     pub params: Option<Value>,
 }
 
-/// JSON-RPC 2.0 Response representation
+/// JSON-RPC 2.0 Response representation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JsonRpcResponse {
+    /// Protocol version string (always `"2.0"`).
     pub jsonrpc: String,
+    /// Identifier matching the originating [`JsonRpcRequest::id`], or `None` on parse errors.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<Value>,
+    /// Successful return payload when the method completed without a protocol-level error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+    /// Structured JSON-RPC error object when request parsing or method dispatch failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
 }
 
-/// JSON-RPC 2.0 Error representation
+/// JSON-RPC 2.0 Error representation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JsonRpcError {
+    /// Standard JSON-RPC 2.0 integer error code (e.g., `-32700` parse error, `-32601` method not found, `-32602` invalid params).
     pub code: i64,
+    /// Human-readable description of the error condition.
     pub message: String,
+    /// Optional supplementary diagnostic data associated with the error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
 
 impl JsonRpcResponse {
+    /// Constructs a successful JSON-RPC 2.0 response wrapping `result`.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Request identifier echoed from the incoming [`JsonRpcRequest`].
+    /// * `result` - Serialized JSON result value for the method call.
+    ///
+    /// # Returns
+    ///
+    /// A [`JsonRpcResponse`] with `jsonrpc = "2.0"`, `result = Some(result)`, and `error = None`.
     pub fn success(id: Option<Value>, result: Value) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
@@ -69,6 +114,17 @@ impl JsonRpcResponse {
         }
     }
 
+    /// Constructs a failed JSON-RPC 2.0 response containing a [`JsonRpcError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Request identifier echoed from the incoming [`JsonRpcRequest`] (`None` if unparseable).
+    /// * `code` - Standard JSON-RPC 2.0 integer error code.
+    /// * `message` - Human-readable error message.
+    ///
+    /// # Returns
+    ///
+    /// A [`JsonRpcResponse`] with `jsonrpc = "2.0"`, `result = None`, and `error = Some(...)`.
     pub fn error(id: Option<Value>, code: i64, message: impl Into<String>) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
@@ -83,19 +139,37 @@ impl JsonRpcResponse {
     }
 }
 
-/// Shared state for Vulcan's Trials MCP server
+/// Shared state for Vulcan's Trials MCP server.
 pub struct McpServerState {
+    /// Currently loaded KiCad [`Board`], or `None` if no board has been loaded yet.
     pub board: Option<Board>,
+    /// Optional shared [`VulkanEngine`] GPU compute context used by placement and routing tools.
     pub vulkan: Option<Arc<VulkanEngine>>,
+    /// Live CPU and GPU utilization sampler spawned when the server starts.
     pub telemetry: SystemTelemetry,
 }
 
-/// Thread-safe Model Context Protocol server instance
+/// Thread-safe Model Context Protocol server instance.
 pub struct McpServer {
+    /// Mutex-protected [`McpServerState`] shared across stdio or concurrent TCP client threads.
     pub state: Arc<Mutex<McpServerState>>,
 }
 
 impl McpServer {
+    /// Creates a new [`McpServer`] with an optional pre-loaded [`Board`] and [`VulkanEngine`] context.
+    ///
+    /// # Arguments
+    ///
+    /// * `board` - Optional initial [`Board`] already parsed from disk.
+    /// * `vulkan` - Optional shared [`VulkanEngine`] handle for GPU compute acceleration.
+    ///
+    /// # Returns
+    ///
+    /// A newly initialized [`McpServer`] with an active background [`SystemTelemetry`] polling thread.
+    ///
+    /// # Side Effects
+    ///
+    /// Spawns a background telemetry thread via [`SystemTelemetry::spawn`].
     pub fn new(board: Option<Board>, vulkan: Option<Arc<VulkanEngine>>) -> Self {
         let compute_counter = vulkan.as_ref().map(|vk| Arc::clone(&vk.compute_busy_ns));
         let telemetry = SystemTelemetry::spawn(compute_counter);
@@ -110,6 +184,24 @@ impl McpServer {
     }
 
     /// Process a raw JSON-RPC string message and produce a response string if one is required.
+    ///
+    /// Parses `message_str` into a [`JsonRpcRequest`], dispatches it via `McpServer::dispatch_request`,
+    /// and serializes the resulting [`JsonRpcResponse`] to a single-line JSON string. Returns `None`
+    /// for empty/whitespace-only inputs or JSON-RPC notifications (`id.is_none()`).
+    ///
+    /// # Arguments
+    ///
+    /// * `message_str` - Raw JSON-RPC 2.0 request payload string.
+    ///
+    /// # Returns
+    ///
+    /// * `Some(String)` containing the serialized JSON-RPC 2.0 response for requests with an `id` or parse errors.
+    /// * `None` if `message_str` is empty or represents a notification (`id == None`).
+    ///
+    /// # Side Effects
+    ///
+    /// May lock [`McpServer::state`], mutate the loaded [`Board`], run GPU/CPU placement or routing,
+    /// or read/write files on disk depending on the requested MCP method.
     pub fn handle_message(&self, message_str: &str) -> Option<String> {
         let trimmed = message_str.trim();
         if trimmed.is_empty() {
@@ -134,6 +226,22 @@ impl McpServer {
         }
     }
 
+    /// Routes a parsed [`JsonRpcRequest`] to the corresponding MCP protocol handler.
+    ///
+    /// Handles `"initialize"`, `"notifications/initialized"`, `"ping"`, `"tools/list"`,
+    /// `"tools/call"`, `"resources/list"`, and `"resources/read"`.
+    ///
+    /// # Arguments
+    ///
+    /// * `req` - Deserialized [`JsonRpcRequest`] to execute.
+    ///
+    /// # Returns
+    ///
+    /// A [`JsonRpcResponse`] containing either the method result or a JSON-RPC error object.
+    ///
+    /// # Side Effects
+    ///
+    /// Acquires [`McpServer::state`] when servicing `tools/call` or `resources/read` requests.
     fn dispatch_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
         let id = req.id.clone();
         match req.method.as_str() {
@@ -278,7 +386,24 @@ impl McpServer {
         }
     }
 
-    /// Dispatch tool calls to engine functions
+    /// Dispatches an MCP `tools/call` invocation by tool `name` and JSON `args` to the underlying
+    /// placement, routing, DRC, or telemetry engine functions.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Registered MCP tool name (one of the 22 tools returned by [`get_all_tool_definitions`]).
+    /// * `args` - JSON object containing tool-specific parameters.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Value)` with a structured JSON summary of the tool's execution results.
+    /// * `Err(String)` if required parameters are missing, no board is loaded, file I/O fails, or `name` is unknown.
+    ///
+    /// # Side Effects
+    ///
+    /// Locks [`McpServer::state`], mutates the in-memory [`Board`] for placement/routing tools,
+    /// writes `.kicad_pcb` / `.ses` files on `save_board` / `export_specctra_ses`, and syncs over
+    /// KiCad IPC when available.
     fn execute_tool(&self, name: &str, args: &Value) -> Result<Value, String> {
         match name {
             // ==================== 1. Board Management ====================
@@ -998,7 +1123,27 @@ impl McpServer {
     }
 }
 
-/// Helper function to evaluate comprehensive physical DRC
+/// Evaluates a comprehensive physical Design Rule Check (DRC) across all copper entities on `board`.
+///
+/// Inspects six classes of physical layout rules:
+/// 1. **Track-to-Track:** Same-layer, different-net copper shorts and netclass clearance violations.
+/// 2. **Track-to-Via:** Copper shorts and netclass clearance violations between tracks and multi-layer vias.
+/// 3. **Via-to-Via & Hole-to-Hole:** Drill edge-to-edge minimum spacing ($\ge 0.25\text{ mm}$) and
+///    different-net via annular ring shorts/clearance violations.
+/// 4. **Track-to-Pad:** Same-layer SMD or through-hole pad-to-track shorts and clearance violations.
+/// 5. **Via-to-Pad:** Different-net via-to-pad shorts and clearance violations.
+/// 6. **Board-Edge Clearance:** Track and via distance to `board.outline_polygon` against
+///    `custom_edge_clr` (or each netclass's `board_edge_clearance` in millimeters).
+///
+/// # Arguments
+///
+/// * `board` - Reference to the [`Board`] to audit.
+/// * `custom_edge_clr` - Optional override in millimeters (`mm`) for minimum copper-to-board-edge clearance.
+///
+/// # Returns
+///
+/// A JSON [`Value`] object containing boolean `is_clean`, `total_violations`, per-category counts,
+/// and detailed arrays (`shorts`, `clearance_violations`, `hole_to_hole_violations`, `board_edge_violations`).
 fn evaluate_drc(board: &Board, custom_edge_clr: Option<f64>) -> Value {
     let mut shorts = Vec::new();
     let mut clearance_violations = Vec::new();
@@ -1257,6 +1402,17 @@ fn evaluate_drc(board: &Board, custom_edge_clr: Option<f64>) -> Value {
     })
 }
 
+/// Collects a JSON summary of physical dimensions, layer stackup, entity counts, and Prim's MST
+/// ratsnest length for `board`.
+///
+/// # Arguments
+///
+/// * `board` - Reference to the currently loaded [`Board`].
+///
+/// # Returns
+///
+/// A JSON [`Value`] object containing board dimensions in millimeters (`mm`), active copper
+/// layers, footprint/net/track/via/arc/keepout/cluster counts, and unrouted MST ratsnest metrics.
 fn collect_board_info(board: &Board) -> Value {
     let pad_positions: Vec<Vec<Point>> = board
         .footprints
@@ -1300,6 +1456,17 @@ fn collect_board_info(board: &Board) -> Value {
     })
 }
 
+/// Collects a JSON snapshot of live CPU/GPU load percentages, active GPU adapter metadata,
+/// cumulative Vulkan compute nanoseconds, and current board entity counts from `state`.
+///
+/// # Arguments
+///
+/// * `state` - Reference to the locked [`McpServerState`].
+///
+/// # Returns
+///
+/// A JSON [`Value`] object with `cpu_load_pct`, `gpu_load_pct`, `gpu_name`, `backend`,
+/// `driver_info`, `compute_busy_ns`, `ratsnest_length_mm`, and `footprints`/`tracks`/`vias` counts.
 fn collect_telemetry_info(state: &McpServerState) -> Value {
     let telem_guard = state.telemetry.state.lock().unwrap();
     let cpu_load = telem_guard.cpu_load_pct;
@@ -1353,10 +1520,25 @@ fn collect_telemetry_info(state: &McpServerState) -> Value {
     })
 }
 
-/// Reads the next JSON-RPC frame from a BufRead source.
+/// Reads the next JSON-RPC frame from a [`BufRead`] source.
+///
 /// Seamlessly supports:
 /// 1. Line-delimited JSON (NDJSON, starting with `{`)
 /// 2. LSP/MCP Content-Length framing (`Content-Length: <n>\r\n\r\n{...}`)
+///
+/// # Arguments
+///
+/// * `reader` - Mutable reference to any buffered input stream implementing [`BufRead`].
+///
+/// # Returns
+///
+/// * `Ok(Some(String))` containing the raw UTF-8 JSON payload of the next frame.
+/// * `Ok(None)` when the underlying stream reaches clean end-of-file (`EOF`).
+///
+/// # Errors
+///
+/// Returns `Err(std::io::Error)` if reading from `reader` fails, if a `Content-Length` header
+/// contains a non-integer length, or if the payload bytes are not valid UTF-8.
 pub fn read_next_json_rpc_frame<R: BufRead>(reader: &mut R) -> std::io::Result<Option<String>> {
     let mut header_line = String::new();
 
@@ -1404,9 +1586,28 @@ pub fn read_next_json_rpc_frame<R: BufRead>(reader: &mut R) -> std::io::Result<O
     }
 }
 
-/// Runs the MCP server on standard I/O (stdio).
-/// Reads JSON-RPC from stdin, writes JSON-RPC to stdout.
-/// Diagnostics and logging go strictly to stderr.
+/// Runs the MCP server on standard I/O (`stdio`).
+///
+/// Reads JSON-RPC frames from `stdin` via [`read_next_json_rpc_frame`], dispatches each message
+/// through [`McpServer::handle_message`], and writes newline-terminated JSON-RPC responses to
+/// `stdout`. Diagnostics and lifecycle status messages go strictly to `stderr`.
+///
+/// # Arguments
+///
+/// * `server` - Shared [`Arc<McpServer>`] instance handling incoming requests.
+///
+/// # Returns
+///
+/// `Ok(())` when `stdin` reaches EOF cleanly.
+///
+/// # Side Effects
+///
+/// Locks `stdin`, writes responses to `stdout`, logs transport status to `stderr`, and executes
+/// any board/GPU/filesystem operations requested by MCP client tool calls.
+///
+/// # Errors
+///
+/// Returns `Err(std::io::Error)` if reading from `stdin` or writing/flushing to `stdout` fails.
 pub fn run_mcp_stdio(server: Arc<McpServer>) -> std::io::Result<()> {
     eprintln!("[Vulcan's Trials MCP] Stdio transport active (JSON-RPC 2.0)");
     let stdin = std::io::stdin();
@@ -1425,7 +1626,26 @@ pub fn run_mcp_stdio(server: Arc<McpServer>) -> std::io::Result<()> {
 }
 
 /// Runs the MCP server over TCP, binding to the given address.
-/// Spawns a dedicated thread for each connected socket client.
+///
+/// Listens on `bind_addr` and spawns a dedicated worker thread running `handle_tcp_client`
+/// for each accepted [`TcpStream`] connection.
+///
+/// # Arguments
+///
+/// * `server` - Shared [`Arc<McpServer>`] instance shared across all client connection threads.
+/// * `bind_addr` - Socket address string to bind (e.g., `"127.0.0.1:8765"`).
+///
+/// # Returns
+///
+/// `Ok(())` if the listener loop exits cleanly.
+///
+/// # Side Effects
+///
+/// Binds a TCP socket, logs connection events to `stderr`, and spawns an OS thread per client.
+///
+/// # Errors
+///
+/// Returns `Err(std::io::Error)` if binding to `bind_addr` or querying `local_addr()` fails.
 pub fn run_mcp_tcp(server: Arc<McpServer>, bind_addr: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind_addr)?;
     let local_addr = listener.local_addr()?;
@@ -1450,6 +1670,28 @@ pub fn run_mcp_tcp(server: Arc<McpServer>, bind_addr: &str) -> std::io::Result<(
     Ok(())
 }
 
+/// Services a single connected MCP TCP client stream until EOF or socket error.
+///
+/// Reads JSON-RPC frames via [`read_next_json_rpc_frame`], processes each request with
+/// [`McpServer::handle_message`], and writes newline-delimited responses back to `stream`.
+///
+/// # Arguments
+///
+/// * `server` - Shared [`Arc<McpServer>`] instance.
+/// * `stream` - Connected client [`TcpStream`].
+///
+/// # Returns
+///
+/// `Ok(())` when the client closes the TCP connection cleanly.
+///
+/// # Side Effects
+///
+/// Reads and writes over the TCP socket, logs peer connect/disconnect messages to `stderr`,
+/// and invokes MCP methods on `server`.
+///
+/// # Errors
+///
+/// Returns `Err(std::io::Error)` if cloning `stream`, reading frames, or writing responses fails.
 fn handle_tcp_client(server: Arc<McpServer>, mut stream: TcpStream) -> std::io::Result<()> {
     let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
     eprintln!("[Vulcan's Trials MCP] Client connected: {}", peer);
@@ -1466,7 +1708,12 @@ fn handle_tcp_client(server: Arc<McpServer>, mut stream: TcpStream) -> std::io::
     Ok(())
 }
 
-/// Returns definitions and JSON schemas for all available tools
+/// Returns definitions and JSON schemas for all 22 available MCP tools exposed by Vulcan's Trials.
+///
+/// # Returns
+///
+/// A `Vec<Value>` where each element is an MCP tool descriptor containing `"name"`,
+/// `"description"`, and a JSON Schema `"inputSchema"` object.
 pub fn get_all_tool_definitions() -> Vec<Value> {
     vec![
         // 1. Board Management

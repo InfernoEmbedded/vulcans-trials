@@ -1,6 +1,28 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
+//! # Automated Pin & Functional Gate Swapping (`swap`)
+//!
+//! Untangles crossed ratsnest airwires and minimizes Euclidean wirelength by reassigning
+//! functionally equivalent IC pins (such as MCU GPIOs, FPGA I/O banks, and connector headers)
+//! and multi-unit logic gates (such as quad NAND gates, dual op-amps, and resistor arrays).
+//!
+//! ## Architecture & Primary Workflows
+//!
+//! 1. **Kuhn-Munkres (Hungarian) Minimum-Cost Bipartite Matching ([`hungarian_min_assignment`]):**
+//!    Solves the $N \times M$ linear sum assignment problem in $O(N^2 M)$ time using 1-indexed
+//!    dual potentials and shortest augmenting path slack updates.
+//! 2. **Accelerated Swap Cost Matrix Construction ([`compute_swap_cost_matrix_with_gpu`]):**
+//!    Evaluates the $M \times K$ assignment cost matrix combining $16 \times 16$ cache-tiled
+//!    centered Gram matrix Euclidean distances ($\|t_r - p_c\|^2 = \|t_r\|^2 + \|p_c\|^2 - 2(T_x P_x^T + T_y P_y^T)_{rc}$)
+//!    with 2D Morton Linear Bounding Volume Hierarchy (LBVH) ray-cast airwire crossing queries
+//!    on either the Vulkan GPU ([`VulkanEngine::evaluate_corridor_cuts_rt_bvh`]) or CPU fallback
+//!    (`query_airwire_crossings_lbvh`).
+//! 3. **2-Opt Crossing Untangler & Iterative Convergence ([`optimize_pin_and_gate_swapping`]):**
+//!    Infers swappable pin/gate groups on all footprints, performs macro-level functional gate
+//!    unit swapping, and runs up to 4 passes of bipartite pin assignment followed by pairwise
+//!    2-opt crossing elimination, recording every swap in [`Board::pin_swap_history`].
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use crate::board::{Board, PinSwapRecord, Point, Segment};
@@ -10,8 +32,20 @@ use crate::vulkan::{
 };
 
 /// Solves the linear sum assignment problem (minimum cost bipartite matching)
-/// for an N x M cost matrix (where N <= M) using the Kuhn-Munkres (Hungarian) algorithm.
-/// Returns a vector `matching` of length N where `matching[i]` is the column assigned to row `i`.
+/// for an `N x M` cost matrix (where `N <= M`) using the Kuhn-Munkres (Hungarian) algorithm.
+///
+/// If `N > M` (more rows than columns), the matrix is automatically transposed, solved for the
+/// `M x N` transpose, and inverted so each assigned column maps back to its optimal row.
+///
+/// # Arguments
+///
+/// * `cost` - Slice of `N` row vectors, each of length `M`, where `cost[i][j]` is the scalar cost
+///   (e.g., wirelength in millimeters plus crossing penalties) of assigning row `i` to column `j`.
+///
+/// # Returns
+///
+/// A `Vec<usize>` `matching` of length `N` where `matching[i]` is the 0-based column index
+/// assigned to row `i`. Returns an empty vector if `cost` is empty.
 pub fn hungarian_min_assignment(cost: &[Vec<f64>]) -> Vec<usize> {
     let n = cost.len();
     if n == 0 {
@@ -104,6 +138,22 @@ pub fn hungarian_min_assignment(cost: &[Vec<f64>]) -> Vec<usize> {
 
 /// Reference $O(M \cdot K \cdot E)$ pin-swap cost matrix evaluation:
 /// `cost[r][c] = distance(target_r, pad_c) + crossing_weight * crossings(pad_c -> target_r, airwires)`.
+///
+/// Computes exact pairwise Euclidean distances in millimeters (`mm`) and brute-force segment
+/// intersection counts against `airwires` for verification and baseline comparison against
+/// [`compute_swap_cost_matrix_accelerated`].
+///
+/// # Arguments
+///
+/// * `targets` - Slice of `M` `(target_point_mm, net_id)` pairs representing remote net centroids.
+/// * `pads` - Slice of `K` candidate physical pad positions in board coordinates (`mm`).
+/// * `airwires` - Slice of `E` existing ratsnest airwire [`Segment`]s on the board.
+/// * `crossing_weight` - Penalty added per strict airwire crossing with a different net.
+///
+/// # Returns
+///
+/// An `M x K` matrix (`Vec<Vec<f64>>`) where entry `[r][c]` is the total assignment cost of
+/// routing `targets[r]` to `pads[c]`.
 pub fn compute_swap_cost_matrix_reference(
     targets: &[(Point, usize)],
     pads: &[Point],
@@ -134,7 +184,22 @@ pub fn compute_swap_cost_matrix_reference(
     cost_matrix
 }
 
-/// Counts how many segments in `airwires` ( tracked via `bvh_nodes`) strictly cross `cand`.
+/// Counts how many segments in `airwires` (tracked via `bvh_nodes`) strictly cross `cand`.
+///
+/// Performs an iterative stack-based traversal of the 2D Morton Linear Bounding Volume Hierarchy
+/// (`bvh_nodes`), pruning internal subtrees whose axis-aligned bounding box (AABB) is not
+/// intersected by `cand` or whose homogeneous `net_id` matches `cand.net_id`.
+///
+/// # Arguments
+///
+/// * `cand` - Candidate airwire [`Segment`] connecting a swappable pad to its remote net target.
+/// * `airwires` - Slice of all board ratsnest [`Segment`] primitives indexed by leaf nodes in `bvh_nodes`.
+/// * `bvh_nodes` - Pre-built flat LBVH node array produced by [`build_gpu_lbvh`].
+///
+/// # Returns
+///
+/// The number of segments in `airwires` belonging to other nets (`aw.net_id != cand.net_id`)
+/// that strictly intersect `cand`.
 #[inline]
 fn query_airwire_crossings_lbvh(
     cand: &Segment,
@@ -189,6 +254,18 @@ fn query_airwire_crossings_lbvh(
 }
 
 /// Counts internal pairwise segment crossings among `segs` using a 2D Morton LBVH when `segs.len() >= 8`.
+///
+/// For small segment sets (`segs.len() < 8`), uses a direct $O(N^2)$ upper-triangular loop to avoid
+/// tree construction overhead. For larger sets, builds a 2D Morton LBVH via [`build_gpu_lbvh`] and
+/// counts unique intersecting pairs `(i, j)` with `j > i` in $O(N \log N)$ time.
+///
+/// # Arguments
+///
+/// * `segs` - Slice of 2D [`Segment`]s to test for mutual intersections.
+///
+/// # Returns
+///
+/// The total number of unique pairs `(i, j)` (`0 <= i < j < segs.len()`) where `segs[i].crosses(&segs[j])` is true.
 pub fn count_segment_crossings_lbvh(segs: &[Segment]) -> usize {
     let n = segs.len();
     if n < 8 {
@@ -268,6 +345,20 @@ pub fn count_segment_crossings_lbvh(segs: &[Segment]) -> usize {
 /// Computes the $M \times K$ pin-swap cost matrix using $16 \times 16$ tiled Gram matrix expansion
 /// ($\|t_r - p_c\|^2 = \|t_r\|^2 + \|p_c\|^2 - 2(T_x P_x^T + T_y P_y^T)_{rc}$) for Euclidean wirelength
 /// and 2D Morton LBVH ray-cast traversal in $O(M \cdot K \log E)$ for airwire crossings.
+///
+/// Convenience wrapper around [`compute_swap_cost_matrix_with_gpu`] with `vulkan = None` (CPU LBVH execution).
+///
+/// # Arguments
+///
+/// * `targets` - Slice of `M` `(target_point_mm, net_id)` pairs representing remote net centroids.
+/// * `pads` - Slice of `K` candidate physical pad coordinates in millimeters (`mm`).
+/// * `airwires` - Slice of `E` existing ratsnest airwire [`Segment`]s on the board.
+/// * `crossing_weight` - Penalty weight added per crossed airwire of a different net.
+///
+/// # Returns
+///
+/// An `M x K` matrix (`Vec<Vec<f64>>`) where entry `[r][c]` is the total assignment cost of
+/// routing `targets[r]` to `pads[c]`.
 pub fn compute_swap_cost_matrix_accelerated(
     targets: &[(Point, usize)],
     pads: &[Point],
@@ -280,6 +371,24 @@ pub fn compute_swap_cost_matrix_accelerated(
 /// Computes the $M \times K$ pin-swap cost matrix using $16 \times 16$ tiled Gram matrix expansion
 /// for Euclidean wirelength and GPU-accelerated 2D Morton LBVH ray-cast traversal
 /// (`VulkanEngine::evaluate_corridor_cuts_rt_bvh`, with CPU LBVH fallback) for airwire crossings.
+///
+/// # Arguments
+///
+/// * `targets` - Slice of `M` `(target_point_mm, net_id)` pairs representing remote net centroids.
+/// * `pads` - Slice of `K` candidate physical pad coordinates in millimeters (`mm`).
+/// * `airwires` - Slice of `E` existing ratsnest airwire [`Segment`]s on the board.
+/// * `crossing_weight` - Penalty weight added per crossed airwire of a different net.
+/// * `vulkan` - Optional [`VulkanEngine`] reference used to dispatch LBVH cut-ray queries on the GPU.
+///
+/// # Returns
+///
+/// An `M x K` cost matrix (`Vec<Vec<f64>>`) where entry `[r][c]` is the wirelength plus weighted
+/// crossing cost of assigning `targets[r]` to `pads[c]`.
+///
+/// # Side Effects
+///
+/// When `vulkan` is `Some` and `crossing_weight > 0.0`, uploads the LBVH and `M * K` candidate
+/// cut rays to the GPU and dispatches the ray-traversal compute shader.
 pub fn compute_swap_cost_matrix_with_gpu(
     targets: &[(Point, usize)],
     pads: &[Point],
@@ -438,7 +547,25 @@ pub fn compute_swap_cost_matrix_with_gpu(
 /// Optimizes pin and gate swapping across the board using bipartite matching (Hungarian algorithm)
 /// and 2-opt airwire crossing untangling.
 ///
-/// Returns the total number of swaps performed.
+/// First infers swappable pin and gate groups for any footprints that do not yet have explicit
+/// swap metadata ([`crate::board::Footprint::infer_swap_groups`]), then runs functional gate unit
+/// swapping (`optimize_gate_swapping_internal`), and finally executes up to 4 iterative passes
+/// of pin swapping (`optimize_pin_swapping_internal`) until convergence.
+///
+/// # Arguments
+///
+/// * `board` - Mutable reference to the [`Board`] whose footprint pad net assignments will be optimized.
+/// * `config` - [`PlacementConfig`] providing optional GPU acceleration handles (`config.vulkan`).
+///
+/// # Returns
+///
+/// The total number of gate and pairwise pin swaps performed across the board.
+///
+/// # Side Effects
+///
+/// * Populates `pin_swap_groups` and `gate_swap_groups` on footprints in `board`.
+/// * Mutates `pad.net_id` and `pad.net_name` in-place on swapped component pads.
+/// * Appends [`PinSwapRecord`] audit entries to `board.pin_swap_history`.
 pub fn optimize_pin_and_gate_swapping(board: &mut Board, config: &PlacementConfig) -> usize {
     let mut total_swaps = 0;
 
@@ -463,6 +590,26 @@ pub fn optimize_pin_and_gate_swapping(board: &mut Board, config: &PlacementConfi
 }
 
 /// Internal helper to perform functional gate unit swapping.
+///
+/// For each footprint with `gate_swap_groups` containing at least 2 isomorphic functional units,
+/// computes the remote centroid target of each pin in each gate unit, builds a `g_count x g_count`
+/// Euclidean wirelength cost matrix, solves for the optimal permutation using
+/// [`hungarian_min_assignment`], and applies the reassignment if it strictly reduces wirelength
+/// by more than `1e-4` mm.
+///
+/// # Arguments
+///
+/// * `board` - Mutable reference to the [`Board`] being optimized.
+/// * `_config` - [`PlacementConfig`] (reserved for future gate-level crossing penalties).
+///
+/// # Returns
+///
+/// The number of multi-gate groups whose functional units were swapped.
+///
+/// # Side Effects
+///
+/// Mutates `pad.net_id` and `pad.net_name` for reassigned gate units and appends entries to
+/// `board.pin_swap_history`.
 fn optimize_gate_swapping_internal(board: &mut Board, _config: &PlacementConfig) -> usize {
     let mut total_swaps = 0;
     let pad_positions: Vec<Vec<Point>> = board
@@ -574,6 +721,26 @@ fn optimize_gate_swapping_internal(board: &mut Board, _config: &PlacementConfig)
 }
 
 /// Internal helper to perform pin swapping within swappable pin groups.
+///
+/// For each footprint's `pin_swap_groups`, computes the centroid of remote connected pads for
+/// every active pin, evaluates the distance cost matrix via [`compute_swap_cost_matrix_with_gpu`],
+/// finds the initial assignment with [`hungarian_min_assignment`], eliminates remaining pairwise
+/// crossings via 2-opt swaps, and commits the new net-to-pad mapping if crossings decrease (or
+/// wirelength decreases without adding crossings).
+///
+/// # Arguments
+///
+/// * `board` - Mutable reference to the [`Board`] being optimized.
+/// * `config` - [`PlacementConfig`] providing optional [`VulkanEngine`] GPU handle.
+///
+/// # Returns
+///
+/// The number of pairwise pin swaps committed during this pass.
+///
+/// # Side Effects
+///
+/// Mutates `pad.net_id` and `pad.net_name` on swapped footprint pads and records [`PinSwapRecord`]
+/// entries in `board.pin_swap_history`.
 fn optimize_pin_swapping_internal(board: &mut Board, config: &PlacementConfig) -> usize {
     let mut total_swaps = 0;
     let pad_positions: Vec<Vec<Point>> = board
@@ -597,11 +764,17 @@ fn optimize_pin_swapping_internal(board: &mut Board, config: &PlacementConfig) -
                 continue;
             }
 
+            /// Captures the original net assignment and remote centroid target for a single pin in a swap group.
             struct PinNetInfo {
+                /// Index of this pin within the current `group` slice (`0..group.len()`).
                 group_idx: usize,
+                /// Index of the physical pad in `fp.pads`.
                 _pad_idx: usize,
+                /// Assigned electrical net ID (`0` if unconnected).
                 net_id: usize,
+                /// Assigned electrical net name.
                 net_name: String,
+                /// Centroid in board coordinates (`mm`) of all remote pads connected to `net_id`.
                 target: Option<Point>,
             }
 

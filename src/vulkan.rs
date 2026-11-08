@@ -1,6 +1,45 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
+//! Dual-backend GPU compute acceleration (`VulkanEngine`) and real-time hardware telemetry (`SystemTelemetry`).
+//!
+//! This module provides GPU-accelerated PCB placement, routing, and Design Rule Checking (DRC)
+//! workloads for Vulcan's Trials through a unified [`VulkanEngine`] facade:
+//!
+//! - **Dual-Backend Execution (`CUDA PTX` + `Vulkan WGSL`):** Automatically probes for bare-metal
+//!   NVIDIA CUDA Driver API (`libcuda.so`) PTX kernels via [`crate::cuda::CudaEngine`] as the primary
+//!   fast path, while initializing [`wgpu`] (`wgpu::Backends::VULKAN`) WGSL compute pipelines as a
+//!   portable cross-vendor GPU backend and automatic fallback. Multi-GPU systems are supported via
+//!   `extra_devices` and [`VulkanEngine::all_engines`].
+//! - **2D & Multi-Layer Euclidean Distance Fields (`DISTANCE_FIELD_WGSL`):** Separable two-pass
+//!   (`pass_h` horizontal + `pass_v` vertical) $O(W \cdot H \cdot R)$ Euclidean distance transform
+//!   over 2D and 3D multi-layer copper obstacle grids for clearance-aware routing penalties.
+//! - **3D Wavefront Lee / A* Routing (`COMPUTE_3D_ROUTING_COST_WGSL`, `WAVEFRONT_3D_RELAX_WGSL`, `WAVEFRONT_3D_BACKTRACK_WGSL`):**
+//!   Evaluates per-cell 3D routing costs with circular netclass clearance checks, plane layer masks,
+//!   PathFinder historical/present congestion penalties, and distance-field repulsion, followed by
+//!   ping-pong 8-connected + inter-layer via relaxation and GPU backtracking.
+//! - **2D Morton Linear Bounding Volume Hierarchy (`GpuBvhNode`, `build_gpu_lbvh`):** Constructs a
+//!   cache-aligned 32-byte-per-node binary LBVH sorted along a 2D Morton Z-order curve (`morton2d_encode`)
+//!   with thread-local and engine-level FNV-1a hash caching (`hash_lbvh_primitives`). Accelerates:
+//!   - Ratsnest segment crossing counts (`RT_BVH_SEGMENT_CROSSINGS_WGSL`),
+//!   - Topological corridor cut congestion evaluation (`RT_BVH_CORRIDOR_CUTS_WGSL`), and
+//!   - Line-of-sight DRC clearance ray queries (`RT_BVH_LINE_OF_SIGHT_DRC_WGSL`).
+//! - **Parallel Tempering Simulated Annealing Auto-Placer (`GPU_SA_PLACER_WGSL`, `BATCH_PLACEMENT_EVAL_WGSL`):**
+//!   Executes parallel Markov Chain Monte Carlo (MCMC) simulated annealing chains on the GPU with
+//!   exact Separating Axis Theorem (SAT) convex courtyard polygon collision detection
+//!   ([`GpuCourtyardBuffers`]), incremental $\Delta E$ evaluation, passive decoupling affinity,
+//!   corridor cut congestion, and signal flow alignment.
+//! - **Batch Continuous Geometry DRC (`BATCH_DRC_EVAL_WGSL`):** Evaluates candidate vias and track
+//!   segments against rotated rectangular, circular, and oblong/oval pads (`GpuDrcPad`), existing
+//!   traces (`GpuDrcTrack`), and vias (`GpuDrcVia`) using symmetric bidirectional copper clearances.
+//! - **CUDA-Accelerated Extended Solvers:** Through [`VulkanEngine::cuda_engine`], also exposes
+//!   SSTL-18 Laplace electrostatic field solving, ground-plane via stitch candidate scoring, and
+//!   silkscreen placement candidate evaluation.
+//! - **System Telemetry (`SystemTelemetry`, `TelemetrySnapshot`):** Background sampling thread
+//!   measuring host CPU utilization from `/proc/stat` and GPU utilization from cumulative Vulkan/CUDA
+//!   compute duty-cycle counters (`compute_busy_ns`), Linux DRM sysfs (`gpu_busy_percent`), and
+//!   `nvidia-smi`.
+
 use rayon::prelude::*;
 use std::fs;
 use std::process::Command;
@@ -10,6 +49,26 @@ use std::thread;
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 
+/// WGSL compute shader for separable two-pass 2D/3D Euclidean Distance Field (EDF) evaluation.
+///
+/// Computes the Euclidean distance (in grid cells, clamped to `radius + 1.0`) from every free grid
+/// cell `(x, y, z)` to the nearest non-zero obstacle cell on the same layer `z`.
+///
+/// # Entry Points & Workgroup Size
+/// - `pass_h` (`@workgroup_size(16, 16, 1)`): Horizontal 1D scan across `[-radius, +radius]` along `x`,
+///   writing squared horizontal distances `min_dx_sq` into `temp_h`.
+/// - `pass_v` (`@workgroup_size(16, 16, 1)`): Vertical 1D scan across `[-radius, +radius]` along `y`,
+///   combining `temp_h[ny * width + x] + dy * dy` and writing `min(sqrt(best_d_sq), f32(radius) + 1.0)`
+///   into `dist_out`.
+///
+/// # Bindings (`@group(0)`)
+/// - `@binding(0)` (`storage, read`): `obstacles: array<u32>` — Flat `[num_layers * height * width]`
+///   obstacle grid (`0` = free cell, non-zero = occupied).
+/// - `@binding(1)` (`storage, read_write`): `temp_h: array<f32>` — Intermediate horizontal squared
+///   distance buffer of length `num_layers * height * width`.
+/// - `@binding(2)` (`storage, read_write`): `dist_out: array<f32>` — Output Euclidean distance field
+///   buffer of length `num_layers * height * width`.
+/// - `@binding(3)` (`uniform`): `params: GridParams` — Grid dimensions (`width`, `height`, `radius`, `num_layers`).
 const DISTANCE_FIELD_WGSL: &str = r#"
 struct GridParams {
     width: u32,
@@ -89,6 +148,23 @@ fn pass_v(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// WGSL compute shader for batch evaluation of candidate PCB component placements.
+///
+/// Evaluates `params.num_candidates` complete board placement candidates in parallel, computing
+/// total Euclidean ratsnest wirelength, pairwise ratsnest segment crossings (`segments_cross`),
+/// pairwise footprint AABB courtyard overlap penalties, and board outline boundary violations.
+///
+/// # Entry Point & Workgroup Size
+/// - `main` (`@workgroup_size(64, 1, 1)`): One invocation per placement candidate `c = gid.x`.
+///
+/// # Bindings (`@group(0)`)
+/// - `@binding(0)` (`storage, read`): `boxes: array<vec4<f32>>` — Flattened `[num_candidates * num_footprints]`
+///   footprint AABBs `[min_x, min_y, max_x, max_y]` in mm.
+/// - `@binding(1)` (`storage, read`): `segs: array<vec4<f32>>` — Flattened `[num_candidates * num_segments]`
+///   ratsnest airwire segments `[x1, y1, x2, y2]` in mm.
+/// - `@binding(2)` (`storage, read_write`): `costs_out: array<f32>` — Output total scalar placement cost
+///   for each candidate `c` (`[num_candidates]`).
+/// - `@binding(3)` (`uniform`): `params: PlacementBatchParams` — Batch dimensions, board bounds, and cost weights.
 const BATCH_PLACEMENT_EVAL_WGSL: &str = r#"
 struct PlacementBatchParams {
     num_candidates: u32,
@@ -182,6 +258,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// WGSL compute shader for GPU-accelerated Parallel Tempering Markov Chain Monte Carlo (MCMC)
+/// Simulated Annealing (`SA`) PCB auto-placement.
+///
+/// Runs `params.num_chains` independent Metropolis-Hastings annealing chains in parallel for
+/// `params.steps_per_pass` random perturbation steps per dispatch. Supports exact Separating Axis
+/// Theorem (SAT) convex courtyard polygon intersection tests (`sat_polys_intersect`,
+/// `footprints_courtyards_intersect`), incremental $\Delta E$ energy evaluation (`evaluate_chain_delta_e`),
+/// decoupling capacitor / passive affinity penalties, topological corridor cut congestion, and
+/// signal flow alignment.
+///
+/// # Entry Point & Workgroup Size
+/// - `main` (`@workgroup_size(64, 1, 1)`): One thread per MCMC chain `c = gid.x` (`0..params.num_chains`),
+///   with exponentially spaced parallel-tempering temperatures derived from `params.base_temp`.
+///
+/// # Bindings (`@group(0)`)
+/// - `@binding(0)` (`storage, read`): `fp_descs: array<vec4<f32>>` — Per-footprint descriptors
+///   `[half_w, half_h, is_locked, packed_aabb_offset]` of length `num_footprints`.
+/// - `@binding(1)` (`storage, read`): `edges: array<vec4<f32>>` — Pairs of `vec4<f32>` endpoints
+///   `([fp_a, off_ax, off_ay, edge_tag], [fp_b, off_bx, off_by, 0.0])` of length `2 * num_edges`.
+/// - `@binding(2)` (`storage, read_write`): `chain_poses: array<vec4<f32>>` — Currentposes (`[0..num_chains * num_footprints]`)
+///   followed by best-seen poses (`[num_chains * num_footprints .. 2 * num_chains * num_footprints]`),
+///   each encoded as `[x_mm, y_mm, rot_deg, layer]`.
+/// - `@binding(3)` (`storage, read_write`): `chain_scores: array<vec4<f32>>` — Per-chain state vector
+///   `[cur_cost, best_cost, cur_overlaps, pass_counter]` of length `num_chains`.
+/// - `@binding(4)` (`uniform`): `params: GpuSaParams` — Annealing schedule, board bounds, grid step, and penalty weights.
+/// - `@binding(5)` (`storage, read`): `fp_poly_ranges: array<vec4<u32>>` — Per-footprint polygon slice headers
+///   `[poly_start, poly_count, flags, orig_layer]`.
+/// - `@binding(6)` (`storage, read`): `courtyard_polys: array<vec4<u32>>` — Convex courtyard polygon headers
+///   `[vertex_start, vertex_count, fp_idx, 0]`.
+/// - `@binding(7)` (`storage, read`): `courtyard_vertices: array<vec2<f32>>` — Local-space courtyard polygon
+///   vertices `[x_mm, y_mm]`.
 const GPU_SA_PLACER_WGSL: &str = r#"
 struct GpuSaParams {
     num_chains: u32,
@@ -919,6 +1026,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// WGSL compute shader for 3D multi-layer PCB routing grid cell traversal cost evaluation.
+///
+/// For each 3D routing cell `(x, y, layer)`, checks whether the layer is blocked by a dedicated
+/// power/ground plane (`plane_layer_mask`) or whether any foreign-net obstacle lies within the
+/// circular clearance radius `params.clearance_cells`. Blocked cells receive `-1.0`; traversable
+/// cells receive `1.0 + congestion_penalty + history_cost + distance_field_penalty`.
+///
+/// # Entry Point & Workgroup Size
+/// - `main` (`@workgroup_size(16, 16, 1)`): One invocation per 3D grid cell `(x, y, layer) = gid.xyz`.
+///
+/// # Bindings (`@group(0)`)
+/// - `@binding(0)` (`storage, read`): `obstacles: array<u32>` — 3D obstacle net IDs (`[num_layers * height * width]`, `0` = free).
+/// - `@binding(1)` (`storage, read`): `dist_field: array<f32>` — 3D Euclidean distance field (`[num_layers * height * width]`).
+/// - `@binding(2)` (`storage, read`): `history_cost: array<f32>` — PathFinder historical congestion costs (`[num_layers * height * width]`).
+/// - `@binding(3)` (`storage, read`): `usage_count: array<u32>` — Present net occupancy counts (`[num_layers * height * width]`).
+/// - `@binding(4)` (`storage, read_write`): `cell_costs_out: array<f32>` — Output traversal cost per cell (`-1.0` if blocked, `>= 1.0` if legal).
+/// - `@binding(5)` (`uniform`): `params: GpuRouteCostParams` — Grid dimensions, active `net_id`, `clearance_cells`, congestion weights, and `plane_layer_mask`.
 const COMPUTE_3D_ROUTING_COST_WGSL: &str = r#"
 struct GpuRouteCostParams {
     width: u32,
@@ -1003,6 +1127,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// WGSL compute shader for a single synchronous 3D Lee/Moore wavefront relaxation step.
+///
+/// Relaxes each traversable cell `(x, y, layer)` against its 8 in-layer octilinear neighbors
+/// (preventing diagonal corner-cutting across blocked orthogonal neighbors) and across all other
+/// layers at `(x, y, ol)` with additive `params.via_cost`.
+///
+/// # Entry Point & Workgroup Size
+/// - `main` (`@workgroup_size(16, 16, 1)`): One invocation per 3D grid cell `(x, y, layer) = gid.xyz`.
+///
+/// # Bindings (`@group(0)`)
+/// - `@binding(0)` (`storage, read`): `cell_costs: array<f32>` — Precomputed per-cell traversal costs (`< 0.0` = blocked).
+/// - `@binding(1)` (`storage, read`): `wavefront_in: array<f32>` — Input accumulated path cost grid from the previous iteration (`1.0e20` = unreached).
+/// - `@binding(2)` (`storage, read_write`): `wavefront_out: array<f32>` — Output relaxed path cost grid for the current iteration.
+/// - `@binding(3)` (`uniform`): `params: WavefrontUniformParams` — Grid dimensions (`width`, `height`, `num_layers`) and `via_cost`.
 const WAVEFRONT_3D_RELAX_WGSL: &str = r#"
 struct WavefrontUniformParams {
     width: u32,
@@ -1092,6 +1230,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// WGSL compute shader for backtracking a shortest 3D route path across a converged wavefront grid.
+///
+/// Traces backward from `(dst_x, dst_y, dst_layer)` to `(src_x, src_y, src_layer)` along the steepest
+/// descent in `dist_grid` (considering 8 in-layer octilinear steps and inter-layer via transitions),
+/// reverses the resulting path in-place so it is ordered from source to destination, and writes the
+/// path length into `path_len_out[0]`.
+///
+/// # Entry Point & Workgroup Size
+/// - `main` (`@workgroup_size(1, 1, 1)`): Single-thread (`gid == (0, 0, 0)`) serial path trace on GPU
+///   to avoid transferring the full 3D wavefront distance volume back to host memory.
+///
+/// # Bindings (`@group(0)`)
+/// - `@binding(0)` (`storage, read`): `dist_grid: array<f32>` — Converged 3D wavefront distance grid (`[num_layers * height * width]`).
+/// - `@binding(1)` (`storage, read`): `cell_costs: array<f32>` — Per-cell traversal costs (`[num_layers * height * width]`).
+/// - `@binding(2)` (`storage, read_write`): `path_out: array<u32>` — Output flattened `(x, y, layer)` triples (`[max_path_len * 3]`).
+/// - `@binding(3)` (`storage, read_write`): `path_len_out: array<u32>` — Output single-element array storing the number of `(x, y, layer)` steps (`0` if unreachable).
+/// - `@binding(4)` (`uniform`): `params: WavefrontBacktrackUniformParams` — Grid dimensions, `via_cost`, source/destination coordinates, and `max_path_len`.
 const WAVEFRONT_3D_BACKTRACK_WGSL: &str = r#"
 struct WavefrontBacktrackUniformParams {
     width: u32,
@@ -1255,6 +1410,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// WGSL compute shader for counting pairwise ratsnest segment crossings using a 2D Morton LBVH.
+///
+/// Each invocation `i = gid.x` traverses the flat binary LBVH (`bvh_nodes`) using an explicit
+/// 32-entry traversal stack, pruning subtrees whose AABB does not intersect segment `segs[i]`
+/// (`ray_aabb_intersects`) and counting strict geometric crossings (`segments_cross_bvh`) against
+/// leaf segments `j > i`.
+///
+/// # Entry Point & Workgroup Size
+/// - `main` (`@workgroup_size(64, 1, 1)`): One invocation per segment `i` (`0..params.count`).
+///
+/// # Bindings (`@group(0)`)
+/// - `@binding(0)` (`storage, read`): `segs: array<vec4<f32>>` — Input 2D line segments `[x1, y1, x2, y2]` of length `params.count`.
+/// - `@binding(1)` (`storage, read`): `bvh_nodes: array<GpuBvhNode>` — Flat 32-byte-per-node Morton LBVH over `segs` (`2 * count - 1` nodes).
+/// - `@binding(2)` (`storage, read_write`): `crossings_out: array<u32>` — Output crossing counts per segment `i` (`j > i`).
+/// - `@binding(3)` (`uniform`): `params: BvhQueryParams` — Number of segments (`count`).
 const RT_BVH_SEGMENT_CROSSINGS_WGSL: &str = r#"
 struct GpuBvhNode {
     min_x: f32,
@@ -1377,6 +1547,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// WGSL compute shader for counting ratsnest crossings across topological corridor cut lines using a 2D Morton LBVH.
+///
+/// Each invocation `c_idx = gid.x` traverses the LBVH (`bvh_nodes`) built over the board's ratsnest
+/// segments (`segs`) and counts how many segments cross the query corridor cut line `cuts[c_idx]`.
+///
+/// # Entry Point & Workgroup Size
+/// - `main` (`@workgroup_size(64, 1, 1)`): One invocation per corridor cut segment `c_idx` (`0..params.count`).
+///
+/// # Bindings (`@group(0)`)
+/// - `@binding(0)` (`storage, read`): `segs: array<vec4<f32>>` — Ratsnest airwire segments `[x1, y1, x2, y2]`.
+/// - `@binding(1)` (`storage, read`): `bvh_nodes: array<GpuBvhNode>` — Flat Morton LBVH constructed over `segs`.
+/// - `@binding(2)` (`storage, read`): `cuts: array<vec4<f32>>` — Query corridor cut segments `[x1, y1, x2, y2]` of length `params.count`.
+/// - `@binding(3)` (`storage, read_write`): `cuts_out: array<u32>` — Output number of ratsnest crossings for each corridor cut (`[params.count]`).
+/// - `@binding(4)` (`uniform`): `params: BvhQueryParams` — Number of corridor cut queries (`count`).
 const RT_BVH_CORRIDOR_CUTS_WGSL: &str = r#"
 struct GpuBvhNode {
     min_x: f32,
@@ -1498,6 +1682,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// WGSL compute shader for batch line-of-sight DRC clearance ray queries against a 2D Morton LBVH.
+///
+/// Each invocation `q_idx = gid.x` traverses the obstacle LBVH (`bvh_nodes`), skipping subtrees
+/// that do not overlap `queries[q_idx].layer_mask`, share the same non-zero `net_id`, or miss the
+/// clearance-inflated AABB `[min_x - r, min_y - r, max_x + r, max_y + r]`. Counts all leaf obstacle
+/// AABB hits along the query ray.
+///
+/// # Entry Point & Workgroup Size
+/// - `main` (`@workgroup_size(64, 1, 1)`): One invocation per DRC ray query `q_idx` (`0..params.count`).
+///
+/// # Bindings (`@group(0)`)
+/// - `@binding(0)` (`storage, read`): `bvh_nodes: array<GpuBvhNode>` — Flat Morton LBVH over obstacle AABBs.
+/// - `@binding(1)` (`storage, read`): `queries: array<GpuDrcRayQuery>` — Input DRC ray queries of length `params.count`.
+/// - `@binding(2)` (`storage, read_write`): `violations_out: array<u32>` — Output violation count per query (`[params.count]`).
+/// - `@binding(3)` (`uniform`): `params: BvhQueryParams` — Number of ray queries (`count`).
 const RT_BVH_LINE_OF_SIGHT_DRC_WGSL: &str = r#"
 struct GpuBvhNode {
     min_x: f32,
@@ -1620,6 +1819,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// WGSL compute shader for exact continuous-geometry batch DRC evaluation of candidate vias and track segments.
+///
+/// Evaluates `params.num_candidates` candidate vias (`kind == 0`) or track segments (`kind == 1`)
+/// against all board pads (`pads`), routed tracks (`tracks`), and existing vias (`vias`), enforcing
+/// symmetric bidirectional copper clearances:
+/// $$\text{req\_dist} = r_{\text{cand}} + \max(\text{clearance}_{\text{cand}}, \text{clearance}_{\text{obs}}) + r_{\text{obs}}$$
+/// Supports circular (`shape == 1`), oblong/oval (`shape == 2`), and rotated rectangular (`shape == 0`)
+/// pads as well as same-net SMD pad overlap and micro-via / standard-via spacing rules.
+///
+/// # Entry Point & Workgroup Size
+/// - `main` (`@workgroup_size(64, 1, 1)`): One invocation per DRC candidate `c = gid.x` (`0..params.num_candidates`).
+///
+/// # Bindings (`@group(0)`)
+/// - `@binding(0)` (`storage, read`): `pads: array<GpuDrcPad>` — Board pads (`[params.num_pads]`).
+/// - `@binding(1)` (`storage, read`): `tracks: array<GpuDrcTrack>` — Routed track segments (`[params.num_tracks]`).
+/// - `@binding(2)` (`storage, read`): `vias: array<GpuDrcVia>` — Existing vias (`[params.num_vias]`).
+/// - `@binding(3)` (`storage, read`): `candidates: array<GpuDrcCandidate>` — Candidate vias or track segments (`[params.num_candidates]`).
+/// - `@binding(4)` (`storage, read_write`): `results_out: array<u32>` — Output legality flags (`1` = DRC clean, `0` = violation) of length `params.num_candidates`.
+/// - `@binding(5)` (`uniform`): `params: DrcBatchParams` — Counts of pads, tracks, vias, and candidates.
 const BATCH_DRC_EVAL_WGSL: &str = r#"
 struct DrcBatchParams {
     num_pads: u32,
@@ -1910,54 +2128,112 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// Cache-aligned 32-byte binary Linear Bounding Volume Hierarchy (LBVH) node for GPU and CPU traversal.
+///
+/// Represents either an internal bounding hierarchy node (`right_or_count < 0`) or a leaf primitive
+/// (`right_or_count > 0`) in a flat depth-first LBVH array constructed by [`build_gpu_lbvh`].
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuBvhNode {
+    /// Minimum X coordinate of the node's axis-aligned bounding box (mm).
     pub min_x: f32,
+    /// Minimum Y coordinate of the node's axis-aligned bounding box (mm).
     pub min_y: f32,
+    /// Maximum X coordinate of the node's axis-aligned bounding box (mm).
     pub max_x: f32,
+    /// Maximum Y coordinate of the node's axis-aligned bounding box (mm).
     pub max_y: f32,
+    /// For internal nodes (`right_or_count < 0`), the index of the left child node;
+    /// for leaf nodes (`right_or_count > 0`), the original primitive index in the input slice.
     pub left_or_prim: i32,
+    /// Node type discriminator and right-child pointer:
+    /// - `> 0`: Leaf node containing `right_or_count` primitives (always `1`).
+    /// - `< 0`: Internal node whose right child resides at index `-right_or_count`.
+    /// - `== 0`: Empty sentinel node.
     pub right_or_count: i32,
+    /// Bitmask of copper layers occupied by the primitive(s) in this subtree (`1 << layer`).
     pub layer_mask: u32,
+    /// Electrical net ID (`> 0`) if all primitives in this subtree belong to the same net, or `0` if mixed/unassigned.
     pub net_id: u32,
 }
 
+/// GPU line-of-sight Design Rule Check (DRC) ray query descriptor (`32` bytes, `#[repr(C)]`).
+///
+/// Used by [`VulkanEngine::evaluate_drc_rt_bvh`] and [`evaluate_drc_brute_force_cpu`] to count
+/// clearance-inflated obstacle AABB intersections along a 2D line segment `(x1, y1) -> (x2, y2)`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuDrcRayQuery {
+    /// Start X coordinate of the query ray segment (mm).
     pub x1: f32,
+    /// Start Y coordinate of the query ray segment (mm).
     pub y1: f32,
+    /// End X coordinate of the query ray segment (mm).
     pub x2: f32,
+    /// End Y coordinate of the query ray segment (mm).
     pub y2: f32,
+    /// Radial copper clearance expansion applied to obstacle AABBs (mm).
     pub clearance: f32,
+    /// Bitmask of copper layers queried by this ray (`1 << layer`).
     pub layer_mask: u32,
+    /// Active electrical net ID (`0` = collide with all nets; `> 0` = ignore same-net obstacles).
     pub net_id: u32,
+    /// Explicit 4-byte alignment padding for 16-byte WGSL uniform/storage alignment.
     pub _pad: u32,
 }
 
+/// Uniform buffer parameters for GPU LBVH query dispatches (`16` bytes, `#[repr(C)]`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct BvhQueryParams {
+    /// Number of active query rays, segments, or corridor cuts in the dispatch batch.
     count: u32,
+    /// Alignment padding word 0.
     _pad0: u32,
+    /// Alignment padding word 1.
     _pad1: u32,
+    /// Alignment padding word 2.
     _pad2: u32,
 }
 
+/// Timing and speedup metrics comparing LBVH-accelerated vs brute-force SIMT/CPU DRC and crossing queries.
+///
+/// Returned by [`VulkanEngine::benchmark_rt_bvh_vs_simt`].
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct RtBvhBenchmarkResult {
+    /// Execution time (in microseconds) of the LBVH-accelerated DRC ray query pass.
     pub bvh_drc_us: f64,
+    /// Execution time (in microseconds) of the brute-force DRC ray query baseline.
     pub simt_drc_us: f64,
+    /// Execution time (in microseconds) of the LBVH-accelerated ratsnest segment crossing pass.
     pub bvh_crossings_us: f64,
+    /// Execution time (in microseconds) of the $O(N^2)$ SIMT ratsnest segment crossing baseline.
     pub simt_crossings_us: f64,
+    /// Relative speedup ratio (`simt_drc_us / bvh_drc_us`) for DRC ray queries.
     pub drc_speedup: f64,
+    /// Relative speedup ratio (`simt_crossings_us / bvh_crossings_us`) for segment crossing queries.
     pub crossings_speedup: f64,
+    /// Whether the active GPU adapter supports hardware ray-tracing / ray-query acceleration (`VK_KHR_ray_query` or OptiX).
     pub rt_hardware_available: bool,
 }
 
+/// Interleaves the bits of 16-bit quantized coordinates `(x, y)` into a 32-bit 2D Morton Z-order code.
+///
+/// Used to spatially sort 2D primitive centroids along a Z-order space-filling curve prior to
+/// top-down binary LBVH construction in [`build_gpu_lbvh`].
+///
+/// # Arguments
+/// * `x` - Quantized 16-bit X coordinate (`0..=65535`).
+/// * `y` - Quantized 16-bit Y coordinate (`0..=65535`).
+///
+/// # Returns
+/// A 32-bit Morton code with `x` bits in even positions and `y` bits in odd positions.
+///
+/// # Side Effects
+/// None (pure bit-manipulation function).
 #[inline]
 pub fn morton2d_encode(x: u16, y: u16) -> u32 {
+    /// Spreads the lower 16 bits of `n` into the even bit positions of a 32-bit word.
     fn part1by1(mut n: u32) -> u32 {
         n &= 0x0000ffff;
         n = (n ^ (n << 8)) & 0x00ff00ff;
@@ -1968,7 +2244,20 @@ pub fn morton2d_encode(x: u16, y: u16) -> u32 {
     part1by1(x as u32) | (part1by1(y as u32) << 1)
 }
 
-/// Fast FNV-1a-style hash over `(primitives.len(), first/last/stride bit-patterns)` for LBVH caching.
+/// Computes a fast 64-bit FNV-1a-style fingerprint over a slice of LBVH input primitives for cache lookup.
+///
+/// Samples up to 64 strided primitives plus the final primitive, mixing their IEEE-754 AABB bit
+/// patterns, `layer_mask`, and `net_id` into a 64-bit hash key used by [`build_gpu_lbvh`] and
+/// [`VulkanEngine::build_cached_lbvh`].
+///
+/// # Arguments
+/// * `primitives` - Slice of `(aabb, layer_mask, net_id)` tuples where `aabb` is `[min_x, min_y, max_x, max_y]`.
+///
+/// # Returns
+/// A 64-bit hash value uniquely identifying the length and sampled geometry of `primitives`.
+///
+/// # Side Effects
+/// None.
 #[inline]
 pub fn hash_lbvh_primitives(primitives: &[([f32; 4], u32, u32)]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325 ^ (primitives.len() as u64);
@@ -2000,11 +2289,22 @@ pub fn hash_lbvh_primitives(primitives: &[([f32; 4], u32, u32)]) -> u64 {
 }
 
 thread_local! {
+    /// Per-thread single-entry LBVH cache storing `(primitives_hash, nodes)` to avoid redundant rebuilds.
     static THREAD_LBVH_CACHE: std::cell::RefCell<Option<(u64, Vec<GpuBvhNode>)>> = const { std::cell::RefCell::new(None) };
 }
+/// Global atomic counter tracking the total number of full LBVH tree constructions executed across all threads.
 static GLOBAL_LBVH_BUILDS: AtomicU64 = AtomicU64::new(0);
+/// Global atomic counter tracking the total number of thread-local LBVH cache hits across all threads.
 static GLOBAL_LBVH_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// Returns global LBVH construction and thread-local cache hit counters.
+///
+/// # Returns
+/// A tuple `(builds, hits)` containing the cumulative number of LBVH builds (`GLOBAL_LBVH_BUILDS`)
+/// and thread-local cache hits (`GLOBAL_LBVH_HITS`).
+///
+/// # Side Effects
+/// Performs relaxed atomic loads from `GLOBAL_LBVH_BUILDS` and `GLOBAL_LBVH_HITS`.
 pub fn lbvh_cache_stats() -> (u64, u64) {
     (
         GLOBAL_LBVH_BUILDS.load(Ordering::Relaxed),
@@ -2014,6 +2314,20 @@ pub fn lbvh_cache_stats() -> (u64, u64) {
 
 /// Builds a flat, cache-aligned 32-byte-per-node binary LBVH (`Vec<GpuBvhNode>`) sorted by
 /// 2D Morton Z-order curve over the input primitives `(aabb, layer_mask, net_id)`.
+///
+/// Quantizes primitive centroids into a $65536 \times 65536$ grid, sorts them by [`morton2d_encode`]
+/// (using parallel Rayon sorting when `primitives.len() >= 256`), and recursively partitions the
+/// sorted range into a pre-order binary tree of `2 * N - 1` nodes.
+///
+/// # Arguments
+/// * `primitives` - Slice of `(aabb, layer_mask, net_id)` tuples where `aabb` is `[min_x, min_y, max_x, max_y]`.
+///
+/// # Returns
+/// A `Vec<GpuBvhNode>` of length `2 * primitives.len() - 1` (or a single empty sentinel node if `primitives` is empty).
+///
+/// # Side Effects
+/// Reads and updates the calling thread's `THREAD_LBVH_CACHE` and increments either `GLOBAL_LBVH_HITS`
+/// or `GLOBAL_LBVH_BUILDS`.
 pub fn build_gpu_lbvh(primitives: &[([f32; 4], u32, u32)]) -> Vec<GpuBvhNode> {
     if primitives.is_empty() {
         return vec![GpuBvhNode {
@@ -2124,6 +2438,7 @@ pub fn build_gpu_lbvh(primitives: &[([f32; 4], u32, u32)]) -> Vec<GpuBvhNode> {
         total_nodes
     ];
 
+    /// Recursively populates `out_nodes` in pre-order layout from a Morton-sorted slice of `(morton_code, prim_idx)`.
     fn build_slice(
         slice: &[(u32, usize)],
         primitives: &[([f32; 4], u32, u32)],
@@ -2191,7 +2506,19 @@ pub fn build_gpu_lbvh(primitives: &[([f32; 4], u32, u32)]) -> Vec<GpuBvhNode> {
     nodes
 }
 
-/// Convenience helper to build an LBVH directly over 2D segments `[x1, y1, x2, y2]`.
+/// Convenience helper to build a 2D Morton LBVH directly over 2D line segments `[x1, y1, x2, y2]`.
+///
+/// Converts each segment into its bounding box `[min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]`
+/// with `layer_mask = 1` and `net_id = 0`, then delegates to [`build_gpu_lbvh`].
+///
+/// # Arguments
+/// * `segs` - Slice of 2D line segments `[x1, y1, x2, y2]` in mm.
+///
+/// # Returns
+/// A flat binary LBVH (`Vec<GpuBvhNode>`) indexing `segs`.
+///
+/// # Side Effects
+/// Updates `THREAD_LBVH_CACHE` and global LBVH statistics via [`build_gpu_lbvh`].
 pub fn build_gpu_lbvh_from_segments(segs: &[[f32; 4]]) -> Vec<GpuBvhNode> {
     let prims: Vec<([f32; 4], u32, u32)> = segs
         .iter()
@@ -2200,6 +2527,22 @@ pub fn build_gpu_lbvh_from_segments(segs: &[[f32; 4]]) -> Vec<GpuBvhNode> {
     build_gpu_lbvh(&prims)
 }
 
+/// CPU slab-clipping intersection test between a 2D line segment `s` and an axis-aligned bounding box.
+///
+/// Mirrors the WGSL `ray_aabb_intersects` helper used in the LBVH traversal shaders.
+///
+/// # Arguments
+/// * `s` - Line segment endpoints `[x1, y1, x2, y2]` in mm.
+/// * `b_min_x` - Minimum X coordinate of the AABB (mm).
+/// * `b_min_y` - Minimum Y coordinate of the AABB (mm).
+/// * `b_max_x` - Maximum X coordinate of the AABB (mm).
+/// * `b_max_y` - Maximum Y coordinate of the AABB (mm).
+///
+/// # Returns
+/// `true` if the closed segment `[x1, y1] -> [x2, y2]` intersects the closed box `[b_min_x, b_min_y, b_max_x, b_max_y]`.
+///
+/// # Side Effects
+/// None.
 #[inline]
 pub fn ray_aabb_intersects_cpu(s: [f32; 4], b_min_x: f32, b_min_y: f32, b_max_x: f32, b_max_y: f32) -> bool {
     let s_min_x = s[0].min(s[2]);
@@ -2230,6 +2573,20 @@ pub fn ray_aabb_intersects_cpu(s: [f32; 4], b_min_x: f32, b_min_y: f32, b_max_x:
     tmax >= tmin
 }
 
+/// CPU proper intersection test between two 2D line segments `s1` and `s2`, excluding shared endpoints.
+///
+/// Returns `false` if any pair of endpoints lies within `1e-3` mm so adjacent ratsnest edges
+/// sharing a pin do not register as crossings.
+///
+/// # Arguments
+/// * `s1` - First line segment `[x1, y1, x2, y2]` in mm.
+/// * `s2` - Second line segment `[x1, y1, x2, y2]` in mm.
+///
+/// # Returns
+/// `true` if `s1` and `s2` strictly cross in their interiors; `false` otherwise.
+///
+/// # Side Effects
+/// None.
 #[inline]
 pub fn segments_cross_cpu(s1: [f32; 4], s2: [f32; 4]) -> bool {
     let eps = 1e-3f32;
@@ -2251,6 +2608,21 @@ pub fn segments_cross_cpu(s1: [f32; 4], s2: [f32; 4]) -> bool {
         && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
 }
 
+/// CPU brute-force reference implementation for batch line-of-sight DRC ray queries.
+///
+/// Tests every query in `queries` against every obstacle in `obstacles`, counting intersections
+/// where the layer masks overlap, the nets differ (or `q.net_id == 0`), and the query segment
+/// intersects the obstacle AABB expanded by `q.clearance`.
+///
+/// # Arguments
+/// * `obstacles` - Slice of `(aabb, layer_mask, net_id)` obstacle primitives.
+/// * `queries` - Slice of [`GpuDrcRayQuery`] ray descriptors.
+///
+/// # Returns
+/// A `Vec<u32>` of length `queries.len()` containing the violation count for each query.
+///
+/// # Side Effects
+/// None.
 pub fn evaluate_drc_brute_force_cpu(
     obstacles: &[([f32; 4], u32, u32)],
     queries: &[GpuDrcRayQuery],
@@ -2281,6 +2653,18 @@ pub fn evaluate_drc_brute_force_cpu(
         .collect()
 }
 
+/// CPU $O(N^2)$ brute-force reference implementation for counting pairwise segment crossings.
+///
+/// For each segment `i`, counts how many subsequent segments `j > i` strictly cross `segs[i]`.
+///
+/// # Arguments
+/// * `segs` - Slice of 2D line segments `[x1, y1, x2, y2]` in mm.
+///
+/// # Returns
+/// A `Vec<u32>` of length `segs.len()` where entry `i` is the number of crossings with `j > i`.
+///
+/// # Side Effects
+/// None.
 pub fn evaluate_segment_crossings_brute_force_cpu(segs: &[[f32; 4]]) -> Vec<u32> {
     let n = segs.len();
     (0..n)
@@ -2297,6 +2681,20 @@ pub fn evaluate_segment_crossings_brute_force_cpu(segs: &[[f32; 4]]) -> Vec<u32>
         .collect()
 }
 
+/// Traverses a CPU/GPU Morton LBVH (`bvh_nodes`) along a 2D query segment `ray` and invokes `on_leaf`
+/// for every candidate leaf primitive index whose AABB intersects `ray`.
+///
+/// Uses a fixed 32-entry stack on the CPU stack frame without heap allocation. Subtrees whose
+/// `net_id` matches a non-zero `query_net_id` are pruned automatically.
+///
+/// # Arguments
+/// * `ray` - Query line segment `[x1, y1, x2, y2]` in mm.
+/// * `query_net_id` - Net ID to ignore (`0` = test all nets).
+/// * `bvh_nodes` - Flat LBVH node slice produced by [`build_gpu_lbvh`].
+/// * `on_leaf` - Callback invoked with the primitive index `usize` for each intersecting leaf node.
+///
+/// # Side Effects
+/// Invokes `on_leaf` for each leaf AABB hit.
 #[inline]
 pub fn query_lbvh_crossing_segments<F: FnMut(usize)>(
     ray: [f32; 4],
@@ -2344,6 +2742,17 @@ pub fn query_lbvh_crossing_segments<F: FnMut(usize)>(
     }
 }
 
+/// CPU brute-force reference implementation for counting ratsnest crossings across corridor cut lines.
+///
+/// # Arguments
+/// * `segs` - Slice of ratsnest segments `[x1, y1, x2, y2]` in mm.
+/// * `cuts` - Slice of corridor cut segments `[x1, y1, x2, y2]` in mm.
+///
+/// # Returns
+/// A `Vec<u32>` of length `cuts.len()` containing the crossing count for each corridor cut.
+///
+/// # Side Effects
+/// None.
 pub fn evaluate_corridor_cuts_brute_force_cpu(segs: &[[f32; 4]], cuts: &[[f32; 4]]) -> Vec<u32> {
     cuts.iter()
         .map(|&cut| {
@@ -2358,6 +2767,21 @@ pub fn evaluate_corridor_cuts_brute_force_cpu(segs: &[[f32; 4]], cuts: &[[f32; 4
         .collect()
 }
 
+/// CPU LBVH-accelerated evaluation of ratsnest crossings across topological corridor cut lines.
+///
+/// Uses [`query_lbvh_crossing_segments`] to prune non-intersecting subtrees and [`segments_cross_cpu`]
+/// to verify exact segment intersections at the leaves.
+///
+/// # Arguments
+/// * `segs` - Slice of ratsnest segments `[x1, y1, x2, y2]` in mm.
+/// * `bvh_nodes` - Pre-built Morton LBVH over `segs` (from [`build_gpu_lbvh_from_segments`]).
+/// * `cuts` - Slice of corridor cut segments `[x1, y1, x2, y2]` in mm.
+///
+/// # Returns
+/// A `Vec<u32>` of length `cuts.len()` containing the crossing count for each corridor cut.
+///
+/// # Side Effects
+/// None.
 pub fn evaluate_corridor_cuts_lbvh_cpu(
     segs: &[[f32; 4]],
     bvh_nodes: &[GpuBvhNode],
@@ -2376,172 +2800,299 @@ pub fn evaluate_corridor_cuts_lbvh_cpu(
         .collect()
 }
 
+/// Uniform buffer parameters for the 2D/3D Euclidean Distance Field shader (`DISTANCE_FIELD_WGSL`).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct GridParams {
+    /// Grid width in cells.
     width: u32,
+    /// Grid height in cells.
     height: u32,
+    /// Maximum search radius in grid cells (`[-radius, +radius]`).
     radius: i32,
+    /// Number of routing layers in the 3D obstacle grid.
     num_layers: u32,
 }
 
+/// Uniform buffer parameters for 3D routing cell traversal cost evaluation (`COMPUTE_3D_ROUTING_COST_WGSL`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuRouteCostParams {
+    /// Routing grid width in cells.
     pub width: u32,
+    /// Routing grid height in cells.
     pub height: u32,
+    /// Number of copper routing layers.
     pub num_layers: u32,
+    /// Active electrical net ID being routed (`0` = treat all non-zero cells as foreign obstacles).
     pub net_id: u32,
+    /// Required circular clearance radius in grid cells around foreign-net obstacles.
     pub clearance_cells: i32,
+    /// PathFinder present congestion multiplier applied to `usage_count`.
     pub present_congestion_factor: f32,
+    /// Weight applied to inverse Euclidean distance field penalty (`obstacle_clearance_weight / dist_field`).
     pub obstacle_clearance_weight: f32,
+    /// Bitmask of dedicated power/ground plane layers (`1 << layer`) blocked to foreign nets.
     pub plane_layer_mask: u32,
 }
 
+/// Uniform buffer parameters for 3D Lee/Moore wavefront relaxation (`WAVEFRONT_3D_RELAX_WGSL`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct WavefrontUniformParams {
+    /// Routing grid width in cells.
     width: u32,
+    /// Routing grid height in cells.
     height: u32,
+    /// Number of copper routing layers.
     num_layers: u32,
+    /// Additive cost penalty incurred when transitioning between layers through a via.
     via_cost: f32,
 }
 
+/// Uniform buffer parameters for GPU 3D wavefront path backtracking (`WAVEFRONT_3D_BACKTRACK_WGSL`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct WavefrontBacktrackUniformParams {
+    /// Routing grid width in cells.
     width: u32,
+    /// Routing grid height in cells.
     height: u32,
+    /// Number of copper routing layers.
     num_layers: u32,
+    /// Additive cost penalty for inter-layer via transitions.
     via_cost: f32,
+    /// Source cell X coordinate.
     src_x: u32,
+    /// Source cell Y coordinate.
     src_y: u32,
+    /// Source cell layer index.
     src_layer: u32,
+    /// Destination cell X coordinate.
     dst_x: u32,
+    /// Destination cell Y coordinate.
     dst_y: u32,
+    /// Destination cell layer index.
     dst_layer: u32,
+    /// Maximum number of `(x, y, layer)` steps that `path_out` can hold.
     max_path_len: u32,
+    /// Explicit 4-byte alignment padding for 16-byte WGSL uniform alignment.
     pad: u32,
 }
 
+/// Uniform buffer counts for continuous-geometry batch DRC evaluation (`BATCH_DRC_EVAL_WGSL`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrcBatchParams {
+    /// Number of board pads in `pads`.
     pub num_pads: u32,
+    /// Number of routed track segments in `tracks`.
     pub num_tracks: u32,
+    /// Number of existing vias in `vias`.
     pub num_vias: u32,
+    /// Number of candidate vias or track segments in `candidates`.
     pub num_candidates: u32,
 }
 
+/// GPU representation of a PCB pad for continuous-geometry batch DRC evaluation (`32` bytes, `#[repr(C)]`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuDrcPad {
+    /// World X coordinate of the pad center (mm).
     pub x: f32,
+    /// World Y coordinate of the pad center (mm).
     pub y: f32,
+    /// Half-width of the pad in local X (mm).
     pub hw: f32,
+    /// Half-height of the pad in local Y (mm).
     pub hh: f32,
+    /// Pad rotation angle in radians.
     pub rot_rad: f32,
+    /// Minimum copper clearance required around this pad (mm).
     pub clearance: f32,
+    /// Lower 16 bits: copper layer bitmask (`1 << layer`, or `0xFFFF` for through-hole);
+    /// upper 16 bits (`layer_mask >> 16`): pad shape (`0` = rect/roundrect, `1` = circle, `2` = oval/oblong).
     pub layer_mask: u32,
+    /// Electrical net ID (`0` = unconnected).
     pub net_id: u32,
 }
 
+/// GPU representation of a routed PCB track segment for batch DRC evaluation (`32` bytes, `#[repr(C)]`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuDrcTrack {
+    /// Track segment start X coordinate (mm).
     pub x1: f32,
+    /// Track segment start Y coordinate (mm).
     pub y1: f32,
+    /// Track segment end X coordinate (mm).
     pub x2: f32,
+    /// Track segment end Y coordinate (mm).
     pub y2: f32,
+    /// Half of the track copper width (`width * 0.5`, in mm).
     pub half_width: f32,
+    /// Netclass copper clearance of the track's net (mm).
     pub clearance: f32,
+    /// Copper layer index on which the track is routed.
     pub layer: u32,
+    /// Electrical net ID of the track.
     pub net_id: u32,
 }
 
+/// GPU representation of an existing PCB via for batch DRC evaluation (`32` bytes, `#[repr(C)]`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuDrcVia {
+    /// Via center X coordinate (mm).
     pub x: f32,
+    /// Via center Y coordinate (mm).
     pub y: f32,
+    /// Outer copper annular ring radius (`size * 0.5`, in mm).
     pub radius: f32,
+    /// Netclass copper clearance of the via's net (mm).
     pub clearance: f32,
+    /// Electrical net ID of the via.
     pub net_id: u32,
+    /// Alignment padding word 0.
     pub _pad0: u32,
+    /// Alignment padding word 1.
     pub _pad1: u32,
+    /// Alignment padding word 2.
     pub _pad2: u32,
 }
 
+/// Candidate via or track segment submitted to [`VulkanEngine::evaluate_drc_candidates`] (`48` bytes, `#[repr(C)]`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuDrcCandidate {
+    /// Candidate via X coordinate (when `kind == 0`) or track start X coordinate (when `kind == 1`), in mm.
     pub x1: f32,
+    /// Candidate via Y coordinate (when `kind == 0`) or track start Y coordinate (when `kind == 1`), in mm.
     pub y1: f32,
+    /// Optional ignored via X coordinate (when `kind == 0` and `_pad0 != 0`) or track end X coordinate (when `kind == 1`), in mm.
     pub x2: f32,
+    /// Optional ignored via Y coordinate (when `kind == 0` and `_pad0 != 0`) or track end Y coordinate (when `kind == 1`), in mm.
     pub y2: f32,
+    /// Via outer radius (when `kind == 0`) or track half-width (when `kind == 1`), in mm.
     pub radius_or_half_width: f32,
+    /// Required copper clearance for the candidate's netclass (mm).
     pub clearance: f32,
+    /// Copper layer index (used when `kind == 1`).
     pub layer: u32,
+    /// Electrical net ID of the candidate.
     pub net_id: u32,
+    /// Candidate geometry kind: `0` for a via at `(x1, y1)`, `1` for a track segment `(x1, y1) -> (x2, y2)`.
     pub kind: u32,
+    /// When non-zero (`1`), allows candidate vias (`kind == 0`) to overlap same-net SMD pads.
     pub ignore_same_net_pads: u32,
+    /// Flag indicating whether `(x2, y2)` holds an existing via position to ignore during via nudge checks.
     pub _pad0: u32,
+    /// Explicit alignment padding word.
     pub _pad1: u32,
 }
 
+/// Uniform buffer parameters for batch PCB placement evaluation (`BATCH_PLACEMENT_EVAL_WGSL`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PlacementBatchParams {
+    /// Number of candidate board placements in the batch.
     pub num_candidates: u32,
+    /// Number of footprints per candidate placement.
     pub num_footprints: u32,
+    /// Number of ratsnest airwire segments per candidate placement.
     pub num_segments: u32,
+    /// Explicit 4-byte alignment padding.
     pub _pad: u32,
+    /// Board outline minimum X coordinate (mm).
     pub board_min_x: f32,
+    /// Board outline minimum Y coordinate (mm).
     pub board_min_y: f32,
+    /// Board outline maximum X coordinate (mm).
     pub board_max_x: f32,
+    /// Board outline maximum Y coordinate (mm).
     pub board_max_y: f32,
+    /// Multiplier for total Euclidean ratsnest wirelength.
     pub wirelength_weight: f32,
+    /// Penalty added per pairwise ratsnest airwire crossing.
     pub crossing_weight: f32,
+    /// Penalty multiplier for pairwise footprint courtyard AABB overlaps.
     pub overlap_penalty: f32,
+    /// Penalty multiplier for footprints protruding outside the board outline.
     pub boundary_penalty: f32,
 }
 
+/// Uniform buffer parameters for the GPU Parallel Tempering Simulated Annealing auto-placer (`GPU_SA_PLACER_WGSL`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuSaParams {
+    /// Number of parallel MCMC simulated annealing chains.
     pub num_chains: u32,
+    /// Number of footprints per chain.
     pub num_footprints: u32,
+    /// Number of ratsnest / affinity / corridor / flow edges in `edges`.
     pub num_edges: u32,
+    /// Number of Metropolis-Hastings perturbation steps executed per chain per compute pass.
     pub steps_per_pass: u32,
+    /// Base PCG pseudo-random number generator seed.
     pub seed: u32,
+    /// Explicit 4-byte alignment padding.
     pub _pad0: u32,
+    /// Penalty added when a ratsnest airwire crosses a topological corridor cut segment.
     pub corridor_congestion_weight: f32,
+    /// Weight applied to schematic signal-flow alignment edges (`tag > 3.5`).
     pub flow_alignment_weight: f32,
+    /// Board outline minimum X coordinate (mm).
     pub board_min_x: f32,
+    /// Board outline minimum Y coordinate (mm).
     pub board_min_y: f32,
+    /// Board outline maximum X coordinate (mm).
     pub board_max_x: f32,
+    /// Board outline maximum Y coordinate (mm).
     pub board_max_y: f32,
+    /// Placement grid snapping increment in mm (`<= 0.0` disables snapping).
     pub grid_step: f32,
+    /// Weight applied to total Euclidean ratsnest wirelength.
     pub wirelength_weight: f32,
+    /// Penalty added per pairwise ratsnest segment crossing.
     pub crossing_weight: f32,
+    /// Penalty multiplier for courtyard polygon overlaps.
     pub overlap_penalty: f32,
+    /// Penalty multiplier for board boundary excursions.
     pub boundary_penalty: f32,
+    /// Weight applied to passive / decoupling capacitor affinity edges (`0.5 < tag < 2.5`).
     pub passive_affinity_weight: f32,
+    /// Threshold distance (mm) beyond which passive affinity edges incur quadratic distance penalties.
     pub passive_max_dist: f32,
+    /// Base annealing temperature for the coldest chain in the geometric temperature ladder.
     pub base_temp: f32,
 }
 
+/// Flattened convex courtyard polygon buffers uploaded to the GPU for exact SAT collision checks
+/// in [`VulkanEngine::run_gpu_sa_placer_chains`].
 #[derive(Clone, Debug, Default)]
 pub struct GpuCourtyardBuffers {
-    /// Per-footprint polygon ranges: [poly_start, poly_count, is_smd_only, orig_layer]
+    /// Per-footprint polygon ranges: `[poly_start, poly_count, is_smd_only, orig_layer]`.
     pub fp_poly_ranges: Vec<[u32; 4]>,
-    /// Courtyard polygon headers: [vertex_start, vertex_count, fp_idx, 0]
+    /// Courtyard polygon headers: `[vertex_start, vertex_count, fp_idx, 0]`.
     pub courtyard_polys: Vec<[u32; 4]>,
-    /// Local vertex coordinates [x, y] in mm (pre-expanded by clearance/spacing)
+    /// Local vertex coordinates `[x, y]` in mm (pre-expanded by clearance/spacing).
     pub courtyard_vertices: Vec<[f32; 2]>,
 }
 
 impl GpuCourtyardBuffers {
+    /// Synthesizes default rectangular 4-vertex courtyard polygons from footprint half-extents `fp_descs`.
+    ///
+    /// Used as a fallback by [`VulkanEngine::run_gpu_sa_placer_chains`] when explicit convex
+    /// courtyard polygons are not provided by the caller.
+    ///
+    /// # Arguments
+    /// * `fp_descs` - Slice of footprint descriptors `[half_w, half_h, is_locked, packed_offset]`.
+    ///
+    /// # Returns
+    /// A populated [`GpuCourtyardBuffers`] containing one axis-aligned 4-vertex box polygon per footprint.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn from_fp_descs(fp_descs: &[[f32; 4]]) -> Self {
         let mut fp_poly_ranges = Vec::with_capacity(fp_descs.len());
         let mut courtyard_polys = Vec::with_capacity(fp_descs.len());
@@ -2568,70 +3119,139 @@ impl GpuCourtyardBuffers {
     }
 }
 
+/// Active GPU compute backend selected by [`VulkanEngine`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuBackendKind {
+    /// Cross-vendor `wgpu` Vulkan WGSL compute backend (`wgpu::Backends::VULKAN`).
     Vulkan,
+    /// Bare-metal NVIDIA CUDA Driver API (`libcuda.so`) PTX kernel backend with Vulkan fallback ready.
     CudaPtx,
 }
 
+/// Reusable pool of `wgpu::Buffer` allocations for 3D wavefront routing and backtracking.
+///
+/// Cached inside [`VulkanEngine::wavefront_buffers`] via `VulkanEngine::with_wavefront_buffers`
+/// so repeated 3D wavefront solves on the same grid dimensions reuse device memory without
+/// per-route buffer creation/destruction overhead.
 pub struct CachedWavefrontBuffers {
+    /// Total number of 3D grid cells (`width * height * num_layers`) for which the buffers are sized.
     pub total_cells: usize,
+    /// Maximum number of `(x, y, layer)` steps allocated in `path_out_buf` and `staging_path_buf`.
     pub max_path_len: u32,
+    /// Device storage buffer holding 3D obstacle net IDs (`[total_cells]`).
     pub obst_buf: wgpu::Buffer,
+    /// Device storage buffer holding 3D Euclidean distance field values (`[total_cells]`).
     pub df_buf: wgpu::Buffer,
+    /// Device storage buffer holding 3D PathFinder historical congestion costs (`[total_cells]`).
     pub hist_buf: wgpu::Buffer,
+    /// Device storage buffer holding 3D present usage counts (`[total_cells]`).
     pub usage_buf: wgpu::Buffer,
+    /// Device storage buffer holding per-cell traversal costs (`[total_cells]`).
     pub cost_buf: wgpu::Buffer,
+    /// Ping-pong wavefront distance buffer A (`[total_cells]`).
     pub dist_a_buf: wgpu::Buffer,
+    /// Ping-pong wavefront distance buffer B (`[total_cells]`).
     pub dist_b_buf: wgpu::Buffer,
+    /// Device storage buffer receiving backtracked `(x, y, layer)` path triples (`[max_path_len * 3]`).
     pub path_out_buf: wgpu::Buffer,
+    /// Single-`u32` device storage buffer receiving the backtracked path length.
     pub path_len_buf: wgpu::Buffer,
+    /// Host-mappable staging buffer for reading back full 3D wavefront distance fields (`[total_cells]`).
     pub staging_buf: wgpu::Buffer,
+    /// Host-mappable staging buffer for reading back `path_len_buf` (`4` bytes).
     pub staging_len_buf: wgpu::Buffer,
+    /// Host-mappable staging buffer for reading back `path_out_buf` (`[max_path_len * 3]`).
     pub staging_path_buf: wgpu::Buffer,
+    /// Number of times this buffer pool was (re)allocated due to grid dimension changes.
     pub alloc_count: usize,
+    /// Number of times existing buffers in this pool were reused without reallocation.
     pub reuse_count: usize,
 }
 
+/// Unified GPU compute engine managing both NVIDIA CUDA PTX fast-path kernels and `wgpu` Vulkan WGSL pipelines.
+///
+/// `VulkanEngine` compiles and caches all WGSL compute pipelines at initialization time, probes for
+/// an optional bare-metal [`crate::cuda::CudaEngine`], and exposes thread-safe methods for:
+/// - 2D and multi-layer Euclidean Distance Fields (`compute_distance_field`, `compute_distance_field_layers`),
+/// - Batch placement evaluation and Parallel Tempering SA auto-placement (`evaluate_placement_batch`, `run_gpu_sa_placer_chains`),
+/// - 3D routing cell cost evaluation and Lee/Moore wavefront routing (`compute_3d_routing_costs`, `compute_3d_wavefront`, `solve_3d_wavefront_path_with_clearance`),
+/// - 2D Morton LBVH construction and traversal for ratsnest crossings, corridor cuts, and line-of-sight DRC (`build_cached_lbvh`, `evaluate_segment_crossings_rt_bvh`, `evaluate_corridor_cuts_rt_bvh`, `evaluate_drc_rt_bvh`),
+/// - Continuous-geometry batch DRC candidate checking (`evaluate_drc_candidates`).
 pub struct VulkanEngine {
+    /// Human-readable GPU adapter name (or `" + "`-joined names when multiple GPUs are active).
     pub device_name: String,
+    /// Active backend description string (e.g., `"Vulkan"` or `"CUDA PTX (NVIDIA bare-metal) [Vulkan fallback ready]"`).
     pub backend_name: String,
+    /// GPU driver version and vendor description string.
     pub driver_info: String,
+    /// Selected primary compute backend ([`GpuBackendKind::CudaPtx`] or [`GpuBackendKind::Vulkan`]).
     pub backend_kind: GpuBackendKind,
+    /// Whether hardware ray query / acceleration structure support was detected on this adapter.
     pub vulkan_rt_ray_query_supported: bool,
+    /// Optional bare-metal NVIDIA CUDA Driver API engine used when `backend_kind == GpuBackendKind::CudaPtx`.
     pub cuda_engine: Option<Arc<crate::cuda::CudaEngine>>,
+    /// Underlying `wgpu` logical device handle.
     device: wgpu::Device,
+    /// Underlying `wgpu` command submission queue.
     queue: wgpu::Queue,
+    /// Compute pipeline for horizontal distance-field pass (`DISTANCE_FIELD_WGSL::pass_h`).
     pipeline: wgpu::ComputePipeline,
+    /// Compute pipeline for vertical distance-field pass (`DISTANCE_FIELD_WGSL::pass_v`).
     df_v_pipeline: wgpu::ComputePipeline,
+    /// Bind group layout shared by `pipeline` (`pass_h`) and `df_v_pipeline` (`pass_v`).
     bind_group_layout: wgpu::BindGroupLayout,
+    /// Compute pipeline for batch placement cost evaluation (`BATCH_PLACEMENT_EVAL_WGSL`).
     placement_pipeline: wgpu::ComputePipeline,
+    /// Bind group layout for `placement_pipeline`.
     placement_bgl: wgpu::BindGroupLayout,
+    /// Compute pipeline for Parallel Tempering Simulated Annealing (`GPU_SA_PLACER_WGSL`).
     sa_pipeline: wgpu::ComputePipeline,
+    /// Bind group layout for `sa_pipeline`.
     sa_bgl: wgpu::BindGroupLayout,
+    /// Compute pipeline for 3D routing cell cost evaluation (`COMPUTE_3D_ROUTING_COST_WGSL`).
     route_cost_pipeline: wgpu::ComputePipeline,
+    /// Bind group layout for `route_cost_pipeline`.
     route_cost_bgl: wgpu::BindGroupLayout,
+    /// Compute pipeline for 3D wavefront relaxation (`WAVEFRONT_3D_RELAX_WGSL`).
     wavefront_pipeline: wgpu::ComputePipeline,
+    /// Bind group layout for `wavefront_pipeline`.
     wavefront_bgl: wgpu::BindGroupLayout,
+    /// Compute pipeline for 3D wavefront GPU backtracking (`WAVEFRONT_3D_BACKTRACK_WGSL`).
     wavefront_backtrack_pipeline: wgpu::ComputePipeline,
+    /// Bind group layout for `wavefront_backtrack_pipeline`.
     wavefront_backtrack_bgl: wgpu::BindGroupLayout,
+    /// Compute pipeline for LBVH ratsnest segment crossings (`RT_BVH_SEGMENT_CROSSINGS_WGSL`).
     bvh_crossings_pipeline: wgpu::ComputePipeline,
+    /// Bind group layout for `bvh_crossings_pipeline`.
     bvh_crossings_bgl: wgpu::BindGroupLayout,
+    /// Compute pipeline for LBVH corridor cut crossings (`RT_BVH_CORRIDOR_CUTS_WGSL`).
     bvh_corridor_cuts_pipeline: wgpu::ComputePipeline,
+    /// Bind group layout for `bvh_corridor_cuts_pipeline`.
     bvh_corridor_cuts_bgl: wgpu::BindGroupLayout,
+    /// Compute pipeline for LBVH line-of-sight DRC ray queries (`RT_BVH_LINE_OF_SIGHT_DRC_WGSL`).
     bvh_drc_pipeline: wgpu::ComputePipeline,
+    /// Bind group layout for `bvh_drc_pipeline`.
     bvh_drc_bgl: wgpu::BindGroupLayout,
+    /// Compute pipeline for continuous-geometry batch DRC evaluation (`BATCH_DRC_EVAL_WGSL`).
     drc_pipeline: wgpu::ComputePipeline,
+    /// Bind group layout for `drc_pipeline`.
     drc_bgl: wgpu::BindGroupLayout,
+    /// Mutex serializing `wgpu` queue submissions and synchronous staging buffer map/poll cycles.
     dispatch_lock: Mutex<()>,
+    /// Cached reusable GPU buffers for 3D wavefront relaxation and backtracking.
     pub wavefront_buffers: Mutex<Option<CachedWavefrontBuffers>>,
+    /// Engine-level single-entry cache storing `(primitives_hash, bvh_nodes)`.
     pub lbvh_cache: Mutex<Option<(u64, Vec<GpuBvhNode>)>>,
+    /// Atomic counter of cache hits in [`Self::lbvh_cache`].
     pub lbvh_cache_hits: AtomicU64,
+    /// Cumulative nanoseconds spent executing GPU compute dispatches, sampled by [`SystemTelemetry`].
     pub compute_busy_ns: Arc<AtomicU64>,
+    /// Additional GPU engines discovered on multi-GPU systems for parallel batch distribution.
     pub extra_devices: Vec<Arc<VulkanEngine>>,
 }
 
 impl std::fmt::Debug for VulkanEngine {
+    /// Formats a concise summary of [`VulkanEngine`] showing device, backend, and ray-query support.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VulkanEngine")
             .field("device_name", &self.device_name)
@@ -2643,18 +3263,52 @@ impl std::fmt::Debug for VulkanEngine {
 }
 
 impl VulkanEngine {
+    /// Initializes the primary [`VulkanEngine`] instance, preferring the bare-metal NVIDIA CUDA PTX
+    /// backend when available and falling back to `wgpu` Vulkan compute pipelines.
+    ///
+    /// Blocks the current thread on `Self::init_async` via `pollster::block_on`.
+    ///
+    /// # Returns
+    /// `Some(Arc<VulkanEngine>)` if at least one hardware GPU adapter (or software adapter when
+    /// `VULCANS_ALLOW_SOFTWARE_GPU=1`) was initialized; `None` if no suitable GPU adapter is available.
+    ///
+    /// # Side Effects
+    /// Enumerates Vulkan/`wgpu` adapters, probes `libcuda.so` via [`crate::cuda::CudaEngine::all_devices`]
+    /// (unless `VULCANS_FORCE_VULKAN=1`), and compiles all WGSL compute pipelines on the device.
     pub fn new() -> Option<Arc<Self>> {
         pollster::block_on(Self::init_async(false)).map(Arc::new)
     }
 
+    /// Initializes a [`VulkanEngine`] instance forced to use the `wgpu` Vulkan WGSL backend only,
+    /// bypassing any NVIDIA CUDA Driver API fast path.
+    ///
+    /// # Returns
+    /// `Some(Arc<VulkanEngine>)` configured with [`GpuBackendKind::Vulkan`], or `None` if no
+    /// suitable Vulkan adapter is found.
+    ///
+    /// # Side Effects
+    /// Enumerates Vulkan/`wgpu` adapters and compiles all WGSL compute shaders on the logical device.
     pub fn new_vulkan_only() -> Option<Arc<Self>> {
         pollster::block_on(Self::init_async(true)).map(Arc::new)
     }
 
+    /// Returns `true` if this engine is actively dispatching compute workloads through the
+    /// bare-metal NVIDIA CUDA PTX backend ([`GpuBackendKind::CudaPtx`]).
+    ///
+    /// # Returns
+    /// `true` when `self.backend_kind == GpuBackendKind::CudaPtx`, `false` when using Vulkan WGSL.
     pub fn is_cuda_active(&self) -> bool {
         self.backend_kind == GpuBackendKind::CudaPtx
     }
 
+    /// Returns a list containing this primary [`VulkanEngine`] followed by any secondary GPU
+    /// engines in [`Self::extra_devices`].
+    ///
+    /// # Returns
+    /// A `Vec<Arc<VulkanEngine>>` of length `1 + self.extra_devices.len()`.
+    ///
+    /// # Side Effects
+    /// Clones `Arc` pointers to the primary and secondary engines.
     pub fn all_engines(self: &Arc<Self>) -> Vec<Arc<Self>> {
         let mut list = Vec::with_capacity(1 + self.extra_devices.len());
         list.push(Arc::clone(self));
@@ -2664,6 +3318,23 @@ impl VulkanEngine {
         list
     }
 
+    /// Asynchronously discovers hardware GPU adapters, pairs them with optional CUDA PTX devices,
+    /// and constructs the primary [`VulkanEngine`] and any multi-GPU [`Self::extra_devices`].
+    ///
+    /// Rejects CPU/software rasterizers (`llvmpipe`, `lavapipe`, `SwiftShader`, `WARP`, `paravirtual`)
+    /// by default to prevent multi-threaded software driver deadlocks in headless environments unless
+    /// `VULCANS_ALLOW_SOFTWARE_GPU=1` is set.
+    ///
+    /// # Arguments
+    /// * `force_vulkan` - When `true`, skips probing [`crate::cuda::CudaEngine`] and forces [`GpuBackendKind::Vulkan`].
+    ///
+    /// # Returns
+    /// `Some(VulkanEngine)` if device and pipeline creation succeed; `None` if no compatible adapter exists.
+    ///
+    /// # Side Effects
+    /// Reads environment variables `VULCANS_ALLOW_SOFTWARE_GPU`, `VULCANS_FORCE_VULKAN`, and
+    /// `VULCANS_GPU_BACKEND`, creates `wgpu::Instance` and `wgpu::Device` handles, and initializes
+    /// CUDA contexts when available.
     async fn init_async(force_vulkan: bool) -> Option<Self> {
         let allow_software = std::env::var("VULCANS_ALLOW_SOFTWARE_GPU")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -2779,6 +3450,25 @@ impl VulkanEngine {
         Self::from_adapter(adapters[0].clone(), busy_ns, extra_devices, force_vulkan, None).await
     }
 
+    /// Constructs a [`VulkanEngine`] from a selected `wgpu::Adapter`, compiling all WGSL compute
+    /// shaders and optionally binding a bare-metal [`crate::cuda::CudaEngine`].
+    ///
+    /// # Arguments
+    /// * `adapter` - The `wgpu::Adapter` to request a logical device and queue from.
+    /// * `compute_busy_ns` - Shared atomic nanosecond accumulator updated by all compute dispatches.
+    /// * `extra_devices` - Secondary GPU engines bundled into the primary engine for multi-GPU batching.
+    /// * `force_vulkan_arg` - When `true`, disables CUDA PTX probing even if a CUDA device is present.
+    /// * `cuda_engine_arg` - Pre-initialized [`crate::cuda::CudaEngine`] to pair with this adapter, if any.
+    ///
+    /// # Returns
+    /// `Some(VulkanEngine)` if `adapter.request_device(...)` succeeds; `None` on device request failure.
+    ///
+    /// # Side Effects
+    /// Requests a `wgpu::Device`, compiles 10 WGSL compute pipelines (`pass_h`, `pass_v`,
+    /// `placement_pipeline`, `sa_pipeline`, `route_cost_pipeline`, `wavefront_pipeline`,
+    /// `wavefront_backtrack_pipeline`, `bvh_crossings_pipeline`, `bvh_corridor_cuts_pipeline`,
+    /// `bvh_drc_pipeline`, `drc_pipeline`), and runs a $16 \times 16$ CUDA distance-field smoke test
+    /// if CUDA is enabled.
     async fn from_adapter(
         adapter: wgpu::Adapter,
         compute_busy_ns: Arc<AtomicU64>,
@@ -3671,6 +4361,21 @@ impl VulkanEngine {
         })
     }
 
+    /// Builds or retrieves a cached 2D Morton LBVH (`Vec<GpuBvhNode>`) for `primitives` using
+    /// the engine-level [`Self::lbvh_cache`].
+    ///
+    /// Computes an FNV-1a fingerprint via [`hash_lbvh_primitives`] and returns a cloned node vector
+    /// immediately on a cache hit, or delegates to [`build_gpu_lbvh`] and stores the result on a miss.
+    ///
+    /// # Arguments
+    /// * `primitives` - Slice of `(aabb, layer_mask, net_id)` tuples where `aabb` is `[min_x, min_y, max_x, max_y]`.
+    ///
+    /// # Returns
+    /// A `Vec<GpuBvhNode>` of length `2 * primitives.len() - 1` (or `1` sentinel node if empty).
+    ///
+    /// # Side Effects
+    /// Locks `self.lbvh_cache`, increments `self.lbvh_cache_hits` on a cache hit, or updates
+    /// `self.lbvh_cache` and thread-local LBVH cache on a miss.
     pub fn build_cached_lbvh(&self, primitives: &[([f32; 4], u32, u32)]) -> Vec<GpuBvhNode> {
         let key = hash_lbvh_primitives(primitives);
         if let Ok(guard) = self.lbvh_cache.lock() {
@@ -3688,6 +4393,25 @@ impl VulkanEngine {
         nodes
     }
 
+    /// Computes a single-layer 2D Euclidean Distance Field (EDF) on the GPU for an obstacle grid.
+    ///
+    /// Dispatches to the CUDA PTX kernel (`CudaEngine::compute_distance_field`) when
+    /// `self.backend_kind == GpuBackendKind::CudaPtx`, falling back automatically to the two-pass
+    /// Vulkan WGSL pipeline ([`Self::compute_distance_field_vulkan_wgsl`]).
+    ///
+    /// # Arguments
+    /// * `obstacles` - Flat `[width * height]` slice of obstacle flags (`0` = free, non-zero = obstacle).
+    /// * `width` - Grid width in cells.
+    /// * `height` - Grid height in cells.
+    /// * `radius` - Maximum search radius in cells.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` of length `width * height` containing Euclidean distances in cells (clamped to
+    /// `radius + 1.0`), or `None` if `obstacles.len() != width * height` or `width * height == 0`.
+    ///
+    /// # Side Effects
+    /// Uploads `obstacles` to the GPU, executes horizontal and vertical distance transform compute
+    /// passes, reads back the distance buffer, and increments `self.compute_busy_ns`.
     pub fn compute_distance_field(&self, obstacles: &[u32], width: u32, height: u32, radius: i32) -> Option<Vec<f32>> {
         let total = (width * height) as usize;
         if obstacles.len() != total || total == 0 {
@@ -3706,6 +4430,24 @@ impl VulkanEngine {
         self.compute_distance_field_vulkan_wgsl(obstacles, width, height, 1, radius)
     }
 
+    /// Executes the separable two-pass 2D/3D Euclidean Distance Field (`DISTANCE_FIELD_WGSL`)
+    /// directly on the `wgpu` Vulkan backend across `num_layers` copper layers.
+    ///
+    /// # Arguments
+    /// * `obstacles_flat` - Flattened `[num_layers * height * width]` obstacle grid (`0` = free, non-zero = obstacle).
+    /// * `width` - Grid width in cells.
+    /// * `height` - Grid height in cells.
+    /// * `num_layers` - Number of copper layers (`z` dimension of workgroup dispatch).
+    /// * `radius` - Search radius in grid cells.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` of length `num_layers * height * width` with per-cell Euclidean distances,
+    /// or `None` if dimensions are zero, slice length mismatches, or buffer mapping fails.
+    ///
+    /// # Side Effects
+    /// Acquires `self.dispatch_lock`, allocates temporary device storage and staging buffers,
+    /// submits `pass_h` and `pass_v` compute passes, blocks on `device.poll(Maintain::Wait)`,
+    /// destroys temporary buffers, and adds elapsed GPU time to `self.compute_busy_ns`.
     pub fn compute_distance_field_vulkan_wgsl(
         &self,
         obstacles_flat: &[u32],
@@ -3844,6 +4586,24 @@ impl VulkanEngine {
         result
     }
 
+    /// Computes a multi-layer 2D Euclidean Distance Field across `num_layers` layers in parallel.
+    ///
+    /// Uses `CudaEngine::compute_distance_field_layers` when CUDA PTX is active, or falls back to
+    /// [`Self::compute_distance_field_vulkan_wgsl`].
+    ///
+    /// # Arguments
+    /// * `obstacles_flat` - Flattened `[num_layers * height * width]` obstacle slice.
+    /// * `width` - Grid width in cells.
+    /// * `height` - Grid height in cells.
+    /// * `num_layers` - Number of routing layers.
+    /// * `radius` - Search radius in grid cells.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` of length `num_layers * height * width` containing per-layer 2D Euclidean
+    /// distances, or `None` if dimensions or slice lengths are invalid.
+    ///
+    /// # Side Effects
+    /// Dispatches GPU compute kernels and updates `self.compute_busy_ns`.
     pub fn compute_distance_field_layers(
         &self,
         obstacles_flat: &[u32],
@@ -3871,6 +4631,24 @@ impl VulkanEngine {
     }
 
 
+    /// Evaluates a batch of candidate PCB component placements in parallel on the GPU.
+    ///
+    /// For each candidate in `0..params.num_candidates`, computes the weighted sum of ratsnest
+    /// Euclidean wirelength, pairwise segment crossings, pairwise footprint AABB overlaps, and
+    /// board boundary violations. Dispatches to CUDA PTX when active, or to `BATCH_PLACEMENT_EVAL_WGSL`.
+    ///
+    /// # Arguments
+    /// * `boxes` - Flattened `[num_candidates * num_footprints]` slice of footprint AABBs `[min_x, min_y, max_x, max_y]`.
+    /// * `segs` - Flattened `[num_candidates * num_segments]` slice of ratsnest segments `[x1, y1, x2, y2]`.
+    /// * `params` - Batch dimensions, board bounding box, and penalty weights ([`PlacementBatchParams`]).
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` of length `params.num_candidates` containing total scalar cost per candidate,
+    /// or `None` if `num_candidates == 0`, `num_footprints == 0`, or input slice lengths mismatch.
+    ///
+    /// # Side Effects
+    /// Uploads `boxes` and `segs` to GPU buffers, submits a compute pass, maps the output staging
+    /// buffer, and increments `self.compute_busy_ns`.
     pub fn evaluate_placement_batch(
         &self,
         boxes: &[[f32; 4]],
@@ -4000,6 +4778,31 @@ impl VulkanEngine {
         result
     }
 
+    /// Runs Parallel Tempering Markov Chain Monte Carlo (MCMC) Simulated Annealing auto-placement
+    /// chains on the GPU across `num_passes` compute passes.
+    ///
+    /// Evaluates exact Separating Axis Theorem (SAT) convex courtyard polygon collisions using
+    /// `courtyards` (or synthesized rectangular courtyards via [`GpuCourtyardBuffers::from_fp_descs`]
+    /// if `courtyards` is `None`), along with incremental $\Delta E$ wirelength, ratsnest crossing,
+    /// passive decoupling affinity, corridor congestion, and signal flow alignment costs.
+    ///
+    /// # Arguments
+    /// * `fp_descs` - Per-footprint descriptors `[half_w, half_h, is_locked, packed_aabb_offset]` of length `params.num_footprints`.
+    /// * `edges` - Pairs of `vec4<f32>` edge endpoints (`2 * params.num_edges` elements).
+    /// * `init_poses` - Flattened initial footprint poses `[x_mm, y_mm, rot_deg, layer]` of length `params.num_chains * params.num_footprints`.
+    /// * `params` - Annealing parameters, board boundaries, and cost weights ([`GpuSaParams`]).
+    /// * `num_passes` - Number of sequential compute pass dispatches (each executing `params.steps_per_pass` MCMC steps).
+    /// * `courtyards` - Optional pre-built [`GpuCourtyardBuffers`] for exact convex polygon SAT intersection checks.
+    ///
+    /// # Returns
+    /// `Some((best_poses, best_scores))` where:
+    /// - `best_poses` has length `num_chains * num_footprints` (`[x_mm, y_mm, rot_deg, layer]`), and
+    /// - `best_scores` has length `num_chains` (`[cur_cost, best_cost, cur_overlaps, pass_count]`);
+    /// or `None` if buffer dimensions are invalid or GPU execution fails.
+    ///
+    /// # Side Effects
+    /// Dispatches `num_passes` GPU compute passes (via CUDA PTX or `GPU_SA_PLACER_WGSL`), reads back
+    /// the best poses and chain score vectors, and updates `self.compute_busy_ns`.
     pub fn run_gpu_sa_placer_chains(
         &self,
         fp_descs: &[[f32; 4]],
@@ -4212,6 +5015,24 @@ impl VulkanEngine {
         result
     }
 
+    /// Evaluates per-cell 3D routing traversal costs across all copper layers for a single net.
+    ///
+    /// Dispatches to `CudaEngine::compute_3d_routing_costs` when `self.backend_kind == GpuBackendKind::CudaPtx`,
+    /// or falls back to [`Self::compute_3d_routing_costs_vulkan_wgsl`].
+    ///
+    /// # Arguments
+    /// * `obstacles` - 3D obstacle net ID grid (`[num_layers * height * width]`, `0` = free).
+    /// * `dist_field` - 3D Euclidean distance field (`[num_layers * height * width]`).
+    /// * `history_cost` - PathFinder historical congestion grid (`[num_layers * height * width]`).
+    /// * `usage_count` - Present net occupancy count grid (`[num_layers * height * width]`).
+    /// * `params` - Routing grid dimensions, active `net_id`, clearance radius, and penalty weights ([`GpuRouteCostParams`]).
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` of length `num_layers * height * width` where blocked cells are `-1.0` and
+    /// legal cells are `>= 1.0`, or `None` if buffer lengths mismatch.
+    ///
+    /// # Side Effects
+    /// Uploads grid buffers to the GPU, executes the 3D routing cost kernel, and updates `self.compute_busy_ns`.
     pub fn compute_3d_routing_costs(
         &self,
         obstacles: &[u32],
@@ -4231,6 +5052,23 @@ impl VulkanEngine {
         self.compute_3d_routing_costs_vulkan_wgsl(obstacles, dist_field, history_cost, usage_count, params)
     }
 
+    /// Executes the 3D routing cell cost evaluation shader (`COMPUTE_3D_ROUTING_COST_WGSL`) directly
+    /// on the `wgpu` Vulkan backend.
+    ///
+    /// # Arguments
+    /// * `obstacles` - 3D obstacle net ID grid (`[num_layers * height * width]`).
+    /// * `dist_field` - 3D Euclidean distance field (`[num_layers * height * width]`).
+    /// * `history_cost` - PathFinder historical congestion grid (`[num_layers * height * width]`).
+    /// * `usage_count` - Present net occupancy count grid (`[num_layers * height * width]`).
+    /// * `params` - Routing grid dimensions, active `net_id`, clearance radius, and penalty weights ([`GpuRouteCostParams`]).
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` of per-cell traversal costs (`-1.0` if blocked), or `None` if dimensions are
+    /// zero, slice lengths mismatch, or staging buffer readback fails.
+    ///
+    /// # Side Effects
+    /// Acquires `self.dispatch_lock`, allocates device and staging buffers, dispatches
+    /// `self.route_cost_pipeline`, blocks on `device.poll(Maintain::Wait)`, and updates `self.compute_busy_ns`.
     pub fn compute_3d_routing_costs_vulkan_wgsl(
         &self,
         obstacles: &[u32],
@@ -4374,6 +5212,22 @@ impl VulkanEngine {
         result
     }
 
+    /// Evaluates 3D routing cell cost grids for a batch of net/parameter configurations, distributing
+    /// work across all active GPUs ([`Self::all_engines`]) in parallel when multiple GPUs are present.
+    ///
+    /// # Arguments
+    /// * `obstacles` - Shared 3D obstacle net ID grid (`[num_layers * height * width]`).
+    /// * `dist_field` - Shared 3D Euclidean distance field (`[num_layers * height * width]`).
+    /// * `history_cost` - Shared PathFinder historical congestion grid (`[num_layers * height * width]`).
+    /// * `usage_count` - Shared present net occupancy count grid (`[num_layers * height * width]`).
+    /// * `batch_params` - Slice of per-net [`GpuRouteCostParams`] configurations to evaluate.
+    ///
+    /// # Returns
+    /// A `Vec<Option<Vec<f32>>>` of length `batch_params.len()`, preserving the input ordering.
+    ///
+    /// # Side Effects
+    /// Spawns scoped worker threads across [`Self::all_engines`] when multiple GPUs are active,
+    /// dispatches CUDA or Vulkan compute kernels, and updates `compute_busy_ns`.
     pub fn compute_3d_routing_costs_batch(
         self: &Arc<Self>,
         obstacles: &[u32],
@@ -4448,6 +5302,24 @@ impl VulkanEngine {
         results
     }
 
+    /// Propagates a 3D Lee/Moore wavefront across `cell_costs` from `seeds` for `iterations` relaxation steps.
+    ///
+    /// Dispatches to `CudaEngine::compute_3d_wavefront` when CUDA PTX is active, or falls back to
+    /// [`Self::compute_3d_wavefront_vulkan_wgsl`].
+    ///
+    /// # Arguments
+    /// * `cell_costs` - Per-cell traversal costs (`[num_layers * height * width]`, `< 0.0` = blocked).
+    /// * `seeds` - Flat 3D cell indices (`layer * width * height + y * width + x`) initialized to distance `0.0`.
+    /// * `params` - Grid dimensions (`width`, `height`, `num_layers`) in [`GpuRouteCostParams`].
+    /// * `via_cost` - Additive cost penalty for inter-layer via transitions.
+    /// * `iterations` - Number of synchronous ping-pong relaxation passes to execute.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` of length `num_layers * height * width` containing accumulated shortest-path
+    /// distances from `seeds` (`1.0e20` if unreached), or `None` if dimensions are invalid.
+    ///
+    /// # Side Effects
+    /// Executes `iterations` GPU wavefront relaxation passes and updates `self.compute_busy_ns`.
     pub fn compute_3d_wavefront(
         &self,
         cell_costs: &[f32],
@@ -4467,6 +5339,19 @@ impl VulkanEngine {
         self.compute_3d_wavefront_vulkan_wgsl(cell_costs, seeds, params, via_cost, iterations)
     }
 
+    /// Acquires the cached [`CachedWavefrontBuffers`] pool for a 3D grid of `total` cells,
+    /// (re)allocating device buffers only when `total` changes, and invokes `f` with the pool.
+    ///
+    /// # Arguments
+    /// * `total` - Total number of 3D grid cells (`width * height * num_layers`).
+    /// * `f` - Closure receiving a shared reference to the sized [`CachedWavefrontBuffers`].
+    ///
+    /// # Returns
+    /// `Some(R)` with the closure's return value, or `None` if locking `self.wavefront_buffers` fails.
+    ///
+    /// # Side Effects
+    /// Locks `self.wavefront_buffers`, destroys previous `wgpu::Buffer` handles if `total_cells != total`,
+    /// allocates new device/staging buffers on a size change, and increments `alloc_count` or `reuse_count`.
     fn with_wavefront_buffers<R, F: FnOnce(&CachedWavefrontBuffers) -> R>(
         &self,
         total: usize,
@@ -4604,6 +5489,24 @@ impl VulkanEngine {
         guard.as_ref().map(f)
     }
 
+    /// Executes `iterations` ping-pong passes of the 3D wavefront relaxation shader (`WAVEFRONT_3D_RELAX_WGSL`)
+    /// directly on the `wgpu` Vulkan backend using `Self::with_wavefront_buffers`.
+    ///
+    /// # Arguments
+    /// * `cell_costs` - Per-cell traversal costs (`[num_layers * height * width]`, `< 0.0` = blocked).
+    /// * `seeds` - Flat 3D cell indices initialized to distance `0.0`.
+    /// * `params` - Grid dimensions (`width`, `height`, `num_layers`).
+    /// * `via_cost` - Additive cost penalty for inter-layer via transitions.
+    /// * `iterations` - Number of relaxation passes (`0` returns the initialized seed grid immediately).
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` containing the relaxed 3D distance field of length `num_layers * height * width`,
+    /// or `None` if `cell_costs.len() != total` or `seeds.is_empty()`.
+    ///
+    /// # Side Effects
+    /// Acquires `self.dispatch_lock` and `self.wavefront_buffers`, writes `cell_costs` and initial
+    /// wavefront buffers to the device queue, dispatches `iterations` compute passes, maps the staging
+    /// buffer, and updates `self.compute_busy_ns`.
     pub fn compute_3d_wavefront_vulkan_wgsl(
         &self,
         cell_costs: &[f32],
@@ -4744,6 +5647,26 @@ impl VulkanEngine {
         })?
     }
 
+    /// Solves a shortest 3D route path from `src` to `dst` on `obstacle_grid` with zero extra cell clearance.
+    ///
+    /// Convenience wrapper around [`Self::solve_3d_wavefront_path_with_clearance`] with `clearance_cells = 0`.
+    ///
+    /// # Arguments
+    /// * `obstacle_grid` - Flat 3D obstacle net ID grid (`[layers * gh * gw]`, `0` = free).
+    /// * `gw` - Grid width in cells.
+    /// * `gh` - Grid height in cells.
+    /// * `layers` - Number of copper routing layers.
+    /// * `src` - Source cell coordinates `(x, y, layer)`.
+    /// * `dst` - Destination cell coordinates `(x, y, layer)`.
+    /// * `net_id` - Active electrical net ID being routed.
+    /// * `via_cost` - Additive cost penalty for inter-layer via transitions.
+    ///
+    /// # Returns
+    /// `Some(Vec<(usize, usize, usize)>)` ordered from `src` to `dst` (inclusive) if a valid path is found,
+    /// or `None` if unreachable or out of bounds.
+    ///
+    /// # Side Effects
+    /// Dispatches GPU wavefront routing and backtracking kernels and updates `self.compute_busy_ns`.
     pub fn solve_3d_wavefront_path(
         &self,
         obstacle_grid: &[u32],
@@ -4768,6 +5691,28 @@ impl VulkanEngine {
         )
     }
 
+    /// Solves a shortest 3D route path from `src` to `dst` enforcing a circular obstacle clearance
+    /// of `clearance_cells` grid cells.
+    ///
+    /// Dispatches to `CudaEngine::solve_3d_wavefront_path_with_clearance` when CUDA PTX is active,
+    /// or falls back to [`Self::solve_3d_wavefront_path_vulkan_wgsl`].
+    ///
+    /// # Arguments
+    /// * `obstacle_grid` - Flat 3D obstacle net ID grid (`[layers * gh * gw]`, `0` = free).
+    /// * `gw` - Grid width in cells.
+    /// * `gh` - Grid height in cells.
+    /// * `layers` - Number of copper routing layers.
+    /// * `src` - Source cell coordinates `(x, y, layer)`.
+    /// * `dst` - Destination cell coordinates `(x, y, layer)`.
+    /// * `net_id` - Active electrical net ID being routed.
+    /// * `via_cost` - Additive cost penalty for inter-layer via transitions.
+    /// * `clearance_cells` - Circular clearance radius in grid cells around foreign-net obstacles.
+    ///
+    /// # Returns
+    /// `Some(Vec<(usize, usize, usize)>)` ordered from `src` to `dst` (inclusive), or `None` if blocked/unreachable.
+    ///
+    /// # Side Effects
+    /// Dispatches GPU cost evaluation, wavefront relaxation, and backtracking passes, and updates `self.compute_busy_ns`.
     pub fn solve_3d_wavefront_path_with_clearance(
         &self,
         obstacle_grid: &[u32],
@@ -4813,6 +5758,29 @@ impl VulkanEngine {
         )
     }
 
+    /// End-to-end `wgpu` Vulkan WGSL 3D wavefront path solver combining cell cost evaluation
+    /// (`COMPUTE_3D_ROUTING_COST_WGSL`), iterative wavefront relaxation (`WAVEFRONT_3D_RELAX_WGSL`),
+    /// and on-GPU path backtracking (`WAVEFRONT_3D_BACKTRACK_WGSL`) in a single command submission.
+    ///
+    /// # Arguments
+    /// * `obstacle_grid` - Flat 3D obstacle net ID grid (`[layers * gh * gw]`).
+    /// * `gw` - Grid width in cells.
+    /// * `gh` - Grid height in cells.
+    /// * `layers` - Number of copper routing layers.
+    /// * `src` - Source cell `(x, y, layer)`.
+    /// * `dst` - Destination cell `(x, y, layer)`.
+    /// * `net_id` - Active electrical net ID.
+    /// * `via_cost` - Inter-layer via transition cost.
+    /// * `clearance_cells` - Circular clearance radius in grid cells.
+    ///
+    /// # Returns
+    /// `Some(Vec<(usize, usize, usize)>)` containing the backtracked 3D path from `src` to `dst`,
+    /// or `None` if `src`/`dst` are out of bounds, blocked by a foreign net, or unreachable.
+    ///
+    /// # Side Effects
+    /// Acquires `self.dispatch_lock` and `self.wavefront_buffers`, submits cost, relaxation, and
+    /// backtrack passes in a single `wgpu::CommandEncoder`, reads back only the compact path buffer,
+    /// and updates `self.compute_busy_ns`.
     pub fn solve_3d_wavefront_path_vulkan_wgsl(
         &self,
         obstacle_grid: &[u32],
@@ -5113,6 +6081,23 @@ impl VulkanEngine {
         })?
     }
 
+    /// Solves a batch of independent 3D wavefront routing requests with zero extra cell clearance.
+    ///
+    /// Convenience wrapper around [`Self::solve_batch_3d_wavefront_paths_with_clearance`] that
+    /// appends `clearance_cells = 0` to each request tuple.
+    ///
+    /// # Arguments
+    /// * `obstacle_grid` - Flat 3D obstacle net ID grid (`[layers * gh * gw]`).
+    /// * `gw` - Grid width in cells.
+    /// * `gh` - Grid height in cells.
+    /// * `layers` - Number of copper routing layers.
+    /// * `requests` - Slice of `(src, dst, net_id, via_cost)` routing requests.
+    ///
+    /// # Returns
+    /// A `Vec<Option<Vec<(usize, usize, usize)>>>` of length `requests.len()`.
+    ///
+    /// # Side Effects
+    /// Dispatches batch GPU wavefront solves across available CUDA or Vulkan devices.
     pub fn solve_batch_3d_wavefront_paths(
         &self,
         obstacle_grid: &[u32],
@@ -5135,6 +6120,25 @@ impl VulkanEngine {
         )
     }
 
+    /// Solves a batch of independent 3D wavefront routing requests with per-request circular clearance
+    /// radii `clearance_cells`.
+    ///
+    /// When `self.backend_kind == GpuBackendKind::CudaPtx`, distributes requests across all CUDA GPUs
+    /// via [`crate::cuda::MultiGpuRouterPool`]; otherwise executes each request sequentially via
+    /// [`Self::solve_3d_wavefront_path_vulkan_wgsl`].
+    ///
+    /// # Arguments
+    /// * `obstacle_grid` - Flat 3D obstacle net ID grid (`[layers * gh * gw]`).
+    /// * `gw` - Grid width in cells.
+    /// * `gh` - Grid height in cells.
+    /// * `layers` - Number of copper routing layers.
+    /// * `requests` - Slice of `(src, dst, net_id, via_cost, clearance_cells)` routing requests.
+    ///
+    /// # Returns
+    /// A `Vec<Option<Vec<(usize, usize, usize)>>>` of length `requests.len()`.
+    ///
+    /// # Side Effects
+    /// Dispatches single- or multi-GPU 3D wavefront path solves and updates `compute_busy_ns`.
     pub fn solve_batch_3d_wavefront_paths_with_clearance(
         &self,
         obstacle_grid: &[u32],
@@ -5180,6 +6184,22 @@ impl VulkanEngine {
             .collect()
     }
 
+    /// Evaluates pairwise ratsnest segment crossings (`j > i`) on the GPU using a 2D Morton LBVH.
+    ///
+    /// Dispatches to `CudaEngine::evaluate_segment_crossings_rt_bvh` when CUDA PTX is active, or
+    /// falls back to [`Self::evaluate_segment_crossings_rt_bvh_vulkan_wgsl`].
+    ///
+    /// # Arguments
+    /// * `segs` - Slice of 2D ratsnest segments `[x1, y1, x2, y2]` in mm.
+    /// * `bvh_nodes` - Pre-built Morton LBVH over `segs` (from [`build_gpu_lbvh_from_segments`]).
+    ///
+    /// # Returns
+    /// `Some(Vec<u32>)` of length `segs.len()` where element `i` is the number of segments `j > i`
+    /// that strictly cross `segs[i]`, or `None` if `segs` or `bvh_nodes` is empty.
+    ///
+    /// # Side Effects
+    /// Uploads `segs` and `bvh_nodes` to GPU buffers, dispatches the LBVH traversal kernel, and
+    /// increments `self.compute_busy_ns`.
     pub fn evaluate_segment_crossings_rt_bvh(
         &self,
         segs: &[[f32; 4]],
@@ -5197,6 +6217,20 @@ impl VulkanEngine {
         self.evaluate_segment_crossings_rt_bvh_vulkan_wgsl(segs, bvh_nodes)
     }
 
+    /// Executes the LBVH pairwise segment crossing shader (`RT_BVH_SEGMENT_CROSSINGS_WGSL`) directly
+    /// on the `wgpu` Vulkan backend.
+    ///
+    /// # Arguments
+    /// * `segs` - Slice of 2D line segments `[x1, y1, x2, y2]` in mm.
+    /// * `bvh_nodes` - Flat Morton LBVH nodes over `segs`.
+    ///
+    /// # Returns
+    /// `Some(Vec<u32>)` of length `segs.len()` containing per-segment crossing counts (`j > i`),
+    /// or `None` if `segs` or `bvh_nodes` is empty or buffer mapping fails.
+    ///
+    /// # Side Effects
+    /// Acquires `self.dispatch_lock`, allocates device and staging buffers, dispatches
+    /// `self.bvh_crossings_pipeline`, blocks on `device.poll(Maintain::Wait)`, and updates `self.compute_busy_ns`.
     pub fn evaluate_segment_crossings_rt_bvh_vulkan_wgsl(
         &self,
         segs: &[[f32; 4]],
@@ -5312,9 +6346,22 @@ impl VulkanEngine {
         result
     }
 
-    /// Evaluate topological corridor cut ray crossings against ratsnest segments using the 2D Morton LBVH.
+    /// Evaluates topological corridor cut ray crossings against ratsnest segments using the 2D Morton LBVH.
+    ///
     /// Automatically dispatches to CUDA PTX when `backend_kind == GpuBackendKind::CudaPtx`,
     /// or to the Vulkan WGSL compute pipeline (`RT_BVH_CORRIDOR_CUTS_WGSL`).
+    ///
+    /// # Arguments
+    /// * `segs` - Slice of 2D ratsnest segments `[x1, y1, x2, y2]` in mm.
+    /// * `bvh_nodes` - Pre-built Morton LBVH over `segs`.
+    /// * `cuts` - Slice of corridor cut query segments `[x1, y1, x2, y2]` in mm.
+    ///
+    /// # Returns
+    /// `Some(Vec<u32>)` of length `cuts.len()` containing the number of ratsnest crossings per cut,
+    /// or `None` if any input slice is empty.
+    ///
+    /// # Side Effects
+    /// Dispatches GPU LBVH corridor cut traversal and updates `self.compute_busy_ns`.
     pub fn evaluate_corridor_cuts_rt_bvh(
         &self,
         segs: &[[f32; 4]],
@@ -5333,6 +6380,21 @@ impl VulkanEngine {
         self.evaluate_corridor_cuts_rt_bvh_vulkan_wgsl(segs, bvh_nodes, cuts)
     }
 
+    /// Executes the LBVH corridor cut crossing shader (`RT_BVH_CORRIDOR_CUTS_WGSL`) directly on the
+    /// `wgpu` Vulkan backend.
+    ///
+    /// # Arguments
+    /// * `segs` - Slice of 2D ratsnest segments `[x1, y1, x2, y2]` in mm.
+    /// * `bvh_nodes` - Flat Morton LBVH nodes over `segs`.
+    /// * `cuts` - Slice of corridor cut query segments `[x1, y1, x2, y2]` in mm.
+    ///
+    /// # Returns
+    /// `Some(Vec<u32>)` of length `cuts.len()` containing crossing counts per cut, or `None` if any
+    /// input slice is empty or staging buffer readback fails.
+    ///
+    /// # Side Effects
+    /// Acquires `self.dispatch_lock`, allocates temporary device and staging buffers, dispatches
+    /// `self.bvh_corridor_cuts_pipeline`, blocks on `device.poll(Maintain::Wait)`, and updates `self.compute_busy_ns`.
     pub fn evaluate_corridor_cuts_rt_bvh_vulkan_wgsl(
         &self,
         segs: &[[f32; 4]],
@@ -5459,6 +6521,21 @@ impl VulkanEngine {
         result
     }
 
+    /// Evaluates batch line-of-sight DRC clearance ray queries against an obstacle Morton LBVH on the GPU.
+    ///
+    /// Dispatches to `CudaEngine::evaluate_drc_rt_bvh` when CUDA PTX is active, or falls back to
+    /// [`Self::evaluate_drc_rt_bvh_vulkan_wgsl`].
+    ///
+    /// # Arguments
+    /// * `bvh_nodes` - Flat Morton LBVH constructed over board obstacle AABBs via [`build_gpu_lbvh`].
+    /// * `queries` - Slice of [`GpuDrcRayQuery`] ray descriptors to test.
+    ///
+    /// # Returns
+    /// `Some(Vec<u32>)` of length `queries.len()` containing the obstacle hit count for each query ray,
+    /// or `None` if `bvh_nodes` or `queries` is empty.
+    ///
+    /// # Side Effects
+    /// Uploads `bvh_nodes` and `queries` to the GPU, executes LBVH ray-AABB traversal, and updates `self.compute_busy_ns`.
     pub fn evaluate_drc_rt_bvh(
         &self,
         bvh_nodes: &[GpuBvhNode],
@@ -5476,6 +6553,20 @@ impl VulkanEngine {
         self.evaluate_drc_rt_bvh_vulkan_wgsl(bvh_nodes, queries)
     }
 
+    /// Executes the LBVH line-of-sight DRC ray query shader (`RT_BVH_LINE_OF_SIGHT_DRC_WGSL`)
+    /// directly on the `wgpu` Vulkan backend.
+    ///
+    /// # Arguments
+    /// * `bvh_nodes` - Flat Morton LBVH over obstacle AABBs.
+    /// * `queries` - Slice of [`GpuDrcRayQuery`] ray descriptors.
+    ///
+    /// # Returns
+    /// `Some(Vec<u32>)` of length `queries.len()` with per-query DRC violation counts, or `None` if
+    /// `bvh_nodes` or `queries` is empty or buffer readback fails.
+    ///
+    /// # Side Effects
+    /// Acquires `self.dispatch_lock`, allocates device and staging buffers, dispatches
+    /// `self.bvh_drc_pipeline`, blocks on `device.poll(Maintain::Wait)`, and updates `self.compute_busy_ns`.
     pub fn evaluate_drc_rt_bvh_vulkan_wgsl(
         &self,
         bvh_nodes: &[GpuBvhNode],
@@ -5591,6 +6682,16 @@ impl VulkanEngine {
         result
     }
 
+    /// Runs a synthetic micro-benchmark comparing LBVH-accelerated DRC and segment crossing queries
+    /// against brute-force SIMT/CPU baselines (512 obstacles, 256 queries).
+    ///
+    /// # Returns
+    /// `Some(RtBvhBenchmarkResult)` containing microsecond timings, relative speedups, and hardware
+    /// ray-query availability, or `None` if any GPU benchmark pass fails.
+    ///
+    /// # Side Effects
+    /// Builds temporary Morton LBVHs, dispatches GPU LBVH and batch placement shaders, and updates
+    /// `self.compute_busy_ns`.
     pub fn benchmark_rt_bvh_vs_simt(&self) -> Option<RtBvhBenchmarkResult> {
         if self.backend_kind == GpuBackendKind::CudaPtx {
             if let Some(cuda) = &self.cuda_engine {
@@ -5675,6 +6776,26 @@ impl VulkanEngine {
         })
     }
 
+    /// Evaluates batch Design Rule Check (DRC) clearance violations for candidate segments against board obstacles.
+    ///
+    /// Checks each candidate in `candidates` against all foreign-net pads, tracks, and vias on
+    /// matching copper layers. Dispatches to the native CUDA PTX kernel when
+    /// [`GpuBackendKind::CudaPtx`] is active, falling back to
+    /// [`Self::evaluate_drc_candidates_vulkan`].
+    ///
+    /// # Arguments
+    /// * `pads` - Slice of board pad obstacles ([`GpuDrcPad`]).
+    /// * `tracks` - Slice of existing routed track segments ([`GpuDrcTrack`]).
+    /// * `vias` - Slice of existing plated through-hole or blind/buried vias ([`GpuDrcVia`]).
+    /// * `candidates` - Slice of candidate trace segments ([`GpuDrcCandidate`]) to test.
+    ///
+    /// # Returns
+    /// `Some(Vec<u32>)` with length `candidates.len()` where `0` means DRC-clean and `1` means a
+    /// clearance violation, or `None` if GPU buffer mapping fails.
+    ///
+    /// # Side Effects
+    /// Allocates and destroys GPU buffers, submits a compute pass, and increments
+    /// `self.compute_busy_ns`.
     pub fn evaluate_drc_candidates(
         &self,
         pads: &[GpuDrcPad],
@@ -5698,6 +6819,25 @@ impl VulkanEngine {
         self.evaluate_drc_candidates_vulkan(pads, tracks, vias, candidates)
     }
 
+    /// Evaluates batch DRC clearance violations using the Vulkan WGSL `BATCH_DRC_EVAL_WGSL` compute pipeline.
+    ///
+    /// Uploads `pads`, `tracks`, `vias`, and `candidates` into GPU storage buffers (substituting
+    /// a zeroed dummy element when an obstacle slice is empty so `wgpu` buffer bindings remain valid),
+    /// dispatches workgroups of 64 threads, and reads back the per-candidate violation flags.
+    ///
+    /// # Arguments
+    /// * `pads` - Slice of board pad obstacles ([`GpuDrcPad`]).
+    /// * `tracks` - Slice of existing routed track segments ([`GpuDrcTrack`]).
+    /// * `vias` - Slice of existing vias ([`GpuDrcVia`]).
+    /// * `candidates` - Slice of candidate trace segments ([`GpuDrcCandidate`]) to test.
+    ///
+    /// # Returns
+    /// `Some(Vec<u32>)` containing `0` (clean) or `1` (violation) per candidate, or `None` if locking
+    /// or staging buffer readback fails.
+    ///
+    /// # Side Effects
+    /// Acquires `self.dispatch_lock`, allocates and destroys transient `wgpu::Buffer` objects, blocks
+    /// until the GPU queue completes (`wgpu::Maintain::Wait`), and increments `self.compute_busy_ns`.
     pub fn evaluate_drc_candidates_vulkan(
         &self,
         pads: &[GpuDrcPad],
@@ -5850,15 +6990,27 @@ impl VulkanEngine {
     }
 }
 
+/// Point-in-time snapshot and rolling 60-sample history of host CPU and GPU utilization.
+///
+/// Consumed by the `egui` telemetry sparklines in `src/gui.rs` and updated periodically by
+/// [`SystemTelemetry`].
 #[derive(Debug, Clone)]
 pub struct TelemetrySnapshot {
+    /// Most recent instantaneous host CPU utilization percentage (`0.0..=100.0`).
     pub cpu_load_pct: f32,
+    /// Most recent instantaneous GPU utilization percentage (`0.0..=100.0`).
     pub gpu_load_pct: f32,
+    /// Rolling 60-sample ring buffer of historical CPU load percentages for GUI sparkline rendering.
     pub cpu_history: Vec<f32>,
+    /// Rolling 60-sample ring buffer of historical GPU load percentages for GUI sparkline rendering.
     pub gpu_history: Vec<f32>,
 }
 
 impl Default for TelemetrySnapshot {
+    /// Creates an initialized [`TelemetrySnapshot`] with zeroed load percentages and 60-sample histories.
+    ///
+    /// # Returns
+    /// A default [`TelemetrySnapshot`] with 60 zeroes in `cpu_history` and `gpu_history`.
     fn default() -> Self {
         Self {
             cpu_load_pct: 0.0,
@@ -5870,6 +7022,17 @@ impl Default for TelemetrySnapshot {
 }
 
 impl TelemetrySnapshot {
+    /// Records a new CPU and GPU utilization sample into the snapshot and advances the 60-sample rolling history.
+    ///
+    /// Both input values are clamped to `[0.0, 100.0]` before being stored. If the history vectors
+    /// exceed 60 elements, the oldest entry at index `0` is evicted.
+    ///
+    /// # Arguments
+    /// * `cpu_pct` - Measured CPU utilization percentage.
+    /// * `gpu_pct` - Measured GPU utilization percentage.
+    ///
+    /// # Side Effects
+    /// Mutates `self.cpu_load_pct`, `self.gpu_load_pct`, `self.cpu_history`, and `self.gpu_history`.
     pub fn record_sample(&mut self, cpu_pct: f32, gpu_pct: f32) {
         let c_pct = cpu_pct.clamp(0.0, 100.0);
         let g_pct = gpu_pct.clamp(0.0, 100.0);
@@ -5886,6 +7049,17 @@ impl TelemetrySnapshot {
     }
 }
 
+/// Parses the aggregate `cpu` line from Linux `/proc/stat` into total and idle jiffies.
+///
+/// Sums all numeric fields on the first line for `total`, and combines column 3 (`idle`) plus
+/// column 4 (`iowait`, if present) as `idle`.
+///
+/// # Arguments
+/// * `stat_content` - Raw text content read from `/proc/stat`.
+///
+/// # Returns
+/// `Some((total_jiffies, idle_jiffies))` if the first line has at least 4 integer columns, or
+/// `None` if malformed or empty.
 pub(crate) fn parse_proc_stat_totals(stat_content: &str) -> Option<(u64, u64)> {
     let first = stat_content.lines().next()?;
     let vals: Vec<u64> = first
@@ -5902,6 +7076,16 @@ pub(crate) fn parse_proc_stat_totals(stat_content: &str) -> Option<(u64, u64)> {
     }
 }
 
+/// Computes the CPU busy percentage between two consecutive `/proc/stat` jiffy samples.
+///
+/// # Arguments
+/// * `prev_total` - Total CPU jiffies from the previous sample (`0` on the very first tick).
+/// * `prev_idle` - Idle + iowait jiffies from the previous sample.
+/// * `cur_total` - Total CPU jiffies from the current sample.
+/// * `cur_idle` - Idle + iowait jiffies from the current sample.
+///
+/// # Returns
+/// CPU utilization in the range `0.0..=100.0`, or `0.0` when `prev_total == 0` or `cur_total <= prev_total`.
 pub(crate) fn compute_cpu_load_pct(prev_total: u64, prev_idle: u64, cur_total: u64, cur_idle: u64) -> f32 {
     let d_total = cur_total.saturating_sub(prev_total);
     let d_idle = cur_idle.saturating_sub(prev_idle);
@@ -5912,17 +7096,48 @@ pub(crate) fn compute_cpu_load_pct(prev_total: u64, prev_idle: u64, cur_total: u
     }
 }
 
+/// Parses one or more lines of numeric GPU utilization percentages and returns the maximum value.
+///
+/// Used to parse both single-line DRM sysfs `gpu_busy_percent` files and multi-GPU `nvidia-smi`
+/// CSV output (`--query-gpu=utilization.gpu --format=csv,noheader,nounits`).
+///
+/// # Arguments
+/// * `s` - Raw text containing whitespace-trimmed floating-point or integer percentages per line.
+///
+/// # Returns
+/// `Some(max_pct)` across all valid numeric lines, or `None` if no line parses as `f32`.
 pub(crate) fn parse_gpu_utilization_str(s: &str) -> Option<f32> {
     s.lines()
         .filter_map(|line| line.trim().parse::<f32>().ok())
         .fold(None, |acc, v| Some(acc.map_or(v, |prev: f32| prev.max(v))))
 }
 
+/// Background system telemetry sampler tracking live host CPU and GPU load percentages.
+///
+/// Spawns a detached daemon thread that wakes every 400 ms to sample `/proc/stat`, Vulkan/CUDA
+/// compute duty cycle counters, and hardware GPU utilization sensors.
 pub struct SystemTelemetry {
+    /// Thread-safe handle to the rolling [`TelemetrySnapshot`] read by the GUI.
     pub state: Arc<Mutex<TelemetrySnapshot>>,
 }
 
 impl SystemTelemetry {
+    /// Spawns the background telemetry sampling thread and returns a [`SystemTelemetry`] handle.
+    ///
+    /// Every 400 ms, the background thread:
+    /// 1. Reads `/proc/stat` to compute host CPU utilization via `parse_proc_stat_totals` and `compute_cpu_load_pct`.
+    /// 2. Computes the GPU duty-cycle percentage from the delta of `compute_busy_ns` over the elapsed wall-clock interval.
+    /// 3. Queries hardware GPU sensors via `read_hw_gpu_utilization` and takes the maximum of the software duty cycle and hardware sensor reading.
+    /// 4. Appends the resulting sample to `self.state`.
+    ///
+    /// # Arguments
+    /// * `compute_busy_ns` - Optional shared atomic counter accumulating nanoseconds spent inside [`VulkanEngine`] GPU dispatches.
+    ///
+    /// # Returns
+    /// A new [`SystemTelemetry`] instance wrapping the shared [`TelemetrySnapshot`] mutex.
+    ///
+    /// # Side Effects
+    /// Spawns a long-running background OS thread that polls `/proc/stat`, `/sys/class/drm`, and `nvidia-smi` every 400 ms.
     pub fn spawn(compute_busy_ns: Option<Arc<AtomicU64>>) -> Self {
         let state = Arc::new(Mutex::new(TelemetrySnapshot::default()));
         let state_clone = Arc::clone(&state);
@@ -5976,6 +7191,18 @@ impl SystemTelemetry {
 // Hardware-specific sysfs (`/sys/class/drm/card*/device/gpu_busy_percent`) and `nvidia-smi`
 // subprocess calls depend on which physical GPU driver is installed on the host machine;
 // the underlying string parser is unit-tested deterministically via `parse_gpu_utilization_str`.
+/// Reads hardware GPU utilization percentage from Linux DRM sysfs or `nvidia-smi`.
+///
+/// Checks `/sys/class/drm/card{0..3}/device/gpu_busy_percent` first (used by `amdgpu` and `xe`/`i915`
+/// drivers) and returns the highest utilization across available cards. If no DRM sysfs node is
+/// readable, invokes `nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits`.
+///
+/// # Returns
+/// `Some(gpu_busy_pct)` if either DRM sysfs or `nvidia-smi` reports a valid utilization percentage,
+/// or `None` if neither sensor interface is available on the host.
+///
+/// # Side Effects
+/// Reads `/sys/class/drm/card*/device/gpu_busy_percent` files and may spawn an `nvidia-smi` child process.
 fn read_hw_gpu_utilization() -> Option<f32> {
     let mut best_drm: Option<f32> = None;
     for drm_path in [

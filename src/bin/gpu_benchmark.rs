@@ -1,16 +1,57 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
+//! # GPU Compute Benchmark (`gpu_benchmark`)
+//!
+//! Standalone comparative benchmark binary measuring execution latency and compute throughput
+//! between the `wgpu` Vulkan WGSL backend ([`VulkanEngine`]) and the bare-metal NVIDIA CUDA Driver
+//! API PTX backend ([`CudaEngine`]).
+//!
+//! ## Benchmark Suites
+//!
+//! 1. **Backend Initialization Latency:** Measures context, adapter, device, and pipeline creation
+//!    time in milliseconds (`ms`) for Vulkan vs. CUDA `cuCtxCreate`.
+//! 2. **Per-Dispatch Launch Overhead:** Measures command buffer submission and host synchronization
+//!    latency on a minimal $16 \times 16$ obstacle grid.
+//! 3. **Distance Field Compute Throughput:** Benchmarks 2D Euclidean Distance Field (EDF) calculation
+//!    across realistic PCB routing grid dimensions ($250 \times 205$ up to $1024 \times 1024$) using
+//!    direct global memory and shared-memory tiled kernels.
+//! 4. **Batch Placement Energy Evaluation Throughput:** Benchmarks candidate placement bounding-box
+//!    overlap, boundary violation, wirelength, and segment crossing evaluation for batches of 64 to
+//!    1024 candidate board states.
+//! 5. **GPU Simulated Annealing (SA) Placer Chains Throughput:** Measures end-to-end execution of 64
+//!    parallel Metropolis-Hastings Markov chains on the GPU.
+
 use std::time::Instant;
 use vulcans_trials::cuda::CudaEngine;
 use vulcans_trials::vulkan::{GpuSaParams, PlacementBatchParams, VulkanEngine};
 
+/// Aggregated wall-clock timing statistics in milliseconds (`ms`) for a benchmarked operation.
 struct BenchStats {
+    /// Arithmetic mean execution time across all timed iterations in milliseconds (`ms`).
     pub mean_ms: f64,
+    /// Minimum observed execution time across all timed iterations in milliseconds (`ms`).
     pub min_ms: f64,
+    /// Maximum observed execution time across all timed iterations in milliseconds (`ms`).
     pub max_ms: f64,
 }
 
+/// Executes a closure `warmup` times without timing, then measures its wall-clock duration
+/// over `iterations` runs to compute mean, minimum, and maximum latency in milliseconds (`ms`).
+///
+/// # Arguments
+///
+/// * `f` - The mutable closure or function under test to invoke on each pass.
+/// * `warmup` - Number of untimed warm-up invocations to prime caches, driver allocations, and GPU clocks.
+/// * `iterations` - Number of timed invocations used to compute [`BenchStats`].
+///
+/// # Returns
+///
+/// A [`BenchStats`] structure containing `mean_ms`, `min_ms`, and `max_ms` across the `iterations` runs.
+///
+/// # Side Effects
+///
+/// Invokes `f` a total of `warmup + iterations` times, which may perform GPU dispatches or allocations.
 fn measure_fn<F: FnMut()>(mut f: F, warmup: usize, iterations: usize) -> BenchStats {
     for _ in 0..warmup {
         f();
@@ -29,6 +70,19 @@ fn measure_fn<F: FnMut()>(mut f: F, warmup: usize, iterations: usize) -> BenchSt
     BenchStats { mean_ms, min_ms, max_ms }
 }
 
+/// Generates a deterministic 2D grid of routing obstacles using a 64-bit Linear Congruential
+/// Generator (LCG) with approximately 15% obstacle density.
+///
+/// # Arguments
+///
+/// * `w` - Grid width in cells.
+/// * `h` - Grid height in cells.
+/// * `seed` - Initial 64-bit LCG state seed for reproducible pseudo-random obstacle placement.
+///
+/// # Returns
+///
+/// A row-major `Vec<u32>` of length `(w * h) as usize` where `1` indicates an obstacle cell
+/// and `0` indicates free routing space.
 fn generate_obstacles(w: u32, h: u32, seed: u64) -> Vec<u32> {
     let mut obs = vec![0u32; (w * h) as usize];
     let mut rng = seed;
@@ -45,6 +99,21 @@ fn generate_obstacles(w: u32, h: u32, seed: u64) -> Vec<u32> {
     obs
 }
 
+/// Synthesizes deterministic candidate footprint bounding boxes, ratsnest airwire segments, and
+/// batch scoring parameters for benchmarking GPU placement energy evaluation.
+///
+/// # Arguments
+///
+/// * `nc` - Number of candidate placement states in the batch.
+/// * `nf` - Number of component footprints per candidate board state.
+/// * `ns` - Number of 2-pin ratsnest segments per candidate board state.
+///
+/// # Returns
+///
+/// A 3-tuple `(boxes, segs, params)`:
+/// * `boxes` - Flattened `nc * nf` array of `[min_x, min_y, max_x, max_y]` footprint AABBs in millimeters (`mm`).
+/// * `segs` - Flattened `nc * ns` array of `[x1, y1, x2, y2]` ratsnest segments in millimeters (`mm`).
+/// * `params` - Configured [`PlacementBatchParams`] uniform buffer describing board bounds ($200 \times 200\text{ mm}$) and penalty weights.
 fn generate_placement_data(nc: usize, nf: usize, ns: usize) -> (Vec<[f32; 4]>, Vec<[f32; 4]>, PlacementBatchParams) {
     let mut boxes = Vec::with_capacity(nc * nf);
     let mut segs = Vec::with_capacity(nc * ns);
@@ -87,6 +156,22 @@ fn generate_placement_data(nc: usize, nf: usize, ns: usize) -> (Vec<[f32; 4]>, V
     (boxes, segs, params)
 }
 
+/// Synthesizes deterministic footprint descriptors, netlist edges, initial chain poses, and
+/// uniform parameters for benchmarking GPU Simulated Annealing (SA) Markov chains.
+///
+/// # Arguments
+///
+/// * `nc` - Number of parallel Simulated Annealing chains (`num_chains`).
+/// * `nf` - Number of footprints per chain (`num_footprints`).
+/// * `ne` - Number of 2-pin netlist edges (`num_edges`).
+///
+/// # Returns
+///
+/// A 4-tuple `(fp_descs, edges, init_poses, params)`:
+/// * `fp_descs` - Vector of `nf` footprint descriptors `[half_width_mm, half_height_mm, is_locked, 0.0]`.
+/// * `edges` - Vector of `ne * 2` endpoint descriptors pairing `[fp_a, pad_dx, pad_dy, is_tie]` and `[fp_b, pad_dx, pad_dy, 0.0]`.
+/// * `init_poses` - Flattened `nc * nf` initial component poses `[x_mm, y_mm, rot_deg, layer]`.
+/// * `params` - Configured [`GpuSaParams`] uniform struct for a $100 \times 100\text{ mm}$ board with $0.5\text{ mm}$ grid step.
 fn generate_sa_chains_data(nc: usize, nf: usize, ne: usize) -> (Vec<[f32; 4]>, Vec<[f32; 4]>, Vec<[f32; 4]>, GpuSaParams) {
     let mut fp_descs = Vec::with_capacity(nf);
     for i in 0..nf {
@@ -140,6 +225,21 @@ fn generate_sa_chains_data(nc: usize, nf: usize, ne: usize) -> (Vec<[f32; 4]>, V
     (fp_descs, edges, init_poses, params)
 }
 
+/// Entrypoint for the `gpu_benchmark` binary.
+///
+/// Runs all five GPU compute benchmark stages comparing [`VulkanEngine`] (WGSL) and
+/// [`CudaEngine`] (bare-metal CUDA PTX & Ampere-tuned PTX) and prints formatted timing
+/// tables and relative speedup factors to standard output.
+///
+/// # Side Effects
+///
+/// * Initializes Vulkan and CUDA GPU contexts and allocates device buffers.
+/// * Prints benchmark progress and results to `stdout`.
+///
+/// # Panics
+///
+/// Panics if either [`VulkanEngine::new_vulkan_only`] or [`CudaEngine::new`] fails to initialize
+/// on the host system.
 fn main() {
     println!("================================================================================");
     println!("     Vulcan's Trials — Compute Benchmark: Vulkan WGSL vs Bare-Metal CUDA PTX     ");

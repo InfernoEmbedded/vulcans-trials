@@ -1,6 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
+//! # Process Memory Telemetry & OOM Safety Watchdog (`memlog`)
+//!
+//! Provides low-overhead Resident Set Size (RSS), Virtual Memory High-Water Mark (`VmHWM`),
+//! and heap/stack data (`VmData`) instrumentation along with a 20 ms background watchdog
+//! thread that protects the host workstation from runaway memory allocations.
+//!
+//! ## Architecture & Primary Workflows
+//!
+//! - **Fast Linux `/proc` Sampling:** [`read_proc_statm_mb`] reads `/proc/self/statm` in a single
+//!   file read (converting 4 KiB pages to MiB) for sub-microsecond inner-loop checks, while
+//!   [`read_proc_status_mb`] parses `/proc/self/status` for exact kernel `VmHWM` high-water marks.
+//! - **Phase Tracking & Checkpoints:** Placement and routing stages call [`checkpoint`],
+//!   [`checkpoint_board`], or [`set_phase_fast`] to attribute memory deltas ($\Delta\text{ MB}$)
+//!   to specific algorithmic phases in `/tmp/vulcans_trials_mem.log` (or the path specified by
+//!   the `VULCANS_MEM_LOG` environment variable).
+//! - **Hard OOM Guard:** Both explicit checkpoints and the background `vulcan-mem-watchdog` thread
+//!   compare current RSS against [`DEFAULT_MAX_RSS_MB`] (or `VULCANS_MAX_RSS_MB`, minimum 256 MiB).
+//!   If exceeded, the logger flushes a stack backtrace and terminates the process with exit code `99`
+//!   before the system swap thrashing or kernel OOM-killer can freeze the desktop session.
+
 use crate::board::Board;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -8,23 +28,48 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// Default filesystem path where process memory and phase transition logs are written
+/// when `VULCANS_MEM_LOG` is not set.
 pub const DEFAULT_MEM_LOG_PATH: &str = "/tmp/vulcans_trials_mem.log";
+
+/// Default maximum Resident Set Size (RSS) safety ceiling in megabytes (`4096.0` MiB / 4 GiB)
+/// before the memory watchdog aborts the process. Can be overridden via `VULCANS_MAX_RSS_MB`.
 pub const DEFAULT_MAX_RSS_MB: f64 = 4096.0;
 
+/// Internal singleton state protected by [`MEM_STATE`] tracking the active log file,
+/// phase label, and historical RSS watermarks.
 struct MemLoggerState {
+    /// Monotonic timestamp captured when the memory logger singleton was first initialized.
     start_instant: Instant,
+    /// Active filesystem path of the memory log file.
     log_path: String,
+    /// Open writable file handle for the memory log, if opening succeeded.
     file: Option<File>,
+    /// Resident Set Size in megabytes (`MB`) recorded at the previous logged event.
     last_rss_mb: f64,
+    /// Peak Resident Set Size in megabytes (`MB`) observed across the lifetime of the process.
     peak_rss_mb: f64,
+    /// Name of the currently executing placement or routing phase.
     current_phase: String,
+    /// Configured hard Resident Set Size ceiling in megabytes (`MB`) before emergency abort.
     max_rss_mb: f64,
 }
 
+/// Process-global lazily initialized mutex holding the [`MemLoggerState`] singleton.
 static MEM_STATE: OnceLock<Mutex<MemLoggerState>> = OnceLock::new();
+
+/// Atomic flag ensuring the `vulcan-mem-watchdog` background thread is spawned at most once.
 static WATCHDOG_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Reads `(rss_mb, vmsize_mb, data_mb)` rapidly from `/proc/self/statm` (Linux 4 KiB pages).
+///
+/// Parses the first (total program size), second (resident set size), and sixth (data + stack)
+/// page counters from `/proc/self/statm` and converts them from 4 KiB pages into megabytes (MiB).
+///
+/// # Returns
+///
+/// A 3-tuple `(rss_mb, vmsize_mb, data_mb)` in megabytes (`MB`). Returns `(0.0, 0.0, 0.0)`
+/// on non-Linux platforms or if `/proc/self/statm` cannot be read.
 pub fn read_proc_statm_mb() -> (f64, f64, f64) {
     if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
         let mut parts = s.split_whitespace();
@@ -45,6 +90,14 @@ pub fn read_proc_statm_mb() -> (f64, f64, f64) {
 }
 
 /// Reads `(vm_rss_mb, vm_hwm_mb, vm_data_mb)` from `/proc/self/status`.
+///
+/// Extracts `VmRSS:`, `VmHWM:` (kernel-tracked peak RSS high-water mark), and `VmData:` lines
+/// reported in kilobytes (KiB) by the Linux kernel and converts them to megabytes (MiB). Falls
+/// back to [`read_proc_statm_mb`] if `/proc/self/status` is unavailable.
+///
+/// # Returns
+///
+/// A 3-tuple `(vm_rss_mb, vm_hwm_mb, vm_data_mb)` in megabytes (`MB`).
 pub fn read_proc_status_mb() -> (f64, f64, f64) {
     let (statm_rss, _, statm_data) = read_proc_statm_mb();
     let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
@@ -81,6 +134,19 @@ pub fn read_proc_status_mb() -> (f64, f64, f64) {
     )
 }
 
+/// Retrieves or initializes the global [`MEM_STATE`] mutex singleton.
+///
+/// On first invocation, reads `VULCANS_MEM_LOG` (defaulting to [`DEFAULT_MEM_LOG_PATH`]) and
+/// `VULCANS_MAX_RSS_MB` (defaulting to [`DEFAULT_MAX_RSS_MB`], clamped to $\ge 256.0\text{ MB}$),
+/// creates/truncates the log file, and writes the initial header and `phase="init"` entry.
+///
+/// # Returns
+///
+/// A `'static` reference to the [`Mutex<MemLoggerState>`] singleton.
+///
+/// # Side Effects
+///
+/// Creates or truncates the log file on disk and writes the header banner on first call.
 fn get_state() -> &'static Mutex<MemLoggerState> {
     MEM_STATE.get_or_init(|| {
         let log_path = std::env::var("VULCANS_MEM_LOG")
@@ -126,6 +192,20 @@ fn get_state() -> &'static Mutex<MemLoggerState> {
 }
 
 /// Ensures the background 20ms memory watchdog thread is running and resets the log for a new run.
+///
+/// # Arguments
+///
+/// * `custom_path` - Optional override file path for the memory log. If `Some(p)` is non-empty and
+///   differs from the current log path, a new truncated log file is opened at `p`.
+///
+/// # Side Effects
+///
+/// * Opens/truncates the target log file if `custom_path` changes the destination.
+/// * Writes an initialization entry to the log file and flushes it.
+/// * Spawns the detached `vulcan-mem-watchdog` thread (if not already running), which polls
+///   [`read_proc_statm_mb`] every 20 ms, logs `[WATCHDOG-SPIKE]` events whenever RSS jumps by
+///   $\ge 48.0\text{ MB}$, and aborts the process with `std::process::exit(99)` if RSS reaches
+///   `max_rss_mb`.
 pub fn init_memlog(custom_path: Option<&str>) {
     let state_mtx = get_state();
     if let Ok(mut st) = state_mtx.lock() {
@@ -216,6 +296,17 @@ pub fn init_memlog(custom_path: Option<&str>) {
 
 /// Updates the active phase label without writing a file line unless RSS jumped by >= 16 MB
 /// or exceeded the safety limit. Suitable for high-frequency inner loops.
+///
+/// # Arguments
+///
+/// * `phase` - Short identifier describing the current inner-loop phase.
+///
+/// # Side Effects
+///
+/// * Updates `current_phase` and `peak_rss_mb` in `MEM_STATE`.
+/// * Writes and flushes a log line if $|\Delta\text{RSS}| \ge 16.0\text{ MB}$ or `rss >= max_rss_mb`.
+/// * Terminates the process via `std::process::exit(99)` after writing a forced stack backtrace
+///   if `rss >= max_rss_mb`.
 pub fn set_phase_fast(phase: &str) {
     let (rss, _, data) = read_proc_statm_mb();
     if let Ok(mut st) = get_state().lock() {
@@ -263,6 +354,18 @@ pub fn set_phase_fast(phase: &str) {
 }
 
 /// Logs an explicit memory checkpoint with arbitrary detail text and flushes immediately.
+///
+/// # Arguments
+///
+/// * `phase` - Name of the execution phase reaching this checkpoint.
+/// * `details` - Optional supplementary key-value metrics or context string to append to the log line.
+///
+/// # Side Effects
+///
+/// * Lazily initializes the memory logger and watchdog via [`init_memlog`] if not already started.
+/// * Reads `/proc/self/status`, updates `current_phase`, `last_rss_mb`, and `peak_rss_mb`, and
+///   writes a formatted timestamped entry to the memory log file.
+/// * Terminates the process with exit code `99` and a full backtrace if `rss >= max_rss_mb`.
 pub fn checkpoint(phase: &str, details: &str) {
     if !WATCHDOG_STARTED.load(Ordering::Relaxed) {
         init_memlog(None);
@@ -321,6 +424,15 @@ pub fn checkpoint(phase: &str, details: &str) {
 }
 
 /// Logs an explicit memory checkpoint along with current board copper counts (`tracks`, `arcs`, `vias`).
+///
+/// # Arguments
+///
+/// * `phase` - Name of the execution phase reaching this checkpoint.
+/// * `board` - Reference to the [`Board`] whose `tracks`, `arcs`, and `vias` counts are formatted into the log entry.
+///
+/// # Side Effects
+///
+/// Delegates to [`checkpoint`], writing to the memory log file and enforcing the OOM safety limit.
 pub fn checkpoint_board(phase: &str, board: &Board) {
     let details = format!(
         "tracks={} arcs={} vias={}",

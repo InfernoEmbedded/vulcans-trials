@@ -1,35 +1,114 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
+//! Unified PCB data model, 2D computational geometry, S-expression parsers, and file I/O.
+//!
+//! This module provides the foundational data structures and serialization engines for
+//! Vulcan's Trials across KiCad (`8.0` / `9.0` / `10.0`) and Specctra workflows:
+//!
+//! - **Core PCB Data Model**: [`Board`], [`Footprint`], [`Pad`], [`TrackSegment`], [`ArcSegment`],
+//!   [`Via`], [`KeepoutZone`], [`BoardText`], [`NetClass`], [`DesignRules`], [`DfmConfig`],
+//!   [`FabPreset`], [`NetTopology`], and [`BusBundle`].
+//! - **2D Geometry & Courtyard Collision Math**: [`Point`], [`AABB`], [`Segment`], and [`Polygon`],
+//!   including Separating Axis Theorem (SAT) convex polygon intersection (`Polygon::intersects_convex`),
+//!   exact rectilinear horizontal-slab decomposition and Hertel-Mehlhorn ear-clipping convex
+//!   decomposition (`Polygon::decompose_convex`), and Monotone Chain convex hulls (`Polygon::convex_hull`).
+//! - **S-Expression & Project Parsers**: In-memory parsing of `.kicad_pcb` boards (`Board::from_kicad_pcb`),
+//!   `.kicad_pro` JSON netclasses and design settings (`Board::load_project_netclasses`), `.kicad_dru`
+//!   custom design rule constraints (`Board::load_design_rules_dru`), and `.kicad_sch` hierarchical
+//!   functional placement clusters (`Board::load_schematic_clusters`).
+//! - **Ratsnest & Connectivity Analysis**: Prim's Euclidean Minimum Spanning Tree (MST) ratsnest
+//!   generator (`Board::generate_ratsnest_segments`), copper union-find connected-component filtering
+//!   (`Board::filter_unrouted_ratsnest`), and topological trace rip-up (`Board::rip_up_connected_traces_to_component_at`).
+//! - **In-Place Exporters & Silkscreen Optimization**: Span-preserving `.kicad_pcb` writer
+//!   (`Board::to_kicad_pcb`, `Board::save_pcb`) that retains all original KiCad metadata and zones,
+//!   Vulkan GPU + Rayon CPU silkscreen text nudging (`Board::nudge_silkscreen_texts_with_gpu`),
+//!   Specctra `.ses` session export (`Board::save_ses`), and pin/gate swap `.eco` back-annotation
+//!   reporting (`Board::generate_back_annotation_report`).
+//! - **Live Interactive State**: [`LiveTrialState`] and [`TrialPhase`] for synchronizing real-time
+//!   placement and routing telemetry with the GUI and headless CLI.
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
+/// Default reference designators locked in place during auto-placement unless overridden.
+///
+/// Includes primary board connectors (`J1`, `J2`) and mechanical mounting holes (`H1`..`H4`).
 pub const DEFAULT_LOCKED_REFS: &[&str] = &[
     "J1", "J2", "H1", "H2", "H3", "H4",
 ];
 
+/// Checks whether a net name represents a ground reference net (`GND`, `/GND`, `GNDA`, `GNDD`, etc.).
+///
+/// Leading whitespace and hierarchical sheet slashes (`/`) are stripped before checking
+/// for a case-insensitive `"GND"` prefix.
+///
+/// # Arguments
+/// * `name` - The net name string slice to inspect.
+///
+/// # Returns
+/// `true` if the normalized net name begins with `"GND"` (case-insensitive), `false` otherwise.
+///
+/// # Side Effects
+/// None.
 pub fn is_gnd_net_name(name: &str) -> bool {
     let base = name.trim().trim_start_matches('/');
     base.len() >= 3 && base.is_char_boundary(3) && base[..3].eq_ignore_ascii_case("GND")
 }
 
+/// A 2D point in KiCad board or footprint coordinates (in millimeters).
+///
+/// Note that KiCad PCB coordinates use a right-handed X-right, Y-down coordinate system.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Point {
+    /// Horizontal coordinate in millimeters (`mm`).
     pub x: f64,
+    /// Vertical coordinate in millimeters (`mm`, increasing downward in KiCad PCB space).
     pub y: f64,
 }
 
 impl Point {
+    /// Constructs a new 2D [`Point`] at `(x, y)` in millimeters.
+    ///
+    /// # Arguments
+    /// * `x` - Horizontal coordinate in `mm`.
+    /// * `y` - Vertical coordinate in `mm`.
+    ///
+    /// # Returns
+    /// A new [`Point`] instance.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn new(x: f64, y: f64) -> Self {
         Self { x, y }
     }
 
+    /// Computes the Euclidean distance in millimeters between `self` and `other`.
+    ///
+    /// # Arguments
+    /// * `other` - The target [`Point`] to measure distance to.
+    ///
+    /// # Returns
+    /// Euclidean distance $\sqrt{(x_1 - x_2)^2 + (y_1 - y_2)^2}$ in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn distance_to(&self, other: &Point) -> f64 {
         (self.x - other.x).hypot(self.y - other.y)
     }
 
+    /// Rotates the point counter-clockwise around the origin `(0.0, 0.0)` in KiCad's Y-down coordinate system.
+    ///
+    /// # Arguments
+    /// * `angle_deg` - Counter-clockwise rotation angle in degrees.
+    ///
+    /// # Returns
+    /// The rotated [`Point`] in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn rotate_ccw(&self, angle_deg: f64) -> Self {
         let rad = angle_deg.to_radians();
         let (sin_a, cos_a) = rad.sin_cos();
@@ -39,6 +118,20 @@ impl Point {
         }
     }
 
+    /// Computes the shortest Euclidean distance from `self` to the finite line segment `ab`.
+    ///
+    /// Projects `self` onto the line through `a` and `b`, clamping the barycentric parameter
+    /// `t` to `[0.0, 1.0]`.
+    ///
+    /// # Arguments
+    /// * `a` - Start endpoint of the line segment in `mm`.
+    /// * `b` - End endpoint of the line segment in `mm`.
+    ///
+    /// # Returns
+    /// Minimum Euclidean distance from `self` to segment `ab` in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn distance_to_segment(&self, a: &Point, b: &Point) -> f64 {
         let dx = b.x - a.x;
         let dy = b.y - a.y;
@@ -53,19 +146,49 @@ impl Point {
     }
 }
 
+/// An Axis-Aligned Bounding Box (AABB) in 2D board coordinates (in millimeters).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct AABB {
+    /// Minimum X coordinate (left edge) in `mm`.
     pub min_x: f64,
+    /// Minimum Y coordinate (top edge in KiCad space) in `mm`.
     pub min_y: f64,
+    /// Maximum X coordinate (right edge) in `mm`.
     pub max_x: f64,
+    /// Maximum Y coordinate (bottom edge in KiCad space) in `mm`.
     pub max_y: f64,
 }
 
 impl AABB {
+    /// Creates a new [`AABB`] from minimum and maximum coordinates in millimeters.
+    ///
+    /// # Arguments
+    /// * `min_x` - Minimum X coordinate in `mm`.
+    /// * `min_y` - Minimum Y coordinate in `mm`.
+    /// * `max_x` - Maximum X coordinate in `mm`.
+    /// * `max_y` - Maximum Y coordinate in `mm`.
+    ///
+    /// # Returns
+    /// A new [`AABB`] instance.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn new(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Self {
         Self { min_x, min_y, max_x, max_y }
     }
 
+    /// Tests whether two axis-aligned bounding boxes have a strictly positive area of intersection.
+    ///
+    /// Touching edges (`self.max_x == other.min_x`) return `false`.
+    ///
+    /// # Arguments
+    /// * `other` - The other [`AABB`] to test against.
+    ///
+    /// # Returns
+    /// `true` if the interiors of `self` and `other` overlap, `false` otherwise.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn overlaps(&self, other: &AABB) -> bool {
         self.min_x < other.max_x
             && self.max_x > other.min_x
@@ -73,21 +196,59 @@ impl AABB {
             && self.max_y > other.min_y
     }
 
+    /// Tests whether a 2D [`Point`] lies inside or on the boundary of this bounding box.
+    ///
+    /// # Arguments
+    /// * `p` - The [`Point`] to test.
+    ///
+    /// # Returns
+    /// `true` if `p.x` is in `[min_x, max_x]` and `p.y` is in `[min_y, max_y]`, `false` otherwise.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn contains_point(&self, p: &Point) -> bool {
         p.x >= self.min_x && p.x <= self.max_x && p.y >= self.min_y && p.y <= self.max_y
     }
 }
 
+/// A 2D closed polygon defined by an ordered sequence of vertices in millimeters.
+///
+/// Used for component courtyards (`F.CrtYd`/`B.CrtYd`), board outlines (`Edge.Cuts`),
+/// and SAT collision detection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Polygon {
+    /// Ordered vertices around the polygon perimeter in `mm`.
     pub vertices: Vec<Point>,
 }
 
 impl Polygon {
+    /// Creates a new [`Polygon`] from a vector of vertices.
+    ///
+    /// # Arguments
+    /// * `vertices` - Ordered list of [`Point`] vertices in `mm`.
+    ///
+    /// # Returns
+    /// A new [`Polygon`] wrapping `vertices`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn new(vertices: Vec<Point>) -> Self {
         Self { vertices }
     }
 
+    /// Constructs a 4-vertex axis-aligned rectangular [`Polygon`] from top-left corner and dimensions.
+    ///
+    /// # Arguments
+    /// * `min_x` - Left X coordinate in `mm`.
+    /// * `min_y` - Top Y coordinate in `mm`.
+    /// * `w` - Rectangle width along X in `mm`.
+    /// * `h` - Rectangle height along Y in `mm`.
+    ///
+    /// # Returns
+    /// A 4-vertex [`Polygon`] representing `[min_x, min_x + w] x [min_y, min_y + h]`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn from_rect(min_x: f64, min_y: f64, w: f64, h: f64) -> Self {
         Self {
             vertices: vec![
@@ -99,6 +260,13 @@ impl Polygon {
         }
     }
 
+    /// Computes the tightest axis-aligned bounding box ([`AABB`]) enclosing all polygon vertices.
+    ///
+    /// # Returns
+    /// An [`AABB`] covering all vertices (or infinite bounds if `vertices` is empty).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn aabb(&self) -> AABB {
         let mut min_x = f64::INFINITY;
         let mut min_y = f64::INFINITY;
@@ -113,6 +281,17 @@ impl Polygon {
         AABB::new(min_x, min_y, max_x, max_y)
     }
 
+    /// Rotates all vertices counter-clockwise by `angle_deg` and translates them by `origin`.
+    ///
+    /// # Arguments
+    /// * `origin` - World translation offset in `mm`.
+    /// * `angle_deg` - Counter-clockwise rotation angle in degrees.
+    ///
+    /// # Returns
+    /// A new transformed [`Polygon`] in world coordinates.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn transform(&self, origin: Point, angle_deg: f64) -> Polygon {
         Polygon::new(
             self.vertices
@@ -125,6 +304,22 @@ impl Polygon {
         )
     }
 
+    /// Expands the polygon outward by `offset` millimeters for clearance halo inflation.
+    ///
+    /// - For axis-aligned 4-vertex rectangles, expands the [`AABB`] directly by `offset` on all four sides.
+    /// - For non-orthogonal convex polygons (such as rotated rectangles, diamonds, trapezoids, or convex N-gons),
+    ///   offsets each edge outward along its unit normal by `offset` and computes the mitered corner vertices,
+    ///   preserving the polygon's orientation and aspect ratio.
+    /// - For non-convex or degenerate polygons, pushes each vertex radially outward from the vertex centroid by `offset`.
+    ///
+    /// # Arguments
+    /// * `offset` - Outward expansion distance in `mm` (returns a clone if `offset <= 0.0`).
+    ///
+    /// # Returns
+    /// An expanded [`Polygon`].
+    ///
+    /// # Side Effects
+    /// None.
     pub fn expanded(&self, offset: f64) -> Polygon {
         if offset <= 0.0 || self.vertices.is_empty() {
             return self.clone();
@@ -158,6 +353,16 @@ impl Polygon {
         )
     }
 
+    /// Determines whether a point lies inside the polygon using the Jordan curve even-odd ray-casting test.
+    ///
+    /// # Arguments
+    /// * `p` - The [`Point`] to test in `mm`.
+    ///
+    /// # Returns
+    /// `true` if `p` is inside the polygon, `false` if outside or if the polygon has fewer than 3 vertices.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn contains_point(&self, p: &Point) -> bool {
         let n = self.vertices.len();
         if n < 3 {
@@ -178,6 +383,18 @@ impl Polygon {
         inside
     }
 
+    /// Computes the shortest distance from an interior point `p` to the nearest polygon boundary edge.
+    ///
+    /// If `p` is outside the polygon (`!self.contains_point(p)`), returns `0.0`.
+    ///
+    /// # Arguments
+    /// * `p` - The query [`Point`] in `mm`.
+    ///
+    /// # Returns
+    /// Distance in `mm` from `p` to the closest polygon edge if `p` is inside, or `0.0` if outside.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn distance_to_point(&self, p: &Point) -> f64 {
         if !self.contains_point(p) {
             return 0.0;
@@ -195,6 +412,20 @@ impl Polygon {
         min_d
     }
 
+    /// Computes the minimum clearance from an interior line segment `s -> e` to the polygon boundary.
+    ///
+    /// Samples the segment at `0.05 mm` intervals and returns the minimum interior boundary distance,
+    /// or `0.0` if either endpoint lies outside the polygon.
+    ///
+    /// # Arguments
+    /// * `s` - Start `(x, y)` coordinates of the segment in `mm`.
+    /// * `e` - End `(x, y)` coordinates of the segment in `mm`.
+    ///
+    /// # Returns
+    /// Minimum distance in `mm` from the segment to the polygon boundary (`0.0` if not strictly inside).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn distance_to_segment(&self, s: (f64, f64), e: (f64, f64)) -> f64 {
         let p_start = Point::new(s.0, s.1);
         let p_end = Point::new(e.0, e.1);
@@ -216,6 +447,13 @@ impl Polygon {
         min_d
     }
 
+    /// Checks whether the polygon is convex by verifying that all consecutive edge cross products have the same sign.
+    ///
+    /// # Returns
+    /// `true` if the polygon is convex (or has 3 or fewer vertices), `false` if concave.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn is_convex(&self) -> bool {
         let n = self.vertices.len();
         if n <= 3 {
@@ -240,6 +478,15 @@ impl Polygon {
         true
     }
 
+    /// Computes the signed area of the polygon using the Shoelace formula.
+    ///
+    /// Positive for counter-clockwise winding in standard Cartesian coordinates (clockwise in Y-down space).
+    ///
+    /// # Returns
+    /// Signed area in $\text{mm}^2$ (`0.0` if fewer than 3 vertices).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn signed_area(&self) -> f64 {
         let n = self.vertices.len();
         if n < 3 {
@@ -253,6 +500,18 @@ impl Polygon {
         area * 0.5
     }
 
+    /// Decomposes a potentially concave polygon into a set of non-overlapping convex [`Polygon`] pieces.
+    ///
+    /// - If already convex, returns a single-element vector containing a clone of `self`.
+    /// - If rectilinear (all edges axis-aligned within `1e-4 mm`), performs an exact horizontal-slab sweep
+    ///   with vertical merging into minimal 4-vertex rectangles.
+    /// - Otherwise, performs ear-clipping triangulation followed by Hertel-Mehlhorn greedy diagonal removal.
+    ///
+    /// # Returns
+    /// A vector of convex [`Polygon`] sub-pieces whose union equals `self`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn decompose_convex(&self) -> Vec<Polygon> {
         if self.is_convex() || self.vertices.len() <= 3 {
             return vec![self.clone()];
@@ -442,6 +701,13 @@ impl Polygon {
         triangles
     }
 
+    /// Computes the 2D convex hull of the polygon's vertices using Andrew's Monotone Chain algorithm.
+    ///
+    /// # Returns
+    /// A convex [`Polygon`] enclosing all vertices of `self`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn convex_hull(&self) -> Polygon {
         if self.vertices.len() <= 3 {
             return self.clone();
@@ -483,6 +749,20 @@ impl Polygon {
         Polygon::new(lower)
     }
 
+    /// Tests whether two convex polygons intersect using the Separating Axis Theorem (SAT).
+    ///
+    /// First performs an $O(1)$ [`AABB`] broad-phase check, then projects both polygons onto the
+    /// outward normal of every edge of `self` and `other`. Touching boundaries (`max_a <= min_b`)
+    /// are treated as non-intersecting.
+    ///
+    /// # Arguments
+    /// * `other` - The other convex [`Polygon`] to test against.
+    ///
+    /// # Returns
+    /// `true` if the interiors of the two convex polygons overlap, `false` otherwise.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn intersects_convex(&self, other: &Polygon) -> bool {
         if self.vertices.len() < 3 || other.vertices.len() < 3 || !self.aabb().overlaps(&other.aabb()) {
             return false;
@@ -504,6 +784,17 @@ impl Polygon {
     }
 }
 
+/// Projects all vertices of `poly` onto the 2D vector `axis` and returns the `(min, max)` scalar dot products.
+///
+/// # Arguments
+/// * `poly` - The [`Polygon`] whose vertices are projected.
+/// * `axis` - The 2D projection axis vector.
+///
+/// # Returns
+/// A tuple `(min_dot, max_dot)` of scalar projections along `axis`.
+///
+/// # Side Effects
+/// None.
 fn project_poly(poly: &Polygon, axis: Point) -> (f64, f64) {
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
@@ -515,18 +806,36 @@ fn project_poly(poly: &Polygon, axis: Point) -> (f64, f64) {
     (min, max)
 }
 
+/// A 2D ratsnest airwire or geometric line segment associated with a specific net ID.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Segment {
+    /// First endpoint in board coordinates (`mm`).
     pub p1: Point,
+    /// Second endpoint in board coordinates (`mm`).
     pub p2: Point,
+    /// Numeric net identifier (`0` = unconnected).
     pub net_id: usize,
 }
 
 impl Segment {
+    /// Computes the Euclidean length of the segment in millimeters.
+    ///
+    /// # Returns
+    /// Distance between `p1` and `p2` in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn length(&self) -> f64 {
         self.p1.distance_to(&self.p2)
     }
 
+    /// Computes the axis-aligned bounding box ([`AABB`]) of the segment.
+    ///
+    /// # Returns
+    /// An [`AABB`] spanning `p1` and `p2` in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn aabb(&self) -> AABB {
         AABB::new(
             self.p1.x.min(self.p2.x),
@@ -536,6 +845,19 @@ impl Segment {
         )
     }
 
+    /// Tests whether two segments on different nets strictly cross each other's interior.
+    ///
+    /// Segments on the same net (`self.net_id == other.net_id`) or segments sharing an endpoint
+    /// within `1e-4 mm` return `false`.
+    ///
+    /// # Arguments
+    /// * `other` - The other [`Segment`] to test for crossing.
+    ///
+    /// # Returns
+    /// `true` if `self` and `other` belong to different nets and strictly intersect, `false` otherwise.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn crosses(&self, other: &Segment) -> bool {
         if self.net_id == other.net_id || !self.aabb().overlaps(&other.aabb()) {
             return false;
@@ -558,23 +880,39 @@ impl Segment {
     }
 }
 
+/// Target multi-pin routing topology for a net or [`NetClass`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum NetTopology {
+    /// Minimum-wirelength Prim's Euclidean Minimum Spanning Tree (default).
     #[default]
     #[serde(alias = "euclidean", alias = "mst", alias = "EuclideanMst")]
     EuclideanMst,
+    /// Serial point-to-point chain minimizing stub branches (used for SPI, I2C, UART, buses).
     #[serde(alias = "daisychain", alias = "daisy", alias = "DaisyChain")]
     DaisyChain,
+    /// Ordered linear fly-by topology for high-speed memory/address/data buses.
     #[serde(alias = "flyby", alias = "FlyBy")]
     FlyBy,
+    /// Balanced T-branch tree topology for clock and strobe distribution.
     #[serde(alias = "tbranch", alias = "t_tree", alias = "TBranch")]
     TBranch,
+    /// Central hub star-point topology for Kelvin sense, analog references, and power rails.
     #[serde(alias = "star", alias = "starpoint", alias = "StarPoint")]
     StarPoint,
 }
 
 impl NetTopology {
+    /// Parses a topology identifier string (e.g. `"mst"`, `"daisy_chain"`, `"flyby"`, `"t_branch"`, `"star"`) into a [`NetTopology`].
+    ///
+    /// # Arguments
+    /// * `s` - String slice to parse (case-insensitive, hyphens/spaces normalized to underscores).
+    ///
+    /// # Returns
+    /// `Some(NetTopology)` if recognized, or `None` if unknown.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn parse(s: &str) -> Option<Self> {
         let clean = s.trim().trim_matches('"').to_ascii_lowercase().replace(['-', ' '], "_");
         match clean.as_str() {
@@ -587,6 +925,22 @@ impl NetTopology {
         }
     }
 
+    /// Infers an appropriate [`NetTopology`] from a net's schematic name when no explicit override is set.
+    ///
+    /// - Sense/Kelvin/Power nets (`+`, `VCC`, `VDD`, `VREF`, `SENSE`, `STAR`) -> [`NetTopology::StarPoint`]
+    /// - Clock/Strobe nets (`CLK`, `SCK`, `STROBE`, `*CK`) -> [`NetTopology::TBranch`]
+    /// - Memory/Data nets (`ADDR`, `DDR`, `DATA`) -> [`NetTopology::FlyBy`]
+    /// - Serial bus nets (`SPI`, `I2C`, `SDA`, `SCL`, `UART`, `BUS`) -> [`NetTopology::DaisyChain`]
+    /// - All other nets -> [`NetTopology::EuclideanMst`]
+    ///
+    /// # Arguments
+    /// * `net_name` - The net name string to classify.
+    ///
+    /// # Returns
+    /// The inferred [`NetTopology`].
+    ///
+    /// # Side Effects
+    /// None.
     pub fn infer_from_net_name(net_name: &str) -> Self {
         let upper = net_name.to_ascii_uppercase();
         if upper.contains("KELVIN")
@@ -626,15 +980,30 @@ impl NetTopology {
     }
 }
 
+/// Commercial PCB fabrication house DFM capability preset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FabPreset {
+    /// JLCPCB standard 2/4-layer process (`0.127 mm` track/space, `0.60/0.30 mm` via, `0.35 mm` edge clearance).
     Jlcpcb,
+    /// PCBWay standard process (`0.15 mm` track/space, `0.60/0.30 mm` via, `0.30 mm` edge clearance).
     PcbWay,
+    /// Eurocircuits standard pooling process (`0.15 mm` track/space, `0.60/0.30 mm` via, `0.40 mm` edge clearance).
     Eurocircuits,
+    /// User-defined custom fabrication constraints.
     Custom,
 }
 
 impl FabPreset {
+    /// Parses a fabrication house name (e.g. `"jlcpcb"`, `"pcbway"`, `"eurocircuits"`) into a [`FabPreset`].
+    ///
+    /// # Arguments
+    /// * `s` - Manufacturer preset name string.
+    ///
+    /// # Returns
+    /// `Some(FabPreset)` if matched, or `None` if unrecognized.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn parse(s: &str) -> Option<Self> {
         let clean = s.trim().to_lowercase().replace(['-', '_', ' ', '.'], "");
         if clean.contains("jlc") {
@@ -648,6 +1017,13 @@ impl FabPreset {
         }
     }
 
+    /// Returns the minimum copper-to-board-edge (`Edge.Cuts`) clearance in millimeters for this preset.
+    ///
+    /// # Returns
+    /// Board edge clearance in `mm` (`0.35 mm` for JLCPCB/Custom, `0.30 mm` for PCBWay, `0.40 mm` for Eurocircuits).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn board_edge_clearance(&self) -> f64 {
         match self {
             Self::Jlcpcb => 0.35,
@@ -657,6 +1033,13 @@ impl FabPreset {
         }
     }
 
+    /// Clamps a [`NetClass`]'s track width, clearance, via dimensions, and edge clearance to meet the fab preset's minimums.
+    ///
+    /// # Arguments
+    /// * `nc` - Mutable reference to the [`NetClass`] to constrain.
+    ///
+    /// # Side Effects
+    /// Mutates `nc.board_edge_clearance`, `nc.clearance`, `nc.track_width`, `nc.via_dia`, and `nc.via_drill` in place.
     pub fn apply_to_netclass(&self, nc: &mut NetClass) {
         nc.board_edge_clearance = self.board_edge_clearance();
         match self {
@@ -683,17 +1066,24 @@ impl FabPreset {
     }
 }
 
+/// Design-for-Manufacturing (DFM) configuration controlling teardrops, edge clearances, and fab presets.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DfmConfig {
+    /// Whether teardrop fillets should be synthesized at pad and via track junctions.
     pub teardrop_enabled: bool,
+    /// Teardrop extension length as a ratio of the pad/via radius (default `0.5`).
     pub teardrop_length_ratio: f64,
+    /// Teardrop width taper ratio relative to the pad/via diameter (default `0.8`).
     pub teardrop_width_ratio: f64,
+    /// Minimum copper clearance to `Edge.Cuts` board outline in `mm` (default `0.35`).
     pub board_edge_clearance: f64,
+    /// Optional fabrication house preset (`Some(FabPreset::Jlcpcb)` by default).
     pub fab_preset: Option<FabPreset>,
 }
 
 impl Default for DfmConfig {
+    /// Returns the default JLCPCB-compatible [`DfmConfig`].
     fn default() -> Self {
         Self {
             teardrop_enabled: true,
@@ -705,23 +1095,36 @@ impl Default for DfmConfig {
     }
 }
 
+/// Global physical Design Rule Check (DRC) minimums imported from `.kicad_pro` or `.kicad_dru`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DesignRules {
+    /// Global minimum copper-to-copper clearance in `mm`.
     pub min_clearance: f64,
+    /// Global minimum copper trace width in `mm` (default `0.127 mm` / 5 mil).
     pub min_track_width: f64,
+    /// Global minimum via outer pad diameter in `mm` (default `0.50 mm`).
     pub min_via_diameter: f64,
+    /// Global minimum via drill hole diameter in `mm` (default `0.20 mm`).
     pub min_via_drill: f64,
+    /// Minimum via annular copper ring width in `mm` (default `0.10 mm`).
     pub min_via_annular_width: f64,
+    /// Minimum plated through-hole drill diameter in `mm` (default `0.20 mm`).
     pub min_through_hole_diameter: f64,
+    /// Minimum drilled hole-to-copper clearance in `mm` (default `0.25 mm`).
     pub min_hole_clearance: f64,
+    /// Minimum edge-to-edge clearance between distinct drilled holes in `mm` (default `0.25 mm`).
     pub min_hole_to_hole: f64,
+    /// Minimum copper-to-board-edge (`Edge.Cuts`) clearance in `mm` (default `0.30 mm`).
     pub min_copper_edge_clearance: f64,
+    /// Minimum copper pour zone clearance in `mm` (default `0.50 mm`).
     pub zone_min_clearance: f64,
+    /// Minimum copper pour web thickness in `mm` (default `0.25 mm`).
     pub zone_min_thickness: f64,
 }
 
 impl Default for DesignRules {
+    /// Returns standard KiCad/JLCPCB baseline [`DesignRules`] minimums.
     fn default() -> Self {
         Self {
             min_clearance: 0.0,
@@ -739,113 +1142,153 @@ impl Default for DesignRules {
     }
 }
 
+/// Electrical and physical routing rules for a named KiCad netclass.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NetClass {
+    /// Netclass identifier (e.g., `"Default"`, `"Power_15V"`, `"USB_Diff"`).
     pub name: String,
+    /// Nominal copper trace width in `mm`.
     pub track_width: f64,
+    /// Minimum copper-to-copper clearance to other nets in `mm`.
     pub clearance: f64,
+    /// Nominal via outer copper diameter in `mm`.
     pub via_dia: f64,
+    /// Nominal via drill hole diameter in `mm`.
     pub via_drill: f64,
+    /// Edge-to-edge gap between differential pair traces in `mm`.
     #[serde(default = "default_diff_pair_dim")]
     pub diff_pair_gap: f64,
+    /// Trace width for differential pair routing in `mm`.
     #[serde(default = "default_diff_pair_dim")]
     pub diff_pair_width: f64,
+    /// Preferred multi-pin routing topology for nets in this class.
     #[serde(default)]
     pub topology: NetTopology,
+    /// Whether teardrop fillets are enabled for nets in this class.
     #[serde(default = "default_true")]
     pub teardrop_enabled: bool,
+    /// Teardrop length ratio for pads/vias on this netclass.
     #[serde(default = "default_teardrop_length_ratio")]
     pub teardrop_length_ratio: f64,
+    /// Teardrop width ratio for pads/vias on this netclass.
     #[serde(default = "default_teardrop_width_ratio")]
     pub teardrop_width_ratio: f64,
+    /// Minimum clearance from `Edge.Cuts` board outline in `mm`.
     #[serde(default = "default_board_edge_clearance")]
     pub board_edge_clearance: f64,
+    /// Maximum allowed parallel coupled length with aggressor nets in `mm` before crosstalk penalty applies.
     #[serde(default = "default_max_coupled_length_mm")]
     pub max_coupled_length_mm: f64,
+    /// Whether high-speed return-path reference plane continuity is required under traces.
     #[serde(default)]
     pub require_return_path: bool,
+    /// Minimum allowed trace width in `mm` from board design rules.
     #[serde(default = "default_min_track_width")]
     pub min_track_width: f64,
+    /// Minimum allowed via diameter in `mm` from board design rules.
     #[serde(default = "default_min_via_diameter")]
     pub min_via_diameter: f64,
+    /// Minimum allowed via drill diameter in `mm` from board design rules.
     #[serde(default = "default_min_via_drill")]
     pub min_via_drill: f64,
+    /// Minimum allowed via annular ring width in `mm` from board design rules.
     #[serde(default = "default_min_via_annular_width")]
     pub min_via_annular_width: f64,
+    /// Minimum allowed through-hole drill diameter in `mm`.
     #[serde(default = "default_min_through_hole_diameter")]
     pub min_through_hole_diameter: f64,
+    /// Minimum hole-to-copper clearance in `mm`.
     #[serde(default = "default_min_hole_clearance")]
     pub min_hole_clearance: f64,
+    /// Minimum hole-to-hole drill clearance in `mm`.
     #[serde(default = "default_min_hole_to_hole")]
     pub min_hole_to_hole: f64,
+    /// Minimum copper zone clearance in `mm`.
     #[serde(default = "default_zone_min_clearance")]
     pub zone_min_clearance: f64,
+    /// Minimum copper zone web thickness in `mm`.
     #[serde(default = "default_zone_min_thickness")]
     pub zone_min_thickness: f64,
 }
 
+/// Serde default helper returning `0.20 mm` for differential pair width and gap.
 fn default_diff_pair_dim() -> f64 {
     0.20
 }
 
+/// Serde default helper returning `true` for boolean flags.
 fn default_true() -> bool {
     true
 }
 
+/// Serde default helper returning `0.5` for teardrop length ratio.
 fn default_teardrop_length_ratio() -> f64 {
     0.5
 }
 
+/// Serde default helper returning `0.8` for teardrop width ratio.
 fn default_teardrop_width_ratio() -> f64 {
     0.8
 }
 
+/// Serde default helper returning `0.35 mm` for board edge clearance.
 fn default_board_edge_clearance() -> f64 {
     0.35
 }
 
+/// Serde default helper returning `15.0 mm` for maximum parallel coupled length.
 fn default_max_coupled_length_mm() -> f64 {
     15.0
 }
 
+/// Serde default helper returning `0.127 mm` for minimum track width.
 fn default_min_track_width() -> f64 {
     0.127
 }
 
+/// Serde default helper returning `0.50 mm` for minimum via outer diameter.
 fn default_min_via_diameter() -> f64 {
     0.50
 }
 
+/// Serde default helper returning `0.20 mm` for minimum via drill diameter.
 fn default_min_via_drill() -> f64 {
     0.20
 }
 
+/// Serde default helper returning `0.10 mm` for minimum via annular ring width.
 fn default_min_via_annular_width() -> f64 {
     0.10
 }
 
+/// Serde default helper returning `0.20 mm` for minimum through-hole drill diameter.
 fn default_min_through_hole_diameter() -> f64 {
     0.20
 }
 
+/// Serde default helper returning `0.25 mm` for minimum hole-to-copper clearance.
 fn default_min_hole_clearance() -> f64 {
     0.25
 }
 
+/// Serde default helper returning `0.25 mm` for minimum hole-to-hole clearance.
 fn default_min_hole_to_hole() -> f64 {
     0.25
 }
 
+/// Serde default helper returning `0.50 mm` for minimum copper zone clearance.
 fn default_zone_min_clearance() -> f64 {
     0.50
 }
 
+/// Serde default helper returning `0.25 mm` for minimum copper zone thickness.
 fn default_zone_min_thickness() -> f64 {
     0.25
 }
 
 impl Default for NetClass {
+    /// Returns the `"Default"` [`NetClass`] with `0.20 mm` trace/clearance and `0.60/0.30 mm` vias.
     fn default() -> Self {
         Self {
             name: "Default".to_string(),
@@ -876,6 +1319,14 @@ impl Default for NetClass {
 }
 
 impl NetClass {
+    /// Applies board-level [`DesignRules`] minimums to this netclass, clamping nominal track width,
+    /// clearance, and via dimensions so they never violate global DRC limits.
+    ///
+    /// # Arguments
+    /// * `rules` - The global [`DesignRules`] to enforce.
+    ///
+    /// # Side Effects
+    /// Mutates `self` in place, updating `min_*` fields and clamping `clearance`, `track_width`, `via_drill`, and `via_dia`.
     pub fn apply_design_rules(&mut self, rules: &DesignRules) {
         self.min_track_width = rules.min_track_width;
         self.min_via_diameter = rules.min_via_diameter;
@@ -898,6 +1349,18 @@ impl NetClass {
             .max(self.via_drill + 2.0 * rules.min_via_annular_width);
     }
 
+    /// Checks whether a netclass or net name suggests a high-speed or differential signal.
+    ///
+    /// Matches substrings `"DIFF"`, `"CLK"`, `"CLOCK"`, `"HIGHSPEED"`, `"HIGH_SPEED"`, `"USB"`, `"PCIE"`, or `"DDR"`.
+    ///
+    /// # Arguments
+    /// * `name` - Netclass or net name string.
+    ///
+    /// # Returns
+    /// `true` if `name` matches a high-speed pattern, `false` otherwise.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn is_high_speed_name(name: &str) -> bool {
         let upper = name.to_uppercase();
         upper.contains("DIFF")
@@ -910,6 +1373,19 @@ impl NetClass {
             || upper.contains("DDR")
     }
 
+    /// Resolves the effective [`NetTopology`] for a net belonging to this [`NetClass`].
+    ///
+    /// If `self.topology` is explicitly set to a non-default topology, returns `self.topology`;
+    /// otherwise infers the topology from `net_name` via [`NetTopology::infer_from_net_name`].
+    ///
+    /// # Arguments
+    /// * `net_name` - The schematic net name.
+    ///
+    /// # Returns
+    /// The resolved [`NetTopology`].
+    ///
+    /// # Side Effects
+    /// None.
     pub fn resolve_topology(&self, net_name: &str) -> NetTopology {
         if self.topology != NetTopology::EuclideanMst {
             self.topology
@@ -919,52 +1395,82 @@ impl NetClass {
     }
 }
 
+/// A named group of electrically interchangeable pins within a component footprint (e.g., MCU GPIO bank).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SwappablePinGroup {
+    /// Group identifier (e.g., `"GPIO"`, `"PA"`).
     pub name: String,
+    /// Indices into [`Footprint::pads`] that may be swapped with one another.
     pub pin_indices: Vec<usize>,
 }
 
+/// A named group of interchangeable multi-pin logic gates or amplifier units within a package (e.g., quad NAND, dual op-amp).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SwappableGateGroup {
+    /// Gate group identifier (e.g., `"gate_group"`).
     pub name: String,
+    /// List of interchangeable gate units, where each unit is an ordered vector of pad indices in [`Footprint::pads`].
     pub gate_units: Vec<Vec<usize>>,
 }
 
+/// Audit record of a single pin or gate swap operation for schematic back-annotation (`.eco`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PinSwapRecord {
+    /// Reference designator of the component whose pins were swapped (e.g., `"U1"`, `"R5"`).
     pub footprint_ref: String,
+    /// Pad number of the first swapped pin.
     pub pad1_number: String,
+    /// Net name originally attached to `pad1_number` prior to the swap.
     pub pad1_net: String,
+    /// Pad number of the second swapped pin.
     pub pad2_number: String,
+    /// Net name originally attached to `pad2_number` prior to the swap.
     pub pad2_net: String,
+    /// Optimization reason for the swap (e.g., `"Pin swap reduced ratsnest wirelength"`).
     pub reason: String,
 }
 
+/// A conductive component pad (SMD or through-hole) belonging to a [`Footprint`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pad {
+    /// Pad pin number or identifier (e.g., `"1"`, `"2"`, `"A1"`).
     pub number: String,
+    /// Geometric pad shape (`"rect"`, `"roundrect"`, `"circle"`, `"oval"`, `"trapezoid"`).
     pub shape: String,
+    /// Local X offset relative to the footprint origin in `mm` (at `0.0` degrees rotation).
     pub offset_x: f64,
+    /// Local Y offset relative to the footprint origin in `mm` (at `0.0` degrees rotation).
     pub offset_y: f64,
+    /// Pad copper width along its local X axis in `mm`.
     pub width: f64,
+    /// Pad copper height along its local Y axis in `mm`.
     pub height: f64,
+    /// Local pad rotation relative to the parent footprint in degrees.
     pub rotation: f64,
+    /// Optional drill hole diameter in `mm` for through-hole pads.
     pub drill: Option<f64>,
+    /// Numeric net ID (`0` = unconnected).
     pub net_id: usize,
+    /// Electrical net name (e.g., `"GND"`, `"+3.3V"`, `"/USB_D+"`).
     pub net_name: String,
+    /// `true` if the pad spans all copper layers (`thru_hole` / `*.Cu`), `false` for single-layer SMD.
     pub is_through_hole: bool,
+    /// Schematic pin function or signal name from `(pinfunction ...)` or `(name ...)`.
     #[serde(default)]
     pub pin_name: String,
+    /// Optional numeric pin-swap equivalence group ID parsed from `(swap_group ...)`.
     #[serde(default)]
     pub swap_group: Option<usize>,
+    /// Optional `(start_byte, end_byte)` span of the pad's `(net ...)` S-expression in [`Board::raw_content`].
     #[serde(default)]
     pub net_span: Option<(usize, usize)>,
+    /// Optional explicit copper layer index (`0` = `F.Cu`, `1` = `B.Cu`) for SMD pads (`None` for through-hole).
     #[serde(default)]
     pub layer: Option<usize>,
 }
 
 impl Default for Pad {
+    /// Returns a default `0.5 x 0.5 mm` rectangular SMD [`Pad`] at `(0.0, 0.0)` with net `0`.
     fn default() -> Self {
         Self {
             number: String::new(),
@@ -987,6 +1493,26 @@ impl Default for Pad {
 }
 
 impl Pad {
+    /// Constructs a new [`Pad`] with the given geometry and net assignment.
+    ///
+    /// Automatically assigns `"circle"` shape and a `0.5 * min(width, height)` drill hole when
+    /// `is_through_hole` is `true`, or `"rect"` shape with `drill: None` for SMD pads.
+    ///
+    /// # Arguments
+    /// * `number` - Pin number or identifier string.
+    /// * `offset_x` - Local X offset from footprint center in `mm`.
+    /// * `offset_y` - Local Y offset from footprint center in `mm`.
+    /// * `width` - Pad width in `mm`.
+    /// * `height` - Pad height in `mm`.
+    /// * `net_id` - Numeric net ID (`0` = unconnected).
+    /// * `net_name` - Electrical net name string.
+    /// * `is_through_hole` - Whether this pad is a plated through-hole pad.
+    ///
+    /// # Returns
+    /// A newly initialized [`Pad`].
+    ///
+    /// # Side Effects
+    /// None.
     pub fn new(
         number: impl Into<String>,
         offset_x: f64,
@@ -1017,32 +1543,64 @@ impl Pad {
     }
 }
 
+/// A physical component footprint placed on the PCB (`F.Cu` top or `B.Cu` bottom layer).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Footprint {
+    /// Component reference designator (e.g., `"U1"`, `"R12"`, `"C5"`).
     pub reference: String,
+    /// Component value or part number (e.g., `"10k"`, `"100nF"`, `"ESP32-C3-WROOM-02"`).
     pub value: String,
+    /// World X coordinate of the footprint origin in `mm`.
     pub x: f64,
+    /// World Y coordinate of the footprint origin in `mm`.
     pub y: f64,
+    /// Counter-clockwise footprint rotation angle in degrees (`0.0..360.0`).
     pub rotation: f64,
+    /// Current copper placement layer index (`0` = `F.Cu` Top, `1` = `B.Cu` Bottom).
     pub layer: usize,      // 0 = F.Cu (Top), 1 = B.Cu (Bottom)
+    /// Original copper layer index (`0` = `F.Cu`, `1` = `B.Cu`) when parsed from `.kicad_pcb`.
     pub orig_layer: usize, // Original layer when loaded from .kicad_pcb
+    /// Whether the footprint position/rotation is locked against auto-placement moves.
     pub is_locked: bool,
+    /// Component copper pads in local footprint coordinates.
     pub pads: Vec<Pad>,
+    /// Overall courtyard bounding width along local X in `mm`.
     pub width: f64,
+    /// Overall courtyard bounding height along local Y in `mm`.
     pub height: f64,
+    /// Convex-decomposed courtyard polygons in local coordinates (`mm`) used for SAT collision checks.
     pub courtyards: Vec<Polygon>,
+    /// Original undecomposed outer courtyard perimeter polygons in local coordinates (`mm`) for rendering.
     #[serde(default)]
     pub perimeters: Vec<Polygon>,
+    /// Additional routing escape margin halo in `mm` around fine-pitch / high-density ICs.
     #[serde(default)]
     pub escape_margin: f64,
+    /// Byte span `(start, end)` of the footprint's `(at X Y [ROT])` token inside [`Board::raw_content`].
     pub at_span: Option<(usize, usize)>,
+    /// Byte span `(start, end)` of the entire `(footprint ...)` block inside [`Board::raw_content`].
     pub fp_span: Option<(usize, usize)>,
+    /// Pin swap equivalence groups, each containing a list of swappable pad indices in `pads`.
     #[serde(default)]
     pub pin_swap_groups: Vec<Vec<usize>>,
+    /// Multi-pin logic gate swap groups within this package.
     #[serde(default)]
     pub gate_swap_groups: Vec<SwappableGateGroup>,
 }
 
+/// Extracts a canonical swappable pin bank prefix (such as `"GPIO"`, `"PA"`, `"IO"`, `"CH"`) from a pin or net name.
+///
+/// Used to automatically group MCU/FPGA I/O bank pins when explicit `(swap_group ...)` tags are absent.
+///
+/// # Arguments
+/// * `s` - Pin function name or net name to inspect (e.g., `"GPIO_12"`, `"PA4"`, `"CH0"`).
+///
+/// # Returns
+/// `Some(prefix)` if `s` starts with a recognized swappable bank prefix followed solely by digits/underscores,
+/// or `None` otherwise.
+///
+/// # Side Effects
+/// None.
 pub fn extract_swappable_prefix(s: &str) -> Option<String> {
     let clean = s.trim();
     if clean.is_empty() {
@@ -1067,6 +1625,7 @@ pub fn extract_swappable_prefix(s: &str) -> Option<String> {
 }
 
 impl Default for Footprint {
+    /// Returns an empty unlocked `1.0 x 1.0 mm` [`Footprint`] at `(0.0, 0.0)` on `F.Cu` (`layer = 0`).
     fn default() -> Self {
         Self {
             reference: String::new(),
@@ -1092,6 +1651,19 @@ impl Default for Footprint {
 }
 
 impl Footprint {
+    /// Resolves the active copper layer index (`0` = `F.Cu`, `1` = `B.Cu`) of `pad` accounting for footprint side flipping.
+    ///
+    /// If the footprint has been flipped from its original side (`self.layer != self.orig_layer`),
+    /// top and bottom pad layers are mirrored (`1 - base`).
+    ///
+    /// # Arguments
+    /// * `pad` - The [`Pad`] whose effective copper layer is queried.
+    ///
+    /// # Returns
+    /// Copper layer index (`0` for `F.Cu`, `1` for `B.Cu`).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn pad_layer(&self, pad: &Pad) -> usize {
         let base = pad.layer.unwrap_or(self.orig_layer);
         if self.layer != self.orig_layer {
@@ -1101,6 +1673,15 @@ impl Footprint {
         }
     }
 
+    /// Determines whether this footprint is a non-polarized 2-pad passive component (resistor, inductor, ferrite bead, or non-polarized capacitor) with identical pad dimensions.
+    ///
+    /// Excludes relays (`REL`, `RY`), LEDs (`LED`), connectors (`CONN`), crystals/clocks (`CLK`), and polarized capacitors (`CP`, `POL`, `TANT`, `ELECT`, `+`).
+    ///
+    /// # Returns
+    /// `true` if the footprint has 2 equal-sized pads that are electrically interchangeable, `false` otherwise.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn is_symmetric_passive(&self) -> bool {
         if self.pads.len() != 2 {
             return false;
@@ -1145,6 +1726,13 @@ impl Footprint {
             && (self.pads[0].height - self.pads[1].height).abs() < 1e-3
     }
 
+    /// Populates [`Footprint::pin_swap_groups`] automatically if no explicit swap groups were parsed.
+    ///
+    /// - For symmetric 2-pin passives (`self.is_symmetric_passive()`), adds `vec![0, 1]`.
+    /// - For multi-pin components, groups pads that share a swappable bank prefix via [`extract_swappable_prefix`].
+    ///
+    /// # Side Effects
+    /// Appends inferred pin-swap index vectors to `self.pin_swap_groups` if it is currently empty.
     pub fn infer_swap_groups(&mut self) {
         if !self.pin_swap_groups.is_empty() {
             return;
@@ -1180,10 +1768,28 @@ impl Footprint {
         }
     }
 
+    /// Checks whether all copper pads of this footprint are Surface-Mount Device (SMD) pads.
+    ///
+    /// # Returns
+    /// `true` if `self.pads` is non-empty and contains zero through-hole pads, `false` otherwise.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn is_smd_only(&self) -> bool {
         !self.pads.is_empty() && self.pads.iter().all(|p| !p.is_through_hole)
     }
 
+    /// Computes the axis-aligned bounding width and height `(world_w, world_h)` of `pad` in board space
+    /// after applying both the footprint's rotation and the pad's local rotation.
+    ///
+    /// # Arguments
+    /// * `pad` - The [`Pad`] to measure.
+    ///
+    /// # Returns
+    /// A tuple `(world_width_mm, world_height_mm)` in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn pad_world_size(&self, pad: &Pad) -> (f64, f64) {
         let total_rot = ((self.rotation + pad.rotation) % 360.0 + 360.0) % 360.0;
         let rad = (-total_rot).to_radians();
@@ -1195,10 +1801,33 @@ impl Footprint {
         )
     }
 
+    /// Returns the 4 rotated corner points of `pad` in world coordinates at the footprint's current pose and layer.
+    ///
+    /// # Arguments
+    /// * `pad` - The [`Pad`] whose corners are computed.
+    ///
+    /// # Returns
+    /// A 4-element vector of [`Point`]s in board coordinates (`mm`).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn pad_world_corners(&self, pad: &Pad) -> Vec<Point> {
         self.pad_world_corners_layered(pad, self.layer)
     }
 
+    /// Returns the 4 rotated corner points of `pad` in world coordinates at the footprint's current `(x, y, rotation)` on `layer`.
+    ///
+    /// Accounts for Y-axis mirroring when `layer != self.orig_layer`.
+    ///
+    /// # Arguments
+    /// * `pad` - The [`Pad`] whose corners are computed.
+    /// * `layer` - Candidate copper layer (`0` = `F.Cu`, `1` = `B.Cu`).
+    ///
+    /// # Returns
+    /// A 4-element vector of [`Point`]s in board coordinates (`mm`).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn pad_world_corners_layered(&self, pad: &Pad, layer: usize) -> Vec<Point> {
         let flipped = layer != self.orig_layer;
         let pad_rot = if flipped { -pad.rotation } else { pad.rotation };
@@ -1224,6 +1853,19 @@ impl Footprint {
             .collect()
     }
 
+    /// Computes the 4 world-space corner points of `pad` when the footprint is placed at arbitrary `(pos, rot, layer)`.
+    ///
+    /// # Arguments
+    /// * `pad` - The [`Pad`] whose corners are computed.
+    /// * `pos` - Candidate footprint origin [`Point`] in `mm`.
+    /// * `rot` - Candidate footprint rotation in degrees.
+    /// * `layer` - Candidate footprint copper layer (`0` = `F.Cu`, `1` = `B.Cu`).
+    ///
+    /// # Returns
+    /// A 4-element vector of corner [`Point`]s in world coordinates (`mm`).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn pad_corners_at(&self, pad: &Pad, pos: Point, rot: f64, layer: usize) -> Vec<Point> {
         let flipped = layer != self.orig_layer;
         let pad_rot = if flipped { -pad.rotation } else { pad.rotation };
@@ -1247,8 +1889,19 @@ impl Footprint {
             .collect()
     }
 
-    /// Computes the bounding box of the footprint relative to its origin (0, 0),
+    /// Computes the bounding box of the footprint relative to its origin `(0, 0)`,
     /// taking into account transformed courtyards (with spacing) and all pad corners.
+    ///
+    /// # Arguments
+    /// * `rot` - Candidate rotation angle in degrees.
+    /// * `layer` - Candidate copper layer (`0` = `F.Cu`, `1` = `B.Cu`).
+    /// * `spacing` - Courtyard inflation spacing in `mm`.
+    ///
+    /// # Returns
+    /// Relative [`AABB`] around `(0.0, 0.0)` in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn relative_bounds(&self, rot: f64, layer: usize, spacing: f64) -> AABB {
         let mut min_x = f64::INFINITY;
         let mut min_y = f64::INFINITY;
@@ -1284,8 +1937,20 @@ impl Footprint {
         }
     }
 
-    /// Computes the strictly legal [min_x, max_x, min_y, max_y] clamping range for the component origin
+    /// Computes the strictly legal `[min_x, max_x, min_y, max_y]` clamping range for the component origin
     /// so that courtyards and copper pads remain entirely inside `boundary`.
+    ///
+    /// # Arguments
+    /// * `rot` - Candidate footprint rotation in degrees.
+    /// * `layer` - Candidate copper layer (`0` = `F.Cu`, `1` = `B.Cu`).
+    /// * `spacing` - Courtyard expansion spacing in `mm`.
+    /// * `boundary` - Target board [`AABB`] boundary in `mm`.
+    ///
+    /// # Returns
+    /// A 4-tuple `(min_x, max_x, min_y, max_y)` of legal origin coordinates in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn origin_clamp_range(
         &self,
         rot: f64,
@@ -1312,6 +1977,16 @@ impl Footprint {
         (min_x, max_x, min_y, max_y)
     }
 
+    /// Computes the absolute world `(x, y)` center position of `pad` given the footprint's current pose and layer.
+    ///
+    /// # Arguments
+    /// * `pad` - Reference to a [`Pad`] belonging to this footprint.
+    ///
+    /// # Returns
+    /// World `(x, y)` coordinates of the pad center in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn pad_absolute_position(&self, pad: &Pad) -> (f64, f64) {
         let oy = if self.layer != self.orig_layer {
             -pad.offset_y
@@ -1322,10 +1997,41 @@ impl Footprint {
         (self.x + p.x, self.y + p.y)
     }
 
+    /// Computes the world-space center [`Point`] of `self.pads[pad_idx]` when the footprint is placed at `(pos, rot)` on `self.layer`.
+    ///
+    /// # Arguments
+    /// * `pad_idx` - Index of the pad in `self.pads`.
+    /// * `pos` - Candidate footprint origin [`Point`] in `mm`.
+    /// * `rot` - Candidate footprint rotation in degrees.
+    ///
+    /// # Returns
+    /// World-space [`Point`] of the pad center in `mm`.
+    ///
+    /// # Panics
+    /// Panics if `pad_idx >= self.pads.len()`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn pad_world_point(&self, pad_idx: usize, pos: Point, rot: f64) -> Point {
         self.pad_world_point_layered(pad_idx, pos, rot, self.layer)
     }
 
+    /// Computes the world-space center [`Point`] of `self.pads[pad_idx]` when the footprint is placed at `(pos, rot, layer)`.
+    ///
+    /// # Arguments
+    /// * `pad_idx` - Index of the pad in `self.pads`.
+    /// * `pos` - Candidate footprint origin [`Point`] in `mm`.
+    /// * `rot` - Candidate footprint rotation in degrees.
+    /// * `layer` - Candidate copper layer (`0` = `F.Cu`, `1` = `B.Cu`).
+    ///
+    /// # Returns
+    /// World-space [`Point`] of the pad center in `mm`.
+    ///
+    /// # Panics
+    /// Panics if `pad_idx >= self.pads.len()`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn pad_world_point_layered(&self, pad_idx: usize, pos: Point, rot: f64, layer: usize) -> Point {
         let pad = &self.pads[pad_idx];
         let oy = if layer != self.orig_layer {
@@ -1337,10 +2043,35 @@ impl Footprint {
         Point::new(pos.x + p.x, pos.y + p.y)
     }
 
+    /// Returns the convex courtyard polygons transformed to `(pos, rot)` on `self.layer` and expanded by `spacing / 2.0`.
+    ///
+    /// # Arguments
+    /// * `pos` - Candidate footprint origin [`Point`] in `mm`.
+    /// * `rot` - Candidate footprint rotation in degrees.
+    /// * `spacing` - Total inter-component courtyard clearance in `mm` (each polygon is expanded by `spacing / 2.0`).
+    ///
+    /// # Returns
+    /// Vector of transformed convex [`Polygon`]s in world coordinates (`mm`).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn transformed_courtyards(&self, pos: Point, rot: f64, spacing: f64) -> Vec<Polygon> {
         self.transformed_courtyards_layered(pos, rot, self.layer, spacing)
     }
 
+    /// Returns the convex courtyard polygons transformed to `(pos, rot, layer)` and expanded by `spacing / 2.0`.
+    ///
+    /// # Arguments
+    /// * `pos` - Candidate footprint origin [`Point`] in `mm`.
+    /// * `rot` - Candidate footprint rotation in degrees.
+    /// * `layer` - Candidate copper layer (`0` = `F.Cu`, `1` = `B.Cu`).
+    /// * `spacing` - Total inter-component courtyard clearance in `mm`.
+    ///
+    /// # Returns
+    /// Vector of transformed convex [`Polygon`]s in world coordinates (`mm`).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn transformed_courtyards_layered(&self, pos: Point, rot: f64, layer: usize, spacing: f64) -> Vec<Polygon> {
         let flipped = layer != self.orig_layer;
         self.courtyards
@@ -1360,10 +2091,35 @@ impl Footprint {
             .collect()
     }
 
+    /// Returns the outer perimeter courtyard polygons transformed to `(pos, rot)` on `self.layer` and expanded by `spacing / 2.0`.
+    ///
+    /// # Arguments
+    /// * `pos` - Candidate footprint origin [`Point`] in `mm`.
+    /// * `rot` - Candidate footprint rotation in degrees.
+    /// * `spacing` - Total courtyard expansion spacing in `mm`.
+    ///
+    /// # Returns
+    /// Vector of transformed perimeter [`Polygon`]s in world coordinates (`mm`).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn transformed_perimeters(&self, pos: Point, rot: f64, spacing: f64) -> Vec<Polygon> {
         self.transformed_perimeters_layered(pos, rot, self.layer, spacing)
     }
 
+    /// Returns the outer perimeter courtyard polygons transformed to `(pos, rot, layer)` and expanded by `spacing / 2.0`.
+    ///
+    /// # Arguments
+    /// * `pos` - Candidate footprint origin [`Point`] in `mm`.
+    /// * `rot` - Candidate footprint rotation in degrees.
+    /// * `layer` - Candidate copper layer (`0` = `F.Cu`, `1` = `B.Cu`).
+    /// * `spacing` - Total courtyard expansion spacing in `mm`.
+    ///
+    /// # Returns
+    /// Vector of transformed perimeter [`Polygon`]s in world coordinates (`mm`).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn transformed_perimeters_layered(&self, pos: Point, rot: f64, layer: usize, spacing: f64) -> Vec<Polygon> {
         let flipped = layer != self.orig_layer;
         let perims = if !self.perimeters.is_empty() {
@@ -1389,6 +2145,13 @@ impl Footprint {
     }
 
     /// Computes the minimum center-to-center pitch between distinct pads (filtering out coincident/thermal sub-pads).
+    ///
+    /// # Returns
+    /// Minimum center-to-center distance in `mm` among pad pairs separated by more than `0.10 mm`
+    /// (or `f64::INFINITY` if fewer than 2 distinct pads exist).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn min_pad_pitch(&self) -> f64 {
         if self.pads.len() < 2 {
             return f64::INFINITY;
@@ -1409,18 +2172,30 @@ impl Footprint {
         min_pitch
     }
 
-    /// Computes the pad density (pads per mm² of footprint courtyard area).
+    /// Computes the pad density (pads per $\text{mm}^2$ of footprint courtyard area).
+    ///
+    /// # Returns
+    /// Number of pads divided by `max(width * height, 1.0)` in $\text{pads/mm}^2$.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn pad_density(&self) -> f64 {
         let area = (self.width * self.height).max(1.0);
         self.pads.len() as f64 / area
     }
 
     /// Computes the dedicated routing escape clearance (halo) around dense or fine-pitch components.
-    /// - High pin-count packages (>= 16 pads) with fine pitch (<= 0.50mm) or high density: 1.20mm
-    /// - Fine-pitch packages (>= 16 pads, pitch <= 0.65mm): 1.00mm
-    /// - Medium pin-count packages (>= 8 pads, pitch <= 0.65mm or high density): 0.90mm
-    /// - Small dense ICs (>= 6 pads, pitch <= 1.00mm, e.g. SOT-23-6 BUCK IC): 0.75mm
-    /// - Standard passives (0603/0805, 2 pads): 0.0mm (standard clearance)
+    /// - High pin-count packages (`>= 16` pads) with fine pitch (`<= 0.50mm`) or high density: `1.20mm`
+    /// - Fine-pitch packages (`>= 16` pads, pitch `<= 0.65mm`): `1.00mm`
+    /// - Medium pin-count packages (`>= 8` pads, pitch `<= 0.65mm` or high density): `0.90mm`
+    /// - Small dense ICs (`>= 6` pads, pitch `<= 1.00mm`, e.g. SOT-23-6 BUCK IC): `0.75mm`
+    /// - Standard passives (0603/0805, 2 pads): `0.0mm` (standard clearance)
+    ///
+    /// # Returns
+    /// Escape margin distance in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn compute_escape_margin(&self) -> f64 {
         let pad_count = self.pads.len();
         if pad_count < 6 {
@@ -1458,6 +2233,15 @@ impl Footprint {
 
     /// Computes the effective placement spacing required for this component:
     /// base courtyard spacing plus twice the component's escape clearance margin.
+    ///
+    /// # Arguments
+    /// * `base_spacing` - Baseline inter-courtyard spacing in `mm`.
+    ///
+    /// # Returns
+    /// Total placement spacing `base_spacing + 2.0 * escape_margin` in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn placement_spacing(&self, base_spacing: f64) -> f64 {
         let margin = if self.escape_margin > 0.0 {
             self.escape_margin
@@ -1469,6 +2253,13 @@ impl Footprint {
 
     /// Detects if this footprint is a Ball Grid Array (BGA) package and calculates its
     /// 2D regular grid geometry, pitch, bounding matrix center, and concentric ring depth per pad.
+    ///
+    /// # Returns
+    /// `Some(BgaGridInfo)` if at least 9 ball pads form a regular 2D matrix (`>= 3x3`) with pitch in `[0.35, 1.05] mm`,
+    /// or `None` otherwise.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn bga_grid_info(&self) -> Option<BgaGridInfo> {
         let smd_pads: Vec<(usize, &Pad)> = self
             .pads
@@ -1627,24 +2418,62 @@ impl Footprint {
         })
     }
 
+    /// Checks whether this footprint is detected as a Ball Grid Array (BGA) package.
+    ///
+    /// # Returns
+    /// `true` if [`Footprint::bga_grid_info`] returns `Some`, `false` otherwise.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn is_bga(&self) -> bool {
         self.bga_grid_info().is_some()
     }
 
+    /// Returns the horizontal and vertical ball pitch `(pitch_x, pitch_y)` in millimeters if this footprint is a BGA.
+    ///
+    /// # Returns
+    /// `Some((pitch_x_mm, pitch_y_mm))` for BGA packages, or `None` otherwise.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn bga_pitch(&self) -> Option<(f64, f64)> {
         self.bga_grid_info().map(|info| (info.pitch_x, info.pitch_y))
     }
 
+    /// Returns the local `(center_x, center_y)` offset of the BGA ball matrix relative to the footprint origin in `mm`.
+    ///
+    /// # Returns
+    /// `Some((center_x_mm, center_y_mm))` if BGA, or `None` otherwise.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn bga_matrix_center(&self) -> Option<(f64, f64)> {
         self.bga_grid_info().map(|info| (info.center_x, info.center_y))
     }
 
+    /// Returns the world-space `(x, y)` center of the BGA ball matrix in millimeters.
+    ///
+    /// # Returns
+    /// `Some((world_cx_mm, world_cy_mm))` if BGA, or `None` otherwise.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn bga_world_center(&self) -> Option<(f64, f64)> {
         let (cx, cy) = self.bga_matrix_center()?;
         let p = Point::new(cx, cy).rotate_ccw(self.rotation);
         Some((self.x + p.x, self.y + p.y))
     }
 
+    /// Returns the concentric perimeter ring depth (`0` = outermost ring, `1` = second ring, etc.) for `pad_idx` in a BGA.
+    ///
+    /// # Arguments
+    /// * `pad_idx` - Index of the pad in `self.pads`.
+    ///
+    /// # Returns
+    /// Ring depth index (`0` if not a BGA or on the outer perimeter).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn bga_pad_ring_index(&self, pad_idx: usize) -> usize {
         if let Some(info) = self.bga_grid_info() {
             if pad_idx < info.pad_rings.len() {
@@ -1655,25 +2484,47 @@ impl Footprint {
     }
 }
 
+/// Extracted 2D ball-grid matrix geometry and per-pad concentric ring indices for a BGA [`Footprint`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BgaGridInfo {
+    /// Horizontal ball-to-ball pitch along local X in `mm`.
     pub pitch_x: f64,
+    /// Vertical ball-to-ball pitch along local Y in `mm`.
     pub pitch_y: f64,
+    /// Local X center of the ball matrix in `mm`.
     pub center_x: f64,
+    /// Local Y center of the ball matrix in `mm`.
     pub center_y: f64,
+    /// Number of columns in the BGA grid.
     pub cols: usize,
+    /// Number of rows in the BGA grid.
     pub rows: usize,
+    /// Minimum local X coordinate of the ball grid in `mm`.
     pub min_x: f64,
+    /// Minimum local Y coordinate of the ball grid in `mm`.
     pub min_y: f64,
+    /// Maximum local X coordinate of the ball grid in `mm`.
     pub max_x: f64,
+    /// Maximum local Y coordinate of the ball grid in `mm`.
     pub max_y: f64,
+    /// Concentric ring depth (`0` = outer ring) for each pad in [`Footprint::pads`].
     pub pad_rings: Vec<usize>,
+    /// Optional `(col, row)` grid coordinates for each pad in [`Footprint::pads`].
     pub pad_grid_indices: Vec<Option<(usize, usize)>>,
 }
 
 
 /// Extracts the outer perimeter boundary line segments of a set of polygons,
 /// discarding internal shared chords (such as triangulation edges).
+///
+/// # Arguments
+/// * `polys` - Slice of [`Polygon`] pieces whose shared internal edges should be removed.
+///
+/// # Returns
+/// Vector of `(start_point, end_point)` boundary edges that appear in exactly one polygon.
+///
+/// # Side Effects
+/// None.
 pub fn outer_perimeter_edges(polys: &[Polygon]) -> Vec<(Point, Point)> {
     if polys.is_empty() {
         return Vec::new();
@@ -1710,50 +2561,112 @@ pub fn outer_perimeter_edges(polys: &[Polygon]) -> Vec<(Point, Point)> {
         .collect()
 }
 
+/// A straight copper trace segment `(segment ...)` routed on a single PCB copper layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrackSegment {
+    /// Start `(x, y)` coordinates in `mm`.
     pub start: (f64, f64),
+    /// End `(x, y)` coordinates in `mm`.
     pub end: (f64, f64),
+    /// Copper trace width in `mm`.
     pub width: f64,
+    /// Copper layer index (`0` = `F.Cu`, `1` = `B.Cu`, `2..` = `In1.Cu..`).
     pub layer: usize, // 0 = F.Cu, 1 = B.Cu
+    /// Numeric net ID (`0` = unconnected).
     pub net_id: usize,
+    /// Whether this trace is locked against rip-up and modification.
     #[serde(default)]
     pub is_locked: bool,
 }
 
 impl TrackSegment {
+    /// Computes the direction angle of the track segment in radians (`(-PI, PI]`).
+    ///
+    /// # Returns
+    /// Angle `atan2(end.y - start.y, end.x - start.x)` in radians.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn angle(&self) -> f64 {
         (self.end.1 - self.start.1).atan2(self.end.0 - self.start.0)
     }
 
+    /// Computes the Euclidean length of the track segment in millimeters.
+    ///
+    /// # Returns
+    /// Segment length in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn length(&self) -> f64 {
         (self.end.0 - self.start.0).hypot(self.end.1 - self.start.1)
     }
 
+    /// Computes the midpoint `(x, y)` of the track segment in millimeters.
+    ///
+    /// # Returns
+    /// Midpoint coordinates `(mid_x, mid_y)` in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn mid_point(&self) -> (f64, f64) {
         ((self.start.0 + self.end.0) * 0.5, (self.start.1 + self.end.1) * 0.5)
     }
 
+    /// Checks whether the segment is routed at a non-octilinear ("any-angle") orientation.
+    ///
+    /// Returns `true` when the segment's angle modulo $45^\circ$ differs from $0^\circ$ and $45^\circ$ by more than $0.5^\circ$.
+    ///
+    /// # Returns
+    /// `true` if the segment is neither orthogonal nor $45^\circ$ diagonal, `false` otherwise.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn is_any_angle(&self) -> bool {
         let deg = self.angle().to_degrees().abs() % 45.0;
         deg > 0.5 && deg < 44.5
     }
 }
 
+/// A circular copper arc trace segment `(arc ...)` on a single PCB copper layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArcSegment {
+    /// Center `(x, y)` of the arc circle in `mm`.
     pub center: (f64, f64),
+    /// Arc radius in `mm`.
     pub radius: f64,
+    /// Starting angle in radians.
     pub start_angle_rad: f64,
+    /// Ending angle in radians (may be greater or less than `start_angle_rad` to denote sweep direction).
     pub end_angle_rad: f64,
+    /// Copper trace width in `mm`.
     pub width: f64,
+    /// Copper layer index (`0` = `F.Cu`, `1` = `B.Cu`, `2..` = `In1.Cu..`).
     pub layer: usize, // 0 = F.Cu, 1 = B.Cu
+    /// Numeric net ID (`0` = unconnected).
     pub net_id: usize,
+    /// Whether this arc is locked against rip-up and modification.
     #[serde(default)]
     pub is_locked: bool,
 }
 
 impl ArcSegment {
+    /// Constructs an unlocked [`ArcSegment`] from center, radius, angular bounds, width, layer, and net ID.
+    ///
+    /// # Arguments
+    /// * `center` - Arc circle center `(x, y)` in `mm`.
+    /// * `radius` - Circle radius in `mm`.
+    /// * `start_angle_rad` - Starting angle in radians.
+    /// * `end_angle_rad` - Ending angle in radians.
+    /// * `width` - Trace width in `mm`.
+    /// * `layer` - Copper layer index (`0` = `F.Cu`, `1` = `B.Cu`).
+    /// * `net_id` - Numeric net ID.
+    ///
+    /// # Returns
+    /// A new [`ArcSegment`].
+    ///
+    /// # Side Effects
+    /// None.
     pub fn new(
         center: (f64, f64),
         radius: f64,
@@ -1775,6 +2688,13 @@ impl ArcSegment {
         }
     }
 
+    /// Computes the `(x, y)` start point of the arc in millimeters.
+    ///
+    /// # Returns
+    /// Start coordinates `(x, y)` in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn start(&self) -> (f64, f64) {
         (
             self.center.0 + self.radius * self.start_angle_rad.cos(),
@@ -1782,6 +2702,13 @@ impl ArcSegment {
         )
     }
 
+    /// Computes the `(x, y)` end point of the arc in millimeters.
+    ///
+    /// # Returns
+    /// End coordinates `(x, y)` in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn end(&self) -> (f64, f64) {
         (
             self.center.0 + self.radius * self.end_angle_rad.cos(),
@@ -1789,6 +2716,13 @@ impl ArcSegment {
         )
     }
 
+    /// Computes the `(x, y)` midpoint along the arc sweep in millimeters (used for KiCad `(arc (start ...) (mid ...) (end ...))` serialization).
+    ///
+    /// # Returns
+    /// Arc midpoint `(x, y)` in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn mid(&self) -> (f64, f64) {
         let mid_angle = self.start_angle_rad + (self.end_angle_rad - self.start_angle_rad) * 0.5;
         (
@@ -1797,14 +2731,43 @@ impl ArcSegment {
         )
     }
 
+    /// Returns the signed angular sweep `end_angle_rad - start_angle_rad` in radians.
+    ///
+    /// # Returns
+    /// Signed sweep angle in radians.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn sweep_angle(&self) -> f64 {
         self.end_angle_rad - self.start_angle_rad
     }
 
+    /// Computes the arc length `radius * |sweep_angle|` in millimeters.
+    ///
+    /// # Returns
+    /// Arc length in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn length(&self) -> f64 {
         self.radius * self.sweep_angle().abs()
     }
 
+    /// Constructs an [`ArcSegment`] passing through three points (`start`, `mid`, `end`), matching KiCad's 3-point arc format.
+    ///
+    /// # Arguments
+    /// * `start` - Arc start point `(x, y)` in `mm`.
+    /// * `mid` - Interior point `(x, y)` along the arc in `mm`.
+    /// * `end` - Arc end point `(x, y)` in `mm`.
+    /// * `width` - Trace width in `mm`.
+    /// * `layer` - Copper layer index.
+    /// * `net_id` - Numeric net ID.
+    ///
+    /// # Returns
+    /// `Some(ArcSegment)` if the three points are non-collinear, or `None` if collinear/degenerate (`|d| < 1e-9`).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn from_3pts(
         start: (f64, f64),
         mid: (f64, f64),
@@ -1856,6 +2819,16 @@ impl ArcSegment {
         })
     }
 
+    /// Approximates the circular arc as a polyline of `steps` straight [`TrackSegment`] chords.
+    ///
+    /// # Arguments
+    /// * `steps` - Number of linear segments to subdivide the arc into (`>= 1`).
+    ///
+    /// # Returns
+    /// Vector of `steps.max(1)` [`TrackSegment`]s.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn to_segments(&self, steps: usize) -> Vec<TrackSegment> {
         let n = steps.max(1);
         let mut segs = Vec::with_capacity(n);
@@ -1880,6 +2853,19 @@ impl ArcSegment {
         segs
     }
 
+    /// Computes the shortest Euclidean distance from a 2D point `p` to the centerline of this circular arc.
+    ///
+    /// If the radial ray from `self.center` through `p` falls within the angular sweep of the arc,
+    /// returns `|dist(p, center) - radius|`; otherwise returns the minimum distance to the two arc endpoints.
+    ///
+    /// # Arguments
+    /// * `p` - Query point `(x, y)` in `mm`.
+    ///
+    /// # Returns
+    /// Shortest distance from `p` to the arc centerline in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn distance_to_point(&self, p: (f64, f64)) -> f64 {
         let dx = p.0 - self.center.0;
         let dy = p.1 - self.center.1;
@@ -1908,46 +2894,87 @@ impl ArcSegment {
     }
 }
 
+/// A plated inter-layer through-via `(via ...)` on the PCB.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Via {
+    /// World `(x, y)` center position in `mm`.
     pub position: (f64, f64),
+    /// Outer copper pad diameter in `mm` (e.g., `0.60 mm`).
     pub size: f64,
+    /// Finished drill hole diameter in `mm` (e.g., `0.30 mm`).
     pub drill: f64,
+    /// Numeric net ID (`0` = unconnected).
     pub net_id: usize,
+    /// Whether this via is locked against rip-up and modification.
     #[serde(default)]
     pub is_locked: bool,
 }
 
+/// A rectangular routing and placement keepout zone `(zone ... (keepout ...))` on the PCB.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeepoutZone {
+    /// Minimum X coordinate in `mm`.
     pub min_x: f64,
+    /// Minimum Y coordinate in `mm`.
     pub min_y: f64,
+    /// Maximum X coordinate in `mm`.
     pub max_x: f64,
+    /// Maximum Y coordinate in `mm`.
     pub max_y: f64,
+    /// Restricted copper layer indices (`0` = `F.Cu`, `1` = `B.Cu`, etc.).
     pub layers: Vec<usize>,
 }
 
+/// A functional component placement cluster extracted from `.kicad_sch` hierarchical sheets or bounding boxes.
 #[derive(Debug, Clone)]
 pub struct CompiledCluster {
+    /// Human-readable cluster name (e.g., `"1. Power / Buck"`, `"U4 Cluster"`).
     pub name: String,
+    /// Optional index into [`Board::footprints`] of the primary anchor IC or connector for this cluster.
     pub anchor_idx: Option<usize>,
+    /// Indices into [`Board::footprints`] of all components belonging to this cluster.
     pub member_indices: Vec<usize>,
+    /// Reference designators of all components belonging to this cluster.
     pub member_refs: Vec<String>,
+    /// Target maximum placement radius around the anchor component in `mm`.
     pub max_radius: f64,
+    /// Simulated annealing cost penalty weight for cluster dispersion beyond `max_radius`.
     pub weight: f64,
 }
 
+/// A multi-net parallel bus bundle routed along shared guide waypoints.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BusBundle {
+    /// Bus bundle name (e.g., `"SPI_BUS"`, `"DATA_BUS"`).
     pub name: String,
+    /// Ordered list of numeric net IDs belonging to the bus.
     pub net_ids: Vec<usize>,
+    /// Ordered centerline guide waypoints `(x, y)` in `mm`.
     pub guide_points: Vec<(f64, f64)>,
+    /// Preferred copper layer index for the bus trunk.
     pub layer: usize,
+    /// Individual trace width in `mm`.
     pub track_width: f64,
+    /// Edge-to-edge spacing between adjacent bus traces in `mm`.
     pub track_spacing: f64,
 }
 
 impl BusBundle {
+    /// Creates a new [`BusBundle`] with the specified nets, guide waypoints, layer, and trace geometry.
+    ///
+    /// # Arguments
+    /// * `name` - Bus bundle identifier.
+    /// * `net_ids` - Vector of numeric net IDs in the bundle.
+    /// * `guide_points` - Centerline guide waypoints `(x, y)` in `mm`.
+    /// * `layer` - Copper layer index.
+    /// * `track_width` - Trace width in `mm`.
+    /// * `track_spacing` - Edge-to-edge trace spacing in `mm`.
+    ///
+    /// # Returns
+    /// A new [`BusBundle`].
+    ///
+    /// # Side Effects
+    /// None.
     pub fn new(
         name: impl Into<String>,
         net_ids: Vec<usize>,
@@ -1967,45 +2994,78 @@ impl BusBundle {
     }
 }
 
+/// Complete in-memory representation of a KiCad PCB layout, netlist, design rules, and routed copper.
 #[derive(Debug, Clone)]
 pub struct Board {
+    /// Filesystem path to the source `.kicad_pcb` file (or empty if parsed from an in-memory string).
     pub file_path: String,
+    /// Raw S-expression text of the original `.kicad_pcb` file used for lossless span-based saving.
     pub raw_content: String,
+    /// Padded minimum X coordinate of the routing canvas (`Edge.Cuts` `min_x - 1.5 mm`).
     pub min_x: f64,
+    /// Padded minimum Y coordinate of the routing canvas (`Edge.Cuts` `min_y - 1.5 mm`).
     pub min_y: f64,
+    /// Padded maximum X coordinate of the routing canvas (`Edge.Cuts` `max_x + 1.5 mm`).
     pub max_x: f64,
+    /// Padded maximum Y coordinate of the routing canvas (`Edge.Cuts` `max_y + 1.5 mm`).
     pub max_y: f64,
+    /// Active footprints currently placed on the board.
     pub footprints: Vec<Footprint>,
+    /// Staging holding palette of unplaced/cleared footprints awaiting interactive or automated placement.
     pub holding_palette: Vec<Footprint>,
+    /// Net name lookup table indexed by numeric `net_id` (`nets[0]` is always `""`).
     pub nets: Vec<String>,
+    /// Reverse lookup map from net name string to numeric `net_id`.
     pub net_name_to_id: HashMap<String, usize>,
+    /// Named [`NetClass`] definitions keyed by class name (always includes `"Default"`).
     pub netclasses: HashMap<String, NetClass>,
+    /// Mapping from net name to its assigned [`NetClass`] name.
     pub net_to_class: HashMap<String, String>,
+    /// Copper and placement keepout zones on the board.
     pub keepouts: Vec<KeepoutZone>,
+    /// Straight routed copper trace segments (`(segment ...)`).
     pub tracks: Vec<TrackSegment>,
+    /// Plated through-vias (`(via ...)`).
     pub vias: Vec<Via>,
+    /// Curved copper arc trace segments (`(arc ...)`).
     pub arcs: Vec<ArcSegment>,
+    /// Functional component clusters compiled from `.kicad_sch`.
     pub clusters: Vec<CompiledCluster>,
+    /// 2D schematic symbol positions `(x, y)` keyed by reference designator.
     pub schematic_positions: HashMap<String, (f64, f64)>,
+    /// Chained closed board outline polygon extracted from `Edge.Cuts` graphic primitives.
     pub outline_polygon: Option<Polygon>,
+    /// Ordered history of pin and gate swaps performed on the board for `.eco` back-annotation.
     pub pin_swap_history: Vec<PinSwapRecord>,
+    /// Multi-net bus bundles defined on the board.
     pub bundles: Vec<BusBundle>,
+    /// Top-level board graphic text annotations (`(gr_text ...)`), primarily on `F.SilkS`/`B.SilkS`.
     pub texts: Vec<BoardText>,
 }
 
+/// A top-level graphic text item `(gr_text ...)` on the PCB (such as silkscreen labels).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoardText {
+    /// Text string content.
     pub text: String,
+    /// World X coordinate in `mm`.
     pub x: f64,
+    /// World Y coordinate in `mm`.
     pub y: f64,
+    /// Text rotation angle in degrees.
     pub rotation: f64,
+    /// KiCad layer name (e.g., `"F.SilkS"`, `"B.SilkS"`, `"F.Fab"`).
     pub layer: String,
+    /// Character glyph width in `mm`.
     pub width: f64,
+    /// Character glyph height in `mm`.
     pub height: f64,
+    /// Optional byte span `(start, end)` of the `(at X Y [ROT])` token inside [`Board::raw_content`].
     pub at_span: Option<(usize, usize)>,
 }
 
 impl Default for Board {
+    /// Constructs an empty `100 x 100 mm` [`Board`] with net `0` (`""`) and a `"Default"` [`NetClass`].
     fn default() -> Self {
         Self {
             file_path: String::new(),
@@ -2038,6 +3098,7 @@ impl Default for Board {
     }
 }
 
+/// Ordered list of all 30 internal KiCad copper layer names (`"In1.Cu"` through `"In30.Cu"`).
 pub const INTERNAL_COPPER_LAYERS: [&str; 30] = [
     "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu", "In5.Cu",
     "In6.Cu", "In7.Cu", "In8.Cu", "In9.Cu", "In10.Cu",
@@ -2047,6 +3108,19 @@ pub const INTERNAL_COPPER_LAYERS: [&str; 30] = [
     "In26.Cu", "In27.Cu", "In28.Cu", "In29.Cu", "In30.Cu",
 ];
 
+/// Detects all active copper layers declared in a `.kicad_pcb` S-expression string.
+///
+/// Always places `"F.Cu"` at index `0` and `"B.Cu"` at index `1`, followed by any present
+/// `"In1.Cu"`..`"In30.Cu"` internal layers in numerical order.
+///
+/// # Arguments
+/// * `raw_content` - Raw `.kicad_pcb` S-expression text.
+///
+/// # Returns
+/// Vector of static copper layer name string slices (`["F.Cu", "B.Cu", ...]`).
+///
+/// # Side Effects
+/// None.
 pub fn detect_copper_layers(raw_content: &str) -> Vec<&'static str> {
     let mut layers = vec!["F.Cu", "B.Cu"];
     if !raw_content.contains("\"In") {
@@ -2061,6 +3135,13 @@ pub fn detect_copper_layers(raw_content: &str) -> Vec<&'static str> {
 }
 
 impl Board {
+    /// Returns whether via-in-pad routing (`__allow_via_in_pad__`) is enabled on this board.
+    ///
+    /// # Returns
+    /// `true` if vias are permitted directly inside SMD pads of the same net, `false` otherwise.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn allow_via_in_pad(&self) -> bool {
         self.net_to_class
             .get("__allow_via_in_pad__")
@@ -2068,6 +3149,15 @@ impl Board {
             .unwrap_or(false)
     }
 
+    /// Sets whether via-in-pad routing is permitted on this board.
+    ///
+    /// Stores the flag in `self.net_to_class` under the internal key `"__allow_via_in_pad__"`.
+    ///
+    /// # Arguments
+    /// * `allow` - `true` to allow same-net vias inside SMD pads, `false` to forbid them.
+    ///
+    /// # Side Effects
+    /// Mutates `self.net_to_class`.
     pub fn set_allow_via_in_pad(&mut self, allow: bool) {
         if allow {
             self.net_to_class
@@ -2077,15 +3167,62 @@ impl Board {
         }
     }
 
+    /// Parses a [`Board`] from an in-memory `.kicad_pcb` S-expression string without loading sibling project files.
+    ///
+    /// # Arguments
+    /// * `content` - Raw `.kicad_pcb` S-expression string slice.
+    ///
+    /// # Returns
+    /// `Ok(Board)` on successful parse, or `Err(String)` if malformed.
+    ///
+    /// # Errors
+    /// Returns `Err` if [`Board::from_content_with_path`] encounters an unrecoverable parse error.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn from_kicad_pcb(content: &str) -> Result<Self, String> {
         Self::from_content_with_path(content, "", &HashSet::new())
     }
 
+    /// Loads a `.kicad_pcb` file from disk along with any sibling `.kicad_pro`, `.kicad_dru`, and `.kicad_sch` files.
+    ///
+    /// # Arguments
+    /// * `path` - Filesystem path to the `.kicad_pcb` file.
+    /// * `extra_locked` - Set of additional component reference designators to lock in place.
+    ///
+    /// # Returns
+    /// `Ok(Board)` on success, or `Err(String)` if the file cannot be read or parsed.
+    ///
+    /// # Errors
+    /// Returns `Err` if reading `path` fails or if parsing fails.
+    ///
+    /// # Side Effects
+    /// Reads `path` and optional sibling `.kicad_pro`, `.kicad_dru`, and `.kicad_sch` files from the filesystem.
     pub fn load(path: &str, extra_locked: &HashSet<String>) -> Result<Self, String> {
         let content = fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", path, e))?;
         Self::from_content_with_path(&content, path, extra_locked)
     }
 
+    /// Parses a `.kicad_pcb` S-expression string and optionally resolves sibling project files relative to `path`.
+    ///
+    /// Extracts top-level nets, netclasses, `Edge.Cuts` outlines, keepout zones, footprints, pads,
+    /// courtyards, segments, arcs, vias, and graphic texts. When `path` is non-empty, also loads
+    /// sibling `.kicad_pro` netclasses, `.kicad_dru` design rules, and `.kicad_sch` placement clusters,
+    /// and heals any multi-pad footprints whose on-disk `(at ...)` pose became desynchronized from routed copper.
+    ///
+    /// # Arguments
+    /// * `content` - Raw `.kicad_pcb` S-expression text.
+    /// * `path` - Source `.kicad_pcb` filesystem path (or `""` for in-memory boards).
+    /// * `extra_locked` - Additional component reference designators to mark as `is_locked = true`.
+    ///
+    /// # Returns
+    /// `Ok(Board)` containing the parsed and initialized PCB model.
+    ///
+    /// # Errors
+    /// Returns `Err` if the S-expression content cannot be parsed.
+    ///
+    /// # Side Effects
+    /// When `path` is non-empty, reads sibling `.kicad_pro`, `.kicad_dru`, and `.kicad_sch` files from disk if they exist.
     pub fn from_content_with_path(content: &str, path: &str, extra_locked: &HashSet<String>) -> Result<Self, String> {
         // 1. Parse top-level nets
         let mut nets = vec!["".to_string()];
@@ -2472,10 +3609,27 @@ impl Board {
         Ok(board)
     }
 
+    /// Returns the ordered list of active copper layer names on this board (`"F.Cu"`, `"B.Cu"`, `"In1.Cu"`, ...).
+    ///
+    /// # Returns
+    /// Vector of static copper layer name string slices.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn copper_layers(&self) -> Vec<&'static str> {
         detect_copper_layers(&self.raw_content)
     }
 
+    /// Maps an internal layer index (`0` = `"F.Cu"`, `1` = `"B.Cu"`, `2..` = `"In1.Cu"..`) to its KiCad copper layer name.
+    ///
+    /// # Arguments
+    /// * `layer_idx` - Internal copper layer index.
+    ///
+    /// # Returns
+    /// Static string slice with the KiCad layer name (defaults to `"B.Cu"` if out of range).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn layer_name(&self, layer_idx: usize) -> &'static str {
         match layer_idx {
             0 => "F.Cu",
@@ -2488,6 +3642,13 @@ impl Board {
         }
     }
 
+    /// Scans all non-keepout `(zone ...)` blocks in [`Board::raw_content`] and maps each copper layer index to its primary copper pour net name.
+    ///
+    /// # Returns
+    /// A `HashMap<usize, String>` mapping copper `layer_idx` to the zone's net name.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn layer_plane_net_names(&self) -> HashMap<usize, String> {
         let layers = self.copper_layers();
         let mut map = HashMap::new();
@@ -2554,6 +3715,13 @@ impl Board {
         map
     }
 
+    /// Maps each copper layer index (`0..num_layers`) that has a copper pour zone to its numeric `net_id`.
+    ///
+    /// # Returns
+    /// A `HashMap<usize, usize>` mapping `layer_idx -> net_id`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn layer_plane_nets(&self) -> HashMap<usize, usize> {
         let mut map = HashMap::new();
         for (l_idx, name) in self.layer_plane_net_names() {
@@ -2564,6 +3732,15 @@ impl Board {
         map
     }
 
+    /// Returns a map of internal copper layers (`layer_idx >= 2`, i.e. `In1.Cu`..`In30.Cu`) to their assigned reference plane `net_id`.
+    ///
+    /// Returns an empty map on 2-layer boards.
+    ///
+    /// # Returns
+    /// A `HashMap<usize, usize>` mapping internal `layer_idx -> plane_net_id`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn inner_plane_nets(&self) -> HashMap<usize, usize> {
         if self.copper_layers().len() <= 2 {
             return HashMap::new();
@@ -2573,12 +3750,32 @@ impl Board {
         map
     }
 
+    /// Checks whether `net_id` is a ground net or is assigned to an internal reference plane zone.
+    ///
+    /// # Arguments
+    /// * `net_id` - Numeric net ID to check.
+    ///
+    /// # Returns
+    /// `true` if `net_id` is a ground net or an inner plane net, `false` otherwise.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn is_plane_net(&self, net_id: usize) -> bool {
         let net_name = self.nets.get(net_id).map(|s| s.as_str()).unwrap_or("");
         is_gnd_net_name(net_name)
             || self.inner_plane_nets().values().any(|&pn| pn == net_id)
     }
 
+    /// Returns the physical `Edge.Cuts` axis-aligned bounding box ([`AABB`]) of the PCB.
+    ///
+    /// Uses `self.outline_polygon.aabb()` if a closed outline polygon exists, or removes the `1.5 mm`
+    /// canvas margin from `(min_x, min_y, max_x, max_y)`.
+    ///
+    /// # Returns
+    /// Physical board [`AABB`] in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn boundary_aabb(&self) -> AABB {
         if let Some(ref poly) = self.outline_polygon {
             poly.aabb()
@@ -2587,7 +3784,13 @@ impl Board {
         }
     }
 
-    /// Minimum clearance from copper to Edge.Cuts outline based on board netclasses (default 0.35 mm).
+    /// Minimum clearance from copper to `Edge.Cuts` outline based on board netclasses (default `0.35 mm`).
+    ///
+    /// # Returns
+    /// Minimum board edge clearance in `mm`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn board_edge_clearance(&self) -> f64 {
         self.netclasses
             .values()
@@ -2597,6 +3800,12 @@ impl Board {
     }
 
     /// Board-level physical DRC constraints imported from `.kicad_pro` and `.kicad_dru`.
+    ///
+    /// # Returns
+    /// Consolidated [`DesignRules`] structure for the board.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn design_rules(&self) -> DesignRules {
         let nc = self.get_netclass_for_net(0);
         DesignRules {
@@ -2620,6 +3829,15 @@ impl Board {
     }
 
     /// Verifies if a point is strictly inside the physical board boundary and outline contour.
+    ///
+    /// # Arguments
+    /// * `p` - 2D [`Point`] in board coordinates (`mm`).
+    ///
+    /// # Returns
+    /// `true` if `p` lies inside both [`Board::boundary_aabb`] and [`Board::outline_polygon`] (if present).
+    ///
+    /// # Side Effects
+    /// None.
     pub fn contains_point_in_boundary(&self, p: &Point) -> bool {
         if !self.boundary_aabb().contains_point(p) {
             return false;
@@ -2634,7 +3852,14 @@ impl Board {
 
     /// Rips up all unlocked tracks and vias, and moves all unlocked footprints
     /// from the active board into the holding palette, sorted naturally by designator
-    /// (letters first, then numbers, e.g. C5 before C20).
+    /// (letters first, then numbers, e.g. `C5` before `C20`).
+    ///
+    /// # Returns
+    /// A tuple `(copper_items_ripped, footprints_moved_to_palette)`.
+    ///
+    /// # Side Effects
+    /// Retains only locked items in `self.tracks`, `self.vias`, `self.arcs`, and `self.footprints`,
+    /// moving unlocked footprints into `self.holding_palette`.
     pub fn clear_unlocked_objects(&mut self) -> (usize, usize) {
         let tracks_ripped = self.tracks.iter().filter(|t| !t.is_locked).count()
             + self.vias.iter().filter(|v| !v.is_locked).count()
@@ -2662,6 +3887,15 @@ impl Board {
 
     /// Rips up all connected tracks and vias from the component at `fp_idx` all the way
     /// to the next attached component(s).
+    ///
+    /// # Arguments
+    /// * `fp_idx` - Index of the footprint in `self.footprints`.
+    ///
+    /// # Returns
+    /// Total number of unlocked tracks, arcs, and vias removed.
+    ///
+    /// # Side Effects
+    /// Mutates `self.tracks`, `self.arcs`, and `self.vias`, and prunes any resulting dangling copper.
     pub fn rip_up_connected_traces_to_component(&mut self, fp_idx: usize) -> usize {
         self.rip_up_connected_traces_to_component_at(fp_idx, None)
     }
@@ -2669,6 +3903,21 @@ impl Board {
     /// Rips up all connected tracks and vias from the component at `fp_idx` (optionally evaluated
     /// at `pos_override: (x, y, rotation, layer)` prior to its move) all the way to the next
     /// attached component(s).
+    ///
+    /// Performs a breadth-first search along connected same-net tracks, arcs, and vias starting at
+    /// `fp_idx`'s pads, stopping whenever a junction touches another component's pad so unrelated
+    /// downstream branches of the same net remain intact.
+    ///
+    /// # Arguments
+    /// * `fp_idx` - Index of the footprint in `self.footprints`.
+    /// * `pos_override` - Optional `(x, y, rotation_deg, layer)` pose where the footprint was connected before moving.
+    ///
+    /// # Returns
+    /// Total number of unlocked tracks, arcs, and vias removed.
+    ///
+    /// # Side Effects
+    /// Removes connected unlocked elements from `self.tracks`, `self.arcs`, and `self.vias`, and calls
+    /// `crate::router::prune_dangling_tracks_and_vias(self)`.
     pub fn rip_up_connected_traces_to_component_at(
         &mut self,
         fp_idx: usize,
@@ -3087,6 +4336,12 @@ impl Board {
     }
 
     /// Restores all components currently in the holding palette back onto the board.
+    ///
+    /// # Returns
+    /// Number of footprints restored from `self.holding_palette` to `self.footprints`.
+    ///
+    /// # Side Effects
+    /// Drains `self.holding_palette` and appends its elements to `self.footprints`.
     pub fn return_holding_palette_to_board(&mut self) -> usize {
         let count = self.holding_palette.len();
         self.footprints.extend(self.holding_palette.drain(..));
@@ -3094,6 +4349,15 @@ impl Board {
     }
 
     /// Restores a single component at `idx` from the holding palette back onto the board.
+    ///
+    /// # Arguments
+    /// * `idx` - Index into `self.holding_palette`.
+    ///
+    /// # Returns
+    /// `Some(Footprint)` if `idx < self.holding_palette.len()`, or `None` if out of bounds.
+    ///
+    /// # Side Effects
+    /// Removes the footprint at `idx` from `self.holding_palette` and pushes it onto `self.footprints`.
     pub fn return_holding_component_to_board(&mut self, idx: usize) -> Option<Footprint> {
         if idx < self.holding_palette.len() {
             let fp = self.holding_palette.remove(idx);
@@ -3104,6 +4368,16 @@ impl Board {
         }
     }
 
+    /// Looks up the [`NetClass`] governing `net_id`, falling back to `"Default"` if unassigned.
+    ///
+    /// # Arguments
+    /// * `net_id` - Numeric net ID.
+    ///
+    /// # Returns
+    /// Shared reference to the [`NetClass`] for `net_id`.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn get_netclass_for_net(&self, net_id: usize) -> &NetClass {
         if let Some(name) = self.nets.get(net_id) {
             if let Some(cname) = self.net_to_class.get(name) {
@@ -3119,12 +4393,35 @@ impl Board {
         DEFAULT_NETCLASS.get_or_init(NetClass::default)
     }
 
+    /// Resolves the target [`NetTopology`] for `net_id` from its [`NetClass`] or net name.
+    ///
+    /// # Arguments
+    /// * `net_id` - Numeric net ID.
+    ///
+    /// # Returns
+    /// The resolved [`NetTopology`].
+    ///
+    /// # Side Effects
+    /// None.
     pub fn get_net_topology(&self, net_id: usize) -> NetTopology {
         let netclass = self.get_netclass_for_net(net_id);
         let net_name = self.nets.get(net_id).map(|s| s.as_str()).unwrap_or("");
         netclass.resolve_topology(net_name)
     }
 
+    /// Generates the unrouted Euclidean Minimum Spanning Tree (MST) ratsnest airwire segments across all non-ground signal nets using Prim's algorithm.
+    ///
+    /// Ground nets (`is_gnd_net_name`) and unconnected pads (`net_id == 0`) are excluded because
+    /// ground connectivity is provided via copper pour planes and stitching vias.
+    ///
+    /// # Arguments
+    /// * `pad_positions` - Precomputed 2D slice where `pad_positions[fp_idx][pad_idx]` is the world [`Point`] of that pad.
+    ///
+    /// # Returns
+    /// Vector of MST [`Segment`]s across all active signal nets.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn generate_ratsnest_segments(&self, pad_positions: &[Vec<Point>]) -> Vec<Segment> {
         let mut net_points: HashMap<usize, Vec<Point>> = HashMap::new();
         for (fp_idx, fp) in self.footprints.iter().enumerate() {
@@ -3188,6 +4485,18 @@ impl Board {
 
     /// Filters out ratsnest airwire segments whose endpoints are already electrically
     /// connected by same-net copper (`tracks` and/or organic `arcs`).
+    ///
+    /// Builds a union-find forest of touching copper chords per net and retains only those
+    /// ratsnest [`Segment`]s whose two endpoints do not belong to the same connected copper component.
+    ///
+    /// # Arguments
+    /// * `ratsnest` - Full list of candidate ratsnest [`Segment`]s.
+    ///
+    /// # Returns
+    /// Filtered vector containing only the remaining unrouted ratsnest [`Segment`]s.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn filter_unrouted_ratsnest(&self, ratsnest: &[Segment]) -> Vec<Segment> {
         if ratsnest.is_empty() || (self.tracks.is_empty() && self.arcs.is_empty()) {
             return ratsnest.to_vec();
@@ -3277,6 +4586,24 @@ impl Board {
             .collect()
     }
 
+    /// Serializes the current [`Board`] state back into a `.kicad_pcb` S-expression document
+    /// by applying in-place byte-span replacements onto [`Board::raw_content`].
+    ///
+    /// Preserves all unparsed KiCad expressions (zones, graphics, properties, dimension callouts,
+    /// and unmodified footprints) while updating moved/rotated/flipped footprint `(at ...)` and pad
+    /// expressions, swapped pad `(net ...)` bindings, nudged silkscreen `(gr_text ...)` coordinates,
+    /// and replacing all copper `(segment ...)`, `(arc ...)`, `(via ...)`, and stale `(filled_polygon ...)`
+    /// blocks with the newly routed geometry.
+    ///
+    /// # Returns
+    /// * `Ok(String)` containing the complete, valid `.kicad_pcb` S-expression text.
+    /// * `Err(String)` if [`Board::raw_content`] lacks a closing root parenthesis `)`.
+    ///
+    /// # Side Effects
+    /// None (purely constructs and returns a serialized `String` in memory).
+    ///
+    /// # Errors
+    /// Returns `Err("Invalid .kicad_pcb syntax")` if no closing parenthesis `)` exists in the document.
     pub fn to_kicad_pcb(&self) -> Result<String, String> {
         let is_kicad10_named_nets = self.raw_content.contains("(version 2026")
             || self.raw_content.contains("(generator_version \"10.")
@@ -3511,10 +4838,28 @@ impl Board {
         Ok(content)
     }
 
+    /// Alias for [`Board::to_kicad_pcb`] that serializes the board state into a `.kicad_pcb` S-expression string.
+    ///
+    /// # Returns
+    /// * `Ok(String)` containing the updated `.kicad_pcb` document text.
+    /// * `Err(String)` if the base `.kicad_pcb` syntax is invalid.
+    ///
+    /// # Side Effects
+    /// None.
+    ///
+    /// # Errors
+    /// Propagates any serialization error from [`Board::to_kicad_pcb`].
     pub fn save_kicad_pcb(&self) -> Result<String, String> {
         self.to_kicad_pcb()
     }
 
+    /// Nudges standalone silkscreen text items (`F.SilkS` and `B.SilkS`) away from exposed copper pads,
+    /// vias, footprint silkscreen outlines, and board edges, initializing a temporary [`crate::vulkan::VulkanEngine`]
+    /// if available for GPU-accelerated collision filtering.
+    ///
+    /// # Side Effects
+    /// * May initialize a transient [`crate::vulkan::VulkanEngine`] device.
+    /// * Mutates `(x, y)` coordinates of colliding entries in `self.texts`.
     pub fn nudge_silkscreen_texts(&mut self) {
         if self.texts.is_empty() {
             return;
@@ -3523,6 +4868,19 @@ impl Board {
         self.nudge_silkscreen_texts_with_gpu(vk.as_ref());
     }
 
+    /// Nudges standalone silkscreen text items (`F.SilkS` and `B.SilkS`) along a 960-point radial spiral
+    /// so they do not overlap exposed copper pads, vias, footprint silkscreen lines, board boundaries,
+    /// or other silkscreen labels.
+    ///
+    /// Uses an optional [`crate::vulkan::VulkanEngine`] compute shader pass to batch-reject candidate poses
+    /// that collide with copper pads or vias, followed by parallel Rayon CPU verification against silkscreen
+    /// lines and sequential text-to-text de-overlapping.
+    ///
+    /// # Arguments
+    /// * `vulkan` - Optional shared reference to a [`crate::vulkan::VulkanEngine`] for GPU candidate pre-filtering.
+    ///
+    /// # Side Effects
+    /// Mutates `(x, y)` coordinates of entries in `self.texts` in place.
     pub fn nudge_silkscreen_texts_with_gpu(
         &mut self,
         vulkan: Option<&std::sync::Arc<crate::vulkan::VulkanEngine>>,
@@ -3836,7 +5194,14 @@ impl Board {
         }
     }
 
-    /// Formats the current UTC timestamp as YYYYMMDDHHMMSS without third-party crates.
+    /// Formats the current UTC timestamp as `YYYYMMDDHHMMSS` using Howard Hinnant's civil calendar
+    /// algorithm on `std::time::SystemTime` without requiring third-party date/time crates.
+    ///
+    /// # Returns
+    /// A 14-character numeric timestamp string (e.g., `"20261108131000"`).
+    ///
+    /// # Side Effects
+    /// Queries the system wall clock via `SystemTime::now()`.
     pub fn current_timestamp_yyyymmddhhmmss() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
         let secs = SystemTime::now()
@@ -3866,8 +5231,18 @@ impl Board {
         format!("{:04}{:02}{:02}{:02}{:02}{:02}", y, m, d, hour, min, sec)
     }
 
-    /// Computes the backup path for a PCB file being overwritten:
-    /// `<board_stem>.kicad_pcb_bak.YYYYMMDDHHMMSS`
+    /// Computes a non-colliding backup path for a PCB file being overwritten, formatted as
+    /// `<board_stem>.kicad_pcb_bak.YYYYMMDDHHMMSS` (with an optional `.1`, `.2`, ... suffix if
+    /// multiple backups occur within the same second).
+    ///
+    /// # Arguments
+    /// * `out_path` - Target `.kicad_pcb` output path about to be overwritten.
+    ///
+    /// # Returns
+    /// A [`PathBuf`] pointing to an unused backup file path in the same directory.
+    ///
+    /// # Side Effects
+    /// Checks filesystem existence of candidate backup paths via `Path::exists`.
     pub fn compute_pcb_backup_path(out_path: &Path) -> PathBuf {
         let ts = Self::current_timestamp_yyyymmddhhmmss();
         let path_str = out_path.to_string_lossy();
@@ -3889,6 +5264,24 @@ impl Board {
         bak
     }
 
+    /// Nudges silkscreen labels, serializes the board to `.kicad_pcb` format, writes it to `out_path`
+    /// (creating a timestamped `.kicad_pcb_bak.*` backup if `out_path` already exists), and synchronizes
+    /// sibling `.kicad_dru`, `.kicad_pro`, `.kicad_sch`, and `.kicad_prl` files.
+    ///
+    /// # Arguments
+    /// * `out_path` - Destination filesystem path for the saved `.kicad_pcb` file.
+    ///
+    /// # Returns
+    /// * `Ok(())` when the `.kicad_pcb` file is written successfully.
+    /// * `Err(String)` if `.kicad_pcb` serialization or file writing fails.
+    ///
+    /// # Side Effects
+    /// * Mutates `self.texts` via [`Board::nudge_silkscreen_texts`].
+    /// * Copies any existing `out_path` to a backup path from [`Board::compute_pcb_backup_path`].
+    /// * Writes `out_path`, its sibling `.kicad_dru` file, and copies sibling `.kicad_pro`/`.kicad_sch`/`.kicad_prl` files if present.
+    ///
+    /// # Errors
+    /// Returns an `Err(String)` if [`Board::to_kicad_pcb`] fails or `std::fs::write` cannot write `out_path`.
     pub fn save_pcb(&mut self, out_path: &Path) -> Result<(), String> {
         self.nudge_silkscreen_texts();
         let content = self.to_kicad_pcb()?;
@@ -3958,8 +5351,18 @@ impl Board {
     }
 
     /// Refills copper zones in a saved `.kicad_pcb` via `kicad-cli pcb drc --refill-zones --save-board`, so
-    /// KiCad's file-open ratsnest sees plane connectivity (`to_kicad_pcb` drops the stale fills).
-    /// Best-effort: returns false when the board has no zones or `kicad-cli` is unavailable/fails.
+    /// KiCad's file-open ratsnest sees plane connectivity ([`Board::to_kicad_pcb`] drops the stale fills).
+    /// Best-effort: returns `false` when the board has no zones or `kicad-cli` is unavailable/fails.
+    ///
+    /// # Arguments
+    /// * `pcb_path` - Path to the saved `.kicad_pcb` file on disk.
+    ///
+    /// # Returns
+    /// `true` if `pcb_path` contains `(zone` definitions and `kicad-cli` refilled and saved the board with exit status `0`, or `false` otherwise.
+    ///
+    /// # Side Effects
+    /// * Reads and modifies `pcb_path` in place via an external `kicad-cli` subprocess.
+    /// * Creates and removes a temporary JSON report file in `std::env::temp_dir()`.
     pub fn refill_zones_in_file(pcb_path: &Path) -> bool {
         if !fs::read_to_string(pcb_path).is_ok_and(|s| s.contains("(zone")) {
             return false;
@@ -3975,6 +5378,14 @@ impl Board {
         ok
     }
 
+    /// Formats a human-readable Engineering Change Order (ECO) back-annotation report listing all
+    /// pin and gate swaps recorded in [`Board::pin_swap_history`].
+    ///
+    /// # Returns
+    /// A Markdown-formatted report `String` detailing each swapped component reference, pad pair, net pair, and reason.
+    ///
+    /// # Side Effects
+    /// None.
     pub fn generate_back_annotation_report(&self) -> String {
         let mut report = String::new();
         report.push_str("# Vulcan's Trials Pin & Gate Swapping Back-Annotation Report\n");
@@ -3988,11 +5399,40 @@ impl Board {
         report
     }
 
+    /// Writes the pin and gate swapping back-annotation report generated by
+    /// [`Board::generate_back_annotation_report`] to disk at `path`.
+    ///
+    /// # Arguments
+    /// * `path` - Destination filesystem path for the ECO report file.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an [`std::io::Error`] if writing fails.
+    ///
+    /// # Side Effects
+    /// Writes a text file to `path`.
+    ///
+    /// # Errors
+    /// Propagates any [`std::io::Error`] returned by `std::fs::write`.
     pub fn save_back_annotation_eco(&self, path: &Path) -> std::io::Result<()> {
         let report = self.generate_back_annotation_report();
         fs::write(path, report)
     }
 
+    /// Exports the current component placement and routed copper network (tracks, discretized arcs,
+    /// and vias) to a Specctra `.ses` session file at `ses_path` (`0.1 um` resolution).
+    ///
+    /// # Arguments
+    /// * `ses_path` - Destination filesystem path for the `.ses` file.
+    ///
+    /// # Returns
+    /// * `Ok(())` when the Specctra session file is written successfully.
+    /// * `Err(String)` if writing to `ses_path` fails.
+    ///
+    /// # Side Effects
+    /// Writes the Specctra `.ses` file to `ses_path` on disk.
+    ///
+    /// # Errors
+    /// Returns `Err(String)` if `std::fs::write` fails.
     pub fn save_ses(&self, ses_path: &Path) -> Result<(), String> {
         let to_ses = |mm: f64| -> i64 { (mm * 10000.0).round() as i64 };
         let mut s = String::from(
@@ -4109,6 +5549,14 @@ impl Board {
         fs::write(ses_path, s).map_err(|e| e.to_string())
     }
 
+    /// Parses netclasses from a `.kicad_pro` JSON or `.kicad_pcb` S-expression string and merges them
+    /// into [`Board::netclasses`].
+    ///
+    /// # Arguments
+    /// * `content` - Raw `.kicad_pro` JSON or `.kicad_pcb` S-expression text.
+    ///
+    /// # Side Effects
+    /// Inserts or overwrites parsed [`NetClass`] entries in `self.netclasses`.
     pub fn parse_netclasses_from_pro_or_pcb(&mut self, content: &str) {
         let classes = parse_netclasses_from_pro_or_pcb(content);
         for (name, nc) in classes {
@@ -4116,11 +5564,32 @@ impl Board {
         }
     }
 
+    /// Reads a `.kicad_pro` project file from `pro_path` and applies its netclass definitions,
+    /// design rules, and net-to-netclass pattern/explicit assignments to `self`.
+    ///
+    /// Does nothing if `pro_path` cannot be read.
+    ///
+    /// # Arguments
+    /// * `pro_path` - Path to the `.kicad_pro` JSON project file.
+    ///
+    /// # Side Effects
+    /// Reads `pro_path` from disk and mutates `self.netclasses` and `self.net_to_class` via [`Board::apply_project_netclasses_str`].
     pub fn load_project_netclasses(&mut self, pro_path: &Path) {
         let Ok(content) = fs::read_to_string(pro_path) else { return };
         self.apply_project_netclasses_str(&content);
     }
 
+    /// Parses a `.kicad_pro` JSON string and applies its netclasses, board-level [`DesignRules`],
+    /// `netclass_assignments`, and wildcard `netclass_patterns` to `self`.
+    ///
+    /// When explicit classes are defined in `content`, resets any prior heuristic net-to-class mappings
+    /// back to `"Default"` before applying the project's explicit assignments and wildcard patterns.
+    ///
+    /// # Arguments
+    /// * `content` - Raw `.kicad_pro` JSON text (or S-expression netclass text).
+    ///
+    /// # Side Effects
+    /// Mutates `self.netclasses` and `self.net_to_class`.
     pub fn apply_project_netclasses_str(&mut self, content: &str) {
         let classes = parse_netclasses_from_pro_or_pcb(content);
         if !classes.is_empty() {
@@ -4187,11 +5656,29 @@ impl Board {
         }
     }
 
+    /// Reads a KiCad `.kicad_dru` custom design rules file from `dru_path` and applies its
+    /// global and netclass-specific constraints to `self`.
+    ///
+    /// Does nothing if `dru_path` cannot be read.
+    ///
+    /// # Arguments
+    /// * `dru_path` - Path to the `.kicad_dru` file.
+    ///
+    /// # Side Effects
+    /// Reads `dru_path` from disk and mutates `self.netclasses` via [`Board::apply_design_rules_dru_str`].
     pub fn load_design_rules_dru(&mut self, dru_path: &Path) {
         let Ok(content) = fs::read_to_string(dru_path) else { return };
         self.apply_design_rules_dru_str(&content);
     }
 
+    /// Parses a `.kicad_dru` S-expression string and clamps all [`Board::netclasses`] to honor
+    /// both global `(rule ...)` constraints and netclass-conditioned constraints.
+    ///
+    /// # Arguments
+    /// * `content` - Raw `.kicad_dru` S-expression text.
+    ///
+    /// # Side Effects
+    /// Mutates [`NetClass`] parameters in `self.netclasses` in place.
     pub fn apply_design_rules_dru_str(&mut self, content: &str) {
         let mut base_rules = self.design_rules();
         apply_dru_rules_to_board(content, &mut base_rules, &mut self.netclasses);
@@ -4201,6 +5688,16 @@ impl Board {
         }
     }
 
+    /// Parses a root `.kicad_sch` schematic file (and any referenced hierarchical sub-sheet files)
+    /// to extract symbol coordinates (`self.schematic_positions`) and functional component clusters
+    /// (`self.clusters`) defined by hierarchical sheets, closed graphical polylines/rectangles, or numbered section headers.
+    ///
+    /// # Arguments
+    /// * `sch_path` - Path to the root `.kicad_sch` file on disk.
+    ///
+    /// # Side Effects
+    /// * Reads `sch_path` and any child `Sheetfile` `.kicad_sch` files from disk.
+    /// * Populates `self.schematic_positions` and `self.clusters`.
     pub fn load_schematic_clusters(&mut self, sch_path: &Path) {
         let Ok(content) = fs::read_to_string(sch_path) else { return };
 
@@ -4556,6 +6053,14 @@ pub fn natural_designator_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     split_ref(a).cmp(&split_ref(b))
 }
 
+/// Extracts a 2D coordinate tuple `(x, y)` in millimeters from an S-expression tag such as `(start X Y)`.
+///
+/// # Arguments
+/// * `block` - S-expression text slice to search within.
+/// * `tag` - Tag name without parentheses (e.g., `"start"`, `"end"`, `"mid"`, `"at"`).
+///
+/// # Returns
+/// `Some((x, y))` in millimeters if the tag and two floating-point numbers are found, or `None` otherwise.
 fn extract_point(block: &str, tag: &str) -> Option<(f64, f64)> {
     let pattern = format!("({} ", tag);
     let pos = block.find(&pattern)?;
@@ -4567,6 +6072,14 @@ fn extract_point(block: &str, tag: &str) -> Option<(f64, f64)> {
     Some((x, y))
 }
 
+/// Extracts a single `f64` scalar value from an S-expression tag such as `(width 0.25)`.
+///
+/// # Arguments
+/// * `block` - S-expression text slice to search within.
+/// * `tag` - Tag name without parentheses (e.g., `"width"`, `"size"`, `"drill"`).
+///
+/// # Returns
+/// `Some(value)` if the tag and a valid `f64` token are present, or `None` otherwise.
 fn extract_named_f64(block: &str, tag: &str) -> Option<f64> {
     let pattern = format!("({} ", tag);
     let pos = block.find(&pattern)?;
@@ -4575,6 +6088,14 @@ fn extract_named_f64(block: &str, tag: &str) -> Option<f64> {
     rest[..end].split_whitespace().next()?.parse::<f64>().ok()
 }
 
+/// Extracts a single `usize` integer value from an S-expression tag such as `(net 3)`.
+///
+/// # Arguments
+/// * `block` - S-expression text slice to search within.
+/// * `tag` - Tag name without parentheses (e.g., `"net"`).
+///
+/// # Returns
+/// `Some(value)` if the tag and a valid `usize` token are present, or `None` otherwise.
 fn extract_named_usize(block: &str, tag: &str) -> Option<usize> {
     let pattern = format!("({} ", tag);
     let pos = block.find(&pattern)?;
@@ -4583,6 +6104,20 @@ fn extract_named_usize(block: &str, tag: &str) -> Option<usize> {
     rest[..end].split_whitespace().next()?.parse::<usize>().ok()
 }
 
+/// Resolves or registers a net ID from an S-expression `(net ...)` clause supporting both numeric IDs
+/// (KiCad 8/9 `(net 4)`) and quoted net names (KiCad 10 `(net "GND")`).
+///
+/// # Arguments
+/// * `block` - S-expression block containing a `(net ...)` attribute.
+/// * `nets` - Mutable board net table where newly encountered net names are appended.
+/// * `net_name_to_id` - Mutable lookup map from net name string to net index.
+///
+/// # Returns
+/// The resolved numeric net ID (`0` if unconnected or missing).
+///
+/// # Side Effects
+/// Appends new net names to `nets` and inserts mappings into `net_name_to_id` when a previously unseen
+/// quoted net name is encountered.
 fn extract_net_id_or_name(
     block: &str,
     nets: &mut Vec<String>,
@@ -4611,6 +6146,19 @@ fn extract_net_id_or_name(
     0
 }
 
+/// Parses a KiCad `(arc (start ...) (mid ...) (end ...) (width ...) (layer ...) (net ...))` block into an [`ArcSegment`].
+///
+/// # Arguments
+/// * `block` - S-expression string for the `(arc ...)` element.
+/// * `active_layers` - Ordered list of active copper layer names (e.g., `["F.Cu", "B.Cu"]`).
+/// * `nets` - Mutable board net list for resolving or inserting quoted net names.
+/// * `net_name_to_id` - Mutable map from net name to net ID.
+///
+/// # Returns
+/// `Some(ArcSegment)` if valid 3-point arc geometry is parsed, or `None` if degenerate/malformed.
+///
+/// # Side Effects
+/// May register new net names in `nets` and `net_name_to_id`.
 fn parse_arc(
     block: &str,
     active_layers: &[&str],
@@ -4633,6 +6181,19 @@ fn parse_arc(
     Some(arc)
 }
 
+/// Parses a KiCad `(segment (start ...) (end ...) (width ...) (layer ...) (net ...))` block into a [`TrackSegment`].
+///
+/// # Arguments
+/// * `block` - S-expression string for the `(segment ...)` element.
+/// * `active_layers` - Ordered list of active copper layer names.
+/// * `nets` - Mutable board net list for resolving or inserting quoted net names.
+/// * `net_name_to_id` - Mutable map from net name to net ID.
+///
+/// # Returns
+/// `Some(TrackSegment)` if `start` and `end` coordinates are valid, or `None` otherwise.
+///
+/// # Side Effects
+/// May register new net names in `nets` and `net_name_to_id`.
 fn parse_segment(
     block: &str,
     active_layers: &[&str],
@@ -4658,6 +6219,18 @@ fn parse_segment(
     })
 }
 
+/// Parses a KiCad `(via (at ...) (size ...) (drill ...) (net ...))` S-expression block into a [`Via`].
+///
+/// # Arguments
+/// * `block` - S-expression string for the `(via ...)` element.
+/// * `nets` - Mutable board net list for resolving or inserting quoted net names.
+/// * `net_name_to_id` - Mutable map from net name to net ID.
+///
+/// # Returns
+/// `Some(Via)` if the `(at X Y)` coordinate is valid, or `None` otherwise.
+///
+/// # Side Effects
+/// May register new net names in `nets` and `net_name_to_id`.
 fn parse_via(
     block: &str,
     nets: &mut Vec<String>,
@@ -4677,6 +6250,14 @@ fn parse_via(
     })
 }
 
+/// Parses a top-level `(gr_text "..." (at X Y [ROT]) (layer "...") (effects (font (size W H))))` block into a [`BoardText`].
+///
+/// # Arguments
+/// * `block` - S-expression string for the `(gr_text ...)` element.
+/// * `byte_offset` - Byte offset of `block` within the raw `.kicad_pcb` source file for in-place span tracking.
+///
+/// # Returns
+/// `Some(BoardText)` if the text literal and `(at ...)` clause are present, or `None` otherwise.
 fn parse_gr_text(block: &str, byte_offset: usize) -> Option<BoardText> {
     let t_start = block.find('"')? + 1;
     let t_end = t_start + block[t_start..].find('"')?;
@@ -4718,6 +6299,14 @@ fn parse_gr_text(block: &str, byte_offset: usize) -> Option<BoardText> {
     })
 }
 
+/// Returns the next whitespace- and parenthesis-delimited token in `s` starting at or after byte index `start`.
+///
+/// # Arguments
+/// * `s` - Input S-expression string slice.
+/// * `start` - Starting byte offset in `s`.
+///
+/// # Returns
+/// Subslice of `s` containing the token (empty slice if `start` is at end or before a delimiter).
 fn next_token(s: &str, start: usize) -> &str {
     let bytes = s.as_bytes();
     let mut i = start;
@@ -4731,6 +6320,15 @@ fn next_token(s: &str, start: usize) -> &str {
     &s[w_start..i]
 }
 
+/// Finds the byte index immediately past the matching closing parenthesis `)` for an S-expression starting at `open_pos`,
+/// ignoring parentheses inside escaped double-quoted strings.
+///
+/// # Arguments
+/// * `bytes` - Raw byte slice of the S-expression document.
+/// * `open_pos` - Byte index of the opening `(` character.
+///
+/// # Returns
+/// `Some(end_byte_offset)` (exclusive) if a balanced closing `)` is found, or `None` if unbalanced.
 fn find_closing_paren(bytes: &[u8], open_pos: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut in_quotes = false;
@@ -4754,6 +6352,14 @@ fn find_closing_paren(bytes: &[u8], open_pos: usize) -> Option<usize> {
     None
 }
 
+/// Parses a 2D [`Point`] from an S-expression prefix tag such as `"(start "` or `"(end "`.
+///
+/// # Arguments
+/// * `s` - S-expression text slice to search within.
+/// * `tag` - Full opening tag prefix including leading parenthesis and trailing space (e.g., `"(start "`).
+///
+/// # Returns
+/// `Some(Point)` in millimeters if parsed, or `None` otherwise.
 fn parse_point_tag(s: &str, tag: &str) -> Option<Point> {
     let p = s.find(tag)?;
     let rest = &s[p + tag.len()..];
@@ -4764,6 +6370,16 @@ fn parse_point_tag(s: &str, tag: &str) -> Option<Point> {
     Some(Point::new(x, y))
 }
 
+/// Approximates a circular arc passing through three points (`p1`, `pm`, `p2`) as a polyline of `steps + 1` vertices.
+///
+/// # Arguments
+/// * `p1` - Arc start point in millimeters.
+/// * `pm` - Arc midpoint on the circumference in millimeters.
+/// * `p2` - Arc end point in millimeters.
+/// * `steps` - Number of linear chord subdivisions.
+///
+/// # Returns
+/// Ordered vector of `Point` vertices along the arc from `p1` to `p2` (falls back to `vec![p1, p2]` if collinear).
 fn discretize_arc(p1: Point, pm: Point, p2: Point, steps: usize) -> Vec<Point> {
     let x1 = p1.x;
     let y1 = p1.y;
@@ -4794,6 +6410,20 @@ fn discretize_arc(p1: Point, pm: Point, p2: Point, steps: usize) -> Vec<Point> {
     pts
 }
 
+/// Parses a graphic element on the `Edge.Cuts` layer (`gr_line`, `gr_arc`, `gr_rect`, `gr_poly`, `gr_circle`),
+/// appending line segments to `lines` and expanding the board bounding box `(min_x, min_y, max_x, max_y)`.
+///
+/// # Arguments
+/// * `block` - S-expression string of the graphic primitive on `Edge.Cuts`.
+/// * `tag` - Graphic element type (`"gr_line"`, `"gr_arc"`, `"gr_rect"`, `"gr_poly"`, or `"gr_circle"`).
+/// * `lines` - Mutable vector of boundary segments `(Point, Point)` to append to.
+/// * `min_x` - Running minimum X coordinate (mm).
+/// * `min_y` - Running minimum Y coordinate (mm).
+/// * `max_x` - Running maximum X coordinate (mm).
+/// * `max_y` - Running maximum Y coordinate (mm).
+///
+/// # Side Effects
+/// Appends discretized boundary edges to `lines` and updates `min_x`, `min_y`, `max_x`, and `max_y`.
 fn parse_edge_cuts_element(
     block: &str,
     tag: &str,
@@ -4891,6 +6521,18 @@ fn parse_edge_cuts_element(
     }
 }
 
+/// Scans an S-expression `block` for all `(start X Y)` and `(end X Y)` coordinate pairs and expands
+/// the bounding box `(min_x, min_y, max_x, max_y)`.
+///
+/// # Arguments
+/// * `block` - S-expression text slice to scan.
+/// * `min_x` - Running minimum X coordinate (mm).
+/// * `min_y` - Running minimum Y coordinate (mm).
+/// * `max_x` - Running maximum X coordinate (mm).
+/// * `max_y` - Running maximum Y coordinate (mm).
+///
+/// # Side Effects
+/// Mutates `min_x`, `min_y`, `max_x`, and `max_y` in place.
 fn extract_coords_into_bounds(block: &str, min_x: &mut f64, min_y: &mut f64, max_x: &mut f64, max_y: &mut f64) {
     for tag in ["(start ", "(end "] {
         let mut idx = 0;
@@ -4914,6 +6556,17 @@ fn extract_coords_into_bounds(block: &str, min_x: &mut f64, min_y: &mut f64, max
     }
 }
 
+/// Scans an S-expression `block` for all `(xy X Y)` vertex tags and expands the bounding box `(min_x, min_y, max_x, max_y)`.
+///
+/// # Arguments
+/// * `block` - S-expression text slice to scan.
+/// * `min_x` - Running minimum X coordinate (mm).
+/// * `min_y` - Running minimum Y coordinate (mm).
+/// * `max_x` - Running maximum X coordinate (mm).
+/// * `max_y` - Running maximum Y coordinate (mm).
+///
+/// # Side Effects
+/// Mutates `min_x`, `min_y`, `max_x`, and `max_y` in place.
 fn extract_xy_into_bounds(block: &str, min_x: &mut f64, min_y: &mut f64, max_x: &mut f64, max_y: &mut f64) {
     let tag = "(xy ";
     let mut idx = 0;
@@ -4936,6 +6589,13 @@ fn extract_xy_into_bounds(block: &str, min_x: &mut f64, min_y: &mut f64, max_x: 
     }
 }
 
+/// Parses an `(at X Y [ROT])` S-expression clause into `(x_mm, y_mm, rotation_deg)`.
+///
+/// # Arguments
+/// * `s` - S-expression slice containing an `(at ...)` clause.
+///
+/// # Returns
+/// `Some((x, y, rotation))` where `rotation` defaults to `0.0` degrees if omitted, or `None` if malformed.
 fn parse_at_xy_rot(s: &str) -> Option<(f64, f64, f64)> {
     let pos = s.find("(at ")?;
     let rest = &s[pos + 4..];
@@ -4947,6 +6607,16 @@ fn parse_at_xy_rot(s: &str) -> Option<(f64, f64, f64)> {
     Some((x, y, rot))
 }
 
+/// Computes in-place byte span replacements for all child `(pad ... (at X Y [ROT]))` clauses inside a footprint
+/// when the footprint's world rotation changes by `delta_rot` degrees (since KiCad stores pad angles in board space).
+///
+/// # Arguments
+/// * `fp_str` - Raw S-expression substring of the `(footprint ...)` block.
+/// * `fp_byte_offset` - Starting byte offset of `fp_str` within the full `.kicad_pcb` file.
+/// * `delta_rot` - Rotation delta in degrees (`new_rot - old_rot`).
+///
+/// # Returns
+/// Vector of `(start_byte, end_byte, replacement_at_clause)` tuples for in-place `.kicad_pcb` patching.
 fn collect_pad_at_replacements(
     fp_str: &str,
     fp_byte_offset: usize,
@@ -5018,6 +6688,14 @@ fn collect_pad_at_replacements(
     reps
 }
 
+/// Extracts the string value of a KiCad `(property "NAME" "VALUE")` clause from an S-expression block.
+///
+/// # Arguments
+/// * `s` - S-expression text slice to search within.
+/// * `prop_name` - Property key to match (e.g., `"Reference"`, `"Value"`).
+///
+/// # Returns
+/// `Some(value_string)` if found, or `None` otherwise.
 fn extract_property(s: &str, prop_name: &str) -> Option<String> {
     let pattern = format!("(property \"{}\" \"", prop_name);
     let pos = s.find(&pattern)?;
@@ -5026,6 +6704,14 @@ fn extract_property(s: &str, prop_name: &str) -> Option<String> {
     Some(s[start..start + end].to_string())
 }
 
+/// Swaps all front (`F.*`) and back (`B.*`) layer references (`Cu`, `SilkS`, `Paste`, `Mask`, `CrtYd`, `Fab`)
+/// inside a footprint S-expression block when a component is flipped between board sides.
+///
+/// # Arguments
+/// * `fp_block` - Raw S-expression string of the footprint block.
+///
+/// # Returns
+/// A new string with all `F.<layer>` and `B.<layer>` tokens exchanged.
 fn swap_footprint_layers(fp_block: &str) -> String {
     let mut s = fp_block.to_string();
     for suffix in ["Cu", "SilkS", "Paste", "Mask", "CrtYd", "Fab"] {
@@ -5039,6 +6725,14 @@ fn swap_footprint_layers(fp_block: &str) -> String {
     s
 }
 
+/// Chains an unordered collection of 2D line segments `(Point, Point)` (with `0.05 mm` endpoint snap tolerance)
+/// into closed [`Polygon`] loops for board outlines (`Edge.Cuts`) and `fp_line` courtyards.
+///
+/// # Arguments
+/// * `lines` - Vector of endpoint pairs `(p1, p2)` in millimeters.
+///
+/// # Returns
+/// Vector of closed [`Polygon`] instances formed by chaining contiguous segments.
 fn chain_lines_into_polygons(mut lines: Vec<(Point, Point)>) -> Vec<Polygon> {
     let mut polys = Vec::new();
     const EPS: f64 = 0.05;
@@ -5082,6 +6776,13 @@ fn chain_lines_into_polygons(mut lines: Vec<(Point, Point)>) -> Vec<Polygon> {
     polys
 }
 
+/// Parses a KiCad `.kicad_dru` dimension literal (supporting `mm`, `um`, `mil`, or unitless `mm`) into millimeters.
+///
+/// # Arguments
+/// * `raw` - Raw dimension token string (e.g., `"0.15mm"`, `"150um"`, `"6mil"`).
+///
+/// # Returns
+/// `Some(value_mm)` converted to millimeters, or `None` if parsing fails.
 fn parse_dru_dimension_mm(raw: &str) -> Option<f64> {
     let s = raw.trim().trim_matches('"').trim();
     if let Some(num_s) = s.strip_suffix("mm") {
@@ -5095,6 +6796,16 @@ fn parse_dru_dimension_mm(raw: &str) -> Option<f64> {
     }
 }
 
+/// Parses KiCad custom design rules (`.kicad_dru` S-expressions) from `content` and applies global or
+/// netclass-scoped minimum constraints onto `rules` and `netclasses`.
+///
+/// # Arguments
+/// * `content` - Raw `.kicad_dru` S-expression text.
+/// * `rules` - Mutable global [`DesignRules`] to tighten with unconditional rules.
+/// * `netclasses` - Mutable map of [`NetClass`] entries to tighten when a `(condition "A.NetClass == '...'")` matches.
+///
+/// # Side Effects
+/// Raises minimum clearances, track widths, via diameters/drills, hole clearances, and edge clearances in `rules` and `netclasses`.
 pub fn apply_dru_rules_to_board(
     content: &str,
     rules: &mut DesignRules,
@@ -5208,6 +6919,14 @@ pub fn apply_dru_rules_to_board(
     }
 }
 
+/// Parses global [`DesignRules`] from either a KiCad `.kicad_pro` JSON project file or a `.kicad_dru`
+/// custom design-rule S-expression file.
+///
+/// # Arguments
+/// * `content` - Raw text of the `.kicad_pro` or `.kicad_dru` file.
+///
+/// # Returns
+/// `Some(DesignRules)` if design rule settings were found, or `None` if neither JSON design settings nor DRU constraints exist.
 pub fn parse_design_rules_from_pro_or_dru(content: &str) -> Option<DesignRules> {
     let trimmed = content.trim_start();
     if trimmed.starts_with('{') {
@@ -5269,6 +6988,14 @@ pub fn parse_design_rules_from_pro_or_dru(content: &str) -> Option<DesignRules> 
     }
 }
 
+/// Parses a map of named [`NetClass`] definitions from either a KiCad `.kicad_pro` JSON file or
+/// `(net_class ...)` S-expression blocks in a `.kicad_pcb` file.
+///
+/// # Arguments
+/// * `content` - Raw `.kicad_pro` JSON or `.kicad_pcb` S-expression content.
+///
+/// # Returns
+/// `HashMap<String, NetClass>` mapping netclass names (such as `"Default"`, `"Power"`) to their parsed rules.
 pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetClass> {
     let mut netclasses = HashMap::new();
     let trimmed = content.trim_start();
@@ -5508,6 +7235,21 @@ pub fn parse_netclasses_from_pro_or_pcb(content: &str) -> HashMap<String, NetCla
     netclasses
 }
 
+/// Parses a KiCad `(footprint ...)` or `(module ...)` S-expression block into a [`Footprint`],
+/// extracting pads, courtyard polygons (decomposed into convex/rectilinear pieces), swap groups, and byte spans.
+///
+/// # Arguments
+/// * `fp_str` - S-expression substring of the footprint block.
+/// * `fp_byte_offset` - Starting byte offset of `fp_str` within the full `.kicad_pcb` source file.
+/// * `nets` - Mutable board net table for registering newly encountered net names.
+/// * `net_name_to_id` - Mutable lookup map from net name to net ID.
+/// * `extra_locked` - Set of user-specified reference designators to mark as locked (`is_locked = true`).
+///
+/// # Returns
+/// `Some(Footprint)` if the footprint has a valid `"Reference"` property, or `None` otherwise.
+///
+/// # Side Effects
+/// May append newly discovered pad net names into `nets` and `net_name_to_id`.
 fn parse_footprint(
     fp_str: &str,
     fp_byte_offset: usize,
@@ -6032,16 +7774,26 @@ fn parse_footprint(
     Some(fp)
 }
 
+/// Execution phase of an interactive or headless Vulcan's Trials auto-placement and auto-routing run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrialPhase {
+    /// No active trial is running; the board is idle and ready for editing or trial launch.
     Idle,
+    /// Phase 1a: Resolving initial courtyard overlaps and boundary violations (`legalize_placement`).
     Legalizing,
+    /// Phase 1b: Running GPU/CPU Parallel Tempering Simulated Annealing auto-placement (`run_auto_placer`).
     AutoPlacing,
+    /// Phase 2: Running multi-layer PathFinder negotiated-congestion and A* auto-routing (`AutoRouter`).
     AutoRouting,
+    /// All requested placement and/or routing phases have finished.
     Completed,
 }
 
 impl TrialPhase {
+    /// Returns a human-readable status banner label describing the current [`TrialPhase`].
+    ///
+    /// # Returns
+    /// A static string slice suitable for GUI status bars and progress logs.
     pub fn label(&self) -> &'static str {
         match self {
             TrialPhase::Idle => "Idle — Ready",
@@ -6053,27 +7805,52 @@ impl TrialPhase {
     }
 }
 
+/// Thread-safe shared state snapshot connecting background placement/routing worker threads with the
+/// real-time `eframe`/`egui` GUI canvas and MCP status endpoints.
 #[derive(Debug, Clone)]
 pub struct LiveTrialState {
+    /// Current working [`Board`] geometry (footprints, tracks, arcs, vias, zones).
     pub board: Board,
+    /// Current Prim's Euclidean minimum spanning tree airwire segments in board space (`mm`).
     pub ratsnest: Vec<Segment>,
+    /// Current execution phase of the trial pipeline.
     pub phase: TrialPhase,
+    /// Normalized progress ratio in `` `[0.0, 1.0]` `` for the active phase.
     pub progress: f32,
+    /// Most recent single-line status message displayed in the GUI header.
     pub status_text: String,
+    /// Ring buffer (capped at 250 lines) of chronological trial log messages.
     pub log_lines: Vec<String>,
+    /// Number of pairwise ratsnest airwire intersections in the current placement.
     pub crossings: usize,
+    /// Total Euclidean MST ratsnest wirelength in millimeters (`mm`).
     pub wirelength_mm: f64,
+    /// Number of unresolved footprint courtyard overlaps.
     pub overlaps: usize,
+    /// Current auto-placer evaluation throughput in state evaluations per second (`evals/s`).
     pub evals_per_sec: f64,
+    /// Number of net connections successfully routed in the current routing pass.
     pub routed_conns: usize,
+    /// Total number of net connections scheduled for routing.
     pub total_conns: usize,
+    /// Current PathFinder / rip-up-and-reroute iteration pass index (1-based when active).
     pub routing_pass: usize,
+    /// Optional snapshot of octilinear `(tracks, arcs)` prior to organic tangent-arc conversion.
     pub straight_copper_snapshot: Option<(Vec<TrackSegment>, Vec<ArcSegment>)>,
+    /// Fillet radius in millimeters (`mm`) used when smoothing acute track junctions.
     pub acid_trap_fillet_radius: f64,
+    /// Whether vias are permitted inside SMD pad copper areas during routing.
     pub allow_via_in_pad: bool,
 }
 
 impl LiveTrialState {
+    /// Constructs a new [`LiveTrialState`] initialized from `board` and computes its initial ratsnest metrics.
+    ///
+    /// # Arguments
+    /// * `board` - Initial [`Board`] instance to wrap.
+    ///
+    /// # Returns
+    /// A newly initialized [`LiveTrialState`] in [`TrialPhase::Idle`].
     pub fn new(board: Board) -> Self {
         let allow_via_in_pad = board.allow_via_in_pad();
         let mut state = Self {
@@ -6098,6 +7875,11 @@ impl LiveTrialState {
         state
     }
 
+    /// Recomputes all world-space pad coordinates, regenerates the Prim's MST `ratsnest` segments,
+    /// and updates `wirelength_mm` and pairwise `crossings`.
+    ///
+    /// # Side Effects
+    /// Updates `self.ratsnest`, `self.wirelength_mm`, and `self.crossings` in place.
     pub fn refresh_ratsnest(&mut self) {
         let pad_pos: Vec<Vec<Point>> = self
             .board
@@ -6122,6 +7904,14 @@ impl LiveTrialState {
         self.crossings = crossings;
     }
 
+    /// Appends a timestamped/formatted status message to `log_lines` (evicting the oldest entry if over 250 lines)
+    /// and updates `status_text`.
+    ///
+    /// # Arguments
+    /// * `msg` - Status string or displayable message to record.
+    ///
+    /// # Side Effects
+    /// Mutates `self.status_text` and `self.log_lines`.
     pub fn push_log(&mut self, msg: impl Into<String>) {
         let s = msg.into();
         self.status_text = s.clone();
@@ -8416,5 +10206,5 @@ mod tests {
         let _ = std::fs::remove_file(&dru_path);
         let _ = std::fs::remove_file(bak_entry.path());
     }
-}
 
+}

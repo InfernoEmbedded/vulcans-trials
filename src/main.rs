@@ -1,6 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
+//! # Vulcan's Trials CLI, GUI & MCP Entrypoint (`vulcans-trials`)
+//!
+//! Primary executable entrypoint for **Vulcan's Trials**, supporting four distinct operational modes:
+//!
+//! 1. **Interactive 2D GUI Mode (default):** Launches the native `eframe`/`egui` desktop window
+//!    ([`VulcansTrialsApp`]) with a real-time 2D PCB canvas, layer visibility toggles, interactive
+//!    placement/routing controls, and live CPU/GPU telemetry sparklines.
+//! 2. **Headless CLI Batch Mode (`--headless`):** Executes automated component placement (`place`),
+//!    multi-layer negotiated-congestion routing (`route`), or both (`both`), then writes the updated
+//!    `.kicad_pcb` and Specctra `.ses` files to disk (and optionally syncs to an open KiCad 10
+//!    instance over IPC).
+//! 3. **Model Context Protocol (MCP) Server Mode (`--mcp` / `--mcp-tcp`):** Runs a JSON-RPC 2.0
+//!    MCP server over standard I/O or a TCP socket so autonomous AI agents can inspect, place,
+//!    route, and verify KiCad boards programmatically.
+//! 4. **Self-Verification Mode (`--self-test`):** Runs a built-in diagnostic suite verifying the
+//!    Vulkan WGSL distance field shader, Separating Axis Theorem (SAT) courtyard collision math,
+//!    BGA dog-bone fanout generation, TopoR any-angle tangent arcs, and KiCad 10 IPC batch framing.
+
 use clap::Parser;
 use std::collections::HashSet;
 use std::path::Path;
@@ -13,6 +31,7 @@ use vulcans_trials::placer::{run_auto_placer, PlacementConfig};
 use vulcans_trials::router::{apply_any_angle_tangent_arcs, AutoRouter, RoutingGrid};
 use vulcans_trials::vulkan::VulkanEngine;
 
+/// Command-line arguments parsed via `clap` for configuring `vulcans-trials` execution.
 #[derive(Parser, Debug)]
 #[command(
     name = "vulcans-trials",
@@ -21,84 +40,92 @@ use vulcans_trials::vulkan::VulkanEngine;
     about = "Vulcan's Trials — Vulkan GPU + Multithreaded CPU Auto-Placer & Auto-Router for KiCad (GPLv3)"
 )]
 struct Args {
-    /// Input KiCad PCB file (.kicad_pcb)
+    /// Input KiCad PCB file (`.kicad_pcb`).
     #[arg(short, long)]
     input: Option<String>,
 
-    /// Output KiCad PCB file (.kicad_pcb) [defaults to input PCB file]
+    /// Output KiCad PCB file (`.kicad_pcb`) (defaults to the input PCB file path if omitted).
     #[arg(short, long)]
     output: Option<String>,
 
-    /// Run in headless CLI mode instead of launching the interactive GUI
+    /// Run in headless CLI mode instead of launching the interactive GUI.
     #[arg(long)]
     headless: bool,
 
-    /// Trial mode in headless execution: "place", "route", or "both"
+    /// Trial mode in headless execution: `"place"`, `"route"`, or `"both"`.
     #[arg(short, long, default_value = "both")]
     mode: String,
 
-    /// Auto-placement duration in seconds
+    /// Auto-placement duration in seconds (`s`).
     #[arg(short, long, default_value_t = 10)]
     duration: u64,
 
-    /// Routing grid resolution in mm
+    /// Routing grid resolution in millimeters (`mm`).
     #[arg(short, long, default_value_t = 0.10)]
     res: f64,
 
-    /// Maximum rip-up and reroute passes
+    /// Maximum rip-up and reroute passes for negotiated-congestion routing.
     #[arg(long, default_value_t = 15)]
     passes: usize,
 
-    /// Additional comma-separated component references to lock
+    /// Additional comma-separated component references to lock (e.g., `"U1,J2,R5"`).
     #[arg(long, default_value = "")]
     lock: String,
 
-    /// Penalty factor for routing non-plane signals across inner power plane layers
+    /// Penalty factor for routing non-plane signals across inner power plane layers.
     #[arg(long, default_value_t = 8.0)]
     inner_plane_penalty: f64,
 
-    /// Enable TopoR-style any-angle topological routing (homotopic rubber-band & tangent arcs)
+    /// Enable TopoR-style any-angle topological routing (homotopic rubber-band & tangent arcs).
     #[arg(long)]
     any_angle: bool,
 
-    /// Automatic acute-angle (< 90°) acid-trap fillet radius in mm (0.0 to disable)
+    /// Automatic acute-angle (< 90 degrees) acid-trap fillet radius in millimeters (`mm`, `0.0` to disable).
     #[arg(long, default_value_t = 0.35)]
     fillet_radius: f64,
 
-    /// Allow vias to be placed inside SMD pads of the same net (disabled by default)
+    /// Allow vias to be placed inside SMD pads of the same net (disabled by default).
     #[arg(long)]
     via_in_pad: bool,
 
-    /// Connect to KiCad 10 IPC socket for real-time live canvas streaming (optional socket path)
+    /// Connect to KiCad 10 IPC socket for real-time live canvas streaming (optional socket path).
     #[arg(long, num_args = 0..=1, default_missing_value = "")]
     kicad_ipc: Option<String>,
 
-    /// Run built-in self-verification suite (Vulkan compute, SAT geometry, router grid)
+    /// Run built-in self-verification suite (Vulkan compute, SAT geometry, router grid).
     #[arg(long)]
     self_test: bool,
 
-    /// Optional KiCad IPC streaming socket endpoint or named pipe
+    /// Optional KiCad IPC streaming socket endpoint or named pipe.
     #[arg(long)]
     ipc: Option<String>,
 
-    /// Run as a Model Context Protocol (MCP) server over standard I/O (JSON-RPC 2.0)
+    /// Run as a Model Context Protocol (MCP) server over standard I/O (JSON-RPC 2.0).
     #[arg(long)]
     mcp: bool,
 
-    /// Run as a Model Context Protocol (MCP) server over TCP listening on <bind_addr> (e.g. 127.0.0.1:8765)
+    /// Run as a Model Context Protocol (MCP) server over TCP listening on `<bind_addr>` (e.g. `127.0.0.1:8765`).
     #[arg(long, value_name = "BIND_ADDR")]
     mcp_tcp: Option<String>,
 
-    /// Automatically trigger auto-placement and auto-routing after opening the GUI
+    /// Automatically trigger auto-placement and auto-routing after opening the GUI.
     #[arg(long)]
     auto_start: bool,
 
-    /// Automatically close the application N seconds after trial completes
+    /// Automatically close the application `N` seconds after the trial completes.
     #[arg(long)]
     auto_exit: Option<u64>,
 }
 
 impl Args {
+    /// Resolves the destination `.kicad_pcb` output file path according to CLI precedence rules.
+    ///
+    /// Returns [`Args::output`] if explicitly provided, falls back to [`Args::input`] for in-place
+    /// saving, or defaults to `"vulcans_trials_out.kicad_pcb"` if neither path is specified.
+    ///
+    /// # Returns
+    ///
+    /// The resolved output `.kicad_pcb` filesystem path as a `String`.
     pub fn resolved_output_path(&self) -> String {
         if let Some(ref out) = self.output {
             return out.clone();
@@ -110,6 +137,17 @@ impl Args {
     }
 }
 
+/// Parses a comma-separated string of component reference designators into a deduplicated set.
+///
+/// Trims leading and trailing whitespace around each token and discards empty entries.
+///
+/// # Arguments
+///
+/// * `lock_arg` - Comma-separated reference designator list (e.g., `"U1, J2, R5"`).
+///
+/// # Returns
+///
+/// A [`HashSet<String>`] containing all non-empty trimmed component reference designators.
 fn parse_locked_refs(lock_arg: &str) -> HashSet<String> {
     lock_arg
         .split(',')
@@ -118,6 +156,30 @@ fn parse_locked_refs(lock_arg: &str) -> HashSet<String> {
         .collect()
 }
 
+/// Executes the built-in self-verification diagnostic suite (`--self-test`).
+///
+/// Validates five core subsystems:
+/// 1. **Vulkan Compute Engine & WGSL Distance Field Shader:** Verifies GPU initialization (or CPU
+///    fallback) and checks exact Euclidean distance values ($d(0)=0.0$, $d(3)=3.0$) on a $16 \times 16$ grid.
+/// 2. **SAT Courtyard Polygon Collision & Segment Crossing Math:** Verifies [`Polygon::intersects_convex`]
+///    for overlapping vs. disjoint squares and [`Segment::crosses`] for intersecting segments.
+/// 3. **BGA Package Detection & Quadrant Dog-Bone Fanout:** Constructs a synthetic $4 \times 4$
+///    $0.8\text{ mm}$-pitch BGA footprint, confirms [`vulcans_trials::board::Footprint::is_bga`], and checks that
+///    [`vulcans_trials::router::generate_bga_dogbone_escapes`] emits 4 quadrant fanout vias.
+/// 4. **TopoR Any-Angle Tangent Arc Geometry:** Verifies [`apply_any_angle_tangent_arcs`] on an
+///    orthogonal corner.
+/// 5. **KiCad 10 IPC Protocol & Batch Streaming:** Queues footprint move, track, and via commands
+///    into a mock [`vulcans_trials::ipc::KiCadIpcClient`] and verifies batch flushing.
+///
+/// # Returns
+///
+/// * `Ok(())` if all five verification stages pass.
+/// * `Err(String)` describing the specific subsystem assertion that failed.
+///
+/// # Side Effects
+///
+/// * Initializes a [`VulkanEngine`] GPU context if supported hardware is present.
+/// * Prints `[PASS]` / `[NOTE]` diagnostic status lines to `stdout`.
 fn run_self_test() -> Result<(), String> {
     println!("=== Vulcan's Trials v{} (InfernoEmbedded) — Self-Test Suite ===", env!("CARGO_PKG_VERSION"));
 
@@ -265,6 +327,32 @@ fn run_self_test() -> Result<(), String> {
     Ok(())
 }
 
+/// Runs a headless CLI placement and/or routing trial on `board` and saves the resulting
+/// `.kicad_pcb` and Specctra `.ses` files to disk.
+///
+/// Depending on `args.mode` (`"place"`, `"route"`, or `"both"`), executes [`run_auto_placer`]
+/// and/or [`AutoRouter::route_all`], refills copper zones in the saved `.kicad_pcb` via
+/// [`Board::refill_zones_in_file`], exports the `.ses` session file, and synchronizes changes
+/// to a running KiCad 10 instance over IPC if connected.
+///
+/// # Arguments
+///
+/// * `args` - Parsed CLI [`Args`] controlling mode, duration, grid resolution, passes, and output path.
+/// * `board` - Mutable reference to the loaded [`Board`] to place and/or route in-place.
+/// * `vulkan` - Optional shared [`VulkanEngine`] handle for GPU-accelerated placement and distance fields.
+/// * `ipc` - Optional shared mutex-guarded [`vulcans_trials::ipc::KiCadIpcClient`] for live streaming and final board sync.
+///
+/// # Returns
+///
+/// * `Ok(())` when placement/routing and `.kicad_pcb` + `.ses` file export succeed.
+/// * `Err(String)` if writing the `.kicad_pcb` or `.ses` file fails.
+///
+/// # Side Effects
+///
+/// * Mutates `board` footprints, tracks, arcs, and vias in-place.
+/// * Writes the output `.kicad_pcb` and `.ses` files to disk and invokes `kicad-cli` zone refilling if available.
+/// * Streams live updates and pushes the final board over the KiCad IPC socket when connected.
+/// * Prints summary metrics to `stdout`.
 fn run_headless_trial(
     args: &Args,
     board: &mut Board,
@@ -348,6 +436,21 @@ fn run_headless_trial(
 // it parses process-global `std::env::args`, calls `std::process::exit(1)` on error, or blocks
 // on an OS window event loop via `eframe::run_native`. All underlying logic (`Args`,
 // `parse_locked_refs`, `run_self_test`, `run_headless_trial`) is unit-tested below.
+/// Process entrypoint for the `vulcans-trials` binary.
+///
+/// Parses command-line [`Args`], initializes the [`vulcans_trials::memlog`] watchdog, probes for
+/// a [`VulkanEngine`] GPU adapter, and dispatches to `--self-test`, the MCP server (`--mcp` /
+/// `--mcp-tcp`), headless batch execution (`--headless`), or the interactive `eframe` 2D GUI.
+///
+/// # Side Effects
+///
+/// * Spawns the background memory watchdog thread via [`vulcans_trials::memlog::init_memlog`].
+/// * Initializes Vulkan GPU resources if available.
+/// * Connects to or auto-discovers a KiCad 10 IPC socket when available.
+/// * Reads/writes `.kicad_pcb` and `.ses` files, serves MCP requests over `stdio`/TCP, or opens
+///   a native desktop GUI window.
+/// * Calls `std::process::exit(1)` if `--self-test`, MCP transport, board loading, or headless
+///   execution fails.
 fn main() {
     let args = Args::parse();
     vulcans_trials::memlog::init_memlog(None);
@@ -475,6 +578,7 @@ fn main() {
         return;
     }
 
+    /// Embedded $256 \times 256$ PNG application window icon bytes.
     pub const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon_256x256.png");
 
     let duration = args.duration;

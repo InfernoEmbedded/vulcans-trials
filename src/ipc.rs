@@ -1,6 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
+//! KiCad 8/9/10 Inter-Process Communication (IPC) client and Protocol Buffers wire engine.
+//!
+//! This module provides real-time and batch synchronization between Vulcan's Trials and a
+//! running KiCad PCBNew session over Unix domain sockets. It supports two transport modes:
+//!
+//! 1. **Native KiCad 9/10 NNG + Protobuf (`kiapi.*`) IPC:** Dynamically loads `libnng.so.1`
+//!    (`Req0` socket dialect) to communicate with KiCad's native API server (typically at
+//!    `/tmp/kicad/api.sock`). Encodes and decodes `kiapi.common.*` and `kiapi.board.*`
+//!    Protocol Buffers wire messages directly without external codegen dependencies.
+//! 2. **Line-Delimited JSON over `UnixStream`:** Used for lightweight streaming telemetry,
+//!    60 FPS (~16 ms) rate-limited viewport updates during Simulated Annealing placement
+//!    and PathFinder autorouting, and deterministic mock socket integration tests.
+//!
+//! # Synchronization Capabilities
+//! - **Socket Discovery:** Automatically probes `$KICAD_IPC_PATH`, `$KICAD_IPC_SOCKET`,
+//!   `$KICAD_API_SOCKET`, `/tmp/kicad/api.sock`, `$XDG_RUNTIME_DIR/kicad/`, and `/tmp/`.
+//! - **Board Push/Pull Sync:** Synchronizes saved `.kicad_pcb` and Specctra `.ses` state into
+//!   KiCad via atomic `RevertDocument` reload or transactional `BeginCommit` / `EndCommit`
+//!   batches (`FlipItems`, `UpdateItems`, `DeleteItems`, `CreateItems`, `RefillZones`, and
+//!   `RefreshEditor`).
+//! - **Footprint & Group Coordinate Transforms:** Applies rigid-body rotation and translation
+//!   in nanometers (`nm`) and degrees (`deg`) across `FootprintInstance` protobuf trees,
+//!   including child fields, pads, pad net reassignments from pin/gate swapping, graphic shapes,
+//!   polygons, and keepout/copper zones.
+
 use crate::board::{Board, Footprint, Point};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -20,72 +45,109 @@ use std::os::unix::net::UnixStream;
 pub enum IpcMessage {
     /// Handshake initiating session between Vulcan's Trials and KiCad 10.
     Handshake {
+        /// Human-readable client application name (`"Vulcan's Trials"`).
         client: String,
+        /// Semantic version string of the client crate (`CARGO_PKG_VERSION`).
         version: String,
     },
     /// Live displacement update for an existing footprint.
     MoveFootprint {
+        /// Component reference designator (e.g., `"U1"`, `"R12"`).
         reference: String,
+        /// Target X coordinate in millimeters (`mm`).
         x: f64,
+        /// Target Y coordinate in millimeters (`mm`).
         y: f64,
+        /// Target orientation angle in degrees (`deg`).
         rotation: f64,
     },
     /// Direct addition of a routed copper track segment.
     AddTrack {
+        /// Track start `(x, y)` coordinates in millimeters (`mm`).
         start: (f64, f64),
+        /// Track end `(x, y)` coordinates in millimeters (`mm`).
         end: (f64, f64),
+        /// Copper trace width in millimeters (`mm`).
         width: f64,
+        /// KiCad copper layer name (e.g., `"F.Cu"`, `"In1.Cu"`, `"B.Cu"`).
         layer: String,
+        /// Internal board net identifier (`0` for unconnected).
         net_id: usize,
     },
     /// Direct addition of a routed via.
     AddVia {
+        /// Via center `(x, y)` coordinates in millimeters (`mm`).
         position: (f64, f64),
+        /// Overall copper annular ring outer diameter in millimeters (`mm`).
         size: f64,
+        /// Finished drill hole diameter in millimeters (`mm`).
         drill: f64,
+        /// Internal board net identifier (`0` for unconnected).
         net_id: usize,
     },
     /// Clear all dynamic autorouted tracks and vias before rerouting pass.
     ClearTracks,
     /// Atomically flush pending canvas mutations and trigger 60 FPS viewport repaint.
     CommitBatch,
-    /// Pull and synchronize the saved board (.kicad_pcb and .ses) into KiCad.
+    /// Pull and synchronize the saved board (`.kicad_pcb` and `.ses`) into KiCad.
     PullBoard {
+        /// Filesystem path to the saved `.kicad_pcb` board file.
         pcb_path: String,
+        /// Filesystem path to the exported Specctra `.ses` session file.
         ses_path: String,
     },
 }
 
+/// Type alias for [`IpcMessage`] representing an outgoing IPC command payload.
 pub type IpcCommand = IpcMessage;
 
 /// Client connection managing the KiCad 10 IPC socket connection, stream buffering,
 /// delta calculation, and ~60 FPS rate-limited throttling.
 pub struct KiCadIpcClient {
+    /// Underlying Unix domain stream socket for line-delimited JSON IPC connections.
     #[cfg(unix)]
     stream: Option<UnixStream>,
+    /// Native KiCad 9/10 NNG (`libnng.so.1`) + Protocol Buffers client handle, if connected to an NNG endpoint.
     nng: Option<NngKiCadClient>,
+    /// Normalized filesystem path to the connected Unix domain socket.
     socket_path: Option<PathBuf>,
+    /// Whether the client currently holds an active, healthy socket connection.
     is_connected: bool,
 
     // Throttling configuration (default 16ms for ~60 FPS viewport refresh)
+    /// Minimum time interval between consecutive batch flushes (defaults to 16 ms for ~60 FPS).
     throttle_interval: Duration,
+    /// Timestamp of the most recent batch commit or board push.
     last_flush_time: Instant,
 
     // Footprint displacement coalescing buffer: reference -> (x, y, rotation)
+    /// Coalescing buffer mapping footprint reference designator to latest pending `(x_mm, y_mm, rotation_deg)`.
     pending_moves: HashMap<String, (f64, f64, f64)>,
     // Last sent positions to suppress redundant sub-millimeter noise
+    /// Cache of last transmitted `(x_mm, y_mm, rotation_deg)` per footprint reference to filter sub-5-micron noise.
     last_sent_moves: HashMap<String, (f64, f64, f64)>,
 
     // Queue of pending copper mutations
+    /// Queued [`IpcMessage::AddTrack`] commands awaiting the next batch commit.
     pending_tracks: Vec<IpcMessage>,
+    /// Queued [`IpcMessage::AddVia`] commands awaiting the next batch commit.
     pending_vias: Vec<IpcMessage>,
 
     // Telemetry & metrics
+    /// Cumulative count of individual IPC messages or board items transmitted over the session.
     total_messages_sent: usize,
+    /// Cumulative count of atomic [`IpcMessage::CommitBatch`] flushes completed.
     total_batches_committed: usize,
 }
 
 impl std::fmt::Debug for KiCadIpcClient {
+    /// Formats the [`KiCadIpcClient`] connection status, queue lengths, and telemetry counters for debugging.
+    ///
+    /// # Arguments
+    /// * `f` - The mutable formatter state to write diagnostic fields into.
+    ///
+    /// # Returns
+    /// `std::fmt::Result` indicating whether formatting succeeded.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KiCadIpcClient")
             .field("socket_path", &self.socket_path)
@@ -103,6 +165,12 @@ impl std::fmt::Debug for KiCadIpcClient {
 
 /// Returns true if `path` refers to a native KiCad 9/10 NNG IPC socket (such as `/tmp/kicad/api.sock`)
 /// rather than a mock line-delimited JSON `UnixListener` test socket (`/tmp/kicad_ipc_test_*.sock`).
+///
+/// # Arguments
+/// * `path` - Filesystem path to the candidate Unix domain socket.
+///
+/// # Returns
+/// `true` if the filename or parent directory matches native KiCad NNG socket naming conventions; `false` otherwise.
 pub fn is_native_kicad_nng_socket_path(path: &Path) -> bool {
     let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let parent_name = path
@@ -118,6 +186,9 @@ pub fn is_native_kicad_nng_socket_path(path: &Path) -> bool {
 
 impl KiCadIpcClient {
     /// Creates a new unconnected IPC client instance with default 60 FPS (16ms) throttling.
+    ///
+    /// # Returns
+    /// An unconnected [`KiCadIpcClient`] with empty coalescing buffers and a 16 ms throttle interval.
     pub fn new() -> Self {
         Self {
             #[cfg(unix)]
@@ -137,6 +208,12 @@ impl KiCadIpcClient {
     }
 
     /// Normalizes a socket path string, stripping `ipc://` or `ipc:` URI schemes.
+    ///
+    /// # Arguments
+    /// * `path` - Raw socket path or URI string (e.g., `"ipc:///tmp/kicad/api.sock"` or `"/tmp/kicad/api.sock"`).
+    ///
+    /// # Returns
+    /// A [`PathBuf`] containing the stripped filesystem path.
     pub fn normalize_socket_path(path: &str) -> PathBuf {
         let trimmed = path.trim();
         let stripped = if let Some(s) = trimmed.strip_prefix("ipc://") {
@@ -152,6 +229,19 @@ impl KiCadIpcClient {
     /// Connects to a specific Unix domain socket path and performs initial handshake.
     /// Uses native NNG Req0 + Protobuf (`kiapi.*`) for KiCad 9/10 sockets (`/tmp/kicad/api.sock`),
     /// and line-delimited JSON over `UnixStream` for mock test sockets.
+    ///
+    /// # Arguments
+    /// * `path` - Target Unix domain socket path or `ipc://` URI.
+    ///
+    /// # Returns
+    /// Connected [`KiCadIpcClient`] ready for streaming or board synchronization.
+    ///
+    /// # Side Effects
+    /// Opens a Unix domain socket or NNG `Req0` dialer and transmits an initial handshake or `Ping` message.
+    ///
+    /// # Errors
+    /// Returns `std::io::Error` if the socket does not exist, connection is refused, NNG library loading fails,
+    /// or the initial handshake/ping times out.
     pub fn connect<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let p = Self::normalize_socket_path(&path.as_ref().to_string_lossy());
         if is_native_kicad_nng_socket_path(&p) {
@@ -209,15 +299,53 @@ impl KiCadIpcClient {
     }
 
     /// Attempts to connect to a custom path if given, or automatically discovers an active KiCad 10 IPC socket.
+    ///
+    /// # Arguments
+    /// * `custom_path` - Optional user-specified socket path or URI override.
+    ///
+    /// # Returns
+    /// `Some(KiCadIpcClient)` if connection succeeded, or `None` if no reachable socket was found.
+    ///
+    /// # Side Effects
+    /// Performs socket discovery I/O and prints connection status or diagnostic errors to stdout/stderr.
+    ///
+    /// # Errors
+    /// Returns `None` if both the custom path (when provided) and auto-discovered paths fail to connect.
     pub fn connect_or_discover(custom_path: Option<&str>) -> Option<Self> {
         Self::connect_or_discover_inner(custom_path, false)
     }
 
     /// Quietly attempts to connect to a custom path or discover an active KiCad 10 IPC socket without logging to stderr on retry failure.
+    ///
+    /// # Arguments
+    /// * `custom_path` - Optional user-specified socket path or URI override.
+    ///
+    /// # Returns
+    /// `Some(KiCadIpcClient)` if connection succeeded, or `None` if no reachable socket was found.
+    ///
+    /// # Side Effects
+    /// Performs socket discovery and connection I/O silently without printing to stdout or stderr.
+    ///
+    /// # Errors
+    /// Returns `None` if no active KiCad IPC socket can be found or connected.
     pub fn connect_or_discover_quiet(custom_path: Option<&str>) -> Option<Self> {
         Self::connect_or_discover_inner(custom_path, true)
     }
 
+    /// Internal implementation of socket connection and fallback discovery with configurable logging verbosity.
+    ///
+    /// # Arguments
+    /// * `custom_path` - Optional explicit socket path to try before falling back to discovery (if it was the default `/tmp/kicad/api.sock`).
+    /// * `quiet` - When `true`, suppresses stdout and stderr connection diagnostics.
+    ///
+    /// # Returns
+    /// `Some(KiCadIpcClient)` when a connection is established, or `None` on failure.
+    ///
+    /// # Side Effects
+    /// Connects to a Unix socket and optionally writes status logs to stdout/stderr.
+    ///
+    /// # Errors
+    /// Returns `None` if the explicit non-default socket fails or if auto-discovery finds no responsive socket.
     fn connect_or_discover_inner(custom_path: Option<&str>, quiet: bool) -> Option<Self> {
         if let Some(cp) = custom_path {
             let norm = Self::normalize_socket_path(cp);
@@ -269,11 +397,20 @@ impl KiCadIpcClient {
 
     /// Discovers active KiCad 10 IPC Unix socket paths on Linux/macOS.
     /// Checks:
-    /// 1. $KICAD_IPC_PATH, $KICAD_IPC_SOCKET, or $KICAD_API_SOCKET env vars (supports ipc:// prefix)
-    /// 2. Well-known KiCad 9/10 socket paths (/tmp/kicad/api.sock, /tmp/kicad.sock)
-    /// 3. $XDG_RUNTIME_DIR/kicad/
-    /// 4. /tmp/kicad/
-    /// 5. /tmp/
+    /// 1. `$KICAD_IPC_PATH`, `$KICAD_IPC_SOCKET`, or `$KICAD_API_SOCKET` env vars (supports `ipc://` prefix)
+    /// 2. Well-known KiCad 9/10 socket paths (`/tmp/kicad/api.sock`, `/tmp/kicad.sock`)
+    /// 3. `$XDG_RUNTIME_DIR/kicad/`
+    /// 4. `/tmp/kicad/`
+    /// 5. `/tmp/`
+    ///
+    /// # Returns
+    /// `Some(PathBuf)` pointing to the first existing KiCad IPC socket discovered, or `None` if none exist.
+    ///
+    /// # Side Effects
+    /// Reads process environment variables and queries filesystem metadata in `/tmp` and `$XDG_RUNTIME_DIR`.
+    ///
+    /// # Errors
+    /// Returns `None` if no matching socket file exists on the filesystem.
     pub fn discover_socket_path() -> Option<PathBuf> {
         // 1. Environment variable override
         if let Ok(env_path) = env::var("KICAD_IPC_PATH")
@@ -321,31 +458,59 @@ impl KiCadIpcClient {
     }
 
     /// Returns whether the client is currently connected.
+    ///
+    /// # Returns
+    /// `true` if the client has an active NNG or `UnixStream` socket connection; `false` otherwise.
     pub fn is_connected(&self) -> bool {
         self.is_connected
     }
 
     /// Returns the socket path connected to, if any.
+    ///
+    /// # Returns
+    /// `Some(&Path)` referencing the connected Unix domain socket path, or `None` if unconnected.
     pub fn socket_path(&self) -> Option<&Path> {
         self.socket_path.as_deref()
     }
 
     /// Sets the minimum throttling interval between flushes (e.g. 16.6ms for 60 FPS).
+    ///
+    /// # Arguments
+    /// * `interval` - Minimum [`Duration`] required between automatic streaming batch commits.
+    ///
+    /// # Side Effects
+    /// Updates `self.throttle_interval`.
     pub fn set_throttle_interval(&mut self, interval: Duration) {
         self.throttle_interval = interval;
     }
 
     /// Returns current throttling interval.
+    ///
+    /// # Returns
+    /// The configured minimum [`Duration`] between streaming flushes.
     pub fn throttle_interval(&self) -> Duration {
         self.throttle_interval
     }
 
     /// Total messages sent and total batches committed.
+    ///
+    /// # Returns
+    /// A tuple `(total_messages_sent, total_batches_committed)` for telemetry reporting.
     pub fn stats(&self) -> (usize, usize) {
         (self.total_messages_sent, self.total_batches_committed)
     }
 
     /// Sends the initial Handshake message.
+    ///
+    /// # Returns
+    /// `Ok(())` when the handshake (or NNG `Ping`) succeeds.
+    ///
+    /// # Side Effects
+    /// Writes a `Ping` protobuf request (NNG mode) or `IpcMessage::Handshake` JSON line (`UnixStream` mode)
+    /// to the socket and increments `self.total_messages_sent`.
+    ///
+    /// # Errors
+    /// Returns `std::io::Error` if the socket write or NNG request fails.
     pub fn send_handshake(&mut self) -> std::io::Result<()> {
         if let Some(ref mut nng) = self.nng {
             nng.ping()?;
@@ -360,6 +525,19 @@ impl KiCadIpcClient {
     }
 
     /// Directly serializes and writes an IPC message as a single line JSON over the socket.
+    ///
+    /// # Arguments
+    /// * `msg` - Reference to the [`IpcMessage`] command to serialize and transmit.
+    ///
+    /// # Returns
+    /// `Ok(())` on successful transmission.
+    ///
+    /// # Side Effects
+    /// Writes newline-delimited JSON to `self.stream` and increments `self.total_messages_sent`.
+    /// If a socket write error occurs, marks `self.is_connected = false` and drops `self.stream`.
+    ///
+    /// # Errors
+    /// Returns `std::io::Error` if JSON serialization fails, the stream is disconnected, or socket I/O fails.
     fn send_raw_message(&mut self, msg: &IpcMessage) -> std::io::Result<()> {
         if self.nng.is_some() {
             self.total_messages_sent += 1;
@@ -397,11 +575,30 @@ impl KiCadIpcClient {
     }
 
     /// Queues a footprint displacement in the coalescing buffer.
+    ///
+    /// # Arguments
+    /// * `reference` - Component reference designator (e.g., `"U1"`).
+    /// * `x` - Target X coordinate in millimeters (`mm`).
+    /// * `y` - Target Y coordinate in millimeters (`mm`).
+    /// * `rotation` - Target rotation angle in degrees (`deg`).
+    ///
+    /// # Side Effects
+    /// Inserts or overwrites the latest pending placement for `reference` in `self.pending_moves`.
     pub fn queue_move_footprint(&mut self, reference: impl Into<String>, x: f64, y: f64, rotation: f64) {
         self.pending_moves.insert(reference.into(), (x, y, rotation));
     }
 
     /// Queues a track segment creation.
+    ///
+    /// # Arguments
+    /// * `start` - Start `(x, y)` coordinates in millimeters (`mm`).
+    /// * `end` - End `(x, y)` coordinates in millimeters (`mm`).
+    /// * `width` - Trace width in millimeters (`mm`).
+    /// * `layer` - KiCad copper layer name (e.g., `"F.Cu"`).
+    /// * `net_id` - Internal board net ID.
+    ///
+    /// # Side Effects
+    /// Appends an [`IpcMessage::AddTrack`] entry to `self.pending_tracks`.
     pub fn queue_add_track(
         &mut self,
         start: (f64, f64),
@@ -420,6 +617,15 @@ impl KiCadIpcClient {
     }
 
     /// Queues a via creation.
+    ///
+    /// # Arguments
+    /// * `position` - Via center `(x, y)` coordinates in millimeters (`mm`).
+    /// * `size` - Via outer copper diameter in millimeters (`mm`).
+    /// * `drill` - Via drill hole diameter in millimeters (`mm`).
+    /// * `net_id` - Internal board net ID.
+    ///
+    /// # Side Effects
+    /// Appends an [`IpcMessage::AddVia`] entry to `self.pending_vias`.
     pub fn queue_add_via(&mut self, position: (f64, f64), size: f64, drill: f64, net_id: usize) {
         self.pending_vias.push(IpcMessage::AddVia {
             position,
@@ -430,6 +636,15 @@ impl KiCadIpcClient {
     }
 
     /// Sends ClearTracks command to clear autorouted copper before rerouting.
+    ///
+    /// # Returns
+    /// `Ok(())` when the command is sent or skipped (when unconnected or using transactional NNG sync).
+    ///
+    /// # Side Effects
+    /// Sends [`IpcMessage::ClearTracks`] over the `UnixStream` socket if connected in JSON stream mode.
+    ///
+    /// # Errors
+    /// Returns `std::io::Error` if writing to the underlying `UnixStream` fails.
     pub fn clear_tracks(&mut self) -> std::io::Result<()> {
         if !self.is_connected {
             return Ok(());
@@ -442,6 +657,23 @@ impl KiCadIpcClient {
 
     /// Stream footprint move with delta threshold check and 60 FPS interval throttling.
     /// Returns true if a batch flush was triggered.
+    ///
+    /// # Arguments
+    /// * `reference` - Component reference designator.
+    /// * `x` - New X coordinate in millimeters (`mm`).
+    /// * `y` - New Y coordinate in millimeters (`mm`).
+    /// * `rotation` - New orientation angle in degrees (`deg`).
+    /// * `force_flush` - If `true`, flushes immediately regardless of `self.throttle_interval`.
+    ///
+    /// # Returns
+    /// `Ok(true)` if a batch commit was flushed to the socket, or `Ok(false)` if coalesced without flushing.
+    ///
+    /// # Side Effects
+    /// Queues the footprint move if displacement exceeds `0.005 mm` or `0.05 deg`, and flushes pending moves
+    /// via [`Self::commit_batch`] when the throttle interval has elapsed or `force_flush` is set.
+    ///
+    /// # Errors
+    /// Returns `std::io::Error` if flushing the batch to the socket fails.
     pub fn stream_footprint_move(
         &mut self,
         reference: &str,
@@ -471,6 +703,17 @@ impl KiCadIpcClient {
     /// Batch stream displacement deltas for footprints during Simulated Annealing.
     /// Only footprints that have significantly moved since their last sent coordinates are queued.
     /// Flushes to IPC if throttle interval (~16ms) has elapsed.
+    ///
+    /// # Arguments
+    /// * `footprints` - Slice of board footprints being placed.
+    /// * `positions` - Parallel slice of candidate `(x, y)` coordinates in millimeters (`mm`).
+    /// * `rotations` - Parallel slice of candidate orientation angles in degrees (`deg`).
+    ///
+    /// # Returns
+    /// Number of footprints whose movement exceeded the delta threshold and were queued.
+    ///
+    /// # Side Effects
+    /// Mutates `self.pending_moves` and, if `self.throttle_interval` has elapsed, flushes the batch over IPC.
     pub fn stream_footprint_deltas(
         &mut self,
         footprints: &[Footprint],
@@ -511,6 +754,18 @@ impl KiCadIpcClient {
 
     /// Stream all current board tracks and vias to KiCad IPC canvas.
     /// Queues AddTrack and AddVia commands and emits CommitBatch.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the [`Board`] whose routed tracks, discretized arcs, and vias should be streamed.
+    ///
+    /// # Returns
+    /// `Ok(count)` with the total number of copper segments and vias queued and committed (`0` if throttled or unconnected).
+    ///
+    /// # Side Effects
+    /// Populates `self.pending_tracks` and `self.pending_vias` and flushes them via [`Self::commit_batch`].
+    ///
+    /// # Errors
+    /// Returns `std::io::Error` if committing the batch over the IPC socket fails.
     pub fn stream_tracks_and_vias(&mut self, board: &Board) -> std::io::Result<usize> {
         if !self.is_connected {
             return Ok(0);
@@ -547,6 +802,24 @@ impl KiCadIpcClient {
 
     /// Pulls the full saved board (footprints, tracks, arcs, vias, and zone refills)
     /// into KiCad over the active IPC socket, bypassing throttle intervals.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the synchronized [`Board`] state.
+    /// * `pcb_path` - Path to the saved `.kicad_pcb` file on disk.
+    /// * `ses_path` - Path to the exported Specctra `.ses` file on disk.
+    ///
+    /// # Returns
+    /// `Ok(count)` with the number of board items synchronized into KiCad.
+    ///
+    /// # Side Effects
+    /// - In NNG mode: Invokes `NngKiCadClient::push_board_state` to revert or transactionally update
+    ///   footprints, tracks, arcs, vias, and copper zones in the live KiCad 10 editor.
+    /// - In JSON stream mode: Sends `ClearTracks`, queues all footprints/tracks/arcs/vias, commits the batch,
+    ///   and transmits [`IpcMessage::PullBoard`].
+    /// - Marks `self.is_connected = false` if an unrecoverable socket error occurs.
+    ///
+    /// # Errors
+    /// Returns `std::io::Error` if the client is disconnected or if socket transmission / KiCad RPC fails.
     pub fn pull_board_into_kicad(
         &mut self,
         board: &Board,
@@ -624,6 +897,17 @@ impl KiCadIpcClient {
     }
 
     /// Flushes all queued moves, tracks, and vias, then issues CommitBatch and flushes socket writer.
+    ///
+    /// # Returns
+    /// `Ok(total_queued)` indicating the total number of queued items drained and committed.
+    ///
+    /// # Side Effects
+    /// Drains `self.pending_moves`, `self.pending_tracks`, and `self.pending_vias`, updates
+    /// `self.last_sent_moves`, writes messages and [`IpcMessage::CommitBatch`] to the socket stream,
+    /// and updates `self.last_flush_time` and `self.total_batches_committed`.
+    ///
+    /// # Errors
+    /// Returns `std::io::Error` if writing to or flushing the underlying Unix socket fails.
     pub fn commit_batch(&mut self) -> std::io::Result<usize> {
         let total_queued = self.pending_moves.len() + self.pending_tracks.len() + self.pending_vias.len();
         if total_queued == 0 {
@@ -695,6 +979,22 @@ impl KiCadIpcClient {
 }
 
 /// Convenience helper that connects (or discovers `/tmp/kicad/api.sock`) and pushes `board` into KiCad.
+///
+/// # Arguments
+/// * `client_slot` - Mutable slot holding an optional reusable [`KiCadIpcClient`] connection.
+/// * `custom_socket_path` - Optional user-configured socket path override.
+/// * `board` - Reference to the saved [`Board`] to synchronize into KiCad.
+/// * `pcb_path` - Filesystem path to the written `.kicad_pcb` file.
+/// * `ses_path` - Filesystem path to the written Specctra `.ses` file.
+///
+/// # Returns
+/// `Ok(synced_count)` with the number of synchronized board items on success.
+///
+/// # Side Effects
+/// Connects or reconnects `*client_slot` if disconnected or stale, and pushes the board state over IPC.
+///
+/// # Errors
+/// Returns `Err(String)` if no active KiCad IPC socket can be discovered or if the board push fails after retry.
 pub fn push_saved_board_to_kicad(
     client_slot: &mut Option<KiCadIpcClient>,
     custom_socket_path: Option<&str>,
@@ -726,50 +1026,92 @@ pub fn push_saved_board_to_kicad(
 // Native KiCad 10 NNG (`libnng.so.1`) + Protobuf (`kiapi.*`) IPC Implementation
 // ============================================================================
 
+/// Null-terminated NNG socket option name for receive timeout (`"recv-timeout\0"`).
 const NNG_OPT_RECVTIMEO: &[u8] = b"recv-timeout\0";
+/// Null-terminated NNG socket option name for send timeout (`"send-timeout\0"`).
 const NNG_OPT_SENDTIMEO: &[u8] = b"send-timeout\0";
+/// NNG flag (`NNG_FLAG_ALLOC = 1`) instructing `nng_recv` to allocate the receive buffer dynamically.
 const NNG_FLAG_ALLOC: i32 = 1;
 
+/// KiCad `BoardLayer` protobuf enum value for front copper (`BL_F_CU = 3`).
 const BL_F_CU: i32 = 3;
+/// KiCad `BoardLayer` protobuf enum value for inner copper layer 1 (`BL_IN1_CU = 4`).
 const BL_IN1_CU: i32 = 4;
+/// KiCad `BoardLayer` protobuf enum value for back copper (`BL_B_CU = 34`).
 const BL_B_CU: i32 = 34;
 
+/// KiCad `KiCadObjectType` protobuf enum value for PCB footprints (`KOT_PCB_FOOTPRINT = 1`).
 const KOT_PCB_FOOTPRINT: i32 = 1;
+/// KiCad `KiCadObjectType` protobuf enum value for PCB copper traces (`KOT_PCB_TRACE = 11`).
 const KOT_PCB_TRACE: i32 = 11;
+/// KiCad `KiCadObjectType` protobuf enum value for PCB vias (`KOT_PCB_VIA = 12`).
 const KOT_PCB_VIA: i32 = 12;
+/// KiCad `KiCadObjectType` protobuf enum value for PCB copper arcs (`KOT_PCB_ARC = 13`).
 const KOT_PCB_ARC: i32 = 13;
 
+/// C-compatible NNG socket handle wrapper matching `nng_socket` in `libnng.so.1`.
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 struct NngSocket {
+    /// Non-zero opaque socket identifier assigned by `nng_req0_open` / `nng_rep0_open`.
     id: u32,
 }
 
+/// FFI function pointer signature for `nng_req0_open`.
 type FnNngReq0Open = unsafe extern "C" fn(*mut NngSocket) -> i32;
+/// FFI function pointer signature for `nng_rep0_open`.
 type FnNngRep0Open = unsafe extern "C" fn(*mut NngSocket) -> i32;
+/// FFI function pointer signature for `nng_close`.
 type FnNngClose = unsafe extern "C" fn(NngSocket) -> i32;
+/// FFI function pointer signature for `nng_dial`.
 type FnNngDial = unsafe extern "C" fn(NngSocket, *const std::os::raw::c_char, *mut usize, i32) -> i32;
+/// FFI function pointer signature for `nng_listen`.
 type FnNngListen = unsafe extern "C" fn(NngSocket, *const std::os::raw::c_char, *mut usize, i32) -> i32;
+/// FFI function pointer signature for `nng_send`.
 type FnNngSend = unsafe extern "C" fn(NngSocket, *const u8, usize, i32) -> i32;
+/// FFI function pointer signature for `nng_recv`.
 type FnNngRecv = unsafe extern "C" fn(NngSocket, *mut *mut u8, *mut usize, i32) -> i32;
+/// FFI function pointer signature for `nng_free`.
 type FnNngFree = unsafe extern "C" fn(*mut u8, usize);
+/// FFI function pointer signature for `nng_socket_set_ms` / `nng_setopt_ms`.
 type FnNngSocketSetMs = unsafe extern "C" fn(NngSocket, *const std::os::raw::c_char, i32) -> i32;
 
+/// Dynamically loaded `libnng.so.1` symbol table for NNG `Req0`/`Rep0` socket operations.
 #[allow(dead_code)]
 struct NngLib {
+    /// Loaded shared library handle kept alive for the lifetime of the process.
     _lib: libloading::Library,
+    /// Symbol pointer to `nng_req0_open`.
     req0_open: FnNngReq0Open,
+    /// Optional symbol pointer to `nng_rep0_open` (used by unit test mock servers).
     rep0_open: Option<FnNngRep0Open>,
+    /// Symbol pointer to `nng_close`.
     close: FnNngClose,
+    /// Symbol pointer to `nng_dial`.
     dial: FnNngDial,
+    /// Optional symbol pointer to `nng_listen` (used by unit test mock servers).
     listen: Option<FnNngListen>,
+    /// Symbol pointer to `nng_send`.
     send: FnNngSend,
+    /// Symbol pointer to `nng_recv`.
     recv: FnNngRecv,
+    /// Symbol pointer to `nng_free`.
     free: FnNngFree,
+    /// Optional symbol pointer to `nng_socket_set_ms` or fallback `nng_setopt_ms`.
     set_ms: Option<FnNngSocketSetMs>,
 }
 
 impl NngLib {
+    /// Returns a static reference to the lazily initialized `libnng.so.1` symbol table.
+    ///
+    /// # Returns
+    /// `Ok(&'static NngLib)` when `libnng.so.1` is available and all required symbols are resolved.
+    ///
+    /// # Side Effects
+    /// On first invocation, dynamically loads `libnng.so.1` into the process address space via `OnceLock`.
+    ///
+    /// # Errors
+    /// Returns `std::io::Error` (`ErrorKind::Unsupported`) if `libnng.so.1` cannot be loaded or is missing symbols.
     fn load() -> std::io::Result<&'static Self> {
         static INSTANCE: std::sync::OnceLock<Result<NngLib, String>> = std::sync::OnceLock::new();
         let res = INSTANCE.get_or_init(Self::load_once);
@@ -782,6 +1124,16 @@ impl NngLib {
         }
     }
 
+    /// Probes standard Linux library paths to load `libnng.so.1` and resolve NNG C API function pointers.
+    ///
+    /// # Returns
+    /// `Ok(NngLib)` containing resolved function pointers.
+    ///
+    /// # Side Effects
+    /// Calls `dlopen` / `dlsym` via `libloading::Library::new`.
+    ///
+    /// # Errors
+    /// Returns `Err(String)` describing the last dynamic linker error if all candidate paths fail.
     fn load_once() -> Result<Self, String> {
         let candidates = [
             "libnng.so.1",
@@ -841,14 +1193,23 @@ impl NngLib {
     }
 }
 
+/// Active KiCad 9/10 NNG `Req0` RPC client speaking `kiapi.*` Protocol Buffers messages.
 struct NngKiCadClient {
+    /// Reference to the statically loaded `libnng.so.1` symbol table.
     lib: &'static NngLib,
+    /// Open NNG `Req0` socket handle.
     sock: NngSocket,
+    /// Session token returned by KiCad in `ApiResponseHeader` (tag 1) and echoed in subsequent requests.
     token: String,
+    /// Unique client identifier string (`"vulcans-trials-<pid>"`) sent in `ApiRequestHeader` (tag 2).
     client_name: String,
 }
 
 impl Drop for NngKiCadClient {
+    /// Closes the underlying NNG `Req0` socket handle when the client is dropped.
+    ///
+    /// # Side Effects
+    /// Invokes `nng_close` via FFI if `self.sock.id != 0` and resets `self.sock.id` to `0`.
     fn drop(&mut self) {
         if self.sock.id != 0 {
             unsafe {
@@ -860,6 +1221,21 @@ impl Drop for NngKiCadClient {
 }
 
 impl NngKiCadClient {
+    /// Opens an NNG `Req0` socket, dials `ipc://<socket_path>`, and verifies connectivity with a `Ping` command.
+    ///
+    /// # Arguments
+    /// * `socket_path` - Filesystem path to the KiCad NNG Unix domain socket (e.g., `/tmp/kicad/api.sock`).
+    ///
+    /// # Returns
+    /// Connected [`NngKiCadClient`] with an initialized session token.
+    ///
+    /// # Side Effects
+    /// Loads `libnng.so.1`, opens an NNG socket with 10-second send/receive timeouts, dials the IPC endpoint,
+    /// and sends a `kiapi.common.commands.Ping` protobuf request.
+    ///
+    /// # Errors
+    /// Returns `std::io::Error` if `libnng.so.1` is unavailable, `nng_req0_open` or `nng_dial` fails,
+    /// or the initial `Ping` command fails.
     fn connect(socket_path: &Path) -> std::io::Result<Self> {
         let lib = NngLib::load()?;
         let mut sock = NngSocket::default();
@@ -896,6 +1272,21 @@ impl NngKiCadClient {
         Ok(client)
     }
 
+    /// Wraps a protobuf command payload in an `ApiRequest` envelope, transmits it over NNG, and decodes the `ApiResponse`.
+    ///
+    /// # Arguments
+    /// * `type_url` - Full protobuf `google.protobuf.Any` type URL (e.g., `"type.googleapis.com/kiapi.common.commands.Ping"`).
+    /// * `payload` - Raw protobuf-encoded bytes of the inner command message.
+    ///
+    /// # Returns
+    /// `Ok((response_type_url, response_payload_bytes))` unpacked from field 3 (`message`) of `ApiResponse`.
+    ///
+    /// # Side Effects
+    /// Performs synchronous NNG `nng_send` and `nng_recv` calls, frees the NNG-allocated buffer via `nng_free`,
+    /// and updates `self.token` if the response header contains a non-empty KiCad session token.
+    ///
+    /// # Errors
+    /// Returns `std::io::Error` if `nng_send` or `nng_recv` fails, or if KiCad returns an `ApiStatusCode` other than `AS_OK` (`1`).
     fn send_command(&mut self, type_url: &str, payload: &[u8]) -> std::io::Result<(String, Vec<u8>)> {
         let mut header = Vec::new();
         if !self.token.is_empty() {
@@ -991,11 +1382,36 @@ impl NngKiCadClient {
         Ok((msg_type_url, msg_val))
     }
 
+    /// Sends a `kiapi.common.commands.Ping` health-check request to KiCad.
+    ///
+    /// # Returns
+    /// `Ok(())` when KiCad responds with `AS_OK`.
+    ///
+    /// # Side Effects
+    /// Performs an NNG request/response round-trip and refreshes `self.token`.
+    ///
+    /// # Errors
+    /// Returns `std::io::Error` if the NNG socket is disconnected or KiCad rejects the ping.
     fn ping(&mut self) -> std::io::Result<()> {
         let _ = self.send_command("type.googleapis.com/kiapi.common.commands.Ping", &[])?;
         Ok(())
     }
 
+    /// Queries KiCad for open PCB documents (`DOCTYPE_PCB = 3`) and selects the `DocumentSpecifier` matching `board` or `pcb_path`.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the [`Board`] being synchronized (used to match `board.file_path`).
+    /// * `pcb_path` - Output `.kicad_pcb` path (matched after stripping `_vulcan`, `_routed`, or `_out` suffixes).
+    ///
+    /// # Returns
+    /// Raw protobuf-encoded `DocumentSpecifier` bytes (`Vec<u8>`) for the target open PCB document.
+    ///
+    /// # Side Effects
+    /// Sends `kiapi.common.commands.GetOpenDocuments` over the NNG socket.
+    ///
+    /// # Errors
+    /// Returns `std::io::Error` (`ErrorKind::NotFound`) if no PCB is open in KiCad or if multiple PCBs are open
+    /// and none match the stem of `pcb_path` or `board.file_path`.
     fn get_open_pcb_document(&mut self, board: &Board, pcb_path: &Path) -> std::io::Result<Vec<u8>> {
         let mut req = Vec::new();
         // DOCTYPE_PCB = 3
@@ -1077,6 +1493,19 @@ impl NngKiCadClient {
         ))
     }
 
+    /// Queries KiCad's net table for the given open PCB document via `kiapi.board.commands.GetNets`.
+    ///
+    /// # Arguments
+    /// * `doc_spec` - Raw protobuf bytes of the target `DocumentSpecifier`.
+    ///
+    /// # Returns
+    /// A [`HashMap`] mapping net name (`String`) to KiCad's internal integer `NetCode` (`i32`).
+    ///
+    /// # Side Effects
+    /// Sends `kiapi.board.commands.GetNets` over the NNG socket.
+    ///
+    /// # Errors
+    /// Returns `std::io::Error` if the RPC call fails.
     fn get_nets_map(&mut self, doc_spec: &[u8]) -> std::io::Result<HashMap<String, i32>> {
         let mut req = Vec::new();
         proto_encode_bytes(1, doc_spec, &mut req);
@@ -1110,6 +1539,26 @@ impl NngKiCadClient {
         Ok(map)
     }
 
+    /// Synchronizes the complete `board` state into the open KiCad PCB editor over NNG + Protobuf.
+    ///
+    /// First attempts an atomic disk reload via `kiapi.common.commands.RevertDocument` followed by
+    /// `RefillZones`. If `RevertDocument` is unsupported by the running KiCad build, falls back to
+    /// an explicit transactional `BeginCommit` / `EndCommit` session that flips/transforms footprints,
+    /// deletes stale copper items, creates all tracks/arcs/vias in chunks of 500, refills copper zones,
+    /// and refreshes the PCBNew canvas.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the [`Board`] containing updated placements, pin swaps, tracks, arcs, and vias.
+    /// * `pcb_path` - Path to the saved `.kicad_pcb` file on disk.
+    ///
+    /// # Returns
+    /// `Ok(total_synced)` indicating the total number of footprints, tracks, arcs, and vias synchronized.
+    ///
+    /// # Side Effects
+    /// Mutates the live open PCB document inside KiCad 10 and triggers zone refills and canvas repainting.
+    ///
+    /// # Errors
+    /// Returns `std::io::Error` if no matching PCB document is open or if any NNG transactional command fails.
     fn push_board_state(&mut self, board: &Board, pcb_path: &Path) -> std::io::Result<usize> {
         let doc_spec = self.get_open_pcb_document(board, pcb_path)?;
 
@@ -1438,10 +1887,24 @@ impl NngKiCadClient {
     }
 }
 
+/// Converts a distance in millimeters (`mm`) to KiCad internal integer nanometers (`nm`).
+///
+/// # Arguments
+/// * `mm` - Coordinate or dimension in millimeters (`1.0 mm = 1,000,000 nm`).
+///
+/// # Returns
+/// Nearest rounded integer value in nanometers (`i64`).
 fn mm_to_nm(mm: f64) -> i64 {
     (mm * 1_000_000.0).round() as i64
 }
 
+/// Normalizes an orientation angle in degrees into the half-open interval `(-180.0, 180.0]`.
+///
+/// # Arguments
+/// * `deg` - Input angle in degrees.
+///
+/// # Returns
+/// Equivalent angle wrapped to `(-180.0, 180.0]` degrees.
 fn normalize_angle_deg(deg: f64) -> f64 {
     let mut a = deg % 360.0;
     if a > 180.0 {
@@ -1452,6 +1915,13 @@ fn normalize_angle_deg(deg: f64) -> f64 {
     a
 }
 
+/// Maps a KiCad copper layer name (`"F.Cu"`, `"In1.Cu"`..`"In30.Cu"`, `"B.Cu"`) to its `kiapi.board.types.BoardLayer` enum value.
+///
+/// # Arguments
+/// * `layer_name` - KiCad copper layer string (e.g., `"F.Cu"`, `"In2.Cu"`, `"B.Cu"`).
+///
+/// # Returns
+/// Protobuf `BoardLayer` enum integer (`BL_F_CU = 3`, `BL_IN1_CU = 4..33`, `BL_B_CU = 34`), defaulting to `BL_F_CU` (`3`).
 fn board_layer_to_kiapi(layer_name: &str) -> i32 {
     match layer_name {
         "F.Cu" => BL_F_CU,
@@ -1469,6 +1939,14 @@ fn board_layer_to_kiapi(layer_name: &str) -> i32 {
     }
 }
 
+/// Appends a base-128 Protocol Buffers unsigned varint encoding of `v` into `out`.
+///
+/// # Arguments
+/// * `v` - 64-bit unsigned integer value (or two's-complement cast `i64 as u64`) to encode.
+/// * `out` - Destination byte buffer.
+///
+/// # Side Effects
+/// Appends 1 to 10 varint bytes to `out`.
 fn proto_encode_varint(mut v: u64, out: &mut Vec<u8>) {
     while v >= 0x80 {
         out.push(((v as u8) & 0x7F) | 0x80);
@@ -1477,10 +1955,28 @@ fn proto_encode_varint(mut v: u64, out: &mut Vec<u8>) {
     out.push(v as u8);
 }
 
+/// Appends a Protocol Buffers field tag (`(field_num << 3) | wire_type`) as a varint into `out`.
+///
+/// # Arguments
+/// * `field_num` - Protobuf field number (`1..`).
+/// * `wire_type` - Protobuf wire type (`0` = varint, `1` = 64-bit, `2` = length-delimited, `5` = 32-bit).
+/// * `out` - Destination byte buffer.
+///
+/// # Side Effects
+/// Appends the encoded tag varint to `out`.
 fn proto_encode_tag(field_num: u32, wire_type: u8, out: &mut Vec<u8>) {
     proto_encode_varint(((field_num as u64) << 3) | (wire_type as u64), out);
 }
 
+/// Appends a non-zero varint field (wire type `0`) with proto3 default-zero suppression into `out`.
+///
+/// # Arguments
+/// * `field_num` - Protobuf field number.
+/// * `val` - Varint value to encode (omitted if `val == 0`).
+/// * `out` - Destination byte buffer.
+///
+/// # Side Effects
+/// Appends the field tag and varint value to `out` when `val != 0`.
 fn proto_encode_varint_field(field_num: u32, val: u64, out: &mut Vec<u8>) {
     if val != 0 {
         proto_encode_tag(field_num, 0, out);
@@ -1488,23 +1984,58 @@ fn proto_encode_varint_field(field_num: u32, val: u64, out: &mut Vec<u8>) {
     }
 }
 
+/// Appends a 64-bit IEEE-754 floating-point field (wire type `1`, little-endian `double`) into `out`.
+///
+/// # Arguments
+/// * `field_num` - Protobuf field number.
+/// * `val` - `f64` value to encode in little-endian byte order.
+/// * `out` - Destination byte buffer.
+///
+/// # Side Effects
+/// Appends the field tag and 8 little-endian bytes to `out`.
 fn proto_encode_f64_field(field_num: u32, val: f64, out: &mut Vec<u8>) {
     proto_encode_tag(field_num, 1, out);
     out.extend_from_slice(&val.to_le_bytes());
 }
 
+/// Appends a length-delimited byte slice field (wire type `2`) into `out`.
+///
+/// # Arguments
+/// * `field_num` - Protobuf field number.
+/// * `bytes` - Raw payload bytes (`[u8]`) for the length-delimited field or sub-message.
+/// * `out` - Destination byte buffer.
+///
+/// # Side Effects
+/// Appends the field tag, payload byte length varint, and `bytes` slice to `out`.
 fn proto_encode_bytes(field_num: u32, bytes: &[u8], out: &mut Vec<u8>) {
     proto_encode_tag(field_num, 2, out);
     proto_encode_varint(bytes.len() as u64, out);
     out.extend_from_slice(bytes);
 }
 
+/// Appends a non-empty UTF-8 string field (wire type `2`) into `out`.
+///
+/// # Arguments
+/// * `field_num` - Protobuf field number.
+/// * `s` - UTF-8 string value (omitted if empty per proto3 semantics).
+/// * `out` - Destination byte buffer.
+///
+/// # Side Effects
+/// Appends the length-delimited string bytes to `out` when `!s.is_empty()`.
 fn proto_encode_str(field_num: u32, s: &str, out: &mut Vec<u8>) {
     if !s.is_empty() {
         proto_encode_bytes(field_num, s.as_bytes(), out);
     }
 }
 
+/// Encodes a `google.protobuf.Any` message wrapping `type_url` (field 1) and serialized `value` bytes (field 2).
+///
+/// # Arguments
+/// * `type_url` - Full protobuf type URL string.
+/// * `value` - Serialized inner protobuf message bytes (`[u8]`).
+///
+/// # Returns
+/// Serialized `google.protobuf.Any` message bytes (`Vec<u8>`).
 fn proto_encode_any(type_url: &str, value: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(type_url.len() + value.len() + 8);
     proto_encode_str(1, type_url, &mut out);
@@ -1514,6 +2045,14 @@ fn proto_encode_any(type_url: &str, value: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Encodes a `kiapi.common.types.Vector2` protobuf message with nanometer coordinates `(x_nm, y_nm)`.
+///
+/// # Arguments
+/// * `x_nm` - X coordinate in nanometers (`nm`, field 1).
+/// * `y_nm` - Y coordinate in nanometers (`nm`, field 2).
+///
+/// # Returns
+/// Serialized `Vector2` protobuf bytes (`Vec<u8>`).
 fn proto_encode_vector2(x_nm: i64, y_nm: i64) -> Vec<u8> {
     let mut out = Vec::with_capacity(20);
     proto_encode_varint_field(1, x_nm as u64, &mut out);
@@ -1521,18 +2060,40 @@ fn proto_encode_vector2(x_nm: i64, y_nm: i64) -> Vec<u8> {
     out
 }
 
+/// Encodes a `kiapi.common.types.Distance` protobuf message with a length in nanometers (`nm`).
+///
+/// # Arguments
+/// * `value_nm` - Distance in nanometers (`nm`, field 1).
+///
+/// # Returns
+/// Serialized `Distance` protobuf bytes (`Vec<u8>`).
 fn proto_encode_distance(value_nm: i64) -> Vec<u8> {
     let mut out = Vec::with_capacity(10);
     proto_encode_varint_field(1, value_nm as u64, &mut out);
     out
 }
 
+/// Encodes a `kiapi.common.types.Angle` protobuf message in degrees (`f64`, field 1).
+///
+/// # Arguments
+/// * `deg` - Angle in degrees (`f64`).
+///
+/// # Returns
+/// Serialized `Angle` protobuf bytes (`Vec<u8>`).
 fn proto_encode_angle(deg: f64) -> Vec<u8> {
     let mut out = Vec::with_capacity(9);
     proto_encode_f64_field(1, deg, &mut out);
     out
 }
 
+/// Encodes a `kiapi.board.types.Net` protobuf message containing a `NetCode` (field 1) and net name string (field 2).
+///
+/// # Arguments
+/// * `code` - KiCad integer net code (`i32`).
+/// * `name` - Net name string (e.g., `"GND"`, `"+3V3"`).
+///
+/// # Returns
+/// Serialized `Net` protobuf bytes (`Vec<u8>`).
 fn proto_encode_net(code: i32, name: &str) -> Vec<u8> {
     let mut net_code = Vec::with_capacity(8);
     proto_encode_varint_field(1, code as u32 as u64, &mut net_code);
@@ -1542,6 +2103,19 @@ fn proto_encode_net(code: i32, name: &str) -> Vec<u8> {
     out
 }
 
+/// Builds a serialized `kiapi.board.types.Track` protobuf message from millimeter geometry and net metadata.
+///
+/// # Arguments
+/// * `start` - Track start `(x, y)` coordinates in millimeters (`mm`, field 2).
+/// * `end` - Track end `(x, y)` coordinates in millimeters (`mm`, field 3).
+/// * `width_mm` - Copper track width in millimeters (`mm`, field 4).
+/// * `layer_enum` - KiCad `BoardLayer` enum value (field 6).
+/// * `net_code` - KiCad integer net code (field 7).
+/// * `net_name` - KiCad net name string (field 7).
+/// * `is_locked` - Whether the track is locked (`LS_LOCKED = 2` vs `LS_UNLOCKED = 1`, field 5).
+///
+/// # Returns
+/// Serialized `Track` protobuf payload (`Vec<u8>`).
 fn build_track_proto(
     start: (f64, f64),
     end: (f64, f64),
@@ -1565,6 +2139,20 @@ fn build_track_proto(
     out
 }
 
+/// Builds a serialized `kiapi.board.types.Arc` protobuf message from 3-point millimeter geometry and net metadata.
+///
+/// # Arguments
+/// * `start` - Arc start `(x, y)` coordinates in millimeters (`mm`, field 2).
+/// * `mid` - Arc midpoint `(x, y)` coordinates on the arc in millimeters (`mm`, field 3).
+/// * `end` - Arc end `(x, y)` coordinates in millimeters (`mm`, field 4).
+/// * `width_mm` - Copper arc width in millimeters (`mm`, field 5).
+/// * `layer_enum` - KiCad `BoardLayer` enum value (field 7).
+/// * `net_code` - KiCad integer net code (field 8).
+/// * `net_name` - KiCad net name string (field 8).
+/// * `is_locked` - Whether the arc is locked (`LS_LOCKED = 2` vs `LS_UNLOCKED = 1`, field 6).
+///
+/// # Returns
+/// Serialized `Arc` protobuf payload (`Vec<u8>`).
 fn build_arc_proto(
     start: (f64, f64),
     mid: (f64, f64),
@@ -1591,6 +2179,18 @@ fn build_arc_proto(
     out
 }
 
+/// Builds a serialized `kiapi.board.types.Via` protobuf message (through-hole `F.Cu` to `B.Cu` padstack) from millimeter dimensions.
+///
+/// # Arguments
+/// * `position` - Via center `(x, y)` coordinates in millimeters (`mm`, field 2).
+/// * `size_mm` - Outer copper pad diameter in millimeters (`mm`).
+/// * `drill_mm` - Drill hole diameter in millimeters (`mm`).
+/// * `net_code` - KiCad integer net code (field 5).
+/// * `net_name` - KiCad net name string (field 5).
+/// * `is_locked` - Whether the via is locked (`LS_LOCKED = 2` vs `LS_UNLOCKED = 1`, field 4).
+///
+/// # Returns
+/// Serialized `Via` protobuf payload (`Vec<u8>`).
 fn build_via_proto(
     position: (f64, f64),
     size_mm: f64,
@@ -1636,6 +2236,20 @@ fn build_via_proto(
     out
 }
 
+/// Decodes a base-128 Protocol Buffers varint from `buf` starting at `*pos`, advancing `*pos` past the decoded bytes.
+///
+/// # Arguments
+/// * `buf` - Input byte slice (`[u8]`) containing wire-encoded protobuf data.
+/// * `pos` - Mutable cursor index into `buf`.
+///
+/// # Returns
+/// `Some(u64)` with the decoded varint value, or `None` if `buf` is truncated or the varint exceeds 64 bits.
+///
+/// # Side Effects
+/// Advances `*pos` by the number of bytes consumed (up to 10 bytes).
+///
+/// # Errors
+/// Returns `None` on unexpected end-of-buffer or varint overflow (`shift >= 64`).
 fn proto_decode_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
     let mut result: u64 = 0;
     let mut shift = 0;
@@ -1654,11 +2268,26 @@ fn proto_decode_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
     None
 }
 
+/// Decodes a standalone varint byte slice `buf` from offset `0`, returning `0` if empty or malformed.
+///
+/// # Arguments
+/// * `buf` - Slice of raw varint bytes (`[u8]`) yielded by [`proto_walk`].
+///
+/// # Returns
+/// Decoded `u64` value, or `0` if decoding fails.
 fn proto_bytes_to_varint(buf: &[u8]) -> u64 {
     let mut pos = 0;
     proto_decode_varint(buf, &mut pos).unwrap_or(0)
 }
 
+/// Iterates sequentially over all top-level Protocol Buffers fields in `buf`, invoking `f(field_num, wire_type, field_bytes)` for each field.
+///
+/// # Arguments
+/// * `buf` - Serialized protobuf message bytes (`[u8]`).
+/// * `f` - Callback closure receiving `(tag: u32, wire_type: u8, value_slice: &[u8])`.
+///
+/// # Side Effects
+/// Invokes `f` for each valid wire field until `buf` is exhausted or a malformed tag/length is encountered.
 fn proto_walk<F: FnMut(u32, u8, &[u8])>(buf: &[u8], mut f: F) {
     let mut pos = 0;
     while pos < buf.len() {
@@ -1705,6 +2334,17 @@ fn proto_walk<F: FnMut(u32, u8, &[u8])>(buf: &[u8], mut f: F) {
     }
 }
 
+/// Walks a serialized protobuf message `buf` and produces a rewritten message buffer, allowing selective in-place field transformation.
+///
+/// For each field `(tag, wire_type, val)`, invokes `f(tag, wire_type, val, &mut out)`. If `f` returns `false`,
+/// the original field is copied verbatim into `out`; if `f` returns `true`, `f` is responsible for writing the replacement field into `out`.
+///
+/// # Arguments
+/// * `buf` - Source protobuf message bytes (`[u8]`).
+/// * `f` - Rewriting closure returning `true` when it has emitted a custom replacement for the current field.
+///
+/// # Returns
+/// Newly allocated `Vec<u8>` containing the rewritten protobuf message.
 fn proto_rewrite<F: FnMut(u32, u8, &[u8], &mut Vec<u8>) -> bool>(buf: &[u8], mut f: F) -> Vec<u8> {
     let mut out = Vec::with_capacity(buf.len() + 16);
     proto_walk(buf, |tag, wt, val| {
@@ -1719,6 +2359,13 @@ fn proto_rewrite<F: FnMut(u32, u8, &[u8], &mut Vec<u8>) -> bool>(buf: &[u8], mut
     out
 }
 
+/// Unpacks a `google.protobuf.Any` message buffer into its `(type_url, value_bytes)` pair.
+///
+/// # Arguments
+/// * `buf` - Serialized `google.protobuf.Any` wire bytes (`[u8]`).
+///
+/// # Returns
+/// A tuple `(type_url, value)` where `type_url` is field 1 and `value` is the raw inner message at field 2.
 fn proto_decode_any(buf: &[u8]) -> (String, Vec<u8>) {
     let mut type_url = String::new();
     let mut value = Vec::new();
@@ -1734,6 +2381,13 @@ fn proto_decode_any(buf: &[u8]) -> (String, Vec<u8>) {
     (type_url, value)
 }
 
+/// Decodes a `kiapi.common.types.Vector2` protobuf message into `(x_nm, y_nm)` nanometer coordinates.
+///
+/// # Arguments
+/// * `buf` - Serialized `Vector2` protobuf bytes (`[u8]`).
+///
+/// # Returns
+/// Tuple `(x_nm, y_nm)` as signed 64-bit integers in nanometers (`nm`).
 fn proto_decode_vector2(buf: &[u8]) -> (i64, i64) {
     let mut x: i64 = 0;
     let mut y: i64 = 0;
@@ -1745,6 +2399,13 @@ fn proto_decode_vector2(buf: &[u8]) -> (i64, i64) {
     (x, y)
 }
 
+/// Decodes a `kiapi.common.types.Angle` protobuf message into degrees (`f64`).
+///
+/// # Arguments
+/// * `buf` - Serialized `Angle` protobuf bytes (`[u8]`).
+///
+/// # Returns
+/// Orientation angle in degrees (`f64`, defaulting to `0.0` if field 1 is absent).
 fn proto_decode_angle(buf: &[u8]) -> f64 {
     let mut deg = 0.0;
     proto_walk(buf, |tag, wt, val| {
@@ -1755,6 +2416,16 @@ fn proto_decode_angle(buf: &[u8]) -> f64 {
     deg
 }
 
+/// Extracts the `kiapi.common.types.KIID` protobuf sub-message (field 1, wire type 2) from a board item message.
+///
+/// # Arguments
+/// * `item_bytes` - Serialized protobuf bytes of a `FootprintInstance`, `Track`, `Arc`, or `Via`.
+///
+/// # Returns
+/// `Some(Vec<u8>)` containing the raw `KIID` sub-message bytes, or `None` if field 1 is missing.
+///
+/// # Errors
+/// Returns `None` if no `KIID` field is present at tag 1.
 fn extract_item_kiid(item_bytes: &[u8]) -> Option<Vec<u8>> {
     let mut kiid = None;
     proto_walk(item_bytes, |tag, wt, val| {
@@ -1765,6 +2436,13 @@ fn extract_item_kiid(item_bytes: &[u8]) -> Option<Vec<u8>> {
     kiid
 }
 
+/// Extracts the UTF-8 string value from a `kiapi.board.types.Field` protobuf message (`Field.text.text.text`).
+///
+/// # Arguments
+/// * `field_bytes` - Serialized `Field` protobuf message bytes (`[u8]`).
+///
+/// # Returns
+/// Extracted string (such as a footprint reference designator `"U1"`), or an empty `String` if not found.
 fn extract_field_text_str(field_bytes: &[u8]) -> String {
     let mut res = String::new();
     // Field.text = tag 3 (BoardText) -> BoardText.text = tag 2 (Text) -> Text.text = tag 5 (string)
@@ -1786,6 +2464,17 @@ fn extract_field_text_str(field_bytes: &[u8]) -> String {
     res
 }
 
+/// Parses the identity and placement summary of a `kiapi.board.types.FootprintInstance` protobuf message.
+///
+/// # Arguments
+/// * `fp_bytes` - Serialized `FootprintInstance` protobuf message bytes (`[u8]`).
+///
+/// # Returns
+/// `Some((reference_designator, kiid_bytes, x_nm, y_nm, orientation_deg, board_layer_enum))` if both a `KIID`
+/// and a non-empty reference designator are present.
+///
+/// # Errors
+/// Returns `None` if the message lacks a `KIID` (field 1) or has an empty reference field (field 7 or definition field 6.7).
 fn parse_footprint_instance_summary(
     fp_bytes: &[u8],
 ) -> Option<(String, Vec<u8>, i64, i64, f64, i32)> {
@@ -1829,6 +2518,24 @@ fn parse_footprint_instance_summary(
 /// Applies rigid-body rotation + translation to a `FootprintInstance` protobuf message and all
 /// its child items (`Field`, `BoardText`, `BoardTextBox`, `Pad`, `BoardGraphicShape`, `Zone`, `Dimension`),
 /// matching KiCad 10's `FOOTPRINT::Deserialize` coordinate expectations.
+///
+/// Also updates pad net assignments (`Pad.net`, field 4) when `pad_nets` contains pin/gate-swapped
+/// net mappings, and converts axis-aligned graphic rectangles (`BoardGraphicShape` tag 5) into
+/// 4-corner closed polygons (`PolySet` tag 8) when rotated by a non-zero angle.
+///
+/// # Arguments
+/// * `fp_bytes` - Original serialized `FootprintInstance` protobuf bytes (`[u8]`).
+/// * `old_x` - Previous footprint anchor X coordinate in nanometers (`nm`).
+/// * `old_y` - Previous footprint anchor Y coordinate in nanometers (`nm`).
+/// * `old_deg` - Previous footprint orientation in degrees (`deg`).
+/// * `new_x` - Target footprint anchor X coordinate in nanometers (`nm`).
+/// * `new_y` - Target footprint anchor Y coordinate in nanometers (`nm`).
+/// * `new_deg` - Target footprint orientation in degrees (`deg`).
+/// * `is_locked` - Whether the footprint is locked (`LS_LOCKED = 2` vs `LS_UNLOCKED = 1`).
+/// * `pad_nets` - Map from pad number string to `(kicad_net_code, net_name)` for pad net synchronization.
+///
+/// # Returns
+/// Transformed `FootprintInstance` protobuf message bytes (`Vec<u8>`) ready for `UpdateItems`.
 #[allow(clippy::too_many_arguments)]
 fn transform_footprint_instance_proto(
     fp_bytes: &[u8],
@@ -2181,6 +2888,19 @@ fn transform_footprint_instance_proto(
 }
 
 /// Helper function to scan a directory for KiCad IPC sockets.
+///
+/// # Arguments
+/// * `dir` - Directory path to inspect for `.sock` Unix domain socket files.
+///
+/// # Returns
+/// `Some(PathBuf)` of the first matching KiCad socket file found in `dir`, or `None` if `dir` is not a directory
+/// or contains no matching `.sock` entry.
+///
+/// # Side Effects
+/// Reads directory entries from the filesystem via `std::fs::read_dir`.
+///
+/// # Errors
+/// Returns `None` if `dir` does not exist, cannot be read, or contains no KiCad socket files.
 fn scan_dir_for_socket(dir: &Path) -> Option<PathBuf> {
     if !dir.is_dir() {
         return None;

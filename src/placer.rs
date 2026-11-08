@@ -1,6 +1,65 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
+//! Multi-objective PCB component auto-placement, courtyard legalization, and spatial indexing.
+//!
+//! This module implements the complete component placement pipeline for Vulcan's Trials,
+//! combining analytical and topological seeding with hybrid Vulkan GPU + multi-core CPU
+//! Parallel Tempering Simulated Annealing (SA).
+//!
+//! # Architecture & Pipeline
+//!
+//! 1. **Holding Palette & Initial Seeding ([`place_all_holding_components_at_best_locations`], [`prioritize_and_position_initial_components`]):**
+//!    Unplaced components from the staging palette and unlocked board footprints are situated in
+//!    strict priority order:
+//!    - High-speed differential pair components (e.g., USB `D+`/`D-` ESD/series passives) are aligned
+//!      along direct routing corridors adjacent to their connector or IC anchors.
+//!    - Bypass and decoupling capacitors are placed radially outside their target active device's
+//!      power pin with the power pad oriented inward to minimize high-frequency loop inductance.
+//!    - Remaining passives and ICs are positioned near the weighted barycenter of their connected
+//!      signal and power pins or schematic cluster anchors.
+//!
+//! 2. **Spatial Indexing & Courtyard Legalization ([`PlacedBoardSpatialIndex`], [`legalize_placement`], [`shove_overlapping_components`]):**
+//!    A 2D Morton Linear Bounding Volume Hierarchy (LBVH) over placed footprint courtyards and
+//!    keepouts accelerates candidate pose legality queries to $O(\log N_f)$ AABB pruning followed
+//!    by exact Separating Axis Theorem (SAT) convex polygon intersection checks (`Polygon::intersects_convex`),
+//!    honoring per-component fine-pitch IC escape margins and opposite-side (`F.Cu` vs. `B.Cu`) SMD
+//!    non-collision rules. Overlapping initial states are resolved via a GPU SA pre-pass and
+//!    multi-threaded CPU repulsive legalization.
+//!
+//! 3. **Topological & Routability Cost Evaluation ([`PlacementState::evaluate_cost`]):**
+//!    Each candidate placement state is scored against a composite energy objective:
+//!    - **Euclidean MST Wirelength:** Total length of Prim's Minimum Spanning Tree ratsnest segments.
+//!    - **Ratsnest Crossings:** Exact segment-segment intersection count accelerated via a 2D Morton
+//!      LBVH over ratsnest edges ($O(E \log E)$).
+//!    - **Corridor Cut Congestion ([`compute_corridor_capacity`]):** Evaluates physical copper track
+//!      capacity across narrow apertures between adjacent component courtyards against the number of
+//!      shared and cut ratsnest nets traversing the gap.
+//!    - **Signal Flow & Bus Ribbon Alignment ([`compute_flow_alignment_penalty_for_link`]):** Penalizes
+//!      lateral pin order inversions (ribbon twisting), direct wire crossings, and angular skew across
+//!      multi-pin component buses.
+//!    - **Schematic Cluster & Passive Affinity ([`build_passive_ties`]):** Quadratic/linear distance
+//!      penalties keeping decoupling capacitors, pull-up/termination passives, and schematic hierarchy
+//!      clusters within their target radius.
+//!    - **Hard Physical Constraints:** Heavy penalties for courtyard polygon overlaps, board outline
+//!      excursions, keepout zone intrusions, and unnecessary layer flips.
+//!
+//! 4. **Hybrid GPU + Multi-Core CPU Parallel Tempering SA ([`run_auto_placer`]):**
+//!    - **Vulkan GPU Chains (`run_gpu_placement_batch`):** Thousands of independent Markov chains
+//!      evaluate candidate moves in parallel on the GPU using flattened courtyard polygon buffers
+//!      ([`build_gpu_sa_descriptors`]), periodically injecting improved legal states into the global best.
+//!    - **CPU Parallel Tempering Replicas:** Multiple Rayon worker threads run SA across a geometric
+//!      temperature ladder using 7 move operators (pair swap, barycentric centroid pull, rigid cluster
+//!      group shift, $90^\circ/180^\circ/270^\circ$ rotation, SMD layer flip, passive tie affinity jump,
+//!      and multi-scale grid shifts).
+//!    - **Replica Exchange & Basin Hopping ([`metropolis_replica_exchange`]):** Adjacent temperature
+//!      rungs exchange states via the Metropolis-Hastings criterion at epoch boundaries, while stagnation
+//!      triggers thermal pulses and legal basin-hopping swaps.
+//!    - **Pin/Gate Swapping & Silkscreen Polish:** Pre- and post-placement passes invoke
+//!      [`optimize_pin_and_gate_swapping`] to untangle swappable MCU/FPGA pins and multi-unit gates,
+//!      while board-level silkscreen reference designator placement (`Board::auto_place_silkscreen_Step`)
+//!      ensures legible, non-overlapping labels after component placement settles.
+
 use crate::board::{Board, LiveTrialState, Point, Polygon, Segment, TrialPhase, AABB};
 use crate::ipc::KiCadIpcClient;
 use crate::vulkan::{
@@ -15,31 +74,55 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Re-exported pin and gate swap optimizer invoked before and after Simulated Annealing placement.
 pub use crate::swap::optimize_pin_and_gate_swapping;
 
+/// Hyperparameters, physical clearances, energy weights, and hardware handles for the PCB auto-placer.
 #[derive(Debug, Clone)]
 pub struct PlacementConfig {
+    /// Total wall-clock duration in seconds for the Simulated Annealing auto-placement run (`s`).
     pub duration_secs: u64,
+    /// Placement coordinate quantization grid step in millimeters (`mm`, default `0.635` mm / 25 mil).
     pub grid_step_mm: f64,
+    /// Minimum physical clearance margin added around component courtyards in millimeters (`mm`).
     pub min_spacing_mm: f64,
+    /// Energy penalty weight per intersecting pair of ratsnest airwire segments.
     pub crossing_weight: f64,
+    /// Energy penalty weight applied to squared routing corridor demand overflow between nearby footprints.
     pub corridor_congestion_weight: f64,
+    /// Energy penalty weight for multi-pin bus lateral order inversions, crossings, and angular skew.
     pub flow_alignment_weight: f64,
+    /// Energy penalty weight per millimeter (`mm`) of total Euclidean MST ratsnest wirelength.
     pub wirelength_weight: f64,
+    /// Base energy penalty weight per pair of overlapping component courtyards (scaled by overlap area in $\text{mm}^2$).
     pub overlap_penalty: f64,
+    /// Base energy penalty weight for courtyard vertices or pads violating the board outline or keepout zones.
     pub boundary_penalty: f64,
+    /// Energy penalty weight attracting non-decoupling passives (pull-ups, series resistors) to their anchor pin.
     pub passive_affinity_weight: f64,
+    /// Target maximum pad-to-pad distance in millimeters (`mm`) before quadratic/linear passive affinity penalties ramp up.
     pub passive_max_dist: f64,
+    /// Energy penalty weight attracting 2-pin decoupling capacitors to their active IC power pin.
     pub decoupling_affinity_weight: f64,
+    /// Target maximum pad-to-pad distance in millimeters (`mm`) between a decoupling capacitor and its IC power pin.
     pub decoupling_max_dist: f64,
+    /// Whether the placer is permitted to flip SMD-only components between `F.Cu` (`0`) and `B.Cu` (`1`).
     pub allow_layer_flip: bool,
+    /// Whether to inflate component placement spacing by each footprint's fine-pitch escape routing margin.
     pub enable_escape_clearance: bool,
+    /// Dimensionless multiplier applied to each footprint's `escape_margin` when `enable_escape_clearance` is enabled.
     pub escape_margin_mult: f64,
+    /// Maximum single-move coordinate jump radius in millimeters (`mm`) at full annealing temperature.
     pub max_jump_radius_mm: f64,
+    /// Probability in `[0.0, 1.0]` of selecting the pairwise component swap move operator during SA.
     pub pair_swap_prob: f64,
+    /// Probability in `[0.0, 1.0]` of selecting the barycentric net-centroid pull move operator during SA.
     pub centroid_pull_prob: f64,
+    /// Dimensionless scaling factor applied to the Parallel Tempering base temperature ladder.
     pub temp_scale: f64,
+    /// Optional shared handle to the Vulkan compute engine for GPU-accelerated SA chains and batch pose scoring.
     pub vulkan: Option<Arc<VulkanEngine>>,
+    /// Optional shared handle to a live KiCad IPC client for real-time footprint delta streaming.
     pub ipc: Option<Arc<Mutex<KiCadIpcClient>>>,
 }
 
@@ -73,7 +156,18 @@ impl Default for PlacementConfig {
 }
 
 impl crate::board::Footprint {
-    /// Computes the effective courtyard placement spacing for this footprint given config.
+    /// Computes the effective courtyard placement expansion spacing in millimeters (`mm`) for this
+    /// footprint under the given [`PlacementConfig`].
+    ///
+    /// When `config.enable_escape_clearance` is `true`, the base `config.min_spacing_mm` is
+    /// augmented by `2.0 * self.escape_margin * config.escape_margin_mult` so dense QFN/BGA/connector
+    /// footprints reserve surrounding routing channels for staggered escape vias.
+    ///
+    /// # Arguments
+    /// * `config` - Placement configuration specifying base spacing and escape clearance settings.
+    ///
+    /// # Returns
+    /// Effective outward courtyard inflation distance in millimeters (`mm`).
     pub fn effective_spacing(&self, config: &PlacementConfig) -> f64 {
         if config.enable_escape_clearance {
             config.min_spacing_mm + 2.0 * self.escape_margin * config.escape_margin_mult
@@ -83,36 +177,75 @@ impl crate::board::Footprint {
     }
 }
 
+/// Complete snapshot of a candidate PCB placement configuration and its evaluated objective metrics.
+///
+/// Stores world-space poses (`positions`, `rotations`, `layers`), pre-transformed geometry caches
+/// (`cached_courtyards`, `cached_bounds`, `cached_pads`) for fast incremental updates during
+/// Simulated Annealing, and the decomposed cost components computed by [`PlacementState::evaluate_cost`].
 #[derive(Debug, Clone)]
 pub struct PlacementState {
+    /// World-space origin coordinates `(x, y)` in millimeters (`mm`) for each footprint, indexed by footprint index.
     pub positions: Vec<Point>,
+    /// Orientation angle in degrees (`[0.0, 360.0)`) for each footprint, indexed by footprint index.
     pub rotations: Vec<f64>,
+    /// Copper layer index (`0` for `F.Cu`, `1` for `B.Cu`) for each footprint, indexed by footprint index.
     pub layers: Vec<usize>,
+    /// Cached world-space inflated courtyard convex polygons for each footprint.
     pub cached_courtyards: Vec<Vec<Polygon>>,
+    /// Cached world-space union axis-aligned bounding box ([`AABB`]) for each footprint's courtyards.
     pub cached_bounds: Vec<AABB>,
+    /// Cached world-space pad center coordinates in millimeters (`mm`) for each footprint (`cached_pads[fp_idx][pad_idx]`).
     pub cached_pads: Vec<Vec<Point>>,
+    /// Hash of the board's pad-to-net assignment used to invalidate `cached_connectivity` after pin/gate swaps.
     pub cached_connectivity_hash: u64,
+    /// Shared topological connectivity cache mapping component pairs `(comp_a, comp_b)` to shared net IDs and multi-pin [`ComponentBusLink`]s.
     pub cached_connectivity: Arc<(HashMap<(usize, usize), Vec<usize>>, Vec<ComponentBusLink>)>,
+    /// Composite weighted objective energy score (lower is better).
     pub cost: f64,
+    /// Number of pairwise intersections among Euclidean MST ratsnest segments.
     pub crossings: usize,
+    /// Total squared routing track demand overflow across narrow inter-component corridors.
     pub corridor_congestion: f64,
+    /// Total topological bus ribbon twisting, crossing, and angular skew penalty across [`ComponentBusLink`]s.
     pub flow_alignment_penalty: f64,
+    /// Total Euclidean MST ratsnest wirelength in millimeters (`mm`).
     pub wirelength: f64,
+    /// Number of colliding footprint courtyard pairs.
     pub overlaps: usize,
+    /// Number of unlocked footprints violating the board outline or keepout zones.
     pub boundary_violations: usize,
 }
 
+/// Directed affinity tether binding a passive component pad to an anchor component pad.
+///
+/// Used by both the initial prioritizer and the Simulated Annealing cost function to keep
+/// decoupling capacitors, bulk capacitors, pull-up/pull-down resistors, and series termination
+/// passives tightly coupled to the specific IC or connector pin they serve.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PassiveTie {
+    /// Footprint index of the passive component (`R`, `C`, `L`, `F`, or `D`) in `board.footprints`.
     pub passive_idx: usize,
+    /// Pad index on the passive footprint (`board.footprints[passive_idx].pads[passive_pad_idx]`).
     pub passive_pad_idx: usize,
+    /// Footprint index of the anchor device (typically an IC `U*`, transistor `Q*`, or connector `J*`).
     pub anchor_idx: usize,
+    /// Pad index on the anchor footprint (`board.footprints[anchor_idx].pads[anchor_pad_idx]`).
     pub anchor_pad_idx: usize,
+    /// Maximum target Euclidean distance in millimeters (`mm`) between the tied pads before excess penalties apply.
     pub max_dist: f64,
+    /// Dimensionless multiplier scaling the affinity energy weight for this tie.
     pub weight_mult: f64,
+    /// `true` if this tie represents a high-priority high-frequency decoupling capacitor on a power rail.
     pub is_decoupling: bool,
 }
 
+/// Determines whether a KiCad net name represents a ground reference rail (`GND`, `AGND`, `DGND`, `PGND`, etc.).
+///
+/// # Arguments
+/// * `name` - Net name string slice from a pad or netlist.
+///
+/// # Returns
+/// `true` if the normalized uppercase net name matches standard ground naming conventions; `false` otherwise.
 pub fn is_ground_net(name: &str) -> bool {
     let s = name.trim();
     if s.is_empty() {
@@ -129,6 +262,15 @@ pub fn is_ground_net(name: &str) -> bool {
         || u.contains("PGND")
 }
 
+/// Determines whether a KiCad net name represents a DC power supply rail (`+3V3`, `+5V`, `VCC`, `VDD`, `VBUS`, `VIN`, etc.).
+///
+/// Explicitly excludes ground nets (checked via [`is_ground_net`]) and empty net names.
+///
+/// # Arguments
+/// * `name` - Net name string slice from a pad or netlist.
+///
+/// # Returns
+/// `true` if the net name matches a non-ground power supply rail convention; `false` otherwise.
 pub fn is_power_net(name: &str) -> bool {
     let s = name.trim().trim_start_matches('/');
     if s.is_empty() || is_ground_net(s) {
@@ -150,6 +292,26 @@ pub fn is_power_net(name: &str) -> bool {
         || u.contains("POWER")
 }
 
+/// Constructs the list of [`PassiveTie`] affinity constraints for all unlocked passive components on `board`.
+///
+/// # Algorithm
+/// 1. **Decoupling & Bulk Capacitors:** Identifies 2-pin capacitors (`C*`) connected between a ground
+///    net ([`is_ground_net`]) and a power net ([`is_power_net`]). Candidate active device power pins
+///    (`U*`, `Q*`, `J*`, `M*`) on the same rail are scored by schematic sheet proximity (or physical/reference
+///    number distance if schematic coordinates are unavailable), shared schematic cluster membership,
+///    device tier (`U` > `Q` > others), and existing capacitor load per pin to distribute decoupling caps
+///    evenly across multi-pin IC supplies. Small ceramic bypass caps receive `is_decoupling = true`
+///    (`max_dist = 2.0` mm, `weight_mult = 1.8`), whereas bulk capacitors (`> 3.8` mm or `>= 47uF`)
+///    receive `max_dist = 8.0` mm (`is_decoupling = false`).
+/// 2. **Signal Passives:** Remaining unlocked passives (`R*`, `C*`, `L*`, `F*`, `D*`) on non-power,
+///    non-ground signal nets are tied to the highest-priority peer component (`U` > `J`/`Q` > passive)
+///    sharing that signal net (`max_dist = 3.5` mm, `weight_mult = 1.0`).
+///
+/// # Arguments
+/// * `board` - Board containing footprints, pad net assignments, schematic positions, and clusters.
+///
+/// # Returns
+/// Vector of [`PassiveTie`] records linking passive pads to their selected anchor pads.
 pub fn build_passive_ties(board: &Board) -> Vec<PassiveTie> {
     // 1. Map of non-power, non-ground signal nets -> Vec<(fp_idx, pad_idx)>
     let mut net_pads: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
@@ -342,8 +504,18 @@ pub fn build_passive_ties(board: &Board) -> Vec<PassiveTie> {
     ties
 }
 
-/// Computes the minimum Euclidean distance between two convex polygons.
-/// Returns 0.0 if the polygons intersect or either is empty.
+/// Computes the minimum Euclidean boundary-to-boundary distance in millimeters (`mm`) between two convex polygons.
+///
+/// First tests for overlap via [`Polygon::intersects_convex`], returning `0.0` immediately if the
+/// polygons intersect or either polygon is empty. Otherwise evaluates point-to-segment distances
+/// between every vertex of `p1` and edge of `p2` (and vice versa).
+///
+/// # Arguments
+/// * `p1` - First convex polygon in world coordinates (`mm`).
+/// * `p2` - Second convex polygon in world coordinates (`mm`).
+///
+/// # Returns
+/// Minimum separation distance in millimeters (`mm`), or `0.0` if intersecting or empty.
 pub fn polygon_clearance_gap(p1: &Polygon, p2: &Polygon) -> f64 {
     if p1.vertices.is_empty() || p2.vertices.is_empty() {
         return 0.0;
@@ -377,8 +549,17 @@ pub fn polygon_clearance_gap(p1: &Polygon, p2: &Polygon) -> f64 {
     }
 }
 
-/// Computes the physical clearance aperture W between two collections of courtyard polygons.
-/// Returns 0.0 if they intersect or either is empty.
+/// Computes the minimum physical clearance aperture $W$ in millimeters (`mm`) between two sets of courtyard polygons.
+///
+/// Evaluates [`polygon_clearance_gap`] across all pairs `(pa, pb)` in `polys_a` $\times$ `polys_b`
+/// and short-circuits to `0.0` as soon as any pair intersects (`gap <= 1e-6`).
+///
+/// # Arguments
+/// * `polys_a` - Courtyard polygon slice for the first footprint.
+/// * `polys_b` - Courtyard polygon slice for the second footprint.
+///
+/// # Returns
+/// Minimum unobstructed gap $W$ in millimeters (`mm`), or `0.0` if intersecting or either slice is empty.
 pub fn courtyards_clearance_gap(polys_a: &[Polygon], polys_b: &[Polygon]) -> f64 {
     if polys_a.is_empty() || polys_b.is_empty() {
         return 0.0;
@@ -402,8 +583,18 @@ pub fn courtyards_clearance_gap(polys_a: &[Polygon], polys_b: &[Polygon]) -> f64
     }
 }
 
-/// Computes multi-layer routing corridor capacity:
-/// Capacity = N_layers * max(0, floor((W - C_min) / (W_track + C_min)))
+/// Computes the multi-layer routing corridor track capacity across a physical gap of width $W$:
+///
+/// $$\text{Capacity} = N_{\text{layers}} \times \max\left(0, \left\lfloor \frac{W - C_{\min}}{W_{\text{track}} + C_{\min}} \right\rfloor\right)$$
+///
+/// # Arguments
+/// * `gap_w` - Physical clearance aperture $W$ between two component courtyards in millimeters (`mm`).
+/// * `track_width` - Nominal copper trace width $W_{\text{track}}$ in millimeters (`mm`).
+/// * `min_clearance` - Minimum copper-to-copper clearance $C_{\min}$ in millimeters (`mm`).
+/// * `num_layers` - Number of routable copper layers $N_{\text{layers}}$.
+///
+/// # Returns
+/// Total number of parallel copper traces that can legally pass through the corridor across all layers.
 pub fn compute_corridor_capacity(
     gap_w: f64,
     track_width: f64,
@@ -418,15 +609,32 @@ pub fn compute_corridor_capacity(
     num_layers.saturating_mul(tracks_per_layer)
 }
 
-/// Represents a multi-pin bus connection between two components.
+/// Represents a multi-pin bus connection ($M \ge 2$ shared signal/power nets) between two footprints.
+///
+/// Used by [`compute_flow_alignment_penalty_for_link`] to evaluate pin ribbon untangling and
+/// relative orientation alignment between coupled ICs, connectors, and resistor arrays.
 #[derive(Debug, Clone)]
 pub struct ComponentBusLink {
+    /// Footprint index of the first component (`comp_a < comp_b`).
     pub comp_a: usize,
+    /// Footprint index of the second component (`comp_a < comp_b`).
     pub comp_b: usize,
+    /// Pairs of `(pad_idx_on_a, pad_idx_on_b)` sharing the same non-ground net between `comp_a` and `comp_b`.
     pub shared_pads: Vec<(usize, usize)>,
 }
 
-/// Discovers shared nets and multi-pin bus links across all components on the board.
+/// Discovers shared non-ground nets and multi-pin [`ComponentBusLink`]s across all footprints on `board`.
+///
+/// Ignores unconnected pads (`net_id == 0`) and ground rails ([`is_ground_net`]) so ground plane
+/// connections do not create artificial point-to-point bus links.
+///
+/// # Arguments
+/// * `board` - Board whose footprints and pad net assignments are analyzed.
+///
+/// # Returns
+/// A tuple `(pair_shared_nets, bus_links)` where:
+/// * `pair_shared_nets` maps ordered component index pairs `(comp_a, comp_b)` to their deduplicated list of shared net IDs.
+/// * `bus_links` contains a [`ComponentBusLink`] for every component pair sharing at least 2 pad connections.
 pub fn build_board_topological_connectivity(
     board: &Board,
 ) -> (HashMap<(usize, usize), Vec<usize>>, Vec<ComponentBusLink>) {
@@ -475,8 +683,23 @@ pub fn build_board_topological_connectivity(
     (pair_shared_nets, bus_links)
 }
 
-/// Evaluates topological signal flow and pin ribbon untangling between two connected components.
-/// Penalizes lateral pad order inversions, direct wire segment crossings, and angular skew.
+/// Evaluates topological signal flow alignment and pin ribbon untangling between two connected components.
+///
+/// Projects pad coordinates onto the normal axis $\mathbf{v} = (-u_y, u_x)$ perpendicular to the
+/// component-to-component axis $\mathbf{u} = \frac{\text{pos}_b - \text{pos}_a}{\|\text{pos}_b - \text{pos}_a\|}$
+/// and accumulates penalties across all pad pairs $(j, k)$ for:
+/// 1. **Lateral Order Inversion (`+1.0`):** When $(s_{a,j} - s_{a,k}) \cdot (s_{b,j} - s_{b,k}) < 0$, indicating a twisted bus ribbon.
+/// 2. **Direct Segment Crossing (`+1.5`):** When straight airwires $\overline{a_j b_j}$ and $\overline{a_k b_k}$ intersect.
+/// 3. **Angular Skew (`+0.5 * (1 - \cos\theta)`):** When airwire vectors diverge from parallel alignment.
+///
+/// # Arguments
+/// * `pads_a` - World-space coordinates (`mm`) of the bus pads on component A.
+/// * `pads_b` - Corresponding world-space coordinates (`mm`) of the connected bus pads on component B.
+/// * `pos_a` - World-space origin (`mm`) of component A.
+/// * `pos_b` - World-space origin (`mm`) of component B.
+///
+/// # Returns
+/// Dimensionless non-negative flow alignment penalty (`0.0` if fewer than 2 pad pairs exist).
 pub fn compute_flow_alignment_penalty_for_link(
     pads_a: &[Point],
     pads_b: &[Point],
@@ -537,6 +760,16 @@ pub fn compute_flow_alignment_penalty_for_link(
     penalty
 }
 
+/// Computes a fast 64-bit hash over all footprint pad `net_id` assignments on `board`.
+///
+/// Used by [`PlacementState::evaluate_cost`] to detect when pin or gate swapping has mutated
+/// pad net assignments and lazily rebuild `PlacementState::cached_connectivity`.
+///
+/// # Arguments
+/// * `board` - Board whose footprint pad net IDs are hashed.
+///
+/// # Returns
+/// 64-bit hash signature of the board's pad connectivity.
 fn board_connectivity_hash(board: &Board) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -551,6 +784,18 @@ fn board_connectivity_hash(board: &Board) -> u64 {
 }
 
 impl PlacementState {
+    /// Constructs a [`PlacementState`] from the current footprint poses on `board` and evaluates its initial cost.
+    ///
+    /// Pre-transforms all footprint courtyards (inflated by [`crate::board::Footprint::effective_spacing`]),
+    /// computes union AABBs and world-space pad coordinates, builds the topological connectivity cache
+    /// via [`build_board_topological_connectivity`], and runs a full [`PlacementState::evaluate`] pass.
+    ///
+    /// # Arguments
+    /// * `board` - Board whose footprint coordinates, rotations, layers, and nets are snapshotted.
+    /// * `config` - Placement hyperparameters and weights used to evaluate initial spacing and cost.
+    ///
+    /// # Returns
+    /// Fully initialized and evaluated [`PlacementState`].
     pub fn from_board(board: &Board, config: &PlacementConfig) -> Self {
         let n = board.footprints.len();
         let mut positions = Vec::with_capacity(n);
@@ -602,6 +847,16 @@ impl PlacementState {
         st
     }
 
+    /// Incrementally recomputes the cached world-space courtyards, bounding box, and pad coordinates
+    /// for a single modified footprint `idx`.
+    ///
+    /// # Arguments
+    /// * `idx` - Footprint index in `board.footprints` whose pose (`positions[idx]`, `rotations[idx]`, `layers[idx]`) changed.
+    /// * `board` - Reference to the [`Board`] containing the footprint geometry definitions.
+    /// * `config` - Placement configuration specifying courtyard spacing margins.
+    ///
+    /// # Side Effects
+    /// Mutates `self.cached_bounds[idx]`, `self.cached_courtyards[idx]`, and `self.cached_pads[idx]`.
     fn update_component(&mut self, idx: usize, board: &Board, config: &PlacementConfig) {
         let fp = &board.footprints[idx];
         let pos = self.positions[idx];
@@ -616,10 +871,51 @@ impl PlacementState {
         }
     }
 
+    /// Evaluates all objective metrics and updates `self.cost` for the current placement state.
+    ///
+    /// Delegates directly to [`PlacementState::evaluate_cost`].
+    ///
+    /// # Arguments
+    /// * `board` - Board geometry, netlist, clusters, and keepout definitions.
+    /// * `config` - Placement weights and clearance parameters.
+    /// * `ties` - Precomputed [`PassiveTie`] affinity constraints.
+    ///
+    /// # Side Effects
+    /// Updates `self.wirelength`, `self.crossings`, `self.corridor_congestion`,
+    /// `self.flow_alignment_penalty`, `self.overlaps`, `self.boundary_violations`, and `self.cost`.
     pub fn evaluate(&mut self, board: &Board, config: &PlacementConfig, ties: &[PassiveTie]) {
         self.evaluate_cost(board, config, ties);
     }
 
+    /// Computes the composite multi-objective placement energy function and updates all diagnostic counters on `self`.
+    ///
+    /// # Cost Formulation
+    /// 1. **Ratsnest Wirelength & Crossings:** Generates Prim's Euclidean MST ratsnest segments over
+    ///    `self.cached_pads` and constructs a 2D Morton LBVH ([`build_gpu_lbvh`]) when $E \ge 16$ so
+    ///    pairwise airwire crossings are counted in $O(E \log E)$ time.
+    /// 2. **Courtyard Collisions:** Tests all footprint pairs with overlapping `cached_bounds` using
+    ///    exact convex SAT (`Polygon::intersects_convex`), skipping locked-locked pairs and opposite-side
+    ///    SMD-only pairs. Adds `config.overlap_penalty * (1.0 + ox * oy)` per colliding pair.
+    /// 3. **Boundary & Keepout Violations:** Penalizes any unlocked footprint whose courtyard vertices
+    ///    or pad centers fall outside the board outline or inside a layer-matching keepout zone, plus a
+    ///    small penalty (`3.5`) for flipping a component away from its original layer.
+    /// 4. **Schematic Cluster Cohesion & Passive Affinity:** Applies linear inside-radius and
+    ///    quadratic/linear outside-radius penalties for schematic clusters (`board.clusters`) and
+    ///    [`PassiveTie`] tethers.
+    /// 5. **Corridor Cut Congestion & Bus Flow Alignment:** For nearby component pairs within `15.0` mm,
+    ///    compares physical routing capacity ([`compute_corridor_capacity`]) against shared nets plus
+    ///    ratsnest segments cut by the centroid-to-centroid ray, adding squared overflow penalties, and
+    ///    evaluates [`compute_flow_alignment_penalty_for_link`] over all [`ComponentBusLink`]s.
+    ///
+    /// # Arguments
+    /// * `board` - Board containing footprints, nets, netclasses, clusters, boundary, and keepouts.
+    /// * `config` - Placement energy weights and physical clearance settings.
+    /// * `ties` - Slice of [`PassiveTie`] constraints binding passives to anchor pins.
+    ///
+    /// # Side Effects
+    /// Mutates `self.wirelength`, `self.crossings`, `self.corridor_congestion`,
+    /// `self.flow_alignment_penalty`, `self.overlaps`, `self.boundary_violations`, `self.cost`,
+    /// and refreshes `self.cached_connectivity` if `board_connectivity_hash(board)` changed.
     pub fn evaluate_cost(&mut self, board: &Board, config: &PlacementConfig, ties: &[PassiveTie]) {
         let segments = board.generate_ratsnest_segments(&self.cached_pads);
         let wirelength: f64 = segments.iter().map(|s| s.length()).sum();
@@ -962,6 +1258,15 @@ impl PlacementState {
             + flip_cost;
     }
 
+    /// Writes the unlocked footprint poses (`x`, `y`, `rotation`, `layer`) from `self` back onto `board`.
+    ///
+    /// Locked footprints (`fp.is_locked == true`) are never modified.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable [`Board`] whose unlocked footprints are updated in-place.
+    ///
+    /// # Side Effects
+    /// Mutates `fp.x`, `fp.y`, `fp.rotation`, and `fp.layer` for every unlocked footprint in `board.footprints`.
     pub fn apply_to_board(&self, board: &mut Board) {
         for (i, fp) in board.footprints.iter_mut().enumerate() {
             if !fp.is_locked {
@@ -974,6 +1279,15 @@ impl PlacementState {
     }
 }
 
+/// Computes the union axis-aligned bounding box ([`AABB`]) enclosing all polygons in `polys`,
+/// or a $\pm 0.5\text{ mm}$ fallback box around `fallback` if `polys` is empty.
+///
+/// # Arguments
+/// * `polys` - Slice of convex courtyard [`Polygon`]s in world coordinates (`mm`).
+/// * `fallback` - Fallback center [`Point`] (`mm`) used when `polys` has no vertices.
+///
+/// # Returns
+/// Enclosing [`AABB`] in millimeters (`mm`).
 fn union_aabb(polys: &[Polygon], fallback: Point) -> AABB {
     let mut min_x = f64::INFINITY;
     let mut min_y = f64::INFINITY;
@@ -993,6 +1307,14 @@ fn union_aabb(polys: &[Polygon], fallback: Point) -> AABB {
     }
 }
 
+/// Quantizes a scalar coordinate `v` in millimeters (`mm`) to the nearest multiple of `step`.
+///
+/// # Arguments
+/// * `v` - Coordinate value in millimeters (`mm`).
+/// * `step` - Grid step size in millimeters (`mm`). If `step <= 0.0`, `v` is returned unchanged.
+///
+/// # Returns
+/// Grid-snapped coordinate in millimeters (`mm`).
 fn snap_to_grid(v: f64, step: f64) -> f64 {
     if step <= 0.0 {
         v
@@ -1001,6 +1323,31 @@ fn snap_to_grid(v: f64, step: f64) -> f64 {
     }
 }
 
+/// Packs footprint bounding descriptors, tagged connectivity edges, and flattened courtyard polygons
+/// into GPU-ready storage buffers for the Vulkan WGSL Simulated Annealing compute shader.
+///
+/// # Buffer Encoding
+/// 1. **Footprint Descriptors (`fp_descs: Vec<[f32; 4]>`):** Each `[hw, hh, locked, packed_center]`
+///    entry stores the half-width `hw` (`mm`), half-height `hh` (`mm`), lock flag (`1.0` if locked,
+///    `0.0` if movable), and quantized local courtyard center offset (`packed_center`).
+/// 2. **Courtyard Buffers ([`GpuCourtyardBuffers`]):** Flattens each footprint's local-space inflated
+///    courtyard polygons into `courtyard_vertices`, `courtyard_polys`, and `fp_poly_ranges` (`[poly_start, count, flags, orig_layer]`),
+///    setting bit flags for SMD-only (`1`), non-centered/multi-polygon SAT required (`2`), and axis-aligned rectangle fast-path (`4`).
+/// 3. **Tagged Connectivity Edges (`edges: Vec<[f32; 4]>`):** Pairs of `[fp_idx, pad_offset_x, pad_offset_y, tag]`
+///    ordered strictly so inner GPU crossing loops can break early:
+///    - `tag = 0.0`: Prim's MST ratsnest airwire segments.
+///    - `tag = 3.0`: Inter-component corridor cut segments.
+///    - `tag = 1.0` / `2.0`: Non-decoupling (`1.0`) and decoupling (`2.0`) [`PassiveTie`] tethers.
+///    - `tag = 4.0`: Bus flow alignment and cluster anchor tethers.
+///
+/// # Arguments
+/// * `board` - Board containing footprints, pads, nets, and clusters.
+/// * `config` - Placement configuration specifying spacing and active penalty weights.
+/// * `ties` - Slice of [`PassiveTie`] constraints.
+/// * `base` - Reference [`PlacementState`] providing initial world-space pad coordinates for MST construction.
+///
+/// # Returns
+/// Tuple `(fp_descs, edges, courtyards)` ready for upload to [`VulkanEngine::run_gpu_sa_placer_chains`].
 pub fn build_gpu_sa_descriptors(
     board: &Board,
     config: &PlacementConfig,
@@ -1249,6 +1596,31 @@ pub fn build_gpu_sa_descriptors(
     (fp_descs, edges, courtyards)
 }
 
+/// Dispatches a parallel batch of Simulated Annealing Markov chains on a Vulkan GPU device and
+/// verifies the top-scoring candidate states on the CPU.
+///
+/// Launches `4096` chains (`128` for small boards with $N_f \le 8$) seeded from `base` via
+/// [`VulkanEngine::run_gpu_sa_placer_chains`]. The top 4 GPU-ranked chains are reconstructed into
+/// full CPU [`PlacementState`]s, evaluated with exact SAT courtyard and LBVH crossing checks, and
+/// subjected to a fast 15-step local overlap-push repair if `1..=2` minor overlaps remain alongside
+/// improved wirelength.
+///
+/// # Arguments
+/// * `vk` - Active [`VulkanEngine`] device to dispatch the compute shader on.
+/// * `board` - Board geometry and netlist reference.
+/// * `config` - Placement hyperparameters and weights.
+/// * `ties` - Precomputed [`PassiveTie`] constraints.
+/// * `movable` - Slice of unlocked footprint indices.
+/// * `base` - Starting [`PlacementState`] used to seed all GPU Markov chains.
+/// * `fp_descs` - Prebuilt GPU footprint descriptor buffer (`[f32; 4]` per footprint).
+/// * `edges` - Prebuilt GPU connectivity and affinity edge buffer (`[f32; 4]` per endpoint).
+/// * `courtyards` - Prebuilt [`GpuCourtyardBuffers`] for GPU polygon collision checks.
+/// * `seed_offset` - Monotonically increasing batch index mixed into the PRNG seed.
+/// * `cooling` - Current annealing cooling factor in `[0.05, 1.0]`.
+///
+/// # Returns
+/// `Some((best_verified_state, total_gpu_evaluations))` if the GPU dispatch succeeded, or `None` if
+/// `movable` is empty or the GPU compute pipeline returned no candidates.
 fn run_gpu_placement_batch(
     vk: &VulkanEngine,
     board: &Board,
@@ -1394,6 +1766,31 @@ fn run_gpu_placement_batch(
     best_verified.map(|c| (c, total_gpu_evals))
 }
 
+/// Resolves courtyard overlaps and board outline / keepout violations in `initial` using a
+/// hybrid GPU SA pre-pass followed by multi-core CPU repulsive legalization.
+///
+/// # Algorithm
+/// 1. Returns `initial` immediately if `overlaps == 0 && boundary_violations == 0`.
+/// 2. Clamps all unlocked footprints strictly within their valid board outline origin range
+///    (`Footprint::origin_clamp_range`) and re-evaluates.
+/// 3. If `config.vulkan` is present, runs a high-penalty GPU SA pre-pass (`1024` chains, `4x` overlap
+///    and boundary penalties) and returns immediately if any chain achieves zero violations.
+/// 4. Otherwise spawns `num_threads` parallel Rayon workers that iteratively identify colliding
+///    footprint pairs and apply repulsive separation vectors, random neighborhood shifts, $90^\circ$
+///    rotations, or optional SMD layer flips until all overlaps and boundary violations are eliminated
+///    (short-circuiting across all threads via an `AtomicBool` once solved).
+///
+/// # Arguments
+/// * `board` - Board geometry, footprints, boundary, and keepouts.
+/// * `config` - Placement configuration specifying clearances, grid step, and optional Vulkan engine.
+/// * `initial` - Starting [`PlacementState`] potentially containing courtyard overlaps or boundary excursions.
+/// * `live` - Optional shared [`LiveTrialState`] for GUI phase and log updates.
+///
+/// # Returns
+/// Legalized [`PlacementState`] minimizing boundary violations first, courtyard overlaps second, and total cost third.
+///
+/// # Side Effects
+/// Updates `live` phase to `TrialPhase::Legalizing` and appends diagnostic log entries when `live` is `Some`.
 pub fn legalize_placement(
     board: &Board,
     config: &PlacementConfig,
@@ -1757,10 +2154,27 @@ pub fn legalize_placement(
         .unwrap_or(initial)
 }
 
-/// Positions components in priority order before Simulated Annealing starts:
-/// 1. High priority differential pair components (aligned and placed with direct corridors).
-/// 2. Decoupling capacitors situated as close as possible to their connected non-ground device power pin.
-/// 3. Remaining components placed around their cluster anchors or schematic positions.
+/// Positions unlocked board components in strict electrical priority order before Simulated Annealing begins.
+///
+/// # Priority Order
+/// 1. **High-Priority Differential Pair Components:** Unlocked footprints connected to differential pair
+///    nets (`USB_Diff` netclass or `USB_D*`/`DP`/`DM`/`D+`/`D-`) are positioned along direct horizontal
+///    routing corridors (`12.0` mm inward from any locked differential anchor such as a USB connector).
+/// 2. **Decoupling Capacitors:** Each 2-pin decoupling capacitor identified via [`build_passive_ties`]
+///    is placed on a radial polar grid (`0.8..=4.0` mm) outward from its target active IC power pin,
+///    filtered for legality via [`PlacedBoardSpatialIndex`] and exact courtyard SAT checks, and optionally
+///    batch-scored on the GPU via [`score_candidate_poses_gpu`] to minimize pad-to-pin loop length.
+/// 3. **Boundary Containment:** Any remaining unlocked footprints staged outside the board outline are
+///    clamped inside `Footprint::origin_clamp_range`.
+///
+/// # Arguments
+/// * `board` - Mutable [`Board`] whose unlocked footprint coordinates and rotations are updated.
+/// * `config` - Placement configuration specifying grid step, spacing, escape margins, and optional Vulkan engine.
+/// * `live` - Optional shared [`LiveTrialState`] to record progress log messages.
+///
+/// # Side Effects
+/// Mutates `x`, `y`, and `rotation` of unlocked footprints in `board.footprints` and appends a log
+/// message to `live` when `Some`.
 pub fn prioritize_and_position_initial_components(
     board: &mut Board,
     config: &PlacementConfig,
@@ -2007,12 +2421,18 @@ pub fn prioritize_and_position_initial_components(
     }
 }
 
+/// Cached world-space courtyard polygons and bounding boxes for a single placed footprint in [`PlacedBoardSpatialIndex`].
 #[derive(Clone, Debug)]
 struct PlacedFootprintSpatialEntry {
+    /// Component reference designator (e.g., `"U1"`, `"C12"`), used to skip self-collision checks.
     reference: String,
+    /// Copper layer index (`0` for `F.Cu`, `1` for `B.Cu`).
     layer: usize,
+    /// `true` if the footprint has only SMD pads (`false` if any THT/NPTH pad spans all layers).
     is_smd_only: bool,
+    /// Pre-transformed convex courtyard polygons paired with their individual [`AABB`]s.
     courtyards: Vec<(Polygon, AABB)>,
+    /// Union [`AABB`] enclosing all polygons in `courtyards`.
     overall_aabb: AABB,
 }
 
@@ -2021,14 +2441,28 @@ struct PlacedFootprintSpatialEntry {
 /// transformations per candidate to $O(\log N_f)$ AABB-BVH pruning + exact SAT verification.
 #[derive(Clone, Debug)]
 pub struct PlacedBoardSpatialIndex {
+    /// Base courtyard clearance margin in millimeters (`mm`) baked into the indexed polygons.
     pub min_spacing_mm: f64,
+    /// Per-footprint cached world-space courtyard polygons and bounding boxes.
     footprints: Vec<PlacedFootprintSpatialEntry>,
+    /// Raw LBVH leaf primitive tuples `([min_x, min_y, max_x, max_y], layer_mask, fp_idx)`.
     primitives: Vec<([f32; 4], u32, u32)>,
+    /// Precomputed [`AABB`]s for all board keepout zones.
     keepout_aabbs: Vec<AABB>,
+    /// Flattened 2D Morton Linear Bounding Volume Hierarchy nodes built via [`build_gpu_lbvh`].
     bvh_nodes: Vec<crate::vulkan::GpuBvhNode>,
 }
 
 impl PlacedBoardSpatialIndex {
+    /// Builds a [`PlacedFootprintSpatialEntry`] and its corresponding LBVH primitive tuple for `fp`.
+    ///
+    /// # Arguments
+    /// * `fp` - Footprint whose world-space courtyards and layer mask are computed.
+    /// * `min_spacing_mm` - Base courtyard spacing in millimeters (`mm`).
+    /// * `idx` - Footprint index stored as the LBVH leaf primitive payload.
+    ///
+    /// # Returns
+    /// Tuple `(entry, ([min_x, min_y, max_x, max_y], layer_mask, idx))`.
     fn build_entry(
         fp: &crate::board::Footprint,
         min_spacing_mm: f64,
@@ -2088,6 +2522,14 @@ impl PlacedBoardSpatialIndex {
         )
     }
 
+    /// Constructs a [`PlacedBoardSpatialIndex`] over all footprints and keepouts currently on `board`.
+    ///
+    /// # Arguments
+    /// * `board` - Board whose footprints and keepout zones are indexed.
+    /// * `min_spacing_mm` - Base courtyard clearance margin in millimeters (`mm`).
+    ///
+    /// # Returns
+    /// Newly constructed [`PlacedBoardSpatialIndex`] with a built 2D Morton LBVH.
     pub fn from_board(board: &Board, min_spacing_mm: f64) -> Self {
         let mut footprints = Vec::with_capacity(board.footprints.len());
         let mut primitives = Vec::with_capacity(board.footprints.len());
@@ -2111,6 +2553,16 @@ impl PlacedBoardSpatialIndex {
         }
     }
 
+    /// Recomputes the spatial entry for a single moved footprint `fp_idx` and rebuilds the LBVH tree.
+    ///
+    /// Does nothing if `fp_idx` is out of bounds.
+    ///
+    /// # Arguments
+    /// * `board` - Board containing the updated footprint pose at `board.footprints[fp_idx]`.
+    /// * `fp_idx` - Index of the modified footprint.
+    ///
+    /// # Side Effects
+    /// Mutates `self.footprints[fp_idx]`, `self.primitives[fp_idx]`, and rebuilds `self.bvh_nodes`.
     pub fn update_footprint(&mut self, board: &Board, fp_idx: usize) {
         if fp_idx >= board.footprints.len() || fp_idx >= self.footprints.len() {
             return;
@@ -2121,6 +2573,13 @@ impl PlacedBoardSpatialIndex {
         self.bvh_nodes = crate::vulkan::build_gpu_lbvh(&self.primitives);
     }
 
+    /// Appends a newly placed footprint `fp` to the spatial index and rebuilds the LBVH tree.
+    ///
+    /// # Arguments
+    /// * `fp` - Newly placed footprint to insert.
+    ///
+    /// # Side Effects
+    /// Pushes onto `self.footprints` and `self.primitives`, and rebuilds `self.bvh_nodes`.
     pub fn push_footprint(&mut self, fp: &crate::board::Footprint) {
         let idx = self.footprints.len();
         let (entry, prim) = Self::build_entry(fp, self.min_spacing_mm, idx);
@@ -2129,6 +2588,21 @@ impl PlacedBoardSpatialIndex {
         self.bvh_nodes = crate::vulkan::build_gpu_lbvh(&self.primitives);
     }
 
+    /// Queries the 2D Morton LBVH to determine whether candidate courtyard polygons `cand_polys`
+    /// for footprint `fp` on `layer` collide with any already-indexed footprint courtyard.
+    ///
+    /// Traverses `self.bvh_nodes` using an explicit 64-entry stack, pruning internal subtrees via
+    /// layer bitmasks and float AABBs before performing exact convex SAT checks (`Polygon::intersects_convex`)
+    /// at leaf nodes. Automatically ignores self-collisions (`entry.reference == fp.reference`) and
+    /// opposite-side SMD-only pairs.
+    ///
+    /// # Arguments
+    /// * `fp` - Candidate footprint being tested.
+    /// * `layer` - Candidate copper layer index (`0` for `F.Cu`, `1` for `B.Cu`).
+    /// * `cand_polys` - Pre-transformed world-space courtyard polygons for the candidate pose.
+    ///
+    /// # Returns
+    /// `true` if any courtyard collision is detected; `false` otherwise.
     #[inline]
     pub fn collides_with_placed_courtyards(
         &self,
@@ -2218,6 +2692,21 @@ impl PlacedBoardSpatialIndex {
 
     /// Evaluates whether placing `fp` at `(pos, rot, layer)` is legal using the precomputed
     /// 2D Morton LBVH over placed footprints and keepouts, with 100% exact SAT courtyard and boundary checks.
+    ///
+    /// Verifies that:
+    /// 1. The component origin `pos`, all courtyard polygon vertices, and all pad corners lie inside `board`'s outline.
+    /// 2. No courtyard polygon AABB overlaps any keepout zone in `self.keepout_aabbs`.
+    /// 3. The placement-spaced courtyards do not collide with any indexed footprint via [`PlacedBoardSpatialIndex::collides_with_placed_courtyards`].
+    ///
+    /// # Arguments
+    /// * `board` - Board providing the outer contour boundary test (`Board::contains_point_in_boundary`).
+    /// * `fp` - Candidate footprint to test.
+    /// * `pos` - Candidate world-space origin `(x, y)` in millimeters (`mm`).
+    /// * `rot` - Candidate orientation angle in degrees.
+    /// * `layer` - Candidate copper layer index (`0` for `F.Cu`, `1` for `B.Cu`).
+    ///
+    /// # Returns
+    /// `true` if the pose is completely legal; `false` otherwise.
     pub fn is_placement_legal(
         &self,
         board: &Board,
@@ -2265,6 +2754,14 @@ impl PlacedBoardSpatialIndex {
     }
 
     /// Batch-evaluates candidate `(pos, rot, layer)` poses against the spatial index.
+    ///
+    /// # Arguments
+    /// * `board` - Board providing outline containment checks.
+    /// * `fp` - Candidate footprint being evaluated.
+    /// * `candidates` - Slice of `(pos, rot, layer)` candidate poses.
+    ///
+    /// # Returns
+    /// Vector of booleans corresponding 1-to-1 with `candidates`, where `true` indicates a legal pose.
     pub fn filter_legal_poses_batch(
         &self,
         board: &Board,
@@ -2279,6 +2776,20 @@ impl PlacedBoardSpatialIndex {
 }
 
 /// Checks if placing `fp` at `pos` with `rot` and `layer` is legal (within board boundary, no keepout intersection, no courtyard collision).
+///
+/// Performs a standalone $O(N_f)$ legality check without requiring a prebuilt [`PlacedBoardSpatialIndex`].
+/// For repeated queries across many candidates, prefer [`PlacedBoardSpatialIndex::is_placement_legal`].
+///
+/// # Arguments
+/// * `board` - Board containing the outline, keepouts, and placed footprints.
+/// * `fp` - Footprint to test.
+/// * `pos` - Candidate world-space origin `(x, y)` in millimeters (`mm`).
+/// * `rot` - Candidate rotation angle in degrees.
+/// * `layer` - Candidate copper layer index (`0` for `F.Cu`, `1` for `B.Cu`).
+/// * `min_spacing_mm` - Base courtyard clearance spacing in millimeters (`mm`).
+///
+/// # Returns
+/// `true` if `fp` lies strictly inside the board outline, avoids keepouts, and does not overlap any other footprint.
 pub fn is_placement_legal(
     board: &Board,
     fp: &crate::board::Footprint,
@@ -2351,8 +2862,27 @@ pub fn is_placement_legal(
 
 /// Shoves unlocked components that overlap with `placed_idx` away from it,
 /// preserving legal courtyard spacing and boundary/keepout clearance.
-/// If direct directional shove leaves residual overlaps, runs local simulated annealing legalization.
-/// Returns the number of shoved components.
+///
+/// # Algorithm
+/// 1. Identifies all unlocked footprints on `board` whose courtyards intersect `board.footprints[placed_idx]`.
+/// 2. Searches outward along 7 fan angles (`0..=±90°`) and 12 radial step distances (`0.5..=12.0` mm)
+///    along the center-to-center repulsion vector using [`PlacedBoardSpatialIndex::is_placement_legal`].
+/// 3. If any residual overlaps remain on the board after directional shoving, temporarily locks
+///    `placed_idx` and runs [`legalize_placement`] to resolve cascading collisions.
+/// 4. Calls `Board::rip_up_connected_traces_to_component_at` for every footprint whose pose changed
+///    so stale copper traces connected to displaced pads are cleanly removed.
+///
+/// # Arguments
+/// * `board` - Mutable [`Board`] containing the stationary footprint `placed_idx` and surrounding footprints.
+/// * `placed_idx` - Index in `board.footprints` of the newly placed or dragged component.
+/// * `min_spacing_mm` - Minimum courtyard clearance spacing in millimeters (`mm`).
+///
+/// # Returns
+/// Number of unlocked footprints that were shoved or legalized.
+///
+/// # Side Effects
+/// Mutates positions/rotations of colliding unlocked footprints in `board.footprints` and rips up
+/// any routed copper traces connected to moved components.
 pub fn shove_overlapping_components(
     board: &mut Board,
     placed_idx: usize,
@@ -2488,7 +3018,21 @@ pub fn shove_overlapping_components(
 }
 
 
-/// Batch-evaluates candidate `(pos, rot, layer)` poses for `fp` on the GPU using `vk.evaluate_placement_batch`.
+/// Batch-evaluates candidate `(pos, rot, layer)` poses for `fp` on the GPU using [`VulkanEngine::evaluate_placement_batch`].
+///
+/// Packs rotated bounding boxes (`[min_x, min_y, max_x, max_y]`) and up to 16 target airwire
+/// segments per candidate pose into GPU buffers and dispatches a single compute pass.
+///
+/// # Arguments
+/// * `vk` - Active [`VulkanEngine`] instance.
+/// * `board` - Board providing the outer boundary AABB.
+/// * `fp` - Footprint whose candidate poses are being scored.
+/// * `candidates` - Slice of `(pos, rot, layer)` candidate poses to evaluate.
+/// * `targets` - Slice of `(pad_idx_on_fp, target_world_point, weight)` connections (capped at 16).
+/// * `config` - Placement weights and spacing configuration.
+///
+/// # Returns
+/// `Some(scores)` with one `f32` cost per candidate if `candidates` is non-empty and GPU dispatch succeeds, or `None`.
 pub fn score_candidate_poses_gpu(
     vk: &VulkanEngine,
     board: &Board,
@@ -2548,10 +3092,23 @@ pub fn score_candidate_poses_gpu(
     vk.evaluate_placement_batch(&boxes, &segs, &params)
 }
 
-/// Finds the most favourable location (x, y), orientation (rotation in degrees), and layer for `fp` on `board`.
-/// - Decoupling capacitors are placed directly adjacent to their connected IC's non-ground power pin, oriented with their power pad facing the IC pin.
-/// - Differential pairs and connected passives/ICs are placed adjacent to their connected pins, minimizing Euclidean wirelength and crossings.
-/// - Unconnected components are placed in the nearest legal, non-colliding location.
+/// Finds the most favourable location `(x, y)` in millimeters (`mm`), orientation (`rotation` in degrees),
+/// and copper `layer` for `fp` on `board`.
+///
+/// Builds a one-off [`PlacedBoardSpatialIndex`] and delegates to [`find_most_favourable_placement_with_index`]:
+/// - Decoupling capacitors are placed directly adjacent to their connected IC's non-ground power pin,
+///   oriented with their power pad facing the IC pin.
+/// - Differential pairs and connected passives/ICs are placed adjacent to their connected pins,
+///   minimizing weighted Euclidean wirelength and crossings.
+/// - Unconnected components are placed in the nearest legal, non-colliding location around the board center.
+///
+/// # Arguments
+/// * `board` - Board containing existing placed footprints, outline, keepouts, and schematic metadata.
+/// * `fp` - Footprint to find a placement pose for.
+/// * `config` - Placement clearances, grid step, and optional Vulkan engine.
+///
+/// # Returns
+/// Tuple `(x_mm, y_mm, rotation_deg, layer_idx)` representing the best legal pose.
 pub fn find_most_favourable_placement(
     board: &Board,
     fp: &crate::board::Footprint,
@@ -2561,6 +3118,21 @@ pub fn find_most_favourable_placement(
     find_most_favourable_placement_with_index(board, fp, config, &spatial_index)
 }
 
+/// Finds the most favourable legal placement pose `(x_mm, y_mm, rotation_deg, layer_idx)` for `fp`
+/// using a caller-supplied [`PlacedBoardSpatialIndex`].
+///
+/// Avoids rebuilding the 2D Morton LBVH when placing multiple components sequentially (such as in
+/// [`place_all_holding_components_at_best_locations`]).
+///
+/// # Arguments
+/// * `board` - Board containing existing placed footprints, nets, and schematic clusters.
+/// * `fp` - Footprint to place.
+/// * `config` - Placement configuration specifying grid step, spacing, and optional GPU scoring.
+/// * `spatial_index` - Prebuilt [`PlacedBoardSpatialIndex`] over currently placed footprints.
+///
+/// # Returns
+/// Tuple `(x_mm, y_mm, rotation_deg, layer_idx)` for the lowest-cost legal candidate pose, or a
+/// boundary-clamped fallback pose if no candidate satisfies all constraints.
 pub fn find_most_favourable_placement_with_index(
     board: &Board,
     fp: &crate::board::Footprint,
@@ -2819,6 +3391,20 @@ pub fn find_most_favourable_placement_with_index(
 }
 
 /// Places a single component from the holding palette at its most favourable location and orientation on the board.
+///
+/// Removes `board.holding_palette[idx]`, computes its optimal non-colliding pose via
+/// [`find_most_favourable_placement`], appends the placed footprint to `board.footprints`, and returns it.
+///
+/// # Arguments
+/// * `board` - Mutable [`Board`] containing the `holding_palette` and existing `footprints`.
+/// * `idx` - Index into `board.holding_palette` of the component to place.
+/// * `config` - Placement configuration specifying clearances, grid step, and optional GPU scoring.
+///
+/// # Returns
+/// `Some(placed_footprint)` if `idx < board.holding_palette.len()`, or `None` if `idx` is out of bounds.
+///
+/// # Side Effects
+/// Removes the item at `idx` from `board.holding_palette` and pushes it onto `board.footprints`.
 pub fn place_holding_component_at_best_location(
     board: &mut Board,
     idx: usize,
@@ -2838,6 +3424,21 @@ pub fn place_holding_component_at_best_location(
 }
 
 /// Places all components in the holding palette at their most favourable locations and orientations on the board.
+///
+/// Drains `board.holding_palette`, sorts the unplaced footprints by electrical priority
+/// (`0` = differential pairs, `1` = 2-pin decoupling capacitors, `2` = active ICs/transistors `U*`/`Q*`,
+/// `3` = general passives), and places each component sequentially using an incrementally updated
+/// [`PlacedBoardSpatialIndex`] via [`find_most_favourable_placement_with_index`].
+///
+/// # Arguments
+/// * `board` - Mutable [`Board`] whose `holding_palette` is drained into `board.footprints`.
+/// * `config` - Placement configuration specifying clearances, grid step, and optional GPU scoring.
+///
+/// # Returns
+/// Total number of footprints moved from `board.holding_palette` onto `board.footprints`.
+///
+/// # Side Effects
+/// Empties `board.holding_palette` and appends all placed footprints to `board.footprints`.
 pub fn place_all_holding_components_at_best_locations(
     board: &mut Board,
     config: &PlacementConfig,
@@ -2883,7 +3484,21 @@ pub fn place_all_holding_components_at_best_locations(
     count
 }
 
-/// Precompute functional component clusters for rigid group moves (e.g. IC + tied decoupling caps/resistors).
+/// Precomputes functional component clusters for rigid group moves (e.g. an active IC together with
+/// its tied decoupling capacitors and termination resistors).
+///
+/// For each footprint $i \in [0, N_f)$, builds a list of movable footprint indices that belong to
+/// its local functional group based on [`PassiveTie`] links where both `anchor_idx` and `passive_idx`
+/// are unlocked (`movable`).
+///
+/// # Arguments
+/// * `board` - Board containing all footprints.
+/// * `ties` - Slice of [`PassiveTie`] affinity relationships.
+/// * `movable` - Slice of unlocked footprint indices.
+///
+/// # Returns
+/// Vector of length `board.footprints.len()`, where `clusters[i]` contains the footprint indices in
+/// component `i`'s rigid move group.
 pub fn build_component_clusters(
     board: &Board,
     ties: &[PassiveTie],
@@ -2906,7 +3521,25 @@ pub fn build_component_clusters(
     clusters
 }
 
-/// Rigidly translate an entire cluster of components by (dx, dy) if all members stay within board bounds.
+/// Rigidly translates an entire cluster of components by `(dx, dy)` in millimeters (`mm`) if and only if
+/// all cluster members remain strictly within their legal board origin clamp ranges.
+///
+/// # Arguments
+/// * `state` - Mutable [`PlacementState`] to update if the group translation is valid.
+/// * `board` - Board providing footprint geometry and clamp bounds.
+/// * `config` - Placement configuration specifying `min_spacing_mm`.
+/// * `cluster` - Slice of footprint indices belonging to the cluster (from [`build_component_clusters`]).
+/// * `dx` - Horizontal translation delta in millimeters (`mm`).
+/// * `dy` - Vertical translation delta in millimeters (`mm`).
+/// * `boundary` - Outer board [`AABB`] used by `Footprint::origin_clamp_range`.
+///
+/// # Returns
+/// `true` if all members fit within the board boundary and `state` was updated; `false` if `cluster`
+/// is empty, the translation is zero, or any member would violate its clamp range (leaving `state` unmodified).
+///
+/// # Side Effects
+/// When returning `true`, translates `state.positions[m]` and refreshes cached geometry via
+/// `state.update_component(m, board, config)` for every `m` in `cluster`.
 pub fn apply_cluster_group_move(
     state: &mut PlacementState,
     board: &Board,
@@ -2938,9 +3571,29 @@ pub fn apply_cluster_group_move(
     }
 }
 
-/// Metropolis-Hastings replica exchange between adjacent temperature rungs in Parallel Tempering.
-/// Swaps configurations between adjacent rungs (i, i+1) with acceptance probability:
-/// P_swap = min(1, exp((beta_i - beta_{i+1}) * (E_i - E_{i+1})))
+/// Performs Metropolis-Hastings replica exchange between adjacent temperature rungs in Parallel Tempering.
+///
+/// Alternates between even `(0, 1), (2, 3), ...` and odd `(1, 2), (3, 4), ...` adjacent rung pairs
+/// based on `epoch % 2`, swapping their [`PlacementState`] configurations with probability:
+///
+/// $$P_{\text{swap}}(i, i+1) = \min\left(1, \exp\big((\beta_i - \beta_{i+1})(E_i - E_{i+1})\big)\right)$$
+///
+/// where $\beta_k = 1 / T_k$ is the inverse temperature of rung $k$ and $E_k$ is `replicas[k].cost`.
+///
+/// # Arguments
+/// * `replicas` - Mutable slice of [`PlacementState`]s ordered from coldest rung (`0`) to hottest rung (`num_threads - 1`).
+/// * `num_threads` - Total number of temperature rungs in the geometric ladder.
+/// * `epoch` - Current epoch index (determines even vs. odd pairing parity).
+/// * `progress` - Normalized elapsed time in `[0.0, 1.0]` used to compute the cooling schedule.
+/// * `temp_scale` - Global temperature scaling factor from [`PlacementConfig::temp_scale`].
+/// * `thermal_boost` - Temporary reheating multiplier (`3.5` during stagnation thermal pulses, `1.0` otherwise).
+/// * `rng` - Random number generator used for Metropolis acceptance rolls.
+///
+/// # Returns
+/// Number of adjacent replica swaps accepted during this exchange pass.
+///
+/// # Side Effects
+/// Swaps elements in `replicas` in-place and advances `rng`.
 pub fn metropolis_replica_exchange(
     replicas: &mut [PlacementState],
     num_threads: usize,
@@ -2978,6 +3631,40 @@ pub fn metropolis_replica_exchange(
     accepted_swaps
 }
 
+/// Executes the complete hybrid Vulkan GPU + multi-core CPU Parallel Tempering Simulated Annealing
+/// PCB auto-placement pipeline on `board`.
+///
+/// # Pipeline Stages
+/// 1. **Holding Palette Placement:** Places any unplaced components from `board.holding_palette`
+///    via [`place_all_holding_components_at_best_locations`].
+/// 2. **Initial Prioritization & Legalization:** Compares the legalized existing board state against
+///    [`prioritize_and_position_initial_components`] + [`legalize_placement`], retaining whichever
+///    achieves lower cost and fewer overlaps.
+/// 3. **Pre-Annealing Pin/Gate Swapping:** Calls [`optimize_pin_and_gate_swapping`] to untangle
+///    initial ratsnest crossings before annealing.
+/// 4. **Parallel Tempering & Vulkan GPU Co-Execution:**
+///    - Spawns background threads for each available [`VulkanEngine`] device to continuously run
+///      `run_gpu_placement_batch` and inject verified improvements into `global_best`.
+///    - Runs `num_threads` CPU replicas across a geometric temperature ladder ($T \in [8.0, 350.0] \times \text{temp\_scale}$),
+///      applying 7 move operators per step, performing [`metropolis_replica_exchange`] at epoch boundaries,
+///      and triggering thermal pulses + legal basin hops upon stagnation.
+///    - Streams live footprint deltas over KiCad IPC (`config.ipc`) and updates GUI telemetry (`live`).
+/// 5. **Final Containment, Pin/Gate Swap & Legalization Pass:** Verifies strict board outline containment
+///    for all unlocked footprints, runs a final [`optimize_pin_and_gate_swapping`] pass, re-legalizes if
+///    needed, applies the winning [`PlacementState`] to `board`, and commits the final IPC batch.
+///
+/// # Arguments
+/// * `board` - Mutable [`Board`] to auto-place in-place.
+/// * `config` - Placement hyperparameters, clearance rules, duration, and optional Vulkan/IPC handles.
+/// * `live` - Optional shared [`LiveTrialState`] for real-time GUI canvas, ratsnest, and sparkline telemetry.
+/// * `stop_flag` - Shared atomic flag allowing early user cancellation from the GUI or CLI signal handler.
+///
+/// # Returns
+/// The best evaluated [`PlacementState`] discovered and applied to `board`.
+///
+/// # Side Effects
+/// Mutates `board.footprints`, `board.holding_palette`, and pad net assignments (via pin/gate swapping),
+/// streams live pose updates to `live` and `config.ipc`, and dispatches compute work to `config.vulkan`.
 pub fn run_auto_placer(
     board: &mut Board,
     config: &PlacementConfig,

@@ -1,6 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
+//! Bare-metal NVIDIA CUDA Driver API (`libcuda.so`) and OptiX (`libnvoptix.so`) compute backend.
+//!
+//! This module provides runtime dynamic loading of the CUDA Driver API and OptiX function tables
+//! without requiring compile-time CUDA SDK link dependencies, alongside PTX module compilation
+//! and loading (`cuda/kernels.ptx` and `cuda/ampere_kernels.ptx`), persistent device memory
+//! buffer management (`PersistentDeviceBuffers`, `CachedWavefrontBuffers`), and automatic
+//! micro-benchmark kernel dispatch calibration (`KernelDispatchProfile`).
+//!
+//! # Accelerated GPU Workloads
+//! - **Euclidean Distance Fields (2D & 3D):** Exact two-pass Felzenszwalb-Huttenlocher separable
+//!   scans, shared-memory tiled evaluation, hand-tuned Ampere PTX (`sm_86`), and WMMA Tensor Core
+//!   (`mma.sync`) kernels.
+//! - **A* / Bellman-Ford 3D Wavefront Expansion & Backtracking:** Multi-layer 3D routing cost grid
+//!   evaluation, parallel iterative wavefront relaxation, and on-GPU shortest-path backtracking
+//!   with multi-GPU work distribution via [`MultiGpuRouterPool`].
+//! - **LBVH Construction & Ray-Tracing / DRC Queries:** Linear Bounding Volume Hierarchy (LBVH)
+//!   traversal kernels for ratsnest segment crossings, routing corridor cut congestion, line-of-sight
+//!   DRC clearance rays, and batched pad/track/via candidate DRC verification.
+//! - **Simulated Annealing (SA) Auto-Placer Chains:** Parallel Tempering Markov Chain Monte Carlo
+//!   (MCMC) placement kernels supporting full evaluation, incremental $\Delta E$ updates, SAT convex
+//!   polygon courtyard collision checks, and Tensor Core batch evaluation.
+//! - **Field Solvers & Layout Optimization Support:** High-throughput device compute infrastructure
+//!   shared across SSTL-18 / transmission-line impedance field solvers, silkscreen placement, and
+//!   via stitching optimization passes.
+
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::ptr;
@@ -8,6 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+/// Re-exported GPU data structures, LBVH builders, and CPU reference evaluators from [`crate::vulkan`].
 pub use crate::vulkan::{
     build_gpu_lbvh, build_gpu_lbvh_from_segments, evaluate_corridor_cuts_brute_force_cpu,
     evaluate_corridor_cuts_lbvh_cpu, evaluate_drc_brute_force_cpu,
@@ -17,65 +43,109 @@ pub use crate::vulkan::{
     GpuSaParams, PlacementBatchParams, RtBvhBenchmarkResult,
 };
 
+/// Process-wide cache of initialized [`CudaEngine`] instances across all detected NVIDIA GPUs,
+/// sorted in descending order of compute capability/tier.
 static ALL_CUDA_ENGINES: OnceLock<Vec<Arc<CudaEngine>>> = OnceLock::new();
 
+/// Embedded baseline PTX assembly image (`cuda/kernels.ptx`) containing SIMT, LBVH, wavefront,
+/// DRC, and Tensor Core kernels.
 pub const KERNELS_PTX: &str = include_str!("../cuda/kernels.ptx");
+
+/// Embedded Ampere-optimized PTX assembly image (`cuda/ampere_kernels.ptx`) with hand-tuned
+/// `sm_80`/`sm_86` distance field and placement evaluation kernels.
 pub const AMPERE_KERNELS_PTX: &str = include_str!("../cuda/ampere_kernels.ptx");
 
+/// Execution strategy variants for 2D/3D Euclidean Distance Field (EDT) computation on CUDA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistanceFieldVariant {
+    /// Two-pass 1D separable Felzenszwalb-Huttenlocher parabolic lower-envelope scan in global memory.
     SimtDirect,
+    /// Shared-memory tiled 2D stencil evaluation with halo padding.
     SimtSharedTiled,
+    /// Hand-written Ampere (`sm_86`) PTX direct global-memory kernel.
     AmperePtxDirect,
+    /// Hand-written Ampere (`sm_86`) PTX shared-memory tiled kernel.
     AmperePtxTiled,
+    /// Warp-Matrix-Multiply-Accumulate (WMMA / Tensor Core) accelerated distance evaluation.
     TensorCore,
 }
 
+/// Execution strategy variants for batched candidate footprint placement cost evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlacementEvalVariant {
+    /// Standard SIMT evaluation of AABB overlaps, boundary violations, wirelength, and crossings.
     SimtStandard,
+    /// Hand-tuned Ampere PTX placement cost kernel.
     AmperePtx,
+    /// Tensor Core accelerated pairwise distance and overlap evaluation kernel.
     TensorCore,
 }
 
+/// Execution strategy variants for 3D multi-layer routing cell cost evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingCost3DVariant {
+    /// Shared-memory tiled 3D clearance and PathFinder congestion cost evaluation.
     SimtSharedTiled,
+    /// Tensor Core accelerated 3D routing cost evaluation.
     TensorCore,
 }
 
+/// Execution strategy variants for GPU Parallel Tempering Simulated Annealing (SA) placement chains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaPlacerVariant {
+    /// Recomputes full board energy at each MCMC perturbation step.
     SimtFullEval,
+    /// Computes only incremental $\Delta E$ for the perturbed footprint(s) per MCMC step.
     SimtIncrementalDeltaE,
+    /// Uses Tensor Core operations to accelerate pairwise courtyard and wirelength terms.
     TensorCore,
 }
 
+/// Per-device auto-calibrated kernel selection profile and micro-benchmark timing telemetry.
 #[derive(Debug, Clone)]
 pub struct KernelDispatchProfile {
+    /// Human-readable CUDA device name reported by `cuDeviceGetName`.
     pub device_name: String,
+    /// Fastest validated [`DistanceFieldVariant`] on this GPU.
     pub best_distance_field: DistanceFieldVariant,
+    /// Fastest validated [`PlacementEvalVariant`] on this GPU.
     pub best_placement_eval: PlacementEvalVariant,
+    /// Fastest validated [`RoutingCost3DVariant`] on this GPU.
     pub best_routing_cost_3d: RoutingCost3DVariant,
+    /// Fastest validated [`SaPlacerVariant`] on this GPU.
     pub best_sa_placer: SaPlacerVariant,
+    /// Median execution times in microseconds (`us`) for each tested [`DistanceFieldVariant`].
     pub df_timings_us: Vec<(DistanceFieldVariant, f64)>,
+    /// Median execution times in microseconds (`us`) for each tested [`PlacementEvalVariant`].
     pub pe_timings_us: Vec<(PlacementEvalVariant, f64)>,
+    /// Median execution times in microseconds (`us`) for each tested [`RoutingCost3DVariant`].
     pub rc_timings_us: Vec<(RoutingCost3DVariant, f64)>,
+    /// Median execution times in microseconds (`us`) for each tested [`SaPlacerVariant`].
     pub sa_timings_us: Vec<(SaPlacerVariant, f64)>,
 }
 
+/// Process-wide cache of calibrated [`KernelDispatchProfile`] entries keyed by `"<ordinal>:<device_name>"`.
 static DISPATCH_PROFILE_CACHE: OnceLock<Mutex<HashMap<String, KernelDispatchProfile>>> = OnceLock::new();
 
+/// CUDA Driver API status/error code (`CUresult`).
 pub type CUresult = c_uint;
+/// CUDA Driver API device handle (`CUdevice` ordinal).
 pub type CUdevice = c_int;
+/// Opaque CUDA Driver API context pointer (`CUcontext`).
 pub type CUcontext = *mut c_void;
+/// Opaque CUDA Driver API loaded PTX/cubin module pointer (`CUmodule`).
 pub type CUmodule = *mut c_void;
+/// Opaque CUDA Driver API kernel function handle (`CUfunction`).
 pub type CUfunction = *mut c_void;
+/// Opaque CUDA Driver API stream handle (`CUstream`).
 pub type CUstream = *mut c_void;
+/// 64-bit device virtual memory address (`CUdeviceptr`).
 pub type CUdeviceptr = u64;
 
+/// CUDA Driver API status code indicating successful completion (`CUDA_SUCCESS == 0`).
 pub const CUDA_SUCCESS: CUresult = 0;
 
+/// Function pointer signature for NVIDIA OptiX `optixQueryFunctionTable` entry point.
 pub type OptixQueryFunctionTableFn = unsafe extern "C" fn(
     abi_id: u32,
     num_options: u32,
@@ -85,15 +155,34 @@ pub type OptixQueryFunctionTableFn = unsafe extern "C" fn(
     table_size: usize,
 ) -> u32;
 
+/// Dynamically loaded NVIDIA OptiX runtime driver (`libnvoptix.so.1`) and negotiated ABI version.
 #[allow(non_snake_case)]
 pub struct OptixDriverApi {
+    /// Handle to the dynamically loaded `libnvoptix.so` shared library keeping symbols alive.
     _lib: libloading::Library,
+    /// Raw entry point to query the OptiX driver function table for a specific ABI version.
     pub optixQueryFunctionTable: OptixQueryFunctionTableFn,
+    /// Negotiated OptiX ABI version number (e.g., `119` for OptiX 9.0, `89` for OptiX 8.0).
     pub abi_version: u32,
+    /// Numeric OptiX SDK version corresponding to `abi_version` (e.g., `90000` for 9.0.0).
     pub optix_version: u32,
 }
 
 impl OptixDriverApi {
+    /// Dynamically loads `libnvoptix.so.1` (if present on the host) and probes supported OptiX
+    /// ABI versions to verify hardware ray-tracing driver availability.
+    ///
+    /// # Returns
+    /// * `Some(Arc<OptixDriverApi>)` if `libnvoptix.so` is found and a valid function table ABI handshake succeeds.
+    /// * `None` if the library is absent or no compatible OptiX ABI version responds.
+    ///
+    /// # Side Effects
+    /// * Dynamically loads `libnvoptix.so.1` into the process address space and caches the handle
+    ///   in a static `OnceLock`.
+    ///
+    /// # Safety
+    /// Invokes `unsafe` dynamic symbol resolution (`libloading::Library::new`) and calls the C ABI
+    /// `optixQueryFunctionTable` entry point with a stack-allocated function pointer table buffer.
     #[allow(non_snake_case)]
     pub fn load() -> Option<Arc<Self>> {
         static OPTIX_ONCE: std::sync::OnceLock<Option<Arc<OptixDriverApi>>> = std::sync::OnceLock::new();
@@ -186,25 +275,44 @@ impl OptixDriverApi {
     }
 }
 
+/// Dynamically loaded function table for the NVIDIA CUDA Driver API (`libcuda.so.1`).
 #[allow(non_snake_case)]
 pub struct CudaDriverApi {
+    /// Handle to the dynamically loaded `libcuda.so` shared library keeping symbols alive.
     _lib: libloading::Library,
+    /// Initializes the CUDA Driver API (`cuInit`).
     pub cuInit: unsafe extern "C" fn(flags: c_uint) -> CUresult,
+    /// Queries the installed CUDA Driver version (`cuDriverGetVersion`).
     pub cuDriverGetVersion: unsafe extern "C" fn(version: *mut c_int) -> CUresult,
+    /// Returns the number of compute-capable CUDA devices (`cuDeviceGetCount`).
     pub cuDeviceGetCount: unsafe extern "C" fn(count: *mut c_int) -> CUresult,
+    /// Retrieves a device handle for a given ordinal (`cuDeviceGet`).
     pub cuDeviceGet: unsafe extern "C" fn(device: *mut CUdevice, ordinal: c_int) -> CUresult,
+    /// Queries the ASCII marketing name of a CUDA device (`cuDeviceGetName`).
     pub cuDeviceGetName: unsafe extern "C" fn(name: *mut c_char, len: c_int, dev: CUdevice) -> CUresult,
+    /// Creates a new CUDA context on the specified device (`cuCtxCreate_v2`).
     pub cuCtxCreate_v2: unsafe extern "C" fn(pctx: *mut CUcontext, flags: c_uint, dev: CUdevice) -> CUresult,
+    /// Destroys a CUDA context and releases its associated resources (`cuCtxDestroy_v2`).
     pub cuCtxDestroy_v2: unsafe extern "C" fn(ctx: CUcontext) -> CUresult,
+    /// Binds the specified CUDA context to the calling host thread (`cuCtxSetCurrent`).
     pub cuCtxSetCurrent: unsafe extern "C" fn(ctx: CUcontext) -> CUresult,
+    /// Blocks until all preceding tasks in the current CUDA context complete (`cuCtxSynchronize`).
     pub cuCtxSynchronize: unsafe extern "C" fn() -> CUresult,
+    /// JIT-compiles and loads a null-terminated PTX or cubin image into a module (`cuModuleLoadData`).
     pub cuModuleLoadData: unsafe extern "C" fn(module: *mut CUmodule, image: *const c_void) -> CUresult,
+    /// Unloads a CUDA module from the current context (`cuModuleUnload`).
     pub cuModuleUnload: unsafe extern "C" fn(module: CUmodule) -> CUresult,
+    /// Retrieves a kernel function handle by symbol name from a loaded module (`cuModuleGetFunction`).
     pub cuModuleGetFunction: unsafe extern "C" fn(hfunc: *mut CUfunction, hmod: CUmodule, name: *const c_char) -> CUresult,
+    /// Allocates `bytesize` bytes of linear device memory (`cuMemAlloc_v2`).
     pub cuMemAlloc_v2: unsafe extern "C" fn(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult,
+    /// Frees device memory previously allocated with `cuMemAlloc_v2` (`cuMemFree_v2`).
     pub cuMemFree_v2: unsafe extern "C" fn(dptr: CUdeviceptr) -> CUresult,
+    /// Synchronously copies `ByteCount` bytes from host memory to device memory (`cuMemcpyHtoD_v2`).
     pub cuMemcpyHtoD_v2: unsafe extern "C" fn(dstDevice: CUdeviceptr, srcHost: *const c_void, ByteCount: usize) -> CUresult,
+    /// Synchronously copies `ByteCount` bytes from device memory to host memory (`cuMemcpyDtoH_v2`).
     pub cuMemcpyDtoH_v2: unsafe extern "C" fn(dstHost: *mut c_void, srcDevice: CUdeviceptr, ByteCount: usize) -> CUresult,
+    /// Launches a CUDA kernel function `f` on the specified grid, block, shared memory, and stream (`cuLaunchKernel`).
     pub cuLaunchKernel: unsafe extern "C" fn(
         f: CUfunction,
         gridDimX: c_uint,
@@ -221,6 +329,19 @@ pub struct CudaDriverApi {
 }
 
 impl CudaDriverApi {
+    /// Dynamically loads `libcuda.so.1` (or `libcuda.so`), resolves all required CUDA Driver API
+    /// entry points, and invokes `cuInit(0)` to initialize the driver.
+    ///
+    /// # Returns
+    /// * `Some(Arc<CudaDriverApi>)` if `libcuda.so` is present, all symbols resolve, and `cuInit(0)` returns [`CUDA_SUCCESS`].
+    /// * `None` if no NVIDIA driver library is available or initialization fails.
+    ///
+    /// # Side Effects
+    /// * Dynamically loads `libcuda.so.1` into the process, calls `cuInit(0)`, and caches the
+    ///   resolved function table in a static `OnceLock`.
+    ///
+    /// # Safety
+    /// Performs `unsafe` dynamic symbol lookups via `libloading` and invokes the C ABI `cuInit(0)` function.
     #[allow(non_snake_case)]
     pub fn load() -> Option<Arc<Self>> {
         static CUDA_ONCE: std::sync::OnceLock<Option<Arc<CudaDriverApi>>> = std::sync::OnceLock::new();
@@ -351,71 +472,138 @@ impl CudaDriverApi {
     }
 }
 
+/// Grow-only persistent device memory buffers reused across distance-field and Simulated Annealing
+/// kernel invocations to avoid repeated `cuMemAlloc_v2` / `cuMemFree_v2` overhead.
 struct PersistentDeviceBuffers {
+    /// Device pointer for the input obstacle grid (`u32` per cell).
     d_obs: CUdeviceptr,
+    /// Allocated capacity in bytes of `d_obs`.
     obs_cap_bytes: usize,
+    /// Device pointer for intermediate separable distance-field pass storage (`f32` per cell).
     d_temp: CUdeviceptr,
+    /// Allocated capacity in bytes of `d_temp`.
     temp_cap_bytes: usize,
+    /// Device pointer for the output distance-field buffer (`f32` per cell).
     d_out: CUdeviceptr,
+    /// Allocated capacity in bytes of `d_out`.
     out_cap_bytes: usize,
+    /// Seven persistent device pointers `[d_fp, d_edges, d_poses, d_scores, d_ranges, d_polys, d_verts]`
+    /// used by the GPU Simulated Annealing auto-placer chains.
     d_sa: [CUdeviceptr; 7],
+    /// Allocated capacities in bytes corresponding to each buffer in `d_sa` (`[usize; 7]`).
     sa_cap: [usize; 7],
 }
 
+/// Cached device memory buffers for 3D wavefront expansion and on-GPU shortest-path backtracking.
 pub struct CachedWavefrontBuffers {
+    /// Total number of 3D grid cells (`width * height * num_layers`) these buffers are sized for.
     pub total_cells: usize,
+    /// Device pointer to the 3D obstacle grid (`u32` per cell).
     pub d_obs: CUdeviceptr,
+    /// Device pointer to the 3D Euclidean distance field (`f32` per cell).
     pub d_df: CUdeviceptr,
+    /// Device pointer to the PathFinder historical congestion cost grid (`f32` per cell).
     pub d_hist: CUdeviceptr,
+    /// Device pointer to the present net occupancy/usage count grid (`u32` per cell).
     pub d_usage: CUdeviceptr,
+    /// Device pointer to the precomputed 3D per-cell traversal cost grid (`f32` per cell).
     pub d_costs: CUdeviceptr,
+    /// Ping-pong wavefront cost buffer A (`f32` per cell).
     pub d_wf_a: CUdeviceptr,
+    /// Ping-pong wavefront cost buffer B (`f32` per cell).
     pub d_wf_b: CUdeviceptr,
+    /// Device output buffer storing backtracked `(x, y, layer)` coordinates (`3 * u32` per step).
     pub d_path_out: CUdeviceptr,
+    /// Device scalar (`u32`) storing the number of steps written into `d_path_out`.
     pub d_path_len: CUdeviceptr,
+    /// Maximum number of `(x, y, layer)` steps that `d_path_out` can hold.
     pub max_path_len: u32,
+    /// Number of times this buffer set has been (re)allocated on the GPU.
     pub alloc_count: usize,
+    /// Number of wavefront solves that reused the existing allocation without reallocating.
     pub reuse_count: usize,
 }
 
+/// Bare-metal CUDA compute engine bound to a single NVIDIA GPU device and CUDA context.
+///
+/// Manages compiled PTX kernel functions, persistent device allocations, OptiX availability,
+/// auto-calibrated dispatch profiles, and cumulative compute busy-time telemetry.
 pub struct CudaEngine {
+    /// Marketing name of the CUDA device (e.g., `"NVIDIA GeForce RTX 3080"`).
     pub device_name: String,
+    /// Compute backend identifier string (`"CUDA PTX (bare-metal)"`).
     pub backend_name: String,
+    /// Formatted CUDA driver version string (e.g., `"CUDA Driver Version 12.4"`).
     pub driver_info: String,
+    /// Whether the NVIDIA OptiX hardware ray-tracing driver (`libnvoptix.so.1`) is available.
     pub optix_available: bool,
+    /// Negotiated OptiX version number (`0` when `optix_available` is `false`).
     pub optix_version: u32,
+    /// Auto-calibrated kernel variant selection profile for this GPU.
     pub dispatch_profile: KernelDispatchProfile,
+    /// Underlying CUDA Driver API context handle (`CUcontext`).
     ctx: CUcontext,
+    /// Loaded primary PTX module (`cuda/kernels.ptx`).
     module: CUmodule,
+    /// Loaded Ampere-specific PTX module (`cuda/ampere_kernels.ptx`), or null if unsupported.
     ampere_module: CUmodule,
+    /// Direct 2D Euclidean distance field kernel handle (`distance_field_kernel`).
     fn_dist_field: CUfunction,
+    /// Horizontal pass of the 2D/3D separable Euclidean distance field (`distance_field_separable_h_kernel`).
     fn_dist_field_sep_h: CUfunction,
+    /// Vertical pass of the 2D/3D separable Euclidean distance field (`distance_field_separable_v_kernel`).
     fn_dist_field_sep_v: CUfunction,
+    /// Shared-memory tiled 2D distance field kernel (`distance_field_tiled_kernel`).
     fn_dist_field_tiled: CUfunction,
+    /// Shared-memory tiled 3D multi-layer distance field kernel (`distance_field_3d_tiled_kernel`).
     pub fn_dist_field_3d_tiled: CUfunction,
+    /// Tensor Core (`mma.sync`) 2D distance field kernel (`distance_field_tensor_core_kernel`).
     pub fn_dist_field_tensor_core: CUfunction,
+    /// Tensor Core (`mma.sync`) 3D multi-layer distance field kernel (`distance_field_3d_tensor_core_kernel`).
     pub fn_dist_field_3d_tensor_core: CUfunction,
+    /// Standard SIMT batched placement cost evaluation kernel (`batch_placement_eval_kernel`).
     fn_batch_placement: CUfunction,
+    /// Tensor Core batched placement cost evaluation kernel (`batch_placement_tensor_core_kernel`).
     pub fn_batch_placement_tensor_core: CUfunction,
+    /// Full-energy GPU Simulated Annealing auto-placer kernel (`gpu_sa_placer_kernel`).
     fn_gpu_sa_placer: CUfunction,
+    /// Incremental $\Delta E$ GPU Simulated Annealing auto-placer kernel (`gpu_sa_placer_delta_e_kernel`).
     pub fn_gpu_sa_placer_delta_e: CUfunction,
+    /// Tensor Core accelerated GPU Simulated Annealing auto-placer kernel (`gpu_sa_placer_tensor_core_kernel`).
     pub fn_gpu_sa_placer_tensor_core: CUfunction,
+    /// Shared-memory tiled 3D routing cell cost kernel (`compute_3d_routing_cost_kernel`).
     fn_route_cost_3d: CUfunction,
+    /// Tensor Core accelerated 3D routing cell cost kernel (`compute_3d_routing_cost_tensor_core_kernel`).
     pub fn_route_cost_3d_tensor_core: CUfunction,
+    /// Parallel 3D Lee/Bellman-Ford wavefront relaxation kernel (`wavefront_3d_relax_kernel`).
     fn_wavefront_3d: CUfunction,
+    /// On-GPU 3D shortest-path wavefront backtracking kernel (`wavefront_3d_backtrack_kernel`).
     fn_wavefront_3d_backtrack: CUfunction,
+    /// LBVH segment-segment crossing count kernel (`rt_bvh_segment_crossings_kernel`).
     fn_rt_bvh_crossings: CUfunction,
+    /// LBVH routing corridor cut congestion kernel (`rt_bvh_corridor_cuts_kernel`).
     fn_rt_bvh_corridor_cuts: CUfunction,
+    /// LBVH line-of-sight DRC clearance ray query kernel (`rt_bvh_line_of_sight_drc_kernel`).
     fn_rt_bvh_drc: CUfunction,
+    /// Batched exact pad/track/via DRC clearance verification kernel (`batch_drc_eval_kernel`).
     fn_batch_drc: CUfunction,
+    /// Optional hand-tuned Ampere direct 2D distance field kernel (`distance_field_ampere`).
     pub fn_df_ampere: Option<CUfunction>,
+    /// Optional hand-tuned Ampere shared-memory tiled 2D distance field kernel (`distance_field_ampere_tiled`).
     pub fn_df_ampere_tiled: Option<CUfunction>,
+    /// Optional hand-tuned Ampere batched placement evaluation kernel (`batch_placement_ampere`).
     pub fn_bp_ampere: Option<CUfunction>,
+    /// Shared handle to the dynamically loaded CUDA Driver API symbol table.
     cuda: Arc<CudaDriverApi>,
+    /// Optional handle to the dynamically loaded NVIDIA OptiX driver API.
     pub optix: Option<Arc<OptixDriverApi>>,
+    /// Mutex serializing context binding and kernel dispatch on this engine's `CUcontext`.
     dispatch_lock: Mutex<()>,
+    /// Mutex-protected persistent device buffers for distance fields and SA placement chains.
     persistent_buffers: Mutex<PersistentDeviceBuffers>,
+    /// Mutex-protected cached device buffers for 3D wavefront routing and backtracking.
     pub wavefront_buffers: Mutex<Option<CachedWavefrontBuffers>>,
+    /// Cumulative nanoseconds spent executing CUDA transfers and kernels, used for live GPU load telemetry.
     pub compute_busy_ns: Arc<AtomicU64>,
 }
 
@@ -423,6 +611,14 @@ unsafe impl Send for CudaEngine {}
 unsafe impl Sync for CudaEngine {}
 
 impl std::fmt::Debug for CudaEngine {
+    /// Formats a concise diagnostic summary of the [`CudaEngine`] including device name, backend,
+    /// OptiX status, and calibrated [`KernelDispatchProfile`].
+    ///
+    /// # Arguments
+    /// * `f` - Target formatter.
+    ///
+    /// # Returns
+    /// `std::fmt::Result` indicating formatting success or error.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CudaEngine")
             .field("device_name", &self.device_name)
@@ -435,6 +631,13 @@ impl std::fmt::Debug for CudaEngine {
 }
 
 impl Drop for CudaEngine {
+    /// Releases all persistent and wavefront GPU device allocations, unloads PTX modules,
+    /// and destroys the underlying CUDA context when the [`CudaEngine`] is dropped.
+    ///
+    /// # Side Effects
+    /// * Binds `self.ctx` via `cuCtxSetCurrent`.
+    /// * Frees all non-null `CUdeviceptr` allocations in `persistent_buffers` and `wavefront_buffers`.
+    /// * Unloads `ampere_module` and `module` via `cuModuleUnload`, and destroys `ctx` via `cuCtxDestroy_v2`.
     fn drop(&mut self) {
         unsafe {
             let _ = (self.cuda.cuCtxSetCurrent)(self.ctx);
@@ -494,12 +697,28 @@ impl Drop for CudaEngine {
     }
 }
 
+/// Computes the median value of a non-empty vector of microsecond timing samples.
+///
+/// # Arguments
+/// * `samples` - Vector of elapsed durations in microseconds (`f64`).
+///
+/// # Returns
+/// The middle element after sorting `samples` in ascending order.
 fn median_us(mut samples: Vec<f64>) -> f64 {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     samples[samples.len() / 2]
 }
 
 impl CudaEngine {
+    /// Enumerates and initializes all available NVIDIA CUDA GPUs on the host, sorted in descending
+    /// order of hardware capability (e.g., `RTX 5090` > `RTX 4090` > `RTX 3080` > `RTX 3060`).
+    ///
+    /// # Returns
+    /// Cached vector of `Arc<CudaEngine>` handles (empty if `libcuda.so` is absent or no CUDA GPUs exist).
+    ///
+    /// # Side Effects
+    /// Dynamically loads `libcuda.so` on first invocation, creates a primary CUDA context per device,
+    /// loads `KERNELS_PTX`, and calibrates per-device kernel dispatch profiles.
     pub fn all_devices() -> Vec<Arc<Self>> {
         ALL_CUDA_ENGINES
             .get_or_init(|| {
@@ -542,10 +761,25 @@ impl CudaEngine {
             .clone()
     }
 
+    /// Returns the primary (highest-capability) [`CudaEngine`] on the host, if any CUDA GPU is available.
+    ///
+    /// # Returns
+    /// `Some(Arc<CudaEngine>)` for the top-ranked CUDA device, or `None` if CUDA is unavailable.
     pub fn new() -> Option<Arc<Self>> {
         Self::all_devices().into_iter().next()
     }
 
+    /// Initializes a [`CudaEngine`] for the specific CUDA device ordinal, compiling/loading all PTX
+    /// kernels and running micro-benchmark dispatch profile calibration.
+    ///
+    /// # Arguments
+    /// * `ordinal` - Zero-based CUDA device index (`0..cuDeviceGetCount`).
+    ///
+    /// # Returns
+    /// `Some(Arc<CudaEngine>)` if context creation and PTX module loading succeed, or `None` otherwise.
+    ///
+    /// # Side Effects
+    /// Creates a CUDA context via `cuCtxCreate_v2`, loads `cuda/kernels.ptx`, and benchmarks kernel variants.
     pub fn new_with_device(ordinal: c_int) -> Option<Arc<Self>> {
         static CUDA_CTX_INIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         let init_mutex = CUDA_CTX_INIT_LOCK.get_or_init(|| Mutex::new(()));
@@ -794,6 +1028,14 @@ impl CudaEngine {
         }
     }
 
+    /// Benchmarks all available SIMT, shared-memory tiled, Ampere PTX, and Tensor Core kernel variants
+    /// on synthetic reference workloads, selecting the fastest numerically valid variant per kernel family.
+    ///
+    /// # Arguments
+    /// * `cache_key` - Unique `"<ordinal>:<device_name>"` key used to memoize calibration in `DISPATCH_PROFILE_CACHE`.
+    ///
+    /// # Side Effects
+    /// Updates `self.dispatch_profile` and caches the resulting [`KernelDispatchProfile`] globally.
     fn calibrate_dispatch_profile(&mut self, cache_key: &str) {
         let cache = DISPATCH_PROFILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
         let mut cache_guard = match cache.lock() {
@@ -1117,6 +1359,18 @@ impl CudaEngine {
         self.dispatch_profile = profile;
     }
 
+    /// Ensures persistent device buffers `(d_obs, d_temp, d_out)` have at least `(in_bytes, out_bytes, out_bytes)`
+    /// allocated capacity, growing them via `cuMemAlloc_v2` only when needed.
+    ///
+    /// # Arguments
+    /// * `in_bytes` - Minimum byte capacity required for `d_obs`.
+    /// * `out_bytes` - Minimum byte capacity required for `d_temp` and `d_out`.
+    ///
+    /// # Returns
+    /// `Some((d_obs, d_temp, d_out))` device pointers on success, or `None` if device allocation fails.
+    ///
+    /// # Safety
+    /// Caller must hold `dispatch_lock` and have bound `self.ctx` as the current CUDA context on the calling thread.
     unsafe fn ensure_persistent_buffers(&self, in_bytes: usize, out_bytes: usize) -> Option<(CUdeviceptr, CUdeviceptr, CUdeviceptr)> {
         let mut bufs = self.persistent_buffers.lock().unwrap_or_else(|e| e.into_inner());
         if bufs.obs_cap_bytes < in_bytes || bufs.d_obs == 0 {
@@ -1161,6 +1415,16 @@ impl CudaEngine {
         Some((bufs.d_obs, bufs.d_temp, bufs.d_out))
     }
 
+    /// Computes a 2D Euclidean Distance Field using the two-pass separable horizontal + vertical CUDA kernels.
+    ///
+    /// # Arguments
+    /// * `obstacles` - Row-major `width * height` obstacle grid (`0` = free, non-zero = obstacle).
+    /// * `width` - Grid width in cells.
+    /// * `height` - Grid height in cells.
+    /// * `radius` - Maximum search radius in cells.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` containing Euclidean distance in cells to the nearest obstacle, or `None` on error.
     pub fn compute_distance_field_separable(
         &self,
         obstacles: &[u32],
@@ -1171,6 +1435,16 @@ impl CudaEngine {
         self.launch_distance_field_kernel(self.fn_dist_field, obstacles, width, height, radius, false)
     }
 
+    /// Computes a 2D Euclidean Distance Field using the calibrated best [`DistanceFieldVariant`] for this GPU.
+    ///
+    /// # Arguments
+    /// * `obstacles` - Row-major `width * height` obstacle grid (`0` = free, non-zero = obstacle).
+    /// * `width` - Grid width in cells.
+    /// * `height` - Grid height in cells.
+    /// * `radius` - Maximum search radius in cells.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` containing Euclidean distances in cells, or `None` if execution fails.
     pub fn compute_distance_field(&self, obstacles: &[u32], width: u32, height: u32, radius: i32) -> Option<Vec<f32>> {
         self.compute_distance_field_variant(
             obstacles,
@@ -1182,6 +1456,17 @@ impl CudaEngine {
         .or_else(|| self.compute_distance_field_mode(obstacles, width, height, radius, true))
     }
 
+    /// Computes a 2D Euclidean Distance Field using an explicit [`DistanceFieldVariant`].
+    ///
+    /// # Arguments
+    /// * `obstacles` - Row-major `width * height` obstacle grid.
+    /// * `width` - Grid width in cells.
+    /// * `height` - Grid height in cells.
+    /// * `radius` - Search radius in cells.
+    /// * `variant` - Kernel implementation variant to dispatch.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` distance field buffer, or `None` if the variant is unsupported or fails.
     pub fn compute_distance_field_variant(
         &self,
         obstacles: &[u32],
@@ -1199,6 +1484,16 @@ impl CudaEngine {
         }
     }
 
+    /// Computes a 2D Euclidean Distance Field using the Tensor Core / WMMA-assisted shared-memory tiled kernel.
+    ///
+    /// # Arguments
+    /// * `obstacles` - Row-major `width * height` obstacle grid.
+    /// * `width` - Grid width in cells.
+    /// * `height` - Grid height in cells.
+    /// * `radius` - Search radius in cells.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` distance field values, or `None` on launch failure.
     pub fn compute_distance_field_tensor_core(
         &self,
         obstacles: &[u32],
@@ -1209,6 +1504,18 @@ impl CudaEngine {
         self.launch_distance_field_kernel(self.fn_dist_field_tensor_core, obstacles, width, height, radius, true)
     }
 
+    /// Dispatches either the shared-memory tiled (`use_shared_memory = true`) or separable direct
+    /// (`use_shared_memory = false`) 2D Euclidean Distance Field kernel.
+    ///
+    /// # Arguments
+    /// * `obstacles` - Row-major `width * height` obstacle grid.
+    /// * `width` - Grid width in cells.
+    /// * `height` - Grid height in cells.
+    /// * `radius` - Search radius in cells.
+    /// * `use_shared_memory` - Whether to stage halo tiles in shared memory.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` distance field values, or `None` on failure.
     pub fn compute_distance_field_mode(
         &self,
         obstacles: &[u32],
@@ -1225,6 +1532,17 @@ impl CudaEngine {
         self.launch_distance_field_kernel(kernel, obstacles, width, height, radius, use_shared_memory)
     }
 
+    /// Computes a 2D Euclidean Distance Field using hand-tuned Ampere SM80+ inline PTX kernels.
+    ///
+    /// # Arguments
+    /// * `obstacles` - Row-major `width * height` obstacle grid.
+    /// * `width` - Grid width in cells.
+    /// * `height` - Grid height in cells.
+    /// * `radius` - Search radius in cells.
+    /// * `tiled` - Whether to use the shared-memory tiled Ampere PTX kernel.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` distance field values, or `None` if Ampere PTX kernels are unavailable.
     pub fn compute_distance_field_ampere(
         &self,
         obstacles: &[u32],
@@ -1241,6 +1559,21 @@ impl CudaEngine {
         self.launch_distance_field_kernel(kernel, obstacles, width, height, radius, tiled)
     }
 
+    /// Low-level launcher for 2D Euclidean Distance Field kernels using persistent device buffers.
+    ///
+    /// # Arguments
+    /// * `kernel` - CUDA function handle to launch.
+    /// * `obstacles` - Flat `width * height` obstacle slice.
+    /// * `width` - Grid width in cells.
+    /// * `height` - Grid height in cells.
+    /// * `radius` - Search radius in cells.
+    /// * `use_shared_memory` - Whether dynamic shared memory halo allocation is required.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` host vector of Euclidean distances, or `None` on CUDA error.
+    ///
+    /// # Side Effects
+    /// Acquires `dispatch_lock`, reuses/grows `persistent_buffers`, launches CUDA kernels, and increments `compute_busy_ns`.
     fn launch_distance_field_kernel(
         &self,
         kernel: CUfunction,
@@ -1377,6 +1710,17 @@ impl CudaEngine {
         }
     }
 
+    /// Computes 2D Euclidean Distance Fields across all `num_layers` copper layers in a single 3D GPU dispatch.
+    ///
+    /// # Arguments
+    /// * `obstacles_flat` - Layer-major flat `width * height * num_layers` obstacle buffer.
+    /// * `width` - Grid width in cells.
+    /// * `height` - Grid height in cells.
+    /// * `num_layers` - Number of copper routing layers.
+    /// * `radius` - Search radius in cells.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` flat multi-layer distance field, or `None` on failure.
     pub fn compute_distance_field_layers(
         &self,
         obstacles_flat: &[u32],
@@ -1388,6 +1732,21 @@ impl CudaEngine {
         self.compute_distance_field_batch_layers(obstacles_flat, width, height, num_layers, radius)
     }
 
+    /// Launches a batched 3D grid (`grid_z = num_layers`) Euclidean Distance Field computation across all layers
+    /// with a single host-to-device upload and device-to-host readback.
+    ///
+    /// # Arguments
+    /// * `obstacles_flat` - Layer-major flat `width * height * num_layers` obstacle buffer.
+    /// * `width` - Grid width in cells.
+    /// * `height` - Grid height in cells.
+    /// * `num_layers` - Number of copper routing layers.
+    /// * `radius` - Search radius in cells.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` flat multi-layer distance field, or `None` on CUDA error.
+    ///
+    /// # Side Effects
+    /// Reuses persistent device buffers and increments `compute_busy_ns`.
     pub fn compute_distance_field_batch_layers(
         &self,
         obstacles_flat: &[u32],
@@ -1520,6 +1879,15 @@ impl CudaEngine {
         }
     }
 
+    /// Evaluates a batch of candidate placement states in parallel using the calibrated best [`PlacementEvalVariant`].
+    ///
+    /// # Arguments
+    /// * `boxes` - Flat slice of `num_candidates * num_footprints` AABBs `` `[min_x, min_y, max_x, max_y]` `` (`mm`).
+    /// * `segs` - Flat slice of `num_candidates * num_segments` airwire segments `` `[x1, y1, x2, y2]` `` (`mm`).
+    /// * `params` - Batch dimensions, board bounds, and cost weights ([`PlacementBatchParams`]).
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` of total placement energies (one per candidate), or `None` on failure.
     pub fn evaluate_placement_batch(
         &self,
         boxes: &[[f32; 4]],
@@ -1530,6 +1898,16 @@ impl CudaEngine {
             .or_else(|| self.evaluate_placement_variant(boxes, segs, params, PlacementEvalVariant::SimtStandard))
     }
 
+    /// Evaluates a batch of candidate placements using an explicit [`PlacementEvalVariant`].
+    ///
+    /// # Arguments
+    /// * `boxes` - Flat slice of candidate footprint AABBs `` `[min_x, min_y, max_x, max_y]` ``.
+    /// * `segs` - Flat slice of candidate airwire segments `` `[x1, y1, x2, y2]` ``.
+    /// * `params` - Batch placement evaluation parameters.
+    /// * `variant` - Kernel implementation variant (`SimtStandard`, `AmperePtx`, or `TensorCore`).
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` of total placement energies per candidate, or `None` on failure.
     pub fn evaluate_placement_variant(
         &self,
         boxes: &[[f32; 4]],
@@ -1545,6 +1923,15 @@ impl CudaEngine {
         self.launch_placement_kernel(kernel, boxes, segs, params)
     }
 
+    /// Evaluates a batch of candidate placements using the hand-tuned Ampere inline PTX kernel.
+    ///
+    /// # Arguments
+    /// * `boxes` - Flat slice of candidate footprint AABBs.
+    /// * `segs` - Flat slice of candidate airwire segments.
+    /// * `params` - Batch placement evaluation parameters.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` of candidate energies, or `None` if Ampere PTX is unavailable.
     pub fn evaluate_placement_ampere(
         &self,
         boxes: &[[f32; 4]],
@@ -1554,6 +1941,15 @@ impl CudaEngine {
         self.evaluate_placement_variant(boxes, segs, params, PlacementEvalVariant::AmperePtx)
     }
 
+    /// Evaluates a batch of candidate placements using the Tensor Core / WMMA kernel variant.
+    ///
+    /// # Arguments
+    /// * `boxes` - Flat slice of candidate footprint AABBs.
+    /// * `segs` - Flat slice of candidate airwire segments.
+    /// * `params` - Batch placement evaluation parameters.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` of candidate energies, or `None` on launch failure.
     pub fn evaluate_placement_tensor_core(
         &self,
         boxes: &[[f32; 4]],
@@ -1563,6 +1959,19 @@ impl CudaEngine {
         self.evaluate_placement_variant(boxes, segs, params, PlacementEvalVariant::TensorCore)
     }
 
+    /// Low-level launcher for batch placement evaluation kernels (`batch_placement_eval_kernel` and variants).
+    ///
+    /// # Arguments
+    /// * `kernel` - CUDA function handle to invoke.
+    /// * `boxes` - Candidate footprint AABBs (`num_candidates * num_footprints`).
+    /// * `segs` - Candidate airwire segments (`num_candidates * num_segments`).
+    /// * `params` - Batch placement parameters.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` of candidate energies, or `None` on allocation/launch failure.
+    ///
+    /// # Side Effects
+    /// Allocates temporary device buffers, runs the kernel, synchronizes, and updates `compute_busy_ns`.
     fn launch_placement_kernel(
         &self,
         kernel: CUfunction,
@@ -1665,6 +2074,23 @@ impl CudaEngine {
         }
     }
 
+    /// Runs parallel Markov-Chain Monte Carlo Simulated Annealing auto-placement chains on the GPU
+    /// using the calibrated best [`SaPlacerVariant`] (typically [`SaPlacerVariant::SimtIncrementalDeltaE`]).
+    ///
+    /// # Arguments
+    /// * `fp_descs` - Per-footprint descriptors `` `[half_w, half_h, is_locked, packed_center_offset]` ``.
+    /// * `edges` - Pairwise topological/corridor/passive/flow edge endpoints (`2 * num_edges` entries).
+    /// * `init_poses` - Initial chain poses `` `[x, y, rot_deg, layer]` `` (`num_chains * num_footprints`).
+    /// * `params` - GPU SA configuration and energy weights ([`GpuSaParams`]).
+    /// * `num_passes` - Number of outer annealing passes per launch.
+    /// * `courtyards` - Optional convex/rectilinear courtyard polygon buffers ([`GpuCourtyardBuffers`]) for exact SAT collision checks.
+    ///
+    /// # Returns
+    /// `Some((best_poses, final_scores))` where `best_poses` has length `num_chains * num_footprints`
+    /// and `final_scores` has length `num_chains` (`` `[total_cost, wirelength, crossings, overlap_area]` ``).
+    ///
+    /// # Side Effects
+    /// Reuses persistent device buffers `d_sa[0..7]` and increments `compute_busy_ns`.
     pub fn run_gpu_sa_placer_chains(
         &self,
         fp_descs: &[[f32; 4]],
@@ -1696,6 +2122,23 @@ impl CudaEngine {
         })
     }
 
+    /// Runs parallel GPU Simulated Annealing auto-placement chains using an explicit [`SaPlacerVariant`],
+    /// reusing persistent device buffer slots `d_sa[0..7]` across invocations.
+    ///
+    /// # Arguments
+    /// * `fp_descs` - Per-footprint descriptors `` `[half_w, half_h, is_locked, packed_center_offset]` ``.
+    /// * `edges` - Edge endpoint pairs (`2 * num_edges` entries).
+    /// * `init_poses` - Initial chain poses (`num_chains * num_footprints`).
+    /// * `params` - GPU SA parameters and penalty weights.
+    /// * `num_passes` - Number of passes to execute inside the kernel.
+    /// * `variant` - Kernel implementation variant (`SimtFullEval`, `SimtIncrementalDeltaE`, or `TensorCore`).
+    /// * `courtyards` - Optional exact convex/rectilinear courtyard polygon buffers.
+    ///
+    /// # Returns
+    /// `Some((best_poses, final_scores))` on success, or `None` on invalid dimensions or CUDA error.
+    ///
+    /// # Side Effects
+    /// Allocates/reuses `persistent_buffers.d_sa[0..7]`, dispatches the SA kernel, and updates `compute_busy_ns`.
     pub fn run_gpu_sa_placer_chains_variant(
         &self,
         fp_descs: &[[f32; 4]],
@@ -1850,6 +2293,18 @@ impl CudaEngine {
         }
     }
 
+    /// Evaluates a 3D PathFinder routing traversal cost map (`width * height * num_layers`) for a single net
+    /// using the calibrated best [`RoutingCost3DVariant`].
+    ///
+    /// # Arguments
+    /// * `obstacles` - 3D obstacle grid (`0` = free, non-zero = net ID or keepout).
+    /// * `dist_field` - 3D Euclidean distance field in cells.
+    /// * `history_cost` - PathFinder historical congestion penalty buffer.
+    /// * `usage_count` - Present net occupancy count per cell.
+    /// * `params` - Net ID, clearance radius, congestion factor, and plane mask ([`GpuRouteCostParams`]).
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` of 3D cell traversal costs, or `None` on failure.
     pub fn compute_3d_routing_costs(
         &self,
         obstacles: &[u32],
@@ -1868,6 +2323,17 @@ impl CudaEngine {
         )
     }
 
+    /// Evaluates a 3D PathFinder routing traversal cost map using the Tensor Core kernel variant.
+    ///
+    /// # Arguments
+    /// * `obstacles` - 3D obstacle grid.
+    /// * `dist_field` - 3D Euclidean distance field.
+    /// * `history_cost` - PathFinder historical congestion buffer.
+    /// * `usage_count` - Present net occupancy count buffer.
+    /// * `params` - Routing cost parameters.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` of 3D cell traversal costs, or `None` on failure.
     pub fn compute_3d_routing_costs_tensor_core(
         &self,
         obstacles: &[u32],
@@ -1886,6 +2352,18 @@ impl CudaEngine {
         )
     }
 
+    /// Evaluates a 3D PathFinder routing cost map using an explicit [`RoutingCost3DVariant`].
+    ///
+    /// # Arguments
+    /// * `obstacles` - 3D obstacle grid.
+    /// * `dist_field` - 3D Euclidean distance field.
+    /// * `history_cost` - PathFinder historical congestion buffer.
+    /// * `usage_count` - Present net occupancy count buffer.
+    /// * `params` - Routing cost parameters.
+    /// * `variant` - Kernel implementation variant (`SimtSharedTiled` or `TensorCore`).
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` of 3D cell traversal costs, or `None` on failure.
     pub fn compute_3d_routing_costs_variant(
         &self,
         obstacles: &[u32],
@@ -1907,6 +2385,16 @@ impl CudaEngine {
     }
 
     /// Evaluates one or more 3D routing cost maps on this GPU while uploading shared grid buffers only once.
+    ///
+    /// # Arguments
+    /// * `obstacles` - Shared 3D obstacle grid.
+    /// * `dist_field` - Shared 3D distance field.
+    /// * `history_cost` - Shared PathFinder historical congestion buffer.
+    /// * `usage_count` - Shared present occupancy count buffer.
+    /// * `batch_params` - Slice of per-net [`GpuRouteCostParams`] configurations.
+    ///
+    /// # Returns
+    /// Vector of `Option<Vec<f32>>` cost maps corresponding 1:1 with `batch_params`.
     pub fn compute_3d_routing_costs_multi(
         &self,
         obstacles: &[u32],
@@ -1925,6 +2413,21 @@ impl CudaEngine {
         )
     }
 
+    /// Evaluates multiple 3D routing cost maps with a single device upload using an explicit [`RoutingCost3DVariant`].
+    ///
+    /// # Arguments
+    /// * `obstacles` - Shared 3D obstacle grid.
+    /// * `dist_field` - Shared 3D distance field.
+    /// * `history_cost` - Shared PathFinder historical congestion buffer.
+    /// * `usage_count` - Shared present occupancy count buffer.
+    /// * `batch_params` - Slice of per-net [`GpuRouteCostParams`].
+    /// * `variant` - Kernel variant to launch for each item in `batch_params`.
+    ///
+    /// # Returns
+    /// Vector of `Option<Vec<f32>>` cost maps for each request.
+    ///
+    /// # Side Effects
+    /// Allocates device buffers once for the batch, launches `batch_params.len()` kernels, and updates `compute_busy_ns`.
     pub fn compute_3d_routing_costs_multi_variant(
         &self,
         obstacles: &[u32],
@@ -2150,6 +2653,18 @@ impl CudaEngine {
         results
     }
 
+    /// Allocates or reuses cached 3D wavefront device buffers (`d_obs`, `d_df`, `d_hist`, `d_usage`, `d_costs`,
+    /// `d_wf_a`, `d_wf_b`, `d_path_out`, `d_path_len`) sized for `total` 3D grid cells.
+    ///
+    /// # Arguments
+    /// * `total` - Total number of 3D grid cells (`width * height * num_layers`).
+    ///
+    /// # Returns
+    /// `Some((d_obs, d_df, d_hist, d_usage, d_costs, d_wf_a, d_wf_b, d_path_out, d_path_len, max_path_len))`
+    /// on success, or `None` if device allocation fails.
+    ///
+    /// # Safety
+    /// Caller must hold `dispatch_lock` and have bound `self.ctx` on the current thread.
     unsafe fn ensure_wavefront_buffers(
         &self,
         total: usize,
@@ -2287,6 +2802,17 @@ impl CudaEngine {
         ))
     }
 
+    /// Computes a 3D Lee/Bellman-Ford wavefront distance field from `seeds` across `iterations` relaxation steps.
+    ///
+    /// # Arguments
+    /// * `cell_costs` - Per-cell traversal cost map (`width * height * num_layers`).
+    /// * `seeds` - Linear indices of source cells initialized to `0.0` cost.
+    /// * `params` - Grid dimensions and layer metadata ([`GpuRouteCostParams`]).
+    /// * `via_cost` - Cost penalty for transitioning between adjacent copper layers.
+    /// * `iterations` - Number of ping-pong relaxation passes to run.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` containing the relaxed 3D cumulative path cost field, or `None` on failure.
     pub fn compute_3d_wavefront(
         &self,
         cell_costs: &[f32],
@@ -2383,6 +2909,14 @@ impl CudaEngine {
         }
     }
 
+    /// Counts pairwise 2D line-segment crossings for each segment in `segs` by traversing `bvh_nodes` on the GPU.
+    ///
+    /// # Arguments
+    /// * `segs` - Slice of 2D line segments `` `[x1, y1, x2, y2]` `` in millimeters.
+    /// * `bvh_nodes` - Pre-built 2D Morton LBVH tree ([`GpuBvhNode`]) over `segs`.
+    ///
+    /// # Returns
+    /// `Some(Vec<u32>)` with the crossing count for each segment in `segs`, or `None` on failure.
     pub fn evaluate_segment_crossings_rt_bvh(
         &self,
         segs: &[[f32; 4]],
@@ -2478,6 +3012,16 @@ impl CudaEngine {
         }
     }
 
+    /// Counts how many airwire segments in `segs` intersect each routing corridor cut segment in `cuts`
+    /// using GPU LBVH traversal (`rt_bvh_corridor_cuts_kernel`).
+    ///
+    /// # Arguments
+    /// * `segs` - Slice of ratsnest airwire segments `` `[x1, y1, x2, y2]` ``.
+    /// * `bvh_nodes` - Pre-built LBVH nodes over `segs`.
+    /// * `cuts` - Slice of corridor cut segments `` `[x1, y1, x2, y2]` `` between adjacent component pairs.
+    ///
+    /// # Returns
+    /// `Some(Vec<u32>)` containing the number of crossing airwires for each cut in `cuts`, or `None` on failure.
     pub fn evaluate_corridor_cuts_rt_bvh(
         &self,
         segs: &[[f32; 4]],
@@ -2588,6 +3132,14 @@ impl CudaEngine {
         }
     }
 
+    /// Evaluates a batch of line-of-sight DRC ray queries against a pre-built obstacle LBVH (`bvh_nodes`) on the GPU.
+    ///
+    /// # Arguments
+    /// * `bvh_nodes` - Pre-built 2D Morton LBVH over obstacle AABBs, layer masks, and net IDs.
+    /// * `queries` - Slice of [`GpuDrcRayQuery`] segments with clearance radii, layer masks, and net IDs.
+    ///
+    /// # Returns
+    /// `Some(Vec<u32>)` of flags (`1` = collision/violation detected, `0` = clear) per query, or `None` on failure.
     pub fn evaluate_drc_rt_bvh(
         &self,
         bvh_nodes: &[GpuBvhNode],
@@ -2683,6 +3235,11 @@ impl CudaEngine {
         }
     }
 
+    /// Runs a comparative micro-benchmark measuring GPU LBVH traversal (`evaluate_drc_rt_bvh` and
+    /// `evaluate_segment_crossings_rt_bvh`) against brute-force SIMT/CPU baselines.
+    ///
+    /// # Returns
+    /// `Some(RtBvhBenchmarkResult)` with microsecond timings and speedup ratios, or `None` if GPU execution fails.
     pub fn benchmark_rt_bvh_vs_simt(&self) -> Option<RtBvhBenchmarkResult> {
         let num_obs = 512usize;
         let num_queries = 256usize;
@@ -2759,6 +3316,17 @@ impl CudaEngine {
         })
     }
 
+    /// Evaluates exact continuous-geometry DRC clearance for a batch of candidate tracks/vias (`candidates`)
+    /// against all board `pads`, `tracks`, and `vias`, distributing chunks across multiple CUDA GPUs when available.
+    ///
+    /// # Arguments
+    /// * `pads` - All board pads encoded as [`GpuDrcPad`].
+    /// * `tracks` - All board track segments encoded as [`GpuDrcTrack`].
+    /// * `vias` - All board vias encoded as [`GpuDrcVia`].
+    /// * `candidates` - Candidate segments or vias to test ([`GpuDrcCandidate`]).
+    ///
+    /// # Returns
+    /// `Some(Vec<u32>)` where `0` indicates legal (clear) and non-zero indicates a clearance violation, or `None` on failure.
     pub fn evaluate_drc_candidates(
         &self,
         pads: &[GpuDrcPad],
@@ -2826,6 +3394,17 @@ impl CudaEngine {
         self.evaluate_drc_candidates_single(pads, tracks, vias, candidates)
     }
 
+    /// Evaluates a slice of [`GpuDrcCandidate`] items against `pads`, `tracks`, and `vias` on this single CUDA GPU
+    /// using `batch_drc_eval_kernel`.
+    ///
+    /// # Arguments
+    /// * `pads` - Board pads encoded as [`GpuDrcPad`].
+    /// * `tracks` - Board track segments encoded as [`GpuDrcTrack`].
+    /// * `vias` - Board vias encoded as [`GpuDrcVia`].
+    /// * `candidates` - Candidate segments or vias to validate.
+    ///
+    /// # Returns
+    /// `Some(Vec<u32>)` of violation flags (`0` = legal, `1` = violation) per candidate, or `None` on CUDA error.
     pub fn evaluate_drc_candidates_single(
         &self,
         pads: &[GpuDrcPad],
@@ -3317,11 +3896,17 @@ impl CudaEngine {
 /// Multi-GPU router pool distributing batched 3D wavefront pathfinding across all available
 /// CUDA GPUs (`RTX 3080` + `RTX 3060`) in parallel, with automatic fallback to `VulkanEngine`.
 pub struct MultiGpuRouterPool {
+    /// Active CUDA GPU engines sorted by capability.
     pub cuda_engines: Vec<Arc<CudaEngine>>,
+    /// Optional `VulkanEngine` fallback used when no CUDA GPUs are present.
     pub vulkan_fallback: Option<Arc<crate::vulkan::VulkanEngine>>,
 }
 
 impl MultiGpuRouterPool {
+    /// Creates a new [`MultiGpuRouterPool`] by discovering all host CUDA GPUs and initializing a fallback `VulkanEngine`.
+    ///
+    /// # Returns
+    /// A configured [`MultiGpuRouterPool`].
     pub fn new() -> Self {
         let cuda_engines = CudaEngine::all_devices();
         let vulkan_fallback = crate::vulkan::VulkanEngine::new();
@@ -3331,6 +3916,13 @@ impl MultiGpuRouterPool {
         }
     }
 
+    /// Creates a [`MultiGpuRouterPool`] reusing an existing `VulkanEngine` handle as fallback alongside all CUDA GPUs.
+    ///
+    /// # Arguments
+    /// * `vulkan` - Optional existing `Arc<VulkanEngine>` fallback instance.
+    ///
+    /// # Returns
+    /// A configured [`MultiGpuRouterPool`].
     pub fn with_vulkan(vulkan: Option<Arc<crate::vulkan::VulkanEngine>>) -> Self {
         let cuda_engines = CudaEngine::all_devices();
         Self {
@@ -3339,6 +3931,10 @@ impl MultiGpuRouterPool {
         }
     }
 
+    /// Returns the number of active GPU compute devices available in this pool.
+    ///
+    /// # Returns
+    /// Number of CUDA devices if non-empty, `1` if only `vulkan_fallback` is present, or `0` if CPU-only.
     pub fn device_count(&self) -> usize {
         if !self.cuda_engines.is_empty() {
             self.cuda_engines.len()
@@ -3349,6 +3945,18 @@ impl MultiGpuRouterPool {
         }
     }
 
+    /// Solves a batch of 3D shortest-path routing requests (with default zero extra clearance radius)
+    /// striped in parallel across all GPUs in the pool.
+    ///
+    /// # Arguments
+    /// * `obstacle_grid` - Flat 3D obstacle grid (`gw * gh * layers`).
+    /// * `gw` - Grid width in cells.
+    /// * `gh` - Grid height in cells.
+    /// * `layers` - Number of copper routing layers.
+    /// * `requests` - Slice of `(src_xyz, dst_xyz, net_id, via_cost)` pathfinding requests.
+    ///
+    /// # Returns
+    /// Vector of `Option<Vec<(usize, usize, usize)>>` 3D grid paths corresponding 1:1 with `requests`.
     pub fn solve_batch_3d_wavefront_paths(
         &self,
         obstacle_grid: &[u32],
@@ -3371,6 +3979,18 @@ impl MultiGpuRouterPool {
         )
     }
 
+    /// Solves a batch of 3D shortest-path routing requests with per-request clearance radii (`clearance_cells`),
+    /// partitioning requests round-robin across all CUDA GPUs in `cuda_engines` (or falling back to `vulkan_fallback`).
+    ///
+    /// # Arguments
+    /// * `obstacle_grid` - Flat 3D obstacle grid (`gw * gh * layers`).
+    /// * `gw` - Grid width in cells.
+    /// * `gh` - Grid height in cells.
+    /// * `layers` - Number of copper routing layers.
+    /// * `requests` - Slice of `(src_xyz, dst_xyz, net_id, via_cost, clearance_cells)` pathfinding requests.
+    ///
+    /// # Returns
+    /// Vector of `Option<Vec<(usize, usize, usize)>>` 3D grid paths corresponding 1:1 with `requests`.
     pub fn solve_batch_3d_wavefront_paths_with_clearance(
         &self,
         obstacle_grid: &[u32],

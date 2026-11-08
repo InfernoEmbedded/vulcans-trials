@@ -1,6 +1,36 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Alastair D'Silva — Vulcan's Trials
 
+//! Multi-layer PCB autorouter, obstacle rasterization grid, shove/nudge engine,
+//! post-route topological glossing, tangent-arc synthesis, and GPU-accelerated DRC cleanup.
+//!
+//! # Architecture Overview
+//!
+//! This module implements the full multi-layer routing pipeline for Vulcan's Trials:
+//! - [`RoutingConfig`] / [`RouterConfig`]: Tunable physical, geometric, and cost weights for
+//!   PathFinder negotiated congestion, crosstalk avoidance, via reduction, and post-route glossing.
+//! - [`RoutingGrid`]: 3D voxelized copper obstacle and clearance grid supporting multi-layer
+//!   Euclidean Distance Field (EDF) transforms on Vulkan GPUs (with a multi-core Rayon CPU fallback),
+//!   per-net 3D routing cost maps, and reference-plane return path checks.
+//! - [`NudgeEngine`]: Component nudging, perpendicular track shoving, via shoving, and cascading
+//!   octilinear continuous track deflection with 45° transition elbows.
+//! - [`AutoRouter`]: Negotiated-congestion PathFinder router with 3D octilinear A* search,
+//!   coupled differential-pair routing (corridor attraction and symmetric dual-state A*),
+//!   trombone/meander length and phase tuning, staggered fine-pitch QFN/SOIC/TSSOP escape stubs,
+//!   BGA dogbone fanouts, and automated ground-plane via stitching.
+//! - Post-route topological glossing ([`TrackChain`], [`gloss_tracks`], [`gloss_tracks_standard`],
+//!   [`relax_homotopic_rubber_bands`]): Collinear segment merging, stair-step and U-turn
+//!   elimination, 2-segment corner dogleg replacement, acute acid-trap avoidance, via pair
+//!   and single-via consolidation, via sliding/alignment, and redundant cycle/stub pruning.
+//! - Organic tangent-arc and spline synthesis ([`CubicBezier`], [`apply_any_angle_tangent_arcs`],
+//!   [`convert_tracks_to_organic`], [`fillet_acute_angle_junctions`]): Smooth circular arc
+//!   (`fp_arc` / `gr_arc`), asymmetric $G^1$ biarc, and cubic Bézier corner rounding with full
+//!   GPU/CPU DRC clearance verification.
+//! - Copper DRC validation and repair ([`GpuDrcContext`], [`validate_and_clean_copper`],
+//!   [`validate_crosstalk_and_coupling`], [`route_bundle_along_guide`]): Exact analytic and
+//!   GPU-accelerated pad/track/via clearance verification, crosstalk coupling length analysis,
+//!   and equidistant river routing for bus bundles.
+
 use crate::board::{ArcSegment, Board, Footprint, LiveTrialState, NetClass, NetTopology, Pad, Point, TrackSegment, TrialPhase, Via};
 pub use crate::board::BusBundle;
 use crate::cuda::{CudaEngine, MultiGpuRouterPool};
@@ -13,17 +43,40 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
+/// Sentinel obstacle net ID (`-1`) representing an impassable keepout zone, board edge margin,
+/// or unconnected pad obstacle in [`RoutingGrid::obstacle_net_ids`].
 pub const KEEPOUT_NET: i32 = -1;
+
+/// Sentinel obstacle net ID (`0`) representing unobstructed free space in [`RoutingGrid::obstacle_net_ids`].
 pub const FREE_NET: i32 = 0;
-/// A* edge-cost multiplier for a diff-pair follower straying outside its leader's corridor.
+
+/// A* edge-cost multiplier (`6.0`) applied when a differential-pair follower trace strays outside
+/// its leader trace's target coupling corridor.
 pub const DIFF_PAIR_OFF_CORRIDOR_MULT: f32 = 6.0;
-/// Mean follower-to-leader distance (mm) above which a routed diff pair counts as uncoupled.
+
+/// Maximum mean follower-to-leader center-to-center spacing (`0.8 mm`) for a routed differential pair
+/// to be considered tightly coupled before triggering dual-state coupled re-routing.
 pub const DIFF_PAIR_COUPLED_MM: f64 = 0.8;
-/// Per-cell cost (in grid steps) for a sided diff-pair leader step with no room for its partner.
+
+/// Per-cell A* cost penalty (`60.0` grid steps) added when a sided differential-pair leader step
+/// leaves insufficient lateral clearance for its partner trace on the required side.
 pub const DIFF_PAIR_SIDE_BLOCKED_PENALTY: f64 = 60.0;
 
-/// Which side (+1 / -1, 0 = ambiguous) of the `leader` path the follower's endpoints sit on,
-/// using the same cross-product convention as `build_diff_pair_corridor`.
+/// Determines which lateral side (`+1.0`, `-1.0`, or `0.0` if ambiguous) of the `leader` grid path
+/// the differential-pair follower's start and end nodes lie on.
+///
+/// Uses the 2D cross product of the leader's initial and terminal tangent vectors against the
+/// follower's start (`fs`) and end (`fe`) nodes, matching the convention of
+/// [`AutoRouter::build_diff_pair_corridor`].
+///
+/// # Arguments
+/// * `leader` - Ordered slice of [`GridNode`]s forming the routed leader trace path.
+/// * `fs` - Grid coordinates of the follower net's start pad.
+/// * `fe` - Grid coordinates of the follower net's end pad.
+///
+/// # Returns
+/// `+1.0` or `-1.0` when both endpoints consistently sit on the same side of the leader trajectory,
+/// or `0.0` when the leader path has fewer than 2 nodes or the endpoints straddle opposite sides.
 pub fn diff_pair_side(leader: &[GridNode], fs: GridNode, fe: GridNode) -> f64 {
     let n = leader.len();
     if n < 2 {
@@ -39,7 +92,16 @@ pub fn diff_pair_side(leader: &[GridNode], fs: GridNode, fe: GridNode) -> f64 {
     if s0 * s1 > 0.0 { s0.signum() } else { 0.0 }
 }
 
-/// Mean distance (mm) from copper of net `a` (sampled every 0.1 mm) to the nearest copper of net `b`.
+/// Computes the mean Euclidean distance (in `mm`) from copper of net `a` (sampled every `0.1 mm`
+/// along tracks and arcs) to the nearest copper segment of net `b`.
+///
+/// # Arguments
+/// * `board` - The [`Board`] containing routed [`TrackSegment`]s and [`ArcSegment`]s.
+/// * `a` - Net ID of the first net to sample.
+/// * `b` - Net ID of the reference partner net.
+///
+/// # Returns
+/// Mean centerline distance in millimeters (`mm`), or [`f64::INFINITY`] if either net has no routed copper.
 pub fn board_net_coupling_mm(board: &Board, a: usize, b: usize) -> f64 {
     let segs = |net: usize| -> Vec<((f64, f64), (f64, f64))> {
         let mut v: Vec<_> = board.tracks.iter().filter(|t| t.net_id == net).map(|t| (t.start, t.end)).collect();
@@ -66,7 +128,16 @@ pub fn board_net_coupling_mm(board: &Board, a: usize, b: usize) -> f64 {
     if n == 0 { f64::INFINITY } else { sum / n as f64 }
 }
 
-/// In-plane length (mm) of a grid path; layer changes (vias) add nothing.
+/// Computes the total in-plane physical length (in `mm`) of a discretized [`GridNode`] path.
+///
+/// Layer transitions (vias where adjacent nodes differ in `layer`) contribute zero planar length.
+///
+/// # Arguments
+/// * `res` - Grid cell resolution in millimeters (`mm`) per cell.
+/// * `path` - Slice of [`GridNode`] steps representing the routed path.
+///
+/// # Returns
+/// Total planar path length in millimeters (`mm`).
 pub fn grid_path_length_mm(res: f64, path: &[GridNode]) -> f64 {
     path.windows(2)
         .filter(|w| w[0].layer == w[1].layer)
@@ -75,8 +146,18 @@ pub fn grid_path_length_mm(res: f64, path: &[GridNode]) -> f64 {
         * res
 }
 
-/// Width a net's tracks should be widened to: `diff_pair_width` for diff-pair members
-/// (whose `track_width` may be set for unrelated single-ended use), else `track_width`.
+/// Returns the target copper track width (in `mm`) for `net_id` based on its netclass and
+/// differential-pair membership.
+///
+/// Returns [`NetClass::diff_pair_width`] when `net_id` is paired with a complementary differential
+/// mate on the board, or [`NetClass::track_width`] for single-ended nets.
+///
+/// # Arguments
+/// * `board` - The [`Board`] providing net names and netclass definitions.
+/// * `net_id` - Numeric net identifier to query.
+///
+/// # Returns
+/// Target track width in millimeters (`mm`).
 pub fn net_target_width(board: &Board, net_id: usize) -> f64 {
     let nc = board.get_netclass_for_net(net_id);
     let name = &board.nets[net_id];
@@ -87,7 +168,16 @@ pub fn net_target_width(board: &Board, net_id: usize) -> f64 {
     }
 }
 
-/// Mean distance (mm) from each `follower` node to the nearest `leader` node.
+/// Computes the mean Euclidean distance (in `mm`) from each node in `follower` to the nearest
+/// node in `leader` on the routing grid.
+///
+/// # Arguments
+/// * `res` - Grid cell resolution in millimeters (`mm`) per cell.
+/// * `leader` - Slice of [`GridNode`]s forming the leader path.
+/// * `follower` - Slice of [`GridNode`]s forming the follower path.
+///
+/// # Returns
+/// Mean distance in millimeters (`mm`), or [`f64::INFINITY`] if either path slice is empty.
 pub fn path_coupling_mm(res: f64, leader: &[GridNode], follower: &[GridNode]) -> f64 {
     if leader.is_empty() || follower.is_empty() {
         return f64::INFINITY;
@@ -109,51 +199,79 @@ pub fn path_coupling_mm(res: f64, leader: &[GridNode], follower: &[GridNode]) ->
     sum / follower.len() as f64 * res
 }
 
+/// Configuration parameters controlling the multi-layer autorouter, negotiated congestion,
+/// via optimization, crosstalk penalties, and post-route glossing passes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoutingConfig {
+    /// Penalty weight added per grid step when a trace runs parallel and closely coupled to a foreign net.
     #[serde(default = "default_crosstalk_penalty")]
     pub crosstalk_penalty: f64,
+    /// When `true`, enables any-angle Euclidean line-of-sight rubber-band glossing instead of strict 45° octilinear routing.
     #[serde(default)]
     pub any_angle_mode: bool,
+    /// Maximum search radius (in `mm`) within which same-net vias are merged during post-route cleanup.
     #[serde(default = "default_via_merge_radius_mm")]
     pub via_merge_radius_mm: f64,
+    /// Maximum extra planar detour length (in `mm`) allowed when replacing a pair of vias with a single-layer detour.
     #[serde(default = "default_via_detour_budget_mm")]
     pub via_detour_budget_mm: f64,
+    /// Maximum allowed ratio of detour length to direct segment length when eliminating a layer-hop via pair.
     #[serde(default = "default_via_hop_max_detour_ratio")]
     pub via_hop_max_detour_ratio: f64,
+    /// Maximum radius (in `mm`) within which multiple ground/power plane ties can share a single stitching via.
     #[serde(default = "default_plane_via_share_radius_mm")]
     pub plane_via_share_radius_mm: f64,
+    /// Maximum distance (in `mm`) to search for or place a reference-plane return-current via near a signal layer transition.
     #[serde(default = "default_return_via_max_dist_mm")]
     pub return_via_max_dist_mm: f64,
+    /// Maximum distance (in `mm`) within which a nearby via is snapped directly onto a compatible pad or terminal.
     #[serde(default = "default_via_pad_snap_dist_mm")]
     pub via_pad_snap_dist_mm: f64,
+    /// Base PathFinder historical/present congestion cost multiplier.
     #[serde(default = "default_congestion_factor")]
     pub congestion_factor: f64,
+    /// Incremental displacement step size (in `mm`) used by [`NudgeEngine`] when shoving tracks or footprints.
     #[serde(default = "default_nudge_step_mm")]
     pub nudge_step_mm: f64,
+    /// Number of iterative post-route topological glossing passes to execute.
     #[serde(default = "default_gloss_passes")]
     pub gloss_passes: usize,
+    /// Chamfer/fillet radius (in `mm`) inserted at acute (< 90°) copper junctions to eliminate acid traps.
     #[serde(default = "default_acid_trap_fillet_radius")]
     pub acid_trap_fillet_radius: f64,
+    /// When `true`, allows placing vias directly inside SMD pads of the same net.
     #[serde(default)]
     pub allow_via_in_pad: bool,
 }
 
+/// Type alias for [`RoutingConfig`] used by external callers and CLI configuration loaders.
 pub type RouterConfig = RoutingConfig;
 
+/// Default crosstalk penalty weight (`4.0`).
 fn default_crosstalk_penalty() -> f64 { 4.0 }
+/// Default same-net via merge radius (`4.00 mm`).
 fn default_via_merge_radius_mm() -> f64 { 4.00 }
+/// Default planar detour budget (`3.50 mm`) for via-pair elimination.
 fn default_via_detour_budget_mm() -> f64 { 3.50 }
+/// Default maximum detour-to-direct length ratio (`1.25`) for via-hop elimination.
 fn default_via_hop_max_detour_ratio() -> f64 { 1.25 }
+/// Default plane-via sharing radius (`3.50 mm`).
 fn default_plane_via_share_radius_mm() -> f64 { 3.50 }
+/// Default maximum distance (`1.40 mm`) to a reference-plane return via.
 fn default_return_via_max_dist_mm() -> f64 { 1.40 }
+/// Default via-to-pad snap radius (`0.50 mm`).
 fn default_via_pad_snap_dist_mm() -> f64 { 0.50 }
+/// Default PathFinder congestion multiplier (`1.50`).
 fn default_congestion_factor() -> f64 { 1.50 }
+/// Default nudge step size (`0.25 mm`).
 fn default_nudge_step_mm() -> f64 { 0.25 }
+/// Default number of post-route glossing passes (`2`).
 fn default_gloss_passes() -> usize { 2 }
+/// Default acute-angle acid-trap fillet radius (`0.35 mm`).
 fn default_acid_trap_fillet_radius() -> f64 { 0.35 }
 
 impl Default for RoutingConfig {
+    /// Creates a [`RoutingConfig`] initialized with standard production PCB routing defaults.
     fn default() -> Self {
         Self {
             crosstalk_penalty: default_crosstalk_penalty(),
@@ -173,39 +291,77 @@ impl Default for RoutingConfig {
     }
 }
 
+/// Discrete 3D coordinate on the [`RoutingGrid`] representing a cell `(gx, gy)` on a specific copper `layer`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GridNode {
+    /// Horizontal grid column index (`0..width`).
     pub gx: usize,
+    /// Vertical grid row index (`0..height`).
     pub gy: usize,
+    /// Copper layer index (`0` = `F.Cu`, `1` = `B.Cu`, `2+` = inner layers `In1.Cu`, etc.).
     pub layer: usize,
 }
 
+/// 3D uniform spatial grid storing rasterized copper obstacles, Euclidean distance fields,
+/// PathFinder congestion history, and precomputed GPU routing cost maps across all copper layers.
 pub struct RoutingGrid {
+    /// Minimum world X coordinate (in `mm`) of the grid bounding box.
     pub min_x: f64,
+    /// Minimum world Y coordinate (in `mm`) of the grid bounding box.
     pub min_y: f64,
+    /// Maximum world X coordinate (in `mm`) of the grid bounding box.
     pub max_x: f64,
+    /// Maximum world Y coordinate (in `mm`) of the grid bounding box.
     pub max_y: f64,
+    /// Spatial size of a single grid cell (in `mm`).
     pub res: f64,
+    /// Number of grid columns along the X axis.
     pub width: usize,
+    /// Number of grid rows along the Y axis.
     pub height: usize,
+    /// Total number of copper layers represented in the 3D grid (`>= 2`).
     pub num_layers: usize,
+    /// Mapping from inner copper layer index to dedicated power/ground plane net ID.
     pub plane_nets: HashMap<usize, usize>,
+    /// Flat 3D array (`num_layers * width * height`) of net IDs occupying each cell
+    /// ([`FREE_NET`] = `0`, [`KEEPOUT_NET`] = `-1`, or positive net ID).
     pub obstacle_net_ids: Vec<i32>,
+    /// Flat 3D array (`num_layers * width * height`) of Euclidean distances (in `mm`) to the nearest obstacle on the same layer.
     pub dist_field: Vec<f32>,
+    /// Flat 3D array (`num_layers * width * height`) of accumulated PathFinder historical congestion penalties.
     pub congestion: Vec<f32>,
+    /// Flat 3D array (`num_layers * width * height`) of present-iteration net occupancy counts per cell.
     pub usage_count: Vec<u32>,
+    /// Per-net cached 3D GPU routing cost maps keyed by `net_id`, storing `(clearance_cells, cost_buffer)`.
     pub gpu_net_cost_maps: HashMap<usize, (i32, Vec<f32>)>,
+    /// Flat 3D array mapping each grid cell to the unlocked footprint index (`Some(fp_idx)`) that owns the pad occupying it.
     pub nudgeable_fp: Vec<Option<usize>>,
+    /// Flat 3D boolean mask indicating whether each cell is covered by an SMD pad (used to prevent illegal via-in-pad collisions).
     pub smd_pad_cells: Vec<bool>,
+    /// Per-net copper clearance requirements (in `mm`), indexed by `net_id`.
     pub net_clearances: Vec<f64>,
+    /// Maximum netclass clearance (in `mm`) across all nets on the board.
     pub max_net_clearance: f64,
+    /// Additional per-millimeter cost penalty applied when routing signal traces on inner layers (`layer >= 2`).
     pub inner_layer_penalty: f64,
+    /// Whether vias are permitted inside same-net SMD pads.
     pub allow_via_in_pad: bool,
+    /// Optional shared handle to the [`VulkanEngine`] used for GPU distance-field and wavefront compute dispatches.
     pub vulkan: Option<Arc<VulkanEngine>>,
+    /// Cached snapshot of the base static obstacle state `(obstacle_net_ids, usage_count, nudgeable_fp, smd_pad_cells)`
+    /// prior to dynamic track commitments, enabling fast rip-up and re-route resets.
     pub base_snapshot: Option<Arc<(Vec<i32>, Vec<u32>, Vec<Option<usize>>, Vec<bool>)>>,
 }
 
-/// Checks whether a segment conforms to the standard octilinear 45-degree grid (0°, 45°, 90°, etc.).
+/// Checks whether a 2D line segment `p1 -> p2` conforms to the standard octilinear 45-degree grid
+/// (`0°`, `45°`, `90°`, `135°`, etc.) within `1e-4 mm` tolerance.
+///
+/// # Arguments
+/// * `p1` - Start point `(x, y)` in millimeters (`mm`).
+/// * `p2` - End point `(x, y)` in millimeters (`mm`).
+///
+/// # Returns
+/// `true` if the segment is horizontal, vertical, or 45° diagonal within `1e-4 mm`.
 #[inline]
 pub fn is_octilinear_segment(p1: (f64, f64), p2: (f64, f64)) -> bool {
     let dx = (p2.0 - p1.0).abs();
@@ -213,9 +369,19 @@ pub fn is_octilinear_segment(p1: (f64, f64), p2: (f64, f64)) -> bool {
     dx < 1e-4 || dy < 1e-4 || (dx - dy).abs() < 1e-4
 }
 
-/// KiCad-standard 45° dogleg corner computation.
-/// When `diagonal_first` is false: straight horizontal/vertical segment first, then 45° diagonal to p1.
-/// When `diagonal_first` is true: 45° diagonal segment first, then straight horizontal/vertical to p1.
+/// Computes a KiCad-standard 45° octilinear dogleg polyline connecting `p0` to `p1`.
+///
+/// When `diagonal_first` is `false`, emits the axial (horizontal or vertical) segment first followed
+/// by a 45° diagonal segment into `p1`. When `diagonal_first` is `true`, emits the 45° diagonal
+/// segment first followed by the axial segment into `p1`.
+///
+/// # Arguments
+/// * `p0` - Start world coordinates `(x, y)` in millimeters (`mm`).
+/// * `p1` - End world coordinates `(x, y)` in millimeters (`mm`).
+/// * `diagonal_first` - Whether to place the 45° diagonal leg at `p0` (`true`) or at `p1` (`false`).
+///
+/// # Returns
+/// A vector of 1, 2, or 3 vertices `[(x, y)]` forming the octilinear connection from `p0` to `p1`.
 pub fn compute_45_dogleg(p0: (f64, f64), p1: (f64, f64), diagonal_first: bool) -> Vec<(f64, f64)> {
     let dx = p1.0 - p0.0;
     let dy = p1.1 - p0.1;
@@ -256,6 +422,17 @@ pub fn compute_45_dogleg(p0: (f64, f64), p1: (f64, f64), diagonal_first: bool) -
 }
 
 impl RoutingGrid {
+    /// Constructs a new 3D [`RoutingGrid`] from the given [`Board`] at spatial resolution `res` (`mm`),
+    /// rasterizes all board outlines, keepouts, pads, and locked copper, and computes the initial
+    /// 2D Euclidean distance fields across all layers.
+    ///
+    /// # Arguments
+    /// * `board` - The [`Board`] whose geometry, netclasses, and obstacles are rasterized.
+    /// * `res` - Grid cell size in millimeters (`mm`).
+    /// * `vulkan` - Optional shared [`VulkanEngine`] for GPU-accelerated distance field and cost map generation.
+    ///
+    /// # Returns
+    /// Fully initialized [`RoutingGrid`] ready for pathfinding.
     pub fn new(board: &Board, res: f64, vulkan: Option<Arc<VulkanEngine>>) -> Self {
         let min_x = board.min_x;
         let min_y = board.min_y;
@@ -305,21 +482,54 @@ impl RoutingGrid {
         grid
     }
 
+    /// Builder-style setter that overrides the inner-layer routing penalty (`inner_layer_penalty`).
+    ///
+    /// # Arguments
+    /// * `pen` - Cost penalty per millimeter for routing on inner copper layers (`layer >= 2`).
+    ///
+    /// # Returns
+    /// Updated [`RoutingGrid`] with the specified inner-layer penalty.
     pub fn with_inner_layer_penalty(mut self, pen: f64) -> Self {
         self.inner_layer_penalty = pen;
         self
     }
 
+    /// Builder-style setter that configures whether vias are allowed inside same-net SMD pads.
+    ///
+    /// # Arguments
+    /// * `allow` - `true` to permit via-in-pad on matching nets, `false` to forbid it.
+    ///
+    /// # Returns
+    /// Updated [`RoutingGrid`] with `allow_via_in_pad` set.
     pub fn with_allow_via_in_pad(mut self, allow: bool) -> Self {
         self.allow_via_in_pad = allow;
         self
     }
 
+    /// Computes the flat 1D slice index into [`RoutingGrid::obstacle_net_ids`] and related 3D buffers
+    /// for grid coordinates `(gx, gy)` on `layer`.
+    ///
+    /// # Arguments
+    /// * `gx` - Grid column index (`0..width`).
+    /// * `gy` - Grid row index (`0..height`).
+    /// * `layer` - Copper layer index (`0..num_layers`).
+    ///
+    /// # Returns
+    /// Flat linear index `layer * (width * height) + gy * width + gx`.
     #[inline]
     pub fn idx(&self, gx: usize, gy: usize, layer: usize) -> usize {
         layer * (self.width * self.height) + gy * self.width + gx
     }
 
+    /// Converts continuous world coordinates `(x, y)` in millimeters (`mm`) to discrete grid indices `(gx, gy)`.
+    ///
+    /// # Arguments
+    /// * `x` - World X coordinate in millimeters (`mm`).
+    /// * `y` - World Y coordinate in millimeters (`mm`).
+    ///
+    /// # Returns
+    /// `Some((gx, gy))` if `(x, y)` lies within the grid bounds `[min_x..max_x, min_y..max_y)`,
+    /// or `None` if out of bounds.
     pub fn world_to_grid(&self, x: f64, y: f64) -> Option<(usize, usize)> {
         if x < self.min_x || x >= self.max_x || y < self.min_y || y >= self.max_y {
             return None;
@@ -333,6 +543,14 @@ impl RoutingGrid {
         }
     }
 
+    /// Converts discrete grid cell coordinates `(gx, gy)` to the cell-center world coordinates `(x, y)` in millimeters (`mm`).
+    ///
+    /// # Arguments
+    /// * `gx` - Grid column index.
+    /// * `gy` - Grid row index.
+    ///
+    /// # Returns
+    /// Cell center `(x, y)` in millimeters (`mm`).
     pub fn grid_to_world(&self, gx: usize, gy: usize) -> (f64, f64) {
         (
             self.min_x + (gx as f64 + 0.5) * self.res,
@@ -340,6 +558,15 @@ impl RoutingGrid {
         )
     }
 
+    /// Rasterizes the board outline edge keepout, explicit keepout zones, component pads
+    /// (both SMD and through-hole), and locked tracks/vias into [`RoutingGrid::obstacle_net_ids`],
+    /// [`RoutingGrid::nudgeable_fp`], and [`RoutingGrid::smd_pad_cells`].
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the [`Board`] whose static and locked copper features are stamped.
+    ///
+    /// # Side Effects
+    /// Clears [`RoutingGrid::gpu_net_cost_maps`] and populates obstacle, pad, and nudgeability buffers in `self`.
     pub fn rasterize_obstacles(&mut self, board: &Board) {
         self.gpu_net_cost_maps.clear();
         let max_world_x = self.min_x + (self.width as f64) * self.res;
@@ -416,12 +643,19 @@ impl RoutingGrid {
             }
         }
 
+        /// Pre-rasterized grid cells for a single footprint pad during parallel obstacle stamping.
         struct PadStamp {
+            /// Parent footprint index in `board.footprints`.
             fp_idx: usize,
+            /// Whether the parent footprint is unlocked and eligible for nudging.
             is_nudgeable: bool,
+            /// Whether the pad is a plated through-hole spanning all copper layers.
             is_through_hole: bool,
+            /// Copper layer index for SMD pads.
             smd_layer: usize,
+            /// Obstacle net value (`net_id as i32` or [`KEEPOUT_NET`] for unconnected pads).
             net_val: i32,
+            /// Rasterized `(gx, gy)` grid cells covered by the pad copper.
             cells: Vec<(usize, usize)>,
         }
 
@@ -546,6 +780,14 @@ impl RoutingGrid {
         }
     }
 
+    /// Rasterizes a single [`TrackSegment`] into [`RoutingGrid::obstacle_net_ids`] on its layer,
+    /// marking free cells within `trk.width / 2.0` of the segment centerline with `trk.net_id`.
+    ///
+    /// # Arguments
+    /// * `trk` - The [`TrackSegment`] to stamp onto the obstacle grid.
+    ///
+    /// # Side Effects
+    /// Invalidates [`RoutingGrid::gpu_net_cost_maps`] and updates [`RoutingGrid::obstacle_net_ids`].
     pub fn commit_track(&mut self, trk: &TrackSegment) {
         if trk.layer >= self.num_layers {
             return;
@@ -577,6 +819,13 @@ impl RoutingGrid {
         }
     }
 
+    /// Rasterizes a through-hole [`Via`] across all copper layers in [`RoutingGrid::obstacle_net_ids`].
+    ///
+    /// # Arguments
+    /// * `v` - The [`Via`] to stamp across all layers `0..num_layers`.
+    ///
+    /// # Side Effects
+    /// Invalidates [`RoutingGrid::gpu_net_cost_maps`] and marks free cells within the via's radius as `v.net_id`.
     pub fn commit_via(&mut self, v: &Via) {
         self.gpu_net_cost_maps.clear();
         let vr_radius = (v.size / 2.0) + (self.res * 0.40);
@@ -601,6 +850,14 @@ impl RoutingGrid {
         }
     }
 
+    /// Returns a 32-bit layer bitmask indicating which inner copper layers are dedicated to a
+    /// foreign power/ground plane (`plane_net != net_id`) and therefore off-limits for planar routing of `net_id`.
+    ///
+    /// # Arguments
+    /// * `net_id` - Numeric net ID being routed.
+    ///
+    /// # Returns
+    /// Bitmask where bit `l` is `1` if layer `l` is a dedicated plane belonging to a net other than `net_id`.
     pub fn plane_layer_mask_for_net(&self, net_id: usize) -> u32 {
         let mut mask = 0u32;
         for (&layer, &plane_net) in &self.plane_nets {
@@ -612,7 +869,17 @@ impl RoutingGrid {
     }
 
     /// Computes a 3D per-cell routing cost and clearance map on the GPU for `net_id`.
+    ///
     /// Cells within `clearance_cells` of any foreign obstacle are marked `-1.0f` (impassable).
+    ///
+    /// # Arguments
+    /// * `net_id` - Target net ID to evaluate.
+    /// * `clearance_cells` - Required obstacle clearance radius in grid cells.
+    /// * `present_congestion_factor` - Multiplier for present-iteration cell occupancy counts.
+    /// * `obstacle_clearance_weight` - Penalty weight for proximity to obstacles in the distance field.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` containing `num_layers * width * height` per-cell traversal costs, or `None` if no Vulkan GPU is available.
     pub fn compute_gpu_3d_routing_cost_for_net(
         &self,
         net_id: usize,
@@ -642,6 +909,14 @@ impl RoutingGrid {
     }
 
     /// Precomputes 3D routing cost and clearance maps across all available GPUs for a batch of `(net_id, clearance_cells)`.
+    ///
+    /// # Arguments
+    /// * `net_clearances_cells` - Slice of `(net_id, clearance_cells)` pairs to evaluate in parallel across GPUs.
+    /// * `present_congestion_factor` - Present congestion penalty multiplier.
+    /// * `obstacle_clearance_weight` - Distance-field obstacle proximity weight.
+    ///
+    /// # Side Effects
+    /// Populates [`RoutingGrid::gpu_net_cost_maps`] with the computed cost vectors for each net in the batch.
     pub fn precompute_gpu_routing_costs_batch(
         &mut self,
         net_clearances_cells: &[(usize, i32)],
@@ -684,6 +959,16 @@ impl RoutingGrid {
     }
 
     /// Computes a 3D shortest-path wavefront potential field on the GPU from target seed indices.
+    ///
+    /// # Arguments
+    /// * `net_id` - Net identifier being routed.
+    /// * `clearance_cells` - Required obstacle clearance radius in grid cells.
+    /// * `seeds` - Slice of flat 3D grid cell indices (`idx`) representing wavefront target seeds (cost `0.0`).
+    /// * `via_cost` - Cost penalty for transitioning between layers.
+    /// * `iterations` - Number of Bellman-Ford wavefront relaxation iterations to dispatch on the GPU.
+    ///
+    /// # Returns
+    /// `Some(Vec<f32>)` containing the relaxed 3D potential field, or `None` if GPU compute is unavailable.
     pub fn compute_gpu_3d_wavefront_for_net(
         &self,
         net_id: usize,
@@ -716,7 +1001,14 @@ impl RoutingGrid {
     }
 
     /// Batch-validates a slice of `(net_id, start, end, width, layer, clearance)` track segments
-    /// on the GPU using `GpuDrcContext` alongside 3D grid obstacle and plane-layer clearance checks.
+    /// on the GPU using [`GpuDrcContext`] alongside 3D grid obstacle and plane-layer clearance checks.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the [`Board`] for DRC context construction and keepout checks.
+    /// * `segments` - Slice of candidate track tuples `(net_id, start_xy, end_xy, width_mm, layer, clearance_mm)`.
+    ///
+    /// # Returns
+    /// `Some(Vec<bool>)` indicating whether each candidate segment is DRC-clean, or `None` if no Vulkan GPU is available.
     pub fn batch_validate_segments_gpu(
         &self,
         board: &Board,
@@ -790,6 +1082,17 @@ impl RoutingGrid {
         Some(results)
     }
 
+    /// Computes a 2D Euclidean Distance Field (in grid cell units) on the CPU using a separable
+    /// 2-pass column-then-row squared distance transform bounded by `radius`.
+    ///
+    /// # Arguments
+    /// * `obstacles` - Flat 2D slice (`width * height`) where non-zero entries indicate occupied obstacle cells.
+    /// * `width` - Grid width in cells.
+    /// * `height` - Grid height in cells.
+    /// * `radius` - Maximum search radius in cells (`radius >= 1`).
+    ///
+    /// # Returns
+    /// Vector of `width * height` Euclidean distances (in grid cells) to the nearest obstacle cell.
     pub fn compute_distance_field_cpu(
         obstacles: &[u32],
         width: usize,
@@ -858,6 +1161,15 @@ impl RoutingGrid {
         out
     }
 
+    /// Recomputes the 2D Euclidean Distance Field (`dist_field`, in `mm`) across all copper layers
+    /// from the current [`RoutingGrid::obstacle_net_ids`] buffer.
+    ///
+    /// Dispatches the distance-field compute shader across all available Vulkan GPUs in parallel
+    /// when [`RoutingGrid::vulkan`] is present, or falls back to multi-core Rayon CPU evaluation
+    /// via [`RoutingGrid::compute_distance_field_cpu`].
+    ///
+    /// # Side Effects
+    /// Overwrites [`RoutingGrid::dist_field`] with updated obstacle distances in millimeters (`mm`).
     pub fn update_distance_fields(&mut self) {
         let layer_cells = self.width * self.height;
         let w = self.width;
@@ -972,6 +1284,22 @@ impl RoutingGrid {
     }
 
 
+    /// Enumerates all legal 3D A* neighbor transitions (8 octilinear planar steps on `node.layer`
+    /// plus through-hole via transitions to other layers) from `node` for `target_net_id`.
+    ///
+    /// Enforces bidirectional netclass clearances (`(track_width / 2.0) + max(req_clearance, obst_clearance)`),
+    /// diagonal corner-pinching guards, dedicated inner plane restrictions, and SMD via-in-pad exclusions.
+    ///
+    /// # Arguments
+    /// * `node` - Current [`GridNode`] being expanded.
+    /// * `target_net_id` - Numeric net ID of the net being routed.
+    /// * `req_clearance` - Required copper clearance (in `mm`) for `target_net_id`.
+    /// * `track_width` - Copper width (in `mm`) of the trace being routed.
+    /// * `via_dia` - Annular ring outer diameter (in `mm`) of a layer-transition via.
+    /// * `u1_center` - Optional world coordinates `(x, y)` of the primary fine-pitch IC (`U1`) for escape clearance relaxation.
+    ///
+    /// # Returns
+    /// Vector of `(neighbor_node, step_cost)` pairs for all legal transitions out of `node`.
     pub fn get_neighbors(
         &self,
         node: GridNode,
@@ -1217,8 +1545,19 @@ impl RoutingGrid {
     }
 
     /// Evaluates proximity to existing routed tracks of foreign nets on the same layer.
-    /// Returns true if the candidate step runs parallel to an adjacent foreign track
-    /// at minimum clearance distance (d <= W + 2 * clearance).
+    ///
+    /// Returns `true` if the candidate step `from -> to` runs parallel to an adjacent foreign track
+    /// within capacitive/inductive crosstalk distance (`d <= track_width + 2.0 * req_clearance`).
+    ///
+    /// # Arguments
+    /// * `from` - Starting [`GridNode`] of the step.
+    /// * `to` - Ending [`GridNode`] of the step.
+    /// * `net_id` - Net ID of the trace being routed.
+    /// * `track_width` - Trace width in millimeters (`mm`).
+    /// * `req_clearance` - Required copper clearance in millimeters (`mm`).
+    ///
+    /// # Returns
+    /// `true` if a foreign net occupies cells parallel to `from -> to` within the coupling threshold.
     pub fn is_step_coupled(
         &self,
         from: GridNode,
@@ -1295,7 +1634,16 @@ impl RoutingGrid {
         false
     }
 
-    /// Determines the physically adjacent reference plane layer for a given signal layer.
+    /// Determines the physically adjacent reference plane layer for a given `signal_layer`.
+    ///
+    /// Maps top copper (`0`) to `In1.Cu` (`2`), bottom copper (`1`) to `In2.Cu` (`3`) or `In1.Cu` (`2`),
+    /// and inner signal layers to the closest defined plane layer.
+    ///
+    /// # Arguments
+    /// * `signal_layer` - Copper layer index of the signal trace.
+    ///
+    /// # Returns
+    /// `Some(plane_layer)` if at least one inner reference plane exists, or `None` on 2-layer boards without planes.
     pub fn adjacent_reference_plane(&self, signal_layer: usize) -> Option<usize> {
         if self.plane_nets.is_empty() {
             return None;
@@ -1323,7 +1671,16 @@ impl RoutingGrid {
         }
     }
 
-    /// Checks if the reference plane at (gx, gy) on ref_layer has a split, cutout, or void.
+    /// Checks if the reference plane at `(gx, gy)` on `ref_layer` has a split, cutout, or void
+    /// that would interrupt high-speed return current continuity.
+    ///
+    /// # Arguments
+    /// * `gx` - Grid column index.
+    /// * `gy` - Grid row index.
+    /// * `ref_layer` - Copper layer index of the reference plane.
+    ///
+    /// # Returns
+    /// `true` if `(gx, gy)` is out of bounds, marked as [`KEEPOUT_NET`], or occupied by a foreign net on `ref_layer`.
     pub fn is_reference_plane_void_at(&self, gx: usize, gy: usize, ref_layer: usize) -> bool {
         if gx >= self.width || gy >= self.height || ref_layer >= self.num_layers {
             return true;
@@ -1347,6 +1704,16 @@ impl RoutingGrid {
 
     /// Checks whether all cells within a circle of `radius_cells` around `(gx, gy)` on `layer`
     /// are free of foreign-net obstacles for `net_id`.
+    ///
+    /// # Arguments
+    /// * `gx` - Center grid column index.
+    /// * `gy` - Center grid row index.
+    /// * `layer` - Copper layer index.
+    /// * `radius_cells` - Clearance radius in grid cells.
+    /// * `net_id` - Numeric net ID allowed within the circle.
+    ///
+    /// # Returns
+    /// `true` if every cell inside the circle is either [`FREE_NET`] or belongs to `net_id`.
     #[allow(non_snake_case)]
     pub fn is_circle_clear_SpecifyRadius(
         &self,
@@ -1385,6 +1752,17 @@ impl RoutingGrid {
         true
     }
 
+    /// Snake-case wrapper around [`RoutingGrid::is_circle_clear_SpecifyRadius`].
+    ///
+    /// # Arguments
+    /// * `gx` - Center grid column index.
+    /// * `gy` - Center grid row index.
+    /// * `layer` - Copper layer index.
+    /// * `radius_cells` - Clearance radius in grid cells.
+    /// * `net_id` - Numeric net ID allowed within the circle.
+    ///
+    /// # Returns
+    /// `true` if every cell inside the circle is free of foreign obstacles.
     pub fn is_circle_clear_specify_radius(
         &self,
         gx: usize,
@@ -1396,8 +1774,15 @@ impl RoutingGrid {
         self.is_circle_clear_SpecifyRadius(gx, gy, layer, radius_cells, net_id)
     }
 
-    /// Solves a batch of 3D shortest paths across all available GPUs using `MultiGpuRouterPool`
-    /// and validates every returned node against `is_circle_clear_SpecifyRadius`.
+    /// Solves a batch of 3D shortest paths across all available GPUs using [`MultiGpuRouterPool`]
+    /// and validates every returned node against [`RoutingGrid::is_circle_clear_SpecifyRadius`].
+    ///
+    /// # Arguments
+    /// * `requests` - Slice of `(src_xyz, dst_xyz, net_id, via_cost)` pathfinding requests.
+    /// * `clearance_cells` - Required obstacle clearance radius in grid cells.
+    ///
+    /// # Returns
+    /// Vector of `Option<Vec<GridNode>>` corresponding 1-to-1 with `requests`.
     pub fn solve_batch_3d_wavefront_paths(
         &self,
         requests: &[((usize, usize, usize), (usize, usize, usize), u32, f32)],
@@ -1449,6 +1834,18 @@ impl RoutingGrid {
     }
 }
 
+/// Computes the shortest Euclidean distance (in `mm`) from point `(px, py)` to the finite line segment `(x1, y1) -> (x2, y2)`.
+///
+/// # Arguments
+/// * `px` - Query point X coordinate (`mm`).
+/// * `py` - Query point Y coordinate (`mm`).
+/// * `x1` - Segment start X coordinate (`mm`).
+/// * `y1` - Segment start Y coordinate (`mm`).
+/// * `x2` - Segment end X coordinate (`mm`).
+/// * `y2` - Segment end Y coordinate (`mm`).
+///
+/// # Returns
+/// Minimum Euclidean distance in millimeters (`mm`).
 pub fn dist_to_segment(px: f64, py: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
     let dx = x2 - x1;
     let dy = y2 - y1;
@@ -1461,7 +1858,20 @@ pub fn dist_to_segment(px: f64, py: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> 
     }
 }
 
+/// Tests whether two 2D line segments `p1 -> p2` and `p3 -> p4` strictly cross each other's interior.
+///
+/// Shared endpoints or collinear touches within `1e-9` tolerance do not count as a strict crossing.
+///
+/// # Arguments
+/// * `p1` - First endpoint of segment A (`mm`).
+/// * `p2` - Second endpoint of segment A (`mm`).
+/// * `p3` - First endpoint of segment B (`mm`).
+/// * `p4` - Second endpoint of segment B (`mm`).
+///
+/// # Returns
+/// `true` if `p1 -> p2` and `p3 -> p4` strictly intersect.
 pub fn segments_intersect(p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), p4: (f64, f64)) -> bool {
+    /// Computes the signed 2D cross-product orientation of `(a, b, c)`.
     fn ccw(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
         (c.1 - a.1) * (b.0 - a.0) - (b.1 - a.1) * (c.0 - a.0)
     }
@@ -1474,6 +1884,18 @@ pub fn segments_intersect(p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), p4: (f
         && ((d3 > 1e-9 && d4 < -1e-9) || (d3 < -1e-9 && d4 > 1e-9))
 }
 
+/// Computes the minimum Euclidean distance (in `mm`) between two finite 2D line segments `p1 -> p2` and `p3 -> p4`.
+///
+/// Returns `0.0` if the segments intersect, or the minimum point-to-segment distance across all four endpoints.
+///
+/// # Arguments
+/// * `p1` - Start point of segment A (`mm`).
+/// * `p2` - End point of segment A (`mm`).
+/// * `p3` - Start point of segment B (`mm`).
+/// * `p4` - End point of segment B (`mm`).
+///
+/// # Returns
+/// Minimum segment-to-segment distance in millimeters (`mm`).
 pub fn dist_segment_to_segment(p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), p4: (f64, f64)) -> f64 {
     if segments_intersect(p1, p2, p3, p4) {
         return 0.0;
@@ -1484,12 +1906,17 @@ pub fn dist_segment_to_segment(p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), p
         .min(dist_to_segment(p4.0, p4.1, p1.0, p1.1, p2.0, p2.1))
 }
 
+/// Interactive and automated shove/nudge engine that displaces unlocked footprints, tracks, and vias
+/// to open routing channels when congestion cannot be resolved by pure pathfinding alone.
 pub struct NudgeEngine {
+    /// Base displacement increment in millimeters (`mm`) per shove step.
     pub step_mm: f64,
+    /// Maximum allowed total displacement in millimeters (`mm`) when nudging a component.
     pub max_displacement_mm: f64,
 }
 
 impl NudgeEngine {
+    /// Creates a new [`NudgeEngine`] with default `0.25 mm` step size and `2.0 mm` maximum displacement.
     pub fn new() -> Self {
         Self {
             step_mm: 0.25,
@@ -1497,6 +1924,16 @@ impl NudgeEngine {
         }
     }
 
+    /// Generates an ordered list of unique 2D displacement vectors `(dx, dy)` (in `mm`) oriented along
+    /// and perpendicular to `push_dir`, up to [`NudgeEngine::max_displacement_mm`].
+    ///
+    /// Includes axial/lateral steps, 45° diagonal steps, and compound corridor-exit shifts.
+    ///
+    /// # Arguments
+    /// * `push_dir` - Preferred push direction vector `(vx, vy)`.
+    ///
+    /// # Returns
+    /// Deduplicated vector of candidate offset vectors `(dx, dy)` in millimeters (`mm`).
     pub fn nudge_candidates(&self, push_dir: (f64, f64)) -> Vec<(f64, f64)> {
         let mag = (push_dir.0 * push_dir.0 + push_dir.1 * push_dir.1).sqrt();
         let (ux, uy) = if mag < 1e-6 {
@@ -1543,6 +1980,18 @@ impl NudgeEngine {
         unique
     }
 
+    /// Validates whether moving footprint `fp_idx` to world position `(nx, ny)` (in `mm`) preserves
+    /// board outline containment, keepout zones, SAT convex courtyard separation (`0.20 mm` margin),
+    /// and pad-to-track copper clearances.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the [`Board`] containing footprints, keepouts, and routed tracks.
+    /// * `fp_idx` - Index of the candidate footprint in `board.footprints`.
+    /// * `nx` - Candidate world X coordinate (`mm`).
+    /// * `ny` - Candidate world Y coordinate (`mm`).
+    ///
+    /// # Returns
+    /// `true` if the proposed footprint placement is completely legal, or `false` if any collision occurs.
     pub fn is_placement_valid(&self, board: &Board, fp_idx: usize, nx: f64, ny: f64) -> bool {
         if fp_idx >= board.footprints.len() {
             return false;
@@ -1622,6 +2071,21 @@ impl NudgeEngine {
         true
     }
 
+    /// Attempts to nudge an unlocked footprint `fp_idx` along `push_dir` to open a blocked routing channel.
+    ///
+    /// If a legal candidate position is found, rips up any traces currently connected to `fp_idx`
+    /// and updates the footprint's `(x, y)` coordinates in `board`.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable reference to the [`Board`].
+    /// * `fp_idx` - Footprint index in `board.footprints`.
+    /// * `push_dir` - Preferred displacement direction vector `(vx, vy)`.
+    ///
+    /// # Returns
+    /// `true` if the footprint was legally displaced, or `false` if locked or no valid nudge candidate exists.
+    ///
+    /// # Side Effects
+    /// Mutates `board.footprints[fp_idx]` coordinates and removes connected traces in `board.tracks` / `board.vias`.
     pub fn try_nudge_component(&self, board: &mut Board, fp_idx: usize, push_dir: (f64, f64)) -> bool {
         if fp_idx >= board.footprints.len() || board.footprints[fp_idx].is_locked {
             return false;
@@ -1647,6 +2111,18 @@ impl NudgeEngine {
     }
 
     /// Shoves an unlocked track segment perpendicular to its line to create clearance.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable reference to the [`Board`].
+    /// * `track_idx` - Index of the target track in `board.tracks`.
+    /// * `dir_sign` - Sign (`>= 0.0` or `< 0.0`) selecting which perpendicular normal direction to try first.
+    /// * `grid` - Optional reference to [`RoutingGrid`] for obstacle cell verification.
+    ///
+    /// # Returns
+    /// `true` if the track segment was shifted to a collision-free parallel position.
+    ///
+    /// # Side Effects
+    /// Updates `board.tracks[track_idx].start` and `board.tracks[track_idx].end` in place.
     pub fn try_shove_track(
         &self,
         board: &mut Board,
@@ -1767,7 +2243,19 @@ impl NudgeEngine {
         false
     }
 
-    /// Shoves an unlocked via to a nearby legal location, extending or dogleg-connecting its incident tracks.
+    /// Shoves an unlocked via to a nearby legal location, extending or updating its incident track endpoints.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable reference to the [`Board`].
+    /// * `via_idx` - Index of the target via in `board.vias`.
+    /// * `push_dir` - Preferred push direction vector `(vx, vy)`.
+    /// * `grid` - Optional reference to [`RoutingGrid`] for obstacle verification across all layers.
+    ///
+    /// # Returns
+    /// `true` if the via and all incident tracks were legally relocated.
+    ///
+    /// # Side Effects
+    /// Updates `board.vias[via_idx].position` and connected endpoints in `board.tracks`.
     pub fn try_shove_via(
         &self,
         board: &mut Board,
@@ -1887,7 +2375,23 @@ impl NudgeEngine {
 
     /// Shoves an unlocked track segment continuously away from an intruder segment,
     /// inserting 45-degree transition elbows to preserve original endpoint connectivity.
+    ///
     /// Supports cascading shove into adjacent unlocked tracks up to 3 recursion hops.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable reference to the [`Board`].
+    /// * `track_idx` - Index of the victim track in `board.tracks`.
+    /// * `intruder_p1` - Start point `(x, y)` of the intruding segment (`mm`).
+    /// * `intruder_p2` - End point `(x, y)` of the intruding segment (`mm`).
+    /// * `intruder_width` - Copper width (`mm`) of the intruding segment.
+    /// * `intruder_net_id` - Net ID of the intruding segment.
+    /// * `grid` - Optional reference to [`RoutingGrid`].
+    ///
+    /// # Returns
+    /// `true` if the victim track (and any cascaded neighbors) was deflected with full DRC legality.
+    ///
+    /// # Side Effects
+    /// Replaces `board.tracks[track_idx]` (and any cascaded tracks) with 2 or 3 octilinear elbow segments.
     pub fn try_continuous_shove_track(
         &self,
         board: &mut Board,
@@ -1915,8 +2419,20 @@ impl NudgeEngine {
         )
     }
 
-    /// Shoves an unlocked track segment with a specific lateral offset (in mm) along its perpendicular normal,
+    /// Shoves an unlocked track segment with a specific lateral offset (in `mm`) along its perpendicular normal,
     /// inserting 45-degree transition elbows and cascading into neighbors if needed.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable reference to the [`Board`].
+    /// * `track_idx` - Index of the target track in `board.tracks`.
+    /// * `offset_mm` - Signed lateral deflection distance in millimeters (`mm`).
+    /// * `grid` - Optional reference to [`RoutingGrid`].
+    ///
+    /// # Returns
+    /// `true` if the deflection succeeded without violating DRC rules.
+    ///
+    /// # Side Effects
+    /// Replaces `board.tracks[track_idx]` with deflected octilinear segments.
     pub fn try_continuous_shove_deflect(
         &self,
         board: &mut Board,
@@ -1952,6 +2468,23 @@ impl NudgeEngine {
         )
     }
 
+    /// Recursive worker for [`NudgeEngine::try_continuous_shove_track`], bounding recursion depth to
+    /// `MAX_DEPTH = 3` and total cascaded track deflections to `MAX_TOTAL_SHOVES = 8`.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable reference to the [`Board`].
+    /// * `track_idx` - Index of the track to deflect in `board.tracks`.
+    /// * `intruder_p1` - Start point `(x, y)` of the intruding segment (`mm`).
+    /// * `intruder_p2` - End point `(x, y)` of the intruding segment (`mm`).
+    /// * `intruder_width` - Width (`mm`) of the intruding segment.
+    /// * `intruder_net_id` - Net ID of the intruding segment.
+    /// * `grid` - Optional reference to [`RoutingGrid`].
+    /// * `depth` - Current recursion depth (`0..3`).
+    /// * `shoved_nets` - Set of net IDs already deflected in the current cascade chain to prevent cycles.
+    /// * `total_shoves` - Counter of total tracks deflected in the cascade chain.
+    ///
+    /// # Returns
+    /// `true` if `track_idx` already meets clearance or was successfully deflected.
     pub fn try_continuous_shove_recursive(
         &self,
         board: &mut Board,
@@ -2047,6 +2580,23 @@ impl NudgeEngine {
         false
     }
 
+    /// Synthesizes the 45° elbow-deflected replacement segments for `track_idx`, validates them
+    /// against board bounds, keepouts, pads, vias, and locked tracks, and recursively shoves any
+    /// conflicting unlocked tracks before committing the replacement to `board.tracks`.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable reference to the [`Board`].
+    /// * `track_idx` - Index of the track in `board.tracks` being deflected.
+    /// * `dir_normal` - Unit normal vector `(nx, ny)` pointing in the deflection direction.
+    /// * `offset_mm` - Deflection distance in millimeters (`mm`).
+    /// * `grid` - Optional reference to [`RoutingGrid`].
+    /// * `depth` - Current cascade recursion depth.
+    /// * `intruder_net_id` - Net ID of the intruding feature causing this deflection.
+    /// * `shoved_nets` - Set of net IDs already deflected in this cascade.
+    /// * `total_shoves` - Mutable counter of total shoves performed.
+    ///
+    /// # Returns
+    /// `true` if the deflection and all child cascades succeeded, or `false` (restoring `board.tracks` from backup) on failure.
     fn execute_continuous_deflection(
         &self,
         board: &mut Board,
@@ -2299,42 +2849,61 @@ impl NudgeEngine {
     }
 }
 
+/// Priority-queue node used by the 3D octilinear A* search in [`AutoRouter`].
 #[derive(Clone, Copy, PartialEq)]
 struct AStarNode {
+    /// Current 3D grid coordinate `(gx, gy, layer)`.
     node: GridNode,
+    /// Accumulated path cost $g(n)$ from the start node.
     cost: f64,
+    /// Total estimated A* priority $f(n) = g(n) + h(n)$ (ordered as a min-heap via reversed `Ord`).
     priority: f64,
 }
 
 impl Eq for AStarNode {}
 
 impl Ord for AStarNode {
+    /// Orders [`AStarNode`]s in reverse `priority` order so [`BinaryHeap`] acts as a min-heap.
     fn cmp(&self, other: &Self) -> Ordering {
         other.priority.partial_cmp(&self.priority).unwrap_or(Ordering::Equal)
     }
 }
 
 impl PartialOrd for AStarNode {
+    /// Delegates partial comparison to [`AStarNode::cmp`].
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
+/// A single point-to-point ratsnest connection task between two pads or Steiner split nodes on a net.
 #[derive(Clone, Debug)]
 pub struct RouteConnection {
+    /// Numeric net ID (`1..board.nets.len()`).
     pub net_id: usize,
+    /// Human-readable net name (e.g., `"USB_DP"`, `"+3V3"`).
     pub net_name: String,
+    /// Start world position and layer `(x_mm, y_mm, layer)`.
     pub start: (f64, f64, usize),
+    /// End world position and layer `(x_mm, y_mm, layer)`.
     pub end: (f64, f64, usize),
+    /// Index of the footprint owning the start pad in `board.footprints`.
     pub start_fp: usize,
+    /// Index of the start pad within `board.footprints[start_fp].pads`.
     pub start_pad: usize,
+    /// Index of the footprint owning the end pad in `board.footprints`.
     pub end_fp: usize,
+    /// Index of the end pad within `board.footprints[end_fp].pads`.
     pub end_pad: usize,
+    /// Electrical and physical design rules ([`NetClass`]) governing this connection.
     pub netclass: NetClass,
+    /// When `Some(leader_net_id)`, marks this connection as the follower of a coupled differential pair.
     pub diff_pair_leader: Option<usize>,
 }
 
 impl RouteConnection {
+    /// Reverses the direction of this connection in place by swapping `start` and `end` coordinates,
+    /// footprint indices, and pad indices.
     pub fn swap_endpoints(&mut self) {
         std::mem::swap(&mut self.start, &mut self.end);
         std::mem::swap(&mut self.start_fp, &mut self.end_fp);
@@ -2342,29 +2911,58 @@ impl RouteConnection {
     }
 }
 
+/// Pre-routed fanout escape stub extending from a fine-pitch SMD pad (such as a 0.5 mm QFN,
+/// SOIC, TSSOP, USB-C receptacle, or BGA ball) to an accessible routing channel or staggered via.
 #[derive(Clone, Debug)]
 pub struct EscapeStub {
+    /// Index of the parent footprint in `board.footprints`.
     pub fp_idx: usize,
+    /// Numeric net ID of the pad.
     pub net_id: usize,
+    /// World coordinates `(x, y)` in `mm` of the pad center.
     pub pad_pos: (f64, f64),
+    /// World coordinates `(x, y)` in `mm` of the outer tip of the escape stub (where global routing attaches).
     pub tip_pos: (f64, f64),
+    /// Copper trace width (in `mm`) of the escape stub segment.
     pub width: f64,
+    /// Optional fanout [`Via`] placed at `tip_pos` when transitioning to an inner/opposite copper layer.
     pub via: Option<Via>,
+    /// Copper layer index at `tip_pos` after any escape via transition.
     pub tip_layer: usize,
+    /// Copper layer index of the SMD pad and planar stub segment.
     pub layer: usize,
 }
 
+/// Metadata describing a single physical component pad participating in net topology construction.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PadInfo {
+    /// World X coordinate of the pad center in millimeters (`mm`).
     pub x: f64,
+    /// World Y coordinate of the pad center in millimeters (`mm`).
     pub y: f64,
+    /// Copper layer index of the pad (`0` for through-hole or `F.Cu`, `1` for `B.Cu`).
     pub layer: usize,
+    /// Index of the owning footprint in `board.footprints`.
     pub fp_idx: usize,
+    /// Index of the pad within `board.footprints[fp_idx].pads`.
     pub pad_idx: usize,
+    /// `true` if the pad belongs to an active driver/source IC or connector (`U*`, `IC*`, `MCU*`, `J*`, `VR*`, `REG*`).
     pub is_driver: bool,
 }
 
 impl PadInfo {
+    /// Creates a new [`PadInfo`] at `(x, y)` on `layer` for footprint `fp_idx` and pad `pad_idx`,
+    /// defaulting `is_driver` to `false`.
+    ///
+    /// # Arguments
+    /// * `x` - Pad center X coordinate (`mm`).
+    /// * `y` - Pad center Y coordinate (`mm`).
+    /// * `layer` - Copper layer index.
+    /// * `fp_idx` - Footprint index in `board.footprints`.
+    /// * `pad_idx` - Pad index within the footprint.
+    ///
+    /// # Returns
+    /// Newly initialized [`PadInfo`].
     pub fn new(x: f64, y: f64, layer: usize, fp_idx: usize, pad_idx: usize) -> Self {
         Self {
             x,
@@ -2376,12 +2974,31 @@ impl PadInfo {
         }
     }
 
+    /// Builder-style setter that marks whether this pad is a signal/power driver source.
+    ///
+    /// # Arguments
+    /// * `is_driver` - `true` if this pad is the source driver of the net.
+    ///
+    /// # Returns
+    /// Updated [`PadInfo`] with `is_driver` set.
     pub fn with_driver(mut self, is_driver: bool) -> Self {
         self.is_driver = is_driver;
         self
     }
 }
 
+/// Decomposes a multi-pad net (`pads`) into an ordered list of 2-terminal [`RouteConnection`]s
+/// according to the specified [`NetTopology`] (`EuclideanMst`, `DaisyChain`, `FlyBy`, `StarPoint`, or `TBranch`).
+///
+/// # Arguments
+/// * `net_id` - Numeric net identifier.
+/// * `net_name` - Net name string.
+/// * `netclass` - [`NetClass`] rules for the net.
+/// * `pads` - Slice of [`PadInfo`]s belonging to `net_id`.
+/// * `topology` - Target [`NetTopology`] routing structure.
+///
+/// # Returns
+/// Vector of [`RouteConnection`]s spanning all pads in `pads` (empty if `pads.len() < 2`).
 pub fn build_net_topology_connections(
     net_id: usize,
     net_name: &str,
@@ -2560,6 +3177,19 @@ pub fn build_net_topology_connections(
     }
 }
 
+/// Recursively constructs a balanced binary Steiner T-branch tree of [`RouteConnection`]s
+/// from `source_pt` to all `receivers`, splitting along the axis of maximum spatial variance.
+///
+/// # Arguments
+/// * `source_pt` - Current trunk origin `(x_mm, y_mm, layer)`.
+/// * `source_fp` - Footprint index associated with `source_pt`.
+/// * `source_pad` - Pad index associated with `source_pt`.
+/// * `receivers` - Slice of remaining receiver [`PadInfo`]s to connect.
+/// * `driver` - Reference to the root driver [`PadInfo`].
+/// * `net_id` - Numeric net identifier.
+/// * `net_name` - Net name string.
+/// * `netclass` - [`NetClass`] rules for the net.
+/// * `connections` - Output vector accumulating the generated trunk and branch [`RouteConnection`]s.
 fn build_t_branch_tree(
     source_pt: (f64, f64, usize),
     source_fp: usize,
@@ -2705,18 +3335,38 @@ fn build_t_branch_tree(
     );
 }
 
+/// Multi-layer PathFinder negotiated-congestion PCB autorouter.
+///
+/// Orchestrates escape stub synthesis, coupled differential-pair routing, 3D octilinear A*
+/// pathfinding, rip-up and re-route with component/track nudging, length/phase meander tuning,
+/// post-route rubber-band glossing, and ground-plane via stitching.
 pub struct AutoRouter {
+    /// Shove and nudge engine for displacing blocking footprints, tracks, and vias.
     pub nudge_engine: NudgeEngine,
+    /// Maximum number of PathFinder rip-up and re-route iterations.
     pub max_ripup_iterations: usize,
+    /// Historical congestion penalty multiplier per rip-up pass.
     pub congestion_factor: f32,
+    /// Additional cost per millimeter for routing signal nets on inner copper layers (`layer >= 2`).
     pub inner_layer_penalty: f64,
+    /// When `true`, allows [`NudgeEngine`] to nudge unlocked footprints when traces are blocked.
     pub allow_component_nudge: bool,
+    /// Penalty weight per grid step when routing parallel and tightly coupled to a foreign net.
     pub crosstalk_penalty: f64,
+    /// Full [`RoutingConfig`] parameter set governing router and post-route behavior.
     pub config: RoutingConfig,
+    /// Optional live [`KiCadIpcClient`] connection for streaming incremental track updates to KiCad.
     pub ipc: Option<Arc<Mutex<KiCadIpcClient>>>,
 }
 
 impl AutoRouter {
+    /// Creates a new [`AutoRouter`] configured for `max_ripup_iterations` PathFinder passes with default [`RoutingConfig`].
+    ///
+    /// # Arguments
+    /// * `max_ripup_iterations` - Maximum number of rip-up and re-route iterations.
+    ///
+    /// # Returns
+    /// Default-initialized [`AutoRouter`].
     pub fn new(max_ripup_iterations: usize) -> Self {
         let config = RoutingConfig::default();
         Self {
@@ -2731,42 +3381,98 @@ impl AutoRouter {
         }
     }
 
+    /// Attaches an optional live [`KiCadIpcClient`] handle for real-time KiCad board synchronization.
+    ///
+    /// # Arguments
+    /// * `ipc` - Optional shared mutex-guarded [`KiCadIpcClient`].
+    ///
+    /// # Returns
+    /// Updated [`AutoRouter`].
     pub fn with_ipc(mut self, ipc: Option<Arc<Mutex<KiCadIpcClient>>>) -> Self {
         self.ipc = ipc;
         self
     }
 
+    /// Sets the parallel crosstalk penalty weight in both `self.crosstalk_penalty` and `self.config.crosstalk_penalty`.
+    ///
+    /// # Arguments
+    /// * `pen` - Crosstalk penalty weight per coupled grid step.
+    ///
+    /// # Returns
+    /// Updated [`AutoRouter`].
     pub fn with_crosstalk_penalty(mut self, pen: f64) -> Self {
         self.crosstalk_penalty = pen;
         self.config.crosstalk_penalty = pen;
         self
     }
 
+    /// Sets the per-millimeter cost penalty for routing signal nets on inner copper layers (`layer >= 2`).
+    ///
+    /// # Arguments
+    /// * `pen` - Inner layer cost penalty per millimeter.
+    ///
+    /// # Returns
+    /// Updated [`AutoRouter`].
     pub fn with_inner_layer_penalty(mut self, pen: f64) -> Self {
         self.inner_layer_penalty = pen;
         self
     }
 
+    /// Configures whether the router may nudge unlocked footprints when routing channels are blocked.
+    ///
+    /// # Arguments
+    /// * `allow` - `true` to enable footprint nudging during rip-up passes.
+    ///
+    /// # Returns
+    /// Updated [`AutoRouter`].
     pub fn with_allow_component_nudge(mut self, allow: bool) -> Self {
         self.allow_component_nudge = allow;
         self
     }
 
+    /// Enables or disables any-angle Euclidean line-of-sight glossing (`config.any_angle_mode`).
+    ///
+    /// # Arguments
+    /// * `enabled` - `true` for any-angle tracks, `false` for strict 45° octilinear tracks.
+    ///
+    /// # Returns
+    /// Updated [`AutoRouter`].
     pub fn with_any_angle_mode(mut self, enabled: bool) -> Self {
         self.config.any_angle_mode = enabled;
         self
     }
 
+    /// Sets the chamfer/fillet radius (in `mm`) used to eliminate acute (< 90°) acid-trap corners.
+    ///
+    /// # Arguments
+    /// * `radius` - Fillet radius in millimeters (`>= 0.0`).
+    ///
+    /// # Returns
+    /// Updated [`AutoRouter`].
     pub fn with_acid_trap_fillet_radius(mut self, radius: f64) -> Self {
         self.config.acid_trap_fillet_radius = radius.max(0.0);
         self
     }
 
+    /// Configures whether vias are permitted inside same-net SMD pads (`config.allow_via_in_pad`).
+    ///
+    /// # Arguments
+    /// * `allow` - `true` to allow via-in-pad on matching nets.
+    ///
+    /// # Returns
+    /// Updated [`AutoRouter`].
     pub fn with_allow_via_in_pad(mut self, allow: bool) -> Self {
         self.config.allow_via_in_pad = allow;
         self
     }
 
+    /// Applies a complete [`RoutingConfig`] struct, synchronizing congestion, crosstalk, and nudge step fields.
+    ///
+    /// # Arguments
+    /// * `config` - [`RoutingConfig`] to apply.
+    ///
+    /// # Returns
+    /// Updated [`AutoRouter`].
     pub fn with_config(mut self, config: RoutingConfig) -> Self {
         self.congestion_factor = config.congestion_factor as f32;
         self.crosstalk_penalty = config.crosstalk_penalty;
@@ -2775,7 +3481,15 @@ impl AutoRouter {
         self
     }
 
-    /// Returns true if `a` and `b` form a differential pair (e.g. `USB_DP`/`USB_DM`, `USB_D+`/`USB_D-`).
+    /// Returns `true` if net names `a` and `b` form a complementary differential pair
+    /// (e.g., `USB_DP`/`USB_DM`, `USB_D+`/`USB_D-`, `CLK_P`/`CLK_N`, or `TX+`/`TX-`).
+    ///
+    /// # Arguments
+    /// * `a` - First net name.
+    /// * `b` - Second net name.
+    ///
+    /// # Returns
+    /// `true` if `a` and `b` share a common non-empty prefix and complementary positive/negative suffixes.
     pub fn are_diff_pair_mates(a: &str, b: &str) -> bool {
         if a == b {
             return false;
@@ -2797,6 +3511,22 @@ impl AutoRouter {
         false
     }
 
+    /// Builds a 3D per-cell A* cost multiplier map (`num_layers * width * height`) that attracts
+    /// a differential-pair follower trace into a tight parallel corridor at `ideal_pitch = track_width + max(req_clearance, max_net_clearance)`
+    /// alongside `partner_path`.
+    ///
+    /// Cells outside the outer corridor band or on the opposite lateral side of `side` receive
+    /// [`DIFF_PAIR_OFF_CORRIDOR_MULT`] (`6.0`), while cells near `ideal_pitch` receive a discount (`0.15..0.65`).
+    ///
+    /// # Arguments
+    /// * `grid` - Reference to the [`RoutingGrid`].
+    /// * `partner_path` - Ordered slice of [`GridNode`]s forming the routed leader trace.
+    /// * `track_width` - Differential-pair trace width (`mm`).
+    /// * `req_clearance` - Target differential gap or netclass clearance (`mm`).
+    /// * `side` - Required lateral side (`+1.0`, `-1.0`, or `0.0` for either side) relative to the leader's tangent.
+    ///
+    /// # Returns
+    /// Flat 3D vector of cost multipliers (`f32`) indexed by [`RoutingGrid::idx`].
     pub fn build_diff_pair_corridor(
         &self,
         grid: &RoutingGrid,
@@ -2857,8 +3587,22 @@ impl AutoRouter {
         corridor
     }
 
-    /// Route `lc` as leader then `fc` inside its corridor, committing both to `grid`.
-    /// Returns `None` (with whatever was committed left on the grid) if either fails.
+    /// Routes `lc` as the differential-pair leader (reserving lateral clearance on the partner side)
+    /// and then routes `fc` inside `lc`'s coupling corridor, committing both paths to `grid`.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the [`Board`].
+    /// * `grid` - Mutable reference to the [`RoutingGrid`].
+    /// * `lc` - Leader [`RouteConnection`].
+    /// * `fc` - Follower [`RouteConnection`].
+    /// * `u1_center` - Optional world coordinates `(x, y)` of the primary fine-pitch IC.
+    /// * `stop_flag` - Atomic cancellation flag.
+    ///
+    /// # Returns
+    /// `Some((leader_path, follower_path))` if both traces routed cleanly, or `None` if either failed.
+    ///
+    /// # Side Effects
+    /// Commits the routed paths into `grid.obstacle_net_ids` and `grid.usage_count`.
     fn route_coupled_pair(
         &self,
         board: &Board,
@@ -2937,6 +3681,18 @@ impl AutoRouter {
         Some((lp, fp))
     }
 
+    /// Extracts all two-terminal [`RouteConnection`]s from `board` for all non-plane signal and power nets,
+    /// prioritized by differential-pair status, intra-footprint proximity, IC escape criticality,
+    /// netclass priority, and Euclidean length.
+    ///
+    /// Automatically pairs complementary differential-pair connections (`diff_pair_leader = Some(leader_net_id)`)
+    /// and selects non-crossing pad pairs on multi-pad USB-C / receptacle footprints.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the [`Board`] whose pads and nets are analyzed.
+    ///
+    /// # Returns
+    /// Priority-ordered vector of [`RouteConnection`]s ready for the autorouter pipeline.
     pub fn extract_connections(&self, board: &Board) -> Vec<RouteConnection> {
         let mut net_pads: HashMap<usize, Vec<PadInfo>> = HashMap::new();
         for (fp_idx, fp) in board.footprints.iter().enumerate() {
@@ -3153,6 +3909,13 @@ impl AutoRouter {
         connections
     }
 
+    /// Returns the numeric routing priority for a netclass `name` (higher values route earlier).
+    ///
+    /// # Arguments
+    /// * `name` - Netclass name string (e.g., `"Switching"`, `"USB_Diff"`, `"Default"`).
+    ///
+    /// # Returns
+    /// Priority score in `1..=10`.
     fn netclass_priority(name: &str) -> usize {
         match name {
             "Switching" | "Power_SW" => 10,
@@ -3164,6 +3927,16 @@ impl AutoRouter {
         }
     }
 
+    /// Performs a breadth-first graph traversal over all tracks, arcs, and vias belonging to
+    /// `conn.net_id` on `board` to verify whether `conn`'s start and end pads are physically
+    /// and electrically connected on compatible copper layers.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the [`Board`] containing footprints, tracks, arcs, and vias.
+    /// * `conn` - The [`RouteConnection`] whose start and end pads are tested for continuity.
+    ///
+    /// # Returns
+    /// `true` if a continuous same-net copper path connects `conn.start_pad` to `conn.end_pad`.
     pub fn is_connection_electrically_connected(board: &Board, conn: &RouteConnection) -> bool {
         let Some(sfp) = board.footprints.get(conn.start_fp) else { return false; };
         let Some(spad) = sfp.pads.get(conn.start_pad) else { return false; };
@@ -3279,6 +4052,28 @@ impl AutoRouter {
         false
     }
 
+    /// Executes the full multi-layer PCB autorouting pipeline on `board` and `grid`.
+    ///
+    /// Performs the following phases:
+    /// 1. Clears unlocked copper, rasterizes obstacles, and synthesizes BGA dogbones, staggered fine-pitch
+    ///    IC escape stubs, and `U1` ground-pad stitching vias.
+    /// 2. Runs iterative PathFinder negotiated-congestion rip-up and re-route passes (coupled differential pairs,
+    ///    parallel portfolio A* + GPU 3D wavefront search, conflict-free wave partitioning, and component/track shoving).
+    /// 3. Commits routed paths, runs post-route rubber-band and topological glossing, widens power/signal tracks,
+    ///    tunes differential-pair phase and netclass target lengths, stitches ground-plane vias, and runs final DRC cleanup.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable reference to the [`Board`] to route.
+    /// * `grid` - Mutable reference to the [`RoutingGrid`].
+    /// * `live` - Optional shared [`LiveTrialState`] for real-time GUI telemetry and progress logging.
+    /// * `stop_flag` - Atomic flag allowing early user cancellation.
+    ///
+    /// # Returns
+    /// Tuple `(routed_connections, total_connections)` reporting final routing completion counts.
+    ///
+    /// # Side Effects
+    /// Mutates `board.tracks`, `board.vias`, `board.arcs`, `board.footprints` (if component nudging is enabled),
+    /// `grid`, `live`, and streams updates over `self.ipc` if connected.
     pub fn route_all(
         &self,
         board: &mut Board,
@@ -3773,6 +4568,11 @@ impl AutoRouter {
                 // Phase 1: Speculative multi-core parallel A* wave or Parallel Portfolio Ensemble
                 #[allow(non_local_definitions)]
                 impl RoutingGrid {
+                    /// Clones the grid's obstacle, distance-field, and congestion state for parallel portfolio evaluation
+                    /// without duplicating cached GPU cost maps.
+                    ///
+                    /// # Returns
+                    /// Independent [`RoutingGrid`] clone sharing `vulkan` and `base_snapshot` handles.
                     pub fn clone_for_portfolio(&self) -> Self {
                         Self {
                             min_x: self.min_x,
@@ -3801,23 +4601,38 @@ impl AutoRouter {
                     }
                 }
 
+                /// Precomputed 2D/3D bounding box and collinear segment/via decomposition of a candidate grid path
+                /// used for fast pairwise conflict detection during parallel wave partitioning.
                 #[derive(Clone, Debug)]
                 struct PathConflictGeom {
+                    /// Numeric net ID of the candidate path.
                     net_id: usize,
+                    /// Trace width in millimeters (`mm`).
                     width: f64,
+                    /// Required netclass clearance in millimeters (`mm`).
                     clearance: f64,
+                    /// Via outer diameter in millimeters (`mm`).
                     via_dia: f64,
+                    /// Minimum world X coordinate (`mm`) of the path's AABB.
                     min_x: f64,
+                    /// Maximum world X coordinate (`mm`) of the path's AABB.
                     max_x: f64,
+                    /// Minimum world Y coordinate (`mm`) of the path's AABB.
                     min_y: f64,
+                    /// Maximum world Y coordinate (`mm`) of the path's AABB.
                     max_y: f64,
+                    /// Maximum half-width or via radius (`mm`) along the path.
                     max_radius: f64,
+                    /// Bitmask of copper layers touched by the path (`0xFFFF_FFFF` if any via is present).
                     layer_mask: u32,
+                    /// Coalesced straight segments `(start_xy, end_xy, layer)`.
                     segs: Vec<((f64, f64), (f64, f64), usize)>,
+                    /// World positions `(x, y)` of layer-transition vias along the path.
                     vias: Vec<(f64, f64)>,
                 }
 
                 impl PathConflictGeom {
+                    /// Extracts the [`PathConflictGeom`] representation from a discrete [`GridNode`] `path`.
                     fn from_path(
                         grid: &RoutingGrid,
                         conn: &RouteConnection,
@@ -3906,6 +4721,8 @@ impl AutoRouter {
                         }
                     }
 
+                    /// Returns `true` if `self` and `other` belong to different nets and their segments or vias
+                    /// violate bidirectional clearance.
                     #[inline]
                     fn conflicts_with(&self, other: &Self, grid_res: f64) -> bool {
                         if self.net_id == other.net_id {
@@ -3970,16 +4787,24 @@ impl AutoRouter {
                     }
                 }
 
+                /// Hyperparameter configuration for a single A* portfolio search thread.
                 #[derive(Clone, Copy, Debug)]
                 struct PortfolioVariant {
+                    /// Multiplier applied to layer-transition via cost.
                     via_mult: f64,
+                    /// Weight applied to historical PathFinder congestion.
                     hist_w: f64,
+                    /// Weight applied to the octilinear heuristic $h(n)$.
                     heur_w: f64,
+                    /// Weight applied to inverse obstacle distance field ($1 / d_{\text{obst}}$).
                     dist_bias: f64,
+                    /// When `true`, searches backward from `goal` to `start`.
                     reverse: bool,
+                    /// When `true`, slightly favors 45° diagonal steps (`0.97x`) over orthogonal steps.
                     diag_first: bool,
                 }
 
+                /// Ensemble of 12 diverse A* cost/direction parameterizations explored concurrently by [`AutoRouter::route_connections_portfolio`].
                 const PORTFOLIO_VARIANTS: [PortfolioVariant; 12] = [
                     PortfolioVariant { via_mult: 1.0,  hist_w: 1.0, heur_w: 1.0,  dist_bias: 0.0,  reverse: false, diag_first: false },
                     PortfolioVariant { via_mult: 1.0,  hist_w: 1.0, heur_w: 1.0,  dist_bias: 0.0,  reverse: true,  diag_first: false },
@@ -3998,8 +4823,18 @@ impl AutoRouter {
                 #[allow(non_local_definitions)]
                 impl AutoRouter {
                     /// Partitions candidate `(conn_idx, path)` routes into conflict-free independent waves
-                    /// via greedy conflict-graph coloring. Two paths of different nets conflict when their
-                    /// clearance-inflated 2D/3D bounding boxes overlap AND their segments or vias encroach.
+                    /// via greedy conflict-graph coloring.
+                    ///
+                    /// Two paths of different nets conflict when their clearance-inflated 2D/3D bounding boxes
+                    /// overlap AND their segments or vias encroach.
+                    ///
+                    /// # Arguments
+                    /// * `grid` - Reference to the [`RoutingGrid`].
+                    /// * `connections` - Slice of [`RouteConnection`]s indexed by `conn_idx`.
+                    /// * `candidates` - Vector of `(conn_idx, grid_path)` pairs to partition.
+                    ///
+                    /// # Returns
+                    /// Vector of conflict-free waves, where all paths within a single wave can be committed in parallel.
                     pub fn partition_into_conflict_free_waves(
                         grid: &RoutingGrid,
                         connections: &[RouteConnection],
@@ -4040,6 +4875,14 @@ impl AutoRouter {
                         waves
                     }
 
+                    /// Evaluates the quality metrics `(via_count, planar_wirelength_mm, congestion_sum)` of a discrete `path`.
+                    ///
+                    /// # Arguments
+                    /// * `grid` - Reference to the [`RoutingGrid`].
+                    /// * `path` - Slice of [`GridNode`]s forming the routed path.
+                    ///
+                    /// # Returns
+                    /// Tuple `(vias, wirelength_mm, congestion_sum)`.
                     pub fn evaluate_path_cost(grid: &RoutingGrid, path: &[GridNode]) -> (usize, f64, f64) {
                         let mut vias = 0usize;
                         let mut wirelength = 0.0f64;
@@ -4061,6 +4904,32 @@ impl AutoRouter {
                         (vias, wirelength, cong_sum)
                     }
 
+                    /// Runs a single parameterized 3D A* search variant between `start` and `goal` using the
+                    /// given portfolio weights (`via_mult`, `hist_w`, `heur_w`, `dist_bias`, `reverse`, `diag_first`).
+                    ///
+                    /// # Arguments
+                    /// * `grid` - Reference to the [`RoutingGrid`].
+                    /// * `start` - Start [`GridNode`].
+                    /// * `goal` - Goal [`GridNode`].
+                    /// * `net_id` - Numeric net identifier.
+                    /// * `req_clearance` - Required copper clearance (`mm`).
+                    /// * `track_width` - Trace width (`mm`).
+                    /// * `via_dia` - Via outer diameter (`mm`).
+                    /// * `u1_center` - Optional `(x, y)` center of fine-pitch IC `U1`.
+                    /// * `max_coupled_length_mm` - Maximum parallel coupled length (`mm`) before crosstalk penalty applies.
+                    /// * `require_return_path` - Whether to penalize reference plane voids.
+                    /// * `via_mult` - Via transition cost multiplier.
+                    /// * `hist_w` - Historical congestion weight.
+                    /// * `heur_w` - Heuristic weight.
+                    /// * `dist_bias` - Inverse obstacle distance bias weight.
+                    /// * `reverse` - If `true`, searches from `goal` to `start` and reverses the resulting path.
+                    /// * `diag_first` - If `true`, slightly favors diagonal steps (`0.97x`).
+                    /// * `abort_flag` - Atomic cancellation flag.
+                    /// * `found_count` - Optional atomic counter tracking how many portfolio variants have already succeeded for this connection.
+                    /// * `max_expansions_override` - Optional cap on A* node expansions.
+                    ///
+                    /// # Returns
+                    /// `Some(Vec<GridNode>)` containing the smoothed path if found within the expansion limit, or `None`.
                     #[allow(clippy::too_many_arguments)]
                     pub fn find_path_portfolio_variant(
                         &self,
@@ -4279,8 +5148,18 @@ impl AutoRouter {
                         None
                     }
 
-                    /// Batch-validates a slice of `(conn_idx, path)` candidates using `GpuDrcContext` on the GPU
-                    /// alongside parallel `is_path_conflict_free` checks across Rayon threads.
+                    /// Batch-validates a slice of `(conn_idx, path)` candidates using [`GpuDrcContext`] on the GPU
+                    /// alongside parallel `AutoRouter::is_path_conflict_free` checks across Rayon threads.
+                    ///
+                    /// # Arguments
+                    /// * `board` - Reference to the [`Board`].
+                    /// * `grid` - Reference to the [`RoutingGrid`].
+                    /// * `connections` - Slice of [`RouteConnection`]s.
+                    /// * `candidates` - Slice of `(conn_idx, path)` candidate routes.
+                    /// * `u1_center` - Optional `(x, y)` center of `U1`.
+                    ///
+                    /// # Returns
+                    /// Vector of `(grid_conflict_free, gpu_drc_clean)` boolean pairs for each candidate.
                     pub fn batch_validate_paths_gpu(
                         &self,
                         board: &Board,
@@ -4390,8 +5269,19 @@ impl AutoRouter {
 
                     /// Expands `target_indices` across a Parallel Portfolio of `(conn_idx, variant_id)`
                     /// trajectories in `par_iter()`, batch-validates all discovered candidates on the GPU
-                    /// (`GpuDrcContext`), and selects for each connection the legal path minimizing
-                    /// `(vias * 10.0 + wirelength)`.
+                    /// ([`GpuDrcContext`]), and selects for each connection the legal path minimizing
+                    /// `(vias * 10.0 + wirelength + bends * 0.20 + cong_sum * 0.02 + drc_pen)`.
+                    ///
+                    /// # Arguments
+                    /// * `board` - Reference to the [`Board`].
+                    /// * `grid` - Reference to the [`RoutingGrid`].
+                    /// * `connections` - Slice of all [`RouteConnection`]s.
+                    /// * `target_indices` - Slice of connection indices to solve in parallel.
+                    /// * `u1_center` - Optional `(x, y)` center of `U1`.
+                    /// * `stop_flag` - Atomic cancellation flag.
+                    ///
+                    /// # Returns
+                    /// Vector of `(conn_idx, Option<Vec<GridNode>>)` pairs containing the winning path for each target connection.
                     pub fn route_connections_portfolio(
                         &self,
                         board: &Board,
@@ -4625,8 +5515,31 @@ impl AutoRouter {
                             .collect()
                     }
 
-                    /// Parallel Multi-Net Rip-Up Portfolio for resolving stubborn late-pass deadlocks
-                    /// when `unrouted_indices.len() <= 6` and `iteration >= 2`.
+                    /// Runs a parallel multi-net rip-up portfolio solver to break stubborn late-pass
+                    /// routing deadlocks when a small number of connections (`<= 6`) remain unrouted.
+                    ///
+                    /// Identifies up to 8 blocking routed connections near the unrouted endpoints or
+                    /// corridors, then launches 8 concurrent Rayon replicas. Each replica rips up a
+                    /// distinct subset of blockers, increments historical congestion along the ripped
+                    /// cells, rebuilds its local grid, and attempts to re-route both the unrouted and
+                    /// ripped connections under permuted ordering and portfolio hyperparameter variants.
+                    ///
+                    /// # Arguments
+                    /// * `board` - Read-only reference to the [`Board`].
+                    /// * `grid` - Mutable [`RoutingGrid`] updated in place if a replica improves total completion.
+                    /// * `connections` - Slice of all [`RouteConnection`] descriptors.
+                    /// * `routed_paths` - Mutable vector of current routed paths, replaced if a strictly better solution is found.
+                    /// * `escape_stubs` - Pre-generated fine-pitch escape stubs.
+                    /// * `unrouted_indices` - Slice of connection indices currently lacking a valid route.
+                    /// * `u1_center` - Optional `(x, y)` center of `U1` in `mm`.
+                    /// * `stop_flag` - Atomic cancellation flag.
+                    ///
+                    /// # Returns
+                    /// `true` if a portfolio replica strictly increased the number of routed connections
+                    /// and updated `routed_paths` and `grid`; `false` otherwise.
+                    ///
+                    /// # Side Effects
+                    /// Mutates `*routed_paths` and rebuilds `grid` state when a superior replica is selected.
                     #[allow(clippy::too_many_arguments)]
                     pub fn try_parallel_ripup_portfolio(
                         &self,
@@ -5872,6 +6785,21 @@ impl AutoRouter {
         (completed_count, total_conns)
     }
 
+    /// Verifies that a discrete grid path is completely free of foreign-net clearance
+    /// conflicts, corner-clipping violations, and (when required) reference-plane return voids.
+    ///
+    /// # Arguments
+    /// * `grid` - Reference to the [`RoutingGrid`].
+    /// * `path` - Sequence of [`GridNode`] waypoints forming the candidate path.
+    /// * `net_id` - Numeric net ID of the signal.
+    /// * `req_clearance` - Required copper-to-copper clearance in `mm`.
+    /// * `track_width` - Trace width in `mm`.
+    /// * `via_dia` - Via outer copper diameter in `mm`.
+    /// * `u1_center` - Optional `(x, y)` center of `U1` in `mm`.
+    /// * `require_return_path` - Whether every node must lie above/below an unbroken reference plane.
+    ///
+    /// # Returns
+    /// `true` if every node and transition along `path` is legal on `grid`.
     fn is_path_conflict_free(
         &self,
         grid: &RoutingGrid,
@@ -5914,6 +6842,24 @@ impl AutoRouter {
         true
     }
 
+    /// Searches for a conflict-free 3D grid path between `start` and `goal` by running 6
+    /// forward/reverse and heuristic-weighted A* strategies in parallel across Rayon workers.
+    ///
+    /// # Arguments
+    /// * `grid` - Read-only reference to the [`RoutingGrid`].
+    /// * `start` - Source [`GridNode`].
+    /// * `goal` - Target [`GridNode`].
+    /// * `net_id` - Net ID being routed.
+    /// * `req_clearance` - Required copper clearance in `mm`.
+    /// * `track_width` - Trace width in `mm`.
+    /// * `via_dia` - Via outer diameter in `mm`.
+    /// * `u1_center` - Optional `(x, y)` center of `U1` in `mm`.
+    /// * `max_coupled_length_mm` - Maximum parallel coupled run length in `mm`.
+    /// * `require_return_path` - Whether an unbroken reference plane is required.
+    /// * `stop_flag` - Atomic cancellation flag.
+    ///
+    /// # Returns
+    /// `Some(path)` with the lowest bend-weighted length among all successful strategies, or `None`.
     fn find_path_parallel(
         &self,
         grid: &RoutingGrid,
@@ -5988,6 +6934,15 @@ impl AutoRouter {
             .map(|(_, p)| p)
     }
 
+    /// Counts the number of directional bends and layer transitions along a discrete grid path.
+    ///
+    /// In-plane direction changes add `1` bend; layer transitions (vias) add `2` bends.
+    ///
+    /// # Arguments
+    /// * `path` - Slice of [`GridNode`] waypoints.
+    ///
+    /// # Returns
+    /// Total weighted bend count.
     pub fn count_path_bends(path: &[GridNode]) -> usize {
         if path.len() < 3 {
             return 0;
@@ -6009,6 +6964,15 @@ impl AutoRouter {
         bends
     }
 
+    /// Generates the inclusive sequence of [`GridNode`] cells along a straight horizontal,
+    /// vertical, or 45-degree diagonal grid segment from `start` to `end` on `start.layer`.
+    ///
+    /// # Arguments
+    /// * `start` - Starting [`GridNode`].
+    /// * `end` - Ending [`GridNode`] (assumed collinear in octilinear space).
+    ///
+    /// # Returns
+    /// Vector of [`GridNode`] cells from `start` to `end` inclusive.
     fn line_nodes(start: GridNode, end: GridNode) -> Vec<GridNode> {
         let dx = end.gx as isize - start.gx as isize;
         let dy = end.gy as isize - start.gy as isize;
@@ -6029,6 +6993,15 @@ impl AutoRouter {
         nodes
     }
 
+    /// Generates up to two canonical 1-bend octilinear dogleg candidate paths between `start`
+    /// and `end` (diagonal-first then straight, and straight-first then diagonal).
+    ///
+    /// # Arguments
+    /// * `start` - Starting [`GridNode`].
+    /// * `end` - Ending [`GridNode`] on the same layer.
+    ///
+    /// # Returns
+    /// Vector of 1 or 2 candidate [`GridNode`] paths connecting `start` to `end`.
     fn two_segment_candidates(start: GridNode, end: GridNode) -> Vec<Vec<GridNode>> {
         let dx = end.gx as isize - start.gx as isize;
         let dy = end.gy as isize - start.gy as isize;
@@ -6075,6 +7048,22 @@ impl AutoRouter {
         results
     }
 
+    /// Smooths a discrete grid path by iteratively replacing multi-bend staircases and jogs
+    /// with conflict-free 0-bend straight lines or 1-bend canonical 45-degree corners.
+    ///
+    /// # Arguments
+    /// * `grid` - Reference to the [`RoutingGrid`].
+    /// * `path` - Initial [`GridNode`] sequence from A*.
+    /// * `net_id` - Numeric net ID of the trace.
+    /// * `req_clearance` - Required copper clearance in `mm`.
+    /// * `track_width` - Trace width in `mm`.
+    /// * `via_dia` - Via outer diameter in `mm`.
+    /// * `u1_center` - Optional `(x, y)` center of `U1` in `mm`.
+    /// * `require_return_path` - Whether reference-plane continuity must be preserved.
+    /// * `max_coupled_length_mm` - Maximum allowed parallel coupled length in `mm`.
+    ///
+    /// # Returns
+    /// Smoothed vector of [`GridNode`] cells with reduced bend count.
     fn smooth_grid_path(
         &self,
         grid: &RoutingGrid,
@@ -6258,6 +7247,24 @@ impl AutoRouter {
         path
     }
 
+    /// Convenience wrapper around [`AutoRouter::find_path_with_constraints`] using default
+    /// coupled-length (`15.0 mm`) and return-path (`false`) settings.
+    ///
+    /// # Arguments
+    /// * `grid` - Reference to the [`RoutingGrid`].
+    /// * `start` - Source [`GridNode`].
+    /// * `goal` - Destination [`GridNode`].
+    /// * `net_id` - Numeric net ID.
+    /// * `req_clearance` - Required copper clearance in `mm`.
+    /// * `track_width` - Trace width in `mm`.
+    /// * `via_dia` - Via outer diameter in `mm`.
+    /// * `u1_center` - Optional `(x, y)` center of `U1` in `mm`.
+    /// * `h_weight` - A* heuristic weight multiplier.
+    /// * `dist_bias` - Distance-field obstacle repulsion bias.
+    /// * `abort_flag` - Atomic cancellation flag.
+    ///
+    /// # Returns
+    /// `Some(path)` if a valid 3D route was found, or `None`.
     pub fn find_path_with_params(
         &self,
         grid: &RoutingGrid,
@@ -6290,6 +7297,24 @@ impl AutoRouter {
         )
     }
 
+    /// Searches for a 3D path guided by an optional precomputed cost-multiplier corridor.
+    ///
+    /// # Arguments
+    /// * `grid` - Reference to the [`RoutingGrid`].
+    /// * `start` - Source [`GridNode`].
+    /// * `goal` - Destination [`GridNode`].
+    /// * `net_id` - Numeric net ID.
+    /// * `req_clearance` - Required copper clearance in `mm`.
+    /// * `track_width` - Trace width in `mm`.
+    /// * `via_dia` - Via outer diameter in `mm`.
+    /// * `u1_center` - Optional `(x, y)` center of `U1` in `mm`.
+    /// * `h_weight` - A* heuristic weight multiplier.
+    /// * `dist_bias` - Distance-field bias.
+    /// * `corridor` - Optional per-cell cost multiplier slice.
+    /// * `abort_flag` - Atomic cancellation flag.
+    ///
+    /// # Returns
+    /// `Some(path)` if a valid route was found, or `None`.
     #[allow(dead_code)]
     fn find_path_with_corridor(
         &self,
@@ -6324,6 +7349,27 @@ impl AutoRouter {
         )
     }
 
+    /// Searches for a 3D octilinear path between `start` and `goal` subject to clearance,
+    /// crosstalk coupled-length, reference-plane return-path, and optional corridor constraints.
+    ///
+    /// # Arguments
+    /// * `grid` - Reference to the [`RoutingGrid`].
+    /// * `start` - Source [`GridNode`].
+    /// * `goal` - Destination [`GridNode`].
+    /// * `net_id` - Numeric net ID.
+    /// * `req_clearance` - Required copper clearance in `mm`.
+    /// * `track_width` - Trace width in `mm`.
+    /// * `via_dia` - Via outer diameter in `mm`.
+    /// * `u1_center` - Optional `(x, y)` center of `U1` in `mm`.
+    /// * `h_weight` - A* heuristic weight multiplier.
+    /// * `dist_bias` - Distance-field obstacle bias (negative values reserve partner pitch).
+    /// * `max_coupled_length_mm` - Maximum parallel coupled length in `mm` before crosstalk penalty.
+    /// * `require_return_path` - Whether reference-plane voids are penalized/rejected.
+    /// * `corridor` - Optional per-cell cost multiplier slice.
+    /// * `abort_flag` - Atomic cancellation flag.
+    ///
+    /// # Returns
+    /// `Some(path)` if a valid route was found within the expansion budget, or `None`.
     pub fn find_path_with_constraints(
         &self,
         grid: &RoutingGrid,
@@ -6347,8 +7393,32 @@ impl AutoRouter {
         )
     }
 
-    /// `find_path_with_constraints` where a diff-pair leader (`dist_bias < 0`) must keep a partner
-    /// pitch free on `partner_side` (+1 left / -1 right of travel, 0 = either side).
+    /// Core 3D octilinear A* pathfinder with support for sided differential-pair leader
+    /// partner-pitch reservation (`dist_bias < 0.0` and `partner_side` in `{-1.0, 0.0, +1.0}`).
+    ///
+    /// Seeds all valid signal layers when starting on a through-hole pad, penalizes bends,
+    /// reference-plane voids, and excessive parallel coupled runs, and smooths the resulting
+    /// path when not bound to a differential corridor.
+    ///
+    /// # Arguments
+    /// * `grid` - Reference to the [`RoutingGrid`].
+    /// * `start` - Source [`GridNode`].
+    /// * `goal` - Destination [`GridNode`].
+    /// * `net_id` - Numeric net ID.
+    /// * `req_clearance` - Required copper clearance in `mm`.
+    /// * `track_width` - Trace width in `mm`.
+    /// * `via_dia` - Via outer diameter in `mm`.
+    /// * `u1_center` - Optional `(x, y)` center of `U1` in `mm`.
+    /// * `h_weight` - A* heuristic weight multiplier.
+    /// * `dist_bias` - Positive for obstacle repulsion, negative for diff-pair pitch reservation.
+    /// * `max_coupled_length_mm` - Maximum parallel coupled length in `mm`.
+    /// * `require_return_path` - Whether reference-plane voids incur heavy penalties.
+    /// * `corridor` - Optional per-cell cost multiplier slice for follower routing.
+    /// * `partner_side` - `+1.0` to reserve partner corridor on the left, `-1.0` on the right, `0.0` either side.
+    /// * `abort_flag` - Atomic cancellation flag.
+    ///
+    /// # Returns
+    /// `Some(path)` from `start` to `goal`, or `None` if unroutable or aborted.
     fn find_path_sided(
         &self,
         grid: &RoutingGrid,
@@ -6594,6 +7664,16 @@ impl AutoRouter {
         None
     }
 
+    /// Computes the admissible 3D octile distance heuristic in `mm` between grid nodes `a` and `b`,
+    /// including a `2.0 mm` layer-change penalty when `a.layer != b.layer`.
+    ///
+    /// # Arguments
+    /// * `grid` - Reference to the [`RoutingGrid`] (for cell resolution `res`).
+    /// * `a` - First [`GridNode`].
+    /// * `b` - Second [`GridNode`].
+    ///
+    /// # Returns
+    /// Estimated minimum cost in `mm`.
     fn heuristic(&self, grid: &RoutingGrid, a: GridNode, b: GridNode) -> f64 {
         let dx = (a.gx as isize - b.gx as isize).abs() as f64 * grid.res;
         let dy = (a.gy as isize - b.gy as isize).abs() as f64 * grid.res;
@@ -6603,6 +7683,19 @@ impl AutoRouter {
         diag * std::f64::consts::SQRT_2 + straight + layer_pen
     }
 
+    /// Rasterizes a routed discrete `path` and any layer-transition vias onto `grid` with
+    /// ownership `net_id`.
+    ///
+    /// # Arguments
+    /// * `grid` - Mutable [`RoutingGrid`] to update.
+    /// * `path` - Slice of [`GridNode`] waypoints.
+    /// * `net_id` - Numeric net ID of the trace.
+    /// * `track_width` - Trace width in `mm`.
+    /// * `via_dia` - Via outer diameter in `mm`.
+    ///
+    /// # Side Effects
+    /// Invalidates `grid.gpu_net_cost_maps`, increments `grid.usage_count`, and stamps
+    /// `net_id` into `grid.obstacle_net_ids` across trace width and via cylinders.
     pub fn commit_path_to_grid(
         &self,
         grid: &mut RoutingGrid,
@@ -6655,6 +7748,20 @@ impl AutoRouter {
         }
     }
 
+    /// Rebuilds the [`RoutingGrid`] obstacle state from the cached base snapshot (or by
+    /// rasterizing static board obstacles, locked copper, and escape stubs) and re-commits
+    /// all currently active `routed_paths`.
+    ///
+    /// # Arguments
+    /// * `board` - Reference to the [`Board`].
+    /// * `grid` - Mutable [`RoutingGrid`] to reset and populate.
+    /// * `connections` - Slice of all [`RouteConnection`] items.
+    /// * `routed_paths` - Slice of currently active grid paths per connection.
+    /// * `escape_stubs` - Slice of pre-routed [`EscapeStub`] structures.
+    ///
+    /// # Side Effects
+    /// Overwrites `grid.obstacle_net_ids`, `grid.usage_count`, `grid.nudgeable_fp`, and
+    /// `grid.smd_pad_cells`, caching `grid.base_snapshot` if not yet initialized.
     fn rebuild_grid_state(
         &self,
         board: &Board,
@@ -6709,7 +7816,17 @@ impl AutoRouter {
         }
     }
 
-    /// Pre-routing pass: nudges unlocked components away if they directly block escape stubs.
+    /// Pre-routing pass that nudges unlocked 2-pad passive components away if their pads
+    /// directly encroach upon provisional fine-pitch IC escape stubs.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable [`Board`] whose unlocked passive footprints may be translated.
+    ///
+    /// # Returns
+    /// `true` if at least one component was nudged; `false` otherwise.
+    ///
+    /// # Side Effects
+    /// Translates blocking footprints in `board` and rips up any incident traces.
     pub fn nudge_components_blocking_escapes(&self, board: &mut Board) -> bool {
         if !self.allow_component_nudge {
             return false;
@@ -6750,6 +7867,13 @@ impl AutoRouter {
         any_nudged
     }
 
+    /// Creates a CPU-only clone of `grid` for a Rayon worker thread during parallel component-nudge trials.
+    ///
+    /// # Arguments
+    /// * `grid` - Source [`RoutingGrid`].
+    ///
+    /// # Returns
+    /// Cloned [`RoutingGrid`] with `vulkan: None`.
     fn clone_grid_for_worker(grid: &RoutingGrid) -> RoutingGrid {
         RoutingGrid {
             min_x: grid.min_x,
@@ -6777,8 +7901,26 @@ impl AutoRouter {
         }
     }
 
-    /// When routing a connection fails, identify blocking unlocked components,
-    /// nudge them away into free space, and retry the path search in parallel across Rayon workers.
+    /// Attempts to resolve an unrouted connection `conn_idx` by identifying nearby unlocked
+    /// 2-pad components, screening candidate nudge poses on the GPU/CPU, and evaluating A*
+    /// re-routing of both the blocked connection and any incident connections in parallel.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable [`Board`] updated if a winning nudge pose is found.
+    /// * `grid` - Mutable [`RoutingGrid`] rebuilt if a component is moved.
+    /// * `connections` - Mutable slice of [`RouteConnection`] items whose pad coordinates update on move.
+    /// * `routed_paths` - Mutable slice of routed paths updated with the new routes.
+    /// * `escape_stubs` - Slice of pre-routed [`EscapeStub`] items.
+    /// * `conn_idx` - Index of the unrouted connection in `connections`.
+    /// * `u1_center` - Optional `(x, y)` center of `U1` in `mm`.
+    /// * `stop_flag` - Atomic cancellation flag.
+    ///
+    /// # Returns
+    /// `true` if a component nudge allowed `conn_idx` and all its incident previously-routed
+    /// connections to route cleanly; `false` otherwise.
+    ///
+    /// # Side Effects
+    /// Mutates `board.footprints`, `connections`, `routed_paths`, and `grid` on success.
     pub fn try_nudge_blocking_components(
         &self,
         board: &mut Board,
@@ -7162,83 +8304,119 @@ impl AutoRouter {
         false
     }
 
-/// Returns the number of reachable grid cells from (gx, gy, layer) using a local BFS,
-/// along with any foreign obstacle nets bounding the pocket.
-pub fn find_choked_pin_bottlenecks(
-    grid: &RoutingGrid,
-    gx: usize,
-    gy: usize,
-    layer: usize,
-    net_id: usize,
-    max_cells: usize,
-) -> (usize, Vec<usize>) {
-    let mut visited = std::collections::HashSet::new();
-    let mut queue = std::collections::VecDeque::new();
-    let mut blocking_nets = std::collections::BTreeSet::new();
+    /// Performs a local 2D breadth-first search (BFS) from `(gx, gy)` on `layer` to detect
+    /// whether a pin/terminal is trapped inside a small enclosed pocket of foreign obstacles.
+    ///
+    /// Includes a clearance halo check around each expanded cell so the BFS cannot leak
+    /// through sub-clearance cracks between foreign traces and pads.
+    ///
+    /// # Arguments
+    /// * `grid` - Reference to the [`RoutingGrid`].
+    /// * `gx` - Starting X grid coordinate.
+    /// * `gy` - Starting Y grid coordinate.
+    /// * `layer` - Copper layer index.
+    /// * `net_id` - Numeric net ID of the pin being probed.
+    /// * `max_cells` - Upper bound on the number of cells to expand before declaring the pin unchoked.
+    ///
+    /// # Returns
+    /// A tuple `(reachable_cells, blocking_nets)` where `reachable_cells` is the number of
+    /// reachable cells (up to `max_cells`) and `blocking_nets` is the sorted list of foreign
+    /// net IDs forming the boundary of the pocket.
+    pub fn find_choked_pin_bottlenecks(
+        grid: &RoutingGrid,
+        gx: usize,
+        gy: usize,
+        layer: usize,
+        net_id: usize,
+        max_cells: usize,
+    ) -> (usize, Vec<usize>) {
+        let mut visited = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        let mut blocking_nets = std::collections::BTreeSet::new();
 
-    queue.push_back((gx, gy));
-    visited.insert((gx, gy));
+        queue.push_back((gx, gy));
+        visited.insert((gx, gy));
 
-    while let Some((cx, cy)) = queue.pop_front() {
-        if visited.len() >= max_cells {
-            break;
-        }
-        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)] {
-            let nx = cx as isize + dx;
-            let ny = cy as isize + dy;
-            if nx >= 0 && nx < grid.width as isize && ny >= 0 && ny < grid.height as isize {
-                let ux = nx as usize;
-                let uy = ny as usize;
-                if !visited.contains(&(ux, uy)) {
-                    let idx = grid.idx(ux, uy, layer);
-                    let obs = grid.obstacle_net_ids[idx];
-                    if obs != FREE_NET && obs != net_id as i32 {
-                        if obs > 0 && !grid.smd_pad_cells[idx] {
-                            blocking_nets.insert(obs as usize);
-                        }
-                        continue;
-                    }
-                    // Also check clearance halo around (ux, uy) so the BFS does not
-                    // leak through sub-clearance cracks between foreign tracks and pads
-                    let dist_from_origin = (ux as isize - gx as isize).abs().max((uy as isize - gy as isize).abs());
-                    let halo_r: isize = if dist_from_origin > 2 { 2 } else { 1 };
-                    let mut halo_blocked = false;
-                    for hdx in -halo_r..=halo_r {
-                        for hdy in -halo_r..=halo_r {
-                            if (hdx == 0 && hdy == 0) || hdx * hdx + hdy * hdy > 5 {
-                                continue;
+        while let Some((cx, cy)) = queue.pop_front() {
+            if visited.len() >= max_cells {
+                break;
+            }
+            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                let nx = cx as isize + dx;
+                let ny = cy as isize + dy;
+                if nx >= 0 && nx < grid.width as isize && ny >= 0 && ny < grid.height as isize {
+                    let ux = nx as usize;
+                    let uy = ny as usize;
+                    if !visited.contains(&(ux, uy)) {
+                        let idx = grid.idx(ux, uy, layer);
+                        let obs = grid.obstacle_net_ids[idx];
+                        if obs != FREE_NET && obs != net_id as i32 {
+                            if obs > 0 && !grid.smd_pad_cells[idx] {
+                                blocking_nets.insert(obs as usize);
                             }
-                            let hx = ux as isize + hdx;
-                            let hy = uy as isize + hdy;
-                            if hx >= 0 && hx < grid.width as isize && hy >= 0 && hy < grid.height as isize {
-                                let h_idx = grid.idx(hx as usize, hy as usize, layer);
-                                let h_obs = grid.obstacle_net_ids[h_idx];
-                                if h_obs != FREE_NET && h_obs != net_id as i32 {
-                                    if h_obs > 0 && !grid.smd_pad_cells[h_idx] {
-                                        blocking_nets.insert(h_obs as usize);
-                                        halo_blocked = true;
-                                    } else if dist_from_origin > 2 {
-                                        halo_blocked = true;
+                            continue;
+                        }
+                        // Also check clearance halo around (ux, uy) so the BFS does not
+                        // leak through sub-clearance cracks between foreign tracks and pads
+                        let dist_from_origin = (ux as isize - gx as isize).abs().max((uy as isize - gy as isize).abs());
+                        let halo_r: isize = if dist_from_origin > 2 { 2 } else { 1 };
+                        let mut halo_blocked = false;
+                        for hdx in -halo_r..=halo_r {
+                            for hdy in -halo_r..=halo_r {
+                                if (hdx == 0 && hdy == 0) || hdx * hdx + hdy * hdy > 5 {
+                                    continue;
+                                }
+                                let hx = ux as isize + hdx;
+                                let hy = uy as isize + hdy;
+                                if hx >= 0 && hx < grid.width as isize && hy >= 0 && hy < grid.height as isize {
+                                    let h_idx = grid.idx(hx as usize, hy as usize, layer);
+                                    let h_obs = grid.obstacle_net_ids[h_idx];
+                                    if h_obs != FREE_NET && h_obs != net_id as i32 {
+                                        if h_obs > 0 && !grid.smd_pad_cells[h_idx] {
+                                            blocking_nets.insert(h_obs as usize);
+                                            halo_blocked = true;
+                                        } else if dist_from_origin > 2 {
+                                            halo_blocked = true;
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    if !halo_blocked {
-                        visited.insert((ux, uy));
-                        queue.push_back((ux, uy));
+                        if !halo_blocked {
+                            visited.insert((ux, uy));
+                            queue.push_back((ux, uy));
+                        }
                     }
                 }
             }
         }
+
+        (visited.len(), blocking_nets.into_iter().collect())
     }
 
-    (visited.len(), blocking_nets.into_iter().collect())
-}
-
-    /// When routing is blocked by an unlocked track of another net:
-    /// Shoves the blocking track or rips it up in parallel across Rayon workers + GPU batch DRC
-    /// so the higher-priority signal can claim the channel.
+    /// Resolves an unrouted connection `conn_idx` blocked by foreign unlocked copper through a
+    /// four-stage push-and-shove / rip-up pipeline:
+    /// 1. **Stage 0:** Speculative parallel lateral deflection of pre-existing unlocked `board.tracks`.
+    /// 2. **Stage 1:** GPU-pre-filtered parallel via shoving along blocking `routed_paths`.
+    /// 3. **Stage 2:** Single-net parallel negotiated shove-and-reroute (lift blocker, route `conn_idx`, reroute blocker).
+    /// 4. **Stage 3:** Multi-track corridor shove portfolio (simultaneously lifting 2–3 blockers).
+    ///
+    /// # Arguments
+    /// * `board` - Mutable [`Board`] (updated if Stage 0 deflects pre-existing `board.tracks`).
+    /// * `grid` - Mutable [`RoutingGrid`] updated with the newly routed/shoved paths.
+    /// * `connections` - Slice of all [`RouteConnection`] items.
+    /// * `routed_paths` - Mutable slice of routed grid paths per connection.
+    /// * `escape_stubs` - Slice of pre-routed [`EscapeStub`] items.
+    /// * `conn_idx` - Index of the blocked connection in `connections`.
+    /// * `u1_center` - Optional `(x, y)` center of `U1` in `mm`.
+    /// * `stop_flag` - Atomic cancellation flag.
+    ///
+    /// # Returns
+    /// `true` if `conn_idx` was successfully routed by shoving or ripping up blocking tracks/vias.
+    ///
+    /// # Side Effects
+    /// Mutates `routed_paths`, `grid` (including historical `congestion` on unrecovered rips),
+    /// and `board.tracks` (in Stage 0).
     pub fn try_nudge_or_ripup_blocking_tracks(
         &self,
         board: &mut Board,
@@ -7896,6 +9074,22 @@ pub fn find_choked_pin_bottlenecks(
         false
     }
 
+    /// Converts all active discrete [`GridNode`] `paths` and used [`EscapeStub`] structures
+    /// into physical world-space [`TrackSegment`] and [`Via`] primitives on `board`.
+    ///
+    /// Preserves locked tracks, vias, and arcs, trims redundant inner-pad steps on through-hole
+    /// terminals, synthesizes 45-degree doglegs at off-grid pad entries/exits, enforces legal
+    /// via placement and annular-ring dimensions, and pairs differential-pair layer-transition vias.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable [`Board`] whose unlocked `tracks`, `vias`, and `arcs` are replaced.
+    /// * `grid` - Reference to the [`RoutingGrid`] for grid-to-world coordinate conversion.
+    /// * `connections` - Slice of [`RouteConnection`] descriptors.
+    /// * `paths` - Slice of optional discrete [`GridNode`] paths per connection.
+    /// * `escape_stubs` - Slice of pre-generated [`EscapeStub`] items.
+    ///
+    /// # Side Effects
+    /// Replaces unlocked copper primitives in `board.tracks`, `board.vias`, and `board.arcs`.
     fn reconstruct_tracks_and_vias(
         &self,
         board: &mut Board,
@@ -8763,10 +9957,28 @@ pub fn find_choked_pin_bottlenecks(
         prune_dangling_tracks_and_vias(board);
     }
 
+    /// Generates 45-degree BGA dogbone escape stubs and interstitial fanout vias for BGA
+    /// footprints on `board`, rasterizing them onto `grid`.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable [`Board`] receiving the generated escape tracks and vias.
+    /// * `grid` - Mutable [`RoutingGrid`] updated with the committed escape copper.
+    ///
+    /// # Side Effects
+    /// Appends locked escape tracks and vias to `board` and commits them to `grid`.
     pub fn generate_bga_dogbone_escapes(&self, board: &mut Board, grid: &mut RoutingGrid) {
         generate_bga_dogbone_escapes(board, grid);
     }
 
+    /// Determines whether `fp` is a dense SMD IC or fine-pitch connector requiring
+    /// staggered pre-routed [`EscapeStub`] fanout stubs.
+    ///
+    /// # Arguments
+    /// * `fp` - Reference to the [`Footprint`] to inspect.
+    ///
+    /// # Returns
+    /// `true` if `fp` has `>= 4` SMD pads and either `>= 8` pads, a minimum pad pitch
+    /// `<= 0.85 mm`, or an IC/connector reference prefix (`U*`, `J*`).
     pub fn is_dense_escape_footprint(fp: &Footprint) -> bool {
         if fp.reference == "J2" {
             return true;
@@ -8792,16 +10004,37 @@ pub fn find_choked_pin_bottlenecks(
         min_pitch <= 0.85 || fp.reference.starts_with('U') || fp.reference.starts_with('J')
     }
 
+    /// Generates staggered outward fanout [`EscapeStub`] segments for dense QFP/QFN/SOIC ICs
+    /// and fine-pitch USB-C connectors on `board`.
+    ///
+    /// Enforces a minimum length stagger (`>= 0.35 mm` to `0.75 mm`) between adjacent `0.5 mm`-pitch
+    /// pins so that subsequent layer-transition vias (`0.60 mm` diameter + `0.20 mm` clearance)
+    /// do not choke adjacent pin escape channels.
+    ///
+    /// # Arguments
+    /// * `board` - Read-only reference to the [`Board`].
+    ///
+    /// # Returns
+    /// Vector of conflict-free [`EscapeStub`] descriptors.
     pub fn generate_escape_stubs(&self, board: &Board) -> Vec<EscapeStub> {
+        /// Cardinal perimeter edge of an SMD IC footprint on which a pad resides.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         enum PadEdge {
+            /// Left (`-X`) edge in local footprint coordinates.
             West,
+            /// Right (`+X`) edge in local footprint coordinates.
             East,
+            /// Top (`-Y`) edge in local footprint coordinates.
             North,
+            /// Bottom (`+Y`) edge in local footprint coordinates.
             South,
         }
 
         impl PadEdge {
+            /// Returns the outward unit normal `(nx, ny)` in local footprint coordinates for this edge.
+            ///
+            /// # Returns
+            /// 2D unit normal vector `(nx, ny)`.
             fn local_normal(self) -> (f64, f64) {
                 match self {
                     PadEdge::West => (-1.0, 0.0),
@@ -9133,9 +10366,13 @@ pub fn find_choked_pin_bottlenecks(
                         });
                     }
 
+                    /// Candidate escape direction vector for a perimeter SMD pad.
                     struct EscapeCandDir {
+                        /// Outward unit direction vector `(dx, dy)` in world space.
                         dir: (f64, f64),
+                        /// Whether this candidate exits diagonally at 45 degrees.
                         is_diag: bool,
+                        /// Dot product alignment with the vector toward the closest target pad.
                         dot: f64,
                     }
 
@@ -9253,6 +10490,15 @@ pub fn find_choked_pin_bottlenecks(
         stubs
     }
 
+    /// Rasterizes a single pre-generated [`EscapeStub`] (trace segment and optional fanout via)
+    /// onto `grid`.
+    ///
+    /// # Arguments
+    /// * `grid` - Mutable [`RoutingGrid`] to update.
+    /// * `stub` - Reference to the [`EscapeStub`] to commit.
+    ///
+    /// # Side Effects
+    /// Stamps `stub.net_id` into `grid.obstacle_net_ids` along the stub segment and optional via.
     pub fn commit_stub_to_grid(&self, grid: &mut RoutingGrid, stub: &EscapeStub) {
         let trk = TrackSegment {
             start: stub.pad_pos,
@@ -9268,6 +10514,14 @@ pub fn find_choked_pin_bottlenecks(
         }
     }
 
+    /// Connects perimeter `GND` SMD pins on `U1` inward to the central exposed thermal ground
+    /// paddle using short `0.15 mm` copper spokes when DRC-legal.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable [`Board`] to which inward ground spokes are appended.
+    ///
+    /// # Side Effects
+    /// Appends `GND` [`TrackSegment`] spokes to `board.tracks`.
     fn connect_u1_ground_pins(&self, board: &mut Board) {
         let Some(gnd_net_id) = board.nets.iter().position(|n| crate::board::is_gnd_net_name(n)) else {
             return;
@@ -9329,6 +10583,20 @@ pub fn find_choked_pin_bottlenecks(
         }
     }
 
+    /// Connects all SMD pads belonging to ground or inner power planes (`GND` and `inner_plane_nets`)
+    /// to their respective copper planes using shared nearby vias, dedicated drop vias (`0.60 mm` / `0.30 mm`),
+    /// local trace tapering/nudging, or short fallback grid routes.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable [`Board`] to populate with plane fanout tracks and stitching vias.
+    /// * `grid` - Reference to the [`RoutingGrid`].
+    ///
+    /// # Returns
+    /// Total number of new plane stitching vias added to `board.vias`.
+    ///
+    /// # Side Effects
+    /// Appends fanout [`TrackSegment`]s and plane [`Via`]s to `board`, and may locally taper or
+    /// shift nearby unlocked signal traces to open a legal via pocket.
     pub fn add_plane_stitching_vias(&self, board: &mut Board, grid: &RoutingGrid) -> usize {
         let mut plane_net_ids: Vec<usize> = Vec::new();
         if let Some(gnd_id) = board.nets.iter().position(|n| crate::board::is_gnd_net_name(n)) {
@@ -10593,6 +11861,19 @@ pub fn find_choked_pin_bottlenecks(
         added_via_positions.len()
     }
 
+    /// Connects all `GND` SMD pads to the ground plane and distributes a `5.0 mm` grid of
+    /// additional ground-plane stitching vias (`0.60 mm` size / `0.30 mm` drill) across open
+    /// board copper areas.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable [`Board`] to which stitching vias and fanout tracks are added.
+    /// * `grid` - Reference to the [`RoutingGrid`].
+    ///
+    /// # Returns
+    /// Total number of ground and plane stitching vias added.
+    ///
+    /// # Side Effects
+    /// Appends `GND` [`Via`] and [`TrackSegment`] items to `board`.
     pub fn add_ground_stitching_vias(&self, board: &mut Board, grid: &RoutingGrid) -> usize {
         let mut added = self.add_plane_stitching_vias(board, grid);
         let Some(gnd_net_id) = board.nets.iter().position(|n| crate::board::is_gnd_net_name(n)) else {
@@ -10733,6 +12014,22 @@ pub fn find_choked_pin_bottlenecks(
         added
     }
 
+    /// Searches candidate radial and diagonal offsets around a plane SMD pad at `(px, py)`
+    /// to find a DRC-legal location for a `0.60 mm` plane drop via and its connecting trace.
+    ///
+    /// # Arguments
+    /// * `board` - Read-only reference to the [`Board`].
+    /// * `grid` - Reference to the [`RoutingGrid`].
+    /// * `plane_net_id` - Numeric net ID of the target plane (`GND` or power plane).
+    /// * `px` - Pad X coordinate in `mm`.
+    /// * `py` - Pad Y coordinate in `mm`.
+    /// * `layer` - Copper layer of the pad.
+    /// * `pad` - Reference to the [`Pad`].
+    /// * `existing_vias` - Slice of recently added plane via coordinates `(x, y)` in `mm` to avoid crowding.
+    /// * `drc_ctx_opt` - Optional pre-built [`GpuDrcContext`] for GPU batch screening.
+    ///
+    /// # Returns
+    /// `Some((vx, vy))` in `mm` if a legal via position and connecting dogleg exist, or `None`.
     fn find_safe_plane_via_location(
         board: &Board,
         grid: &RoutingGrid,
@@ -10947,6 +12244,21 @@ pub fn find_choked_pin_bottlenecks(
         None
     }
 
+    /// Balances intra-pair length skew between differential pair nets `net_p` and `net_n`
+    /// within `tolerance_mm` by inserting small 45-degree phase-matching bumps on the shorter net.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable [`Board`] whose shorter differential trace is lengthened.
+    /// * `grid` - Mutable [`RoutingGrid`].
+    /// * `net_p` - Positive differential net ID.
+    /// * `net_n` - Negative differential net ID.
+    /// * `tolerance_mm` - Maximum permissible length skew in `mm`.
+    ///
+    /// # Returns
+    /// `true` if the resulting skew is within `tolerance_mm`.
+    ///
+    /// # Side Effects
+    /// Replaces straight segments on the shorter net in `board.tracks` with 45-degree phase bumps.
     pub fn match_diff_pair_phase(
         &self,
         board: &mut Board,
@@ -10958,6 +12270,21 @@ pub fn find_choked_pin_bottlenecks(
         match_diff_pair_phase(board, grid, net_p, net_n, tolerance_mm)
     }
 
+    /// Lengthens `net_id` to `target_length_mm` by inserting serpentine trombone meanders
+    /// bounded by `max_amplitude_mm`.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable [`Board`] whose `tracks` on `net_id` are meander-tuned.
+    /// * `grid` - Mutable [`RoutingGrid`].
+    /// * `net_id` - Numeric net ID to tune.
+    /// * `target_length_mm` - Target total trace length in `mm`.
+    /// * `max_amplitude_mm` - Maximum lateral meander amplitude in `mm`.
+    ///
+    /// # Returns
+    /// `true` if the target length was reached or meanders were inserted.
+    ///
+    /// # Side Effects
+    /// Replaces straight segments in `board.tracks` with serpentine meander segments.
     pub fn tune_net_length(
         &self,
         board: &mut Board,
@@ -10969,22 +12296,66 @@ pub fn find_choked_pin_bottlenecks(
         tune_net_length(board, grid, net_id, target_length_mm, max_amplitude_mm)
     }
 
+    /// Eliminates redundant layer-hopping via pairs on `board` using `self.config`.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable [`Board`] whose tracks and vias are simplified.
+    /// * `grid` - Mutable [`RoutingGrid`].
+    ///
+    /// # Side Effects
+    /// Removes redundant vias from `board.vias` and promotes intermediate segments in `board.tracks`.
     pub fn reduce_vias(&self, board: &mut Board, grid: &mut RoutingGrid) {
         reduce_vias_with_config(board, grid, &self.config);
     }
 
+    /// Runs post-route rubber-band track glossing on `board` using `self.config.any_angle_mode`.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable [`Board`] whose unlocked tracks are glossed.
+    /// * `grid` - Reference to the [`RoutingGrid`].
+    ///
+    /// # Side Effects
+    /// Replaces multi-segment staircases and jogs in `board.tracks` with direct DRC-clean segments.
     pub fn gloss_tracks(&self, board: &mut Board, grid: &RoutingGrid) {
         gloss_tracks_with_mode(board, grid, self.config.any_angle_mode);
     }
 
+    /// Removes dangling dead-end trace stubs and isolated vias from `board`.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable [`Board`] to prune.
+    ///
+    /// # Side Effects
+    /// Retains only electrically useful copper in `board.tracks`, `board.arcs`, and `board.vias`.
     pub fn prune_dangling_tracks_and_vias(&self, board: &mut Board) {
         prune_dangling_tracks_and_vias(board);
     }
 
+    /// Validates all routed copper on `board` against pad, via, and trace clearances, applying
+    /// neck-down, lateral micro-nudges, or corner trim repairs as needed.
+    ///
+    /// # Arguments
+    /// * `board` - Mutable [`Board`] to validate and clean.
+    ///
+    /// # Side Effects
+    /// Modifies `board.tracks`, `board.arcs`, and `board.vias` in place to eliminate DRC violations.
     pub fn validate_and_clean_copper(&self, board: &mut Board) {
         validate_and_clean_copper(board);
     }
 
+    /// Places companion ground return-path vias (`0.60 mm` / `0.30 mm`) within
+    /// `self.config.return_via_max_dist_mm` of any high-speed signal via whose netclass
+    /// requires an unbroken reference return path (`require_return_path`).
+    ///
+    /// # Arguments
+    /// * `board` - Mutable [`Board`] to which companion `GND` vias are added.
+    /// * `grid` - Reference to the [`RoutingGrid`].
+    ///
+    /// # Returns
+    /// Number of companion return-path `GND` vias added to `board.vias`.
+    ///
+    /// # Side Effects
+    /// Appends `GND` [`Via`] items to `board.vias`.
     pub fn add_return_path_ground_vias(&self, board: &mut Board, grid: &RoutingGrid) -> usize {
         let Some(gnd_net_id) = board.nets.iter().position(|n| crate::board::is_gnd_net_name(n)) else {
             return 0;
@@ -11168,12 +12539,28 @@ pub fn find_choked_pin_bottlenecks(
         added_count
     }
 
+    /// Audits all routed tracks on `board` for excessive parallel crosstalk coupling and
+    /// reference-plane return discontinuities.
+    ///
+    /// # Arguments
+    /// * `board` - Read-only reference to the [`Board`].
+    ///
+    /// # Returns
+    /// Vector of detected [`CouplingViolation`] records.
     pub fn validate_crosstalk_and_coupling(&self, board: &Board) -> Vec<CouplingViolation> {
         validate_crosstalk_and_coupling(board)
     }
 
     /// Dispatches a batch of 3D wavefront pathfinding requests across all available GPUs
-    /// via `MultiGpuRouterPool` and returns obstacle-free `GridNode` paths.
+    /// via `MultiGpuRouterPool` and returns obstacle-free [`GridNode`] paths.
+    ///
+    /// # Arguments
+    /// * `grid` - Reference to the [`RoutingGrid`].
+    /// * `requests` - Slice of `(start, goal, net_id, via_cost)` tuples.
+    /// * `clearance_cells` - Required obstacle clearance radius in grid cells.
+    ///
+    /// # Returns
+    /// Vector of `Option<Vec<GridNode>>` paths corresponding 1-to-1 with `requests`.
     pub fn solve_batch_gpu_wavefront_paths(
         &self,
         grid: &RoutingGrid,
@@ -11195,6 +12582,23 @@ pub fn find_choked_pin_bottlenecks(
     }
 }
 
+/// Aligns parallel horizontal and vertical segments of a routed differential pair
+/// (`leader_net` and `follower_net`) to the exact target center-to-center pitch
+/// `diff_width + diff_gap` when DRC-legal.
+///
+/// # Arguments
+/// * `board` - Mutable [`Board`] whose follower trace segments are adjusted.
+/// * `leader_net` - Numeric net ID of the leader trace.
+/// * `follower_net` - Numeric net ID of the follower trace.
+/// * `diff_width` - Differential trace width in `mm`.
+/// * `diff_gap` - Target edge-to-edge differential gap in `mm`.
+/// * `leader_start` - Leader start terminal `(x, y, layer)`.
+/// * `leader_end` - Leader end terminal `(x, y, layer)`.
+/// * `follower_start` - Follower start terminal `(x, y, layer)`.
+/// * `follower_end` - Follower end terminal `(x, y, layer)`.
+///
+/// # Side Effects
+/// Modifies `follower_net` segments in `board.tracks` in place to tighten coupled pitch.
 pub fn enforce_coupled_diff_pair_spacing(
     board: &mut Board,
     leader_net: usize,
@@ -11515,6 +12919,21 @@ pub fn enforce_coupled_diff_pair_spacing(
     }
 }
 
+/// Matches the total routed copper length of differential pair nets `net_p` and `net_n`
+/// within `tolerance_mm` by inserting small 45-degree phase-matching bumps on the shorter net.
+///
+/// # Arguments
+/// * `board` - Mutable [`Board`] whose tracks are modified.
+/// * `grid` - Mutable [`RoutingGrid`] used to verify obstacle clearance for bump vertices.
+/// * `net_p` - Positive differential net ID.
+/// * `net_n` - Negative differential net ID.
+/// * `tolerance_mm` - Maximum permissible length skew in `mm`.
+///
+/// # Returns
+/// `true` if the final skew between `net_p` and `net_n` is `<= tolerance_mm`.
+///
+/// # Side Effects
+/// Replaces straight [`TrackSegment`]s on the shorter net in `board.tracks` with 45-degree bumps.
 pub fn match_diff_pair_phase(
     board: &mut Board,
     grid: &mut RoutingGrid,
@@ -11535,8 +12954,24 @@ pub fn match_diff_pair_phase(
     match_diff_pair_phase_lengths(board, grid, net_p, net_n, len_p, len_n, tolerance_mm)
 }
 
-/// Phase-match a diff pair given each net's signal-path length (excluding branches such as
-/// USB-C A/B jumpers, which would otherwise read as skew and add bogus meanders).
+/// Phase-matches a differential pair (`net_p`, `net_n`) given explicit signal-path lengths
+/// `len_p` and `len_n` in `mm` (excluding secondary branches such as USB-C A/B pin jumpers
+/// that would otherwise read as skew and insert spurious meanders).
+///
+/// # Arguments
+/// * `board` - Mutable [`Board`] whose shorter net receives phase-matching bumps.
+/// * `grid` - Mutable [`RoutingGrid`] for obstacle checking.
+/// * `net_p` - Positive differential net ID.
+/// * `net_n` - Negative differential net ID.
+/// * `len_p` - Measured main-path length of `net_p` in `mm`.
+/// * `len_n` - Measured main-path length of `net_n` in `mm`.
+/// * `tolerance_mm` - Maximum permissible skew in `mm`.
+///
+/// # Returns
+/// `true` if the remaining skew is `<= tolerance_mm`.
+///
+/// # Side Effects
+/// Replaces straight segments on the shorter net in `board.tracks` with outward 45-degree trapezoid bumps.
 pub fn match_diff_pair_phase_lengths(
     board: &mut Board,
     grid: &mut RoutingGrid,
@@ -11727,6 +13162,21 @@ pub fn match_diff_pair_phase_lengths(
     remaining_skew <= tolerance_mm
 }
 
+/// Tunes the total copper length of `net_id` up to `target_length_mm` by inserting
+/// serpentine accordion/trombone meanders bounded by `max_amplitude_mm`.
+///
+/// # Arguments
+/// * `board` - Mutable [`Board`] whose unlocked segments on `net_id` are lengthened.
+/// * `grid` - Mutable [`RoutingGrid`] used to check lateral obstacle clearance.
+/// * `net_id` - Numeric net ID to length-tune.
+/// * `target_length_mm` - Desired total trace length in `mm`.
+/// * `max_amplitude_mm` - Maximum lateral meander excursion in `mm`.
+///
+/// # Returns
+/// `true` if the net length reached `target_length_mm - 0.05` or at least one meander was inserted.
+///
+/// # Side Effects
+/// Replaces straight [`TrackSegment`]s of `net_id` in `board.tracks` with serpentine meander teeth.
 pub fn tune_net_length(
     board: &mut Board,
     grid: &mut RoutingGrid,
@@ -11955,26 +13405,66 @@ pub fn tune_net_length(
     current_len >= target_length_mm - 0.05 || modified
 }
 
+/// Contiguous single-layer polyline chain of connected [`TrackSegment`]s sharing a net and width.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackChain {
+    /// Numeric net ID (`1..`).
     pub net_id: usize,
+    /// Copper layer index (`0..num_layers`).
     pub layer: usize,
+    /// Uniform trace width in `mm` along this chain.
     pub width: f64,
+    /// Ordered sequence of 2D vertex coordinates `(x, y)` in `mm`.
     pub points: Vec<(f64, f64)>,
 }
 
+/// Quantizes a 2D world point `(x, y)` in `mm` to integer `0.1 um` (`1e-4 mm`) units
+/// for exact topological endpoint matching.
+///
+/// # Arguments
+/// * `p` - World coordinates `(x, y)` in `mm`.
+///
+/// # Returns
+/// Quantized integer pair `(qx, qy)`.
 fn quant_point(p: (f64, f64)) -> (i64, i64) {
     ((p.0 * 10000.0).round() as i64, (p.1 * 10000.0).round() as i64)
 }
 
+/// Extracts maximal degree-2 polyline [`TrackChain`]s from a slice of [`TrackSegment`]s,
+/// splitting chains at pads, vias, T-junctions, layer changes, or trace width changes.
+///
+/// # Arguments
+/// * `tracks` - Slice of [`TrackSegment`]s (typically belonging to one net).
+/// * `board` - Reference to the [`Board`] used to identify pad, via, and locked-copper terminals.
+///
+/// # Returns
+/// Vector of contiguous [`TrackChain`] polylines.
 pub fn extract_track_chains(tracks: &[TrackSegment], board: &Board) -> Vec<TrackChain> {
     extract_track_chains_impl(tracks, board, false)
 }
 
+/// Extracts maximal degree-2 polyline [`TrackChain`]s for organic curve fitting, grouping
+/// segments on the same layer together even if local neck-down widths vary.
+///
+/// # Arguments
+/// * `tracks` - Slice of [`TrackSegment`]s.
+/// * `board` - Reference to the [`Board`].
+///
+/// # Returns
+/// Vector of contiguous [`TrackChain`] polylines using the minimum segment width in each chain.
 pub fn extract_track_chains_for_organic(tracks: &[TrackSegment], board: &Board) -> Vec<TrackChain> {
     extract_track_chains_impl(tracks, board, true)
 }
 
+/// Internal implementation of [`extract_track_chains`] and [`extract_track_chains_for_organic`].
+///
+/// # Arguments
+/// * `tracks` - Slice of [`TrackSegment`]s to chain.
+/// * `board` - Reference to the [`Board`].
+/// * `unify_signal_widths` - If `true`, segments of different widths on the same layer are chained together.
+///
+/// # Returns
+/// Vector of extracted [`TrackChain`] polylines.
 fn extract_track_chains_impl(
     tracks: &[TrackSegment],
     board: &Board,
@@ -12152,6 +13642,14 @@ fn extract_track_chains_impl(
     all_chains
 }
 
+/// Simplifies a 2D polyline in place by removing duplicate vertices, redundant intermediate
+/// collinear vertices, and zero-area 180-degree foldback spikes.
+///
+/// # Arguments
+/// * `pts` - Mutable vector of `(x, y)` vertices in `mm`.
+///
+/// # Side Effects
+/// Compacts `pts` in place.
 pub fn merge_collinear_points(pts: &mut Vec<(f64, f64)>) {
     if pts.len() < 2 {
         return;
@@ -12197,6 +13695,13 @@ pub fn merge_collinear_points(pts: &mut Vec<(f64, f64)>) {
     *pts = cleaned;
 }
 
+/// Counts the number of non-collinear interior bends along a 2D polyline `pts`.
+///
+/// # Arguments
+/// * `pts` - Slice of `(x, y)` vertices in `mm`.
+///
+/// # Returns
+/// Number of interior vertices where the unit tangent direction changes (`dot < 0.9999`).
 pub fn count_chain_bends(pts: &[(f64, f64)]) -> usize {
     if pts.len() < 3 {
         return 0;
@@ -12220,6 +13725,21 @@ pub fn count_chain_bends(pts: &[(f64, f64)]) -> usize {
     bends
 }
 
+/// Checks whether a candidate trace segment from `p1` to `p2` of `width` on `layer` for `net_id`
+/// satisfies all board outline, keepout, dedicated-plane, foreign pad, foreign via, foreign track,
+/// and same-net SMD pad grazing rules.
+///
+/// # Arguments
+/// * `board` - Reference to the [`Board`].
+/// * `grid` - Optional reference to the [`RoutingGrid`] for plane-net lookup.
+/// * `p1` - Segment start `(x, y)` in `mm`.
+/// * `p2` - Segment end `(x, y)` in `mm`.
+/// * `layer` - Copper layer index.
+/// * `net_id` - Numeric net ID of the segment.
+/// * `width` - Trace width in `mm`.
+///
+/// # Returns
+/// `true` if the segment is completely DRC-clean against all board obstacles.
 pub fn is_segment_clear(
     board: &Board,
     grid: Option<&RoutingGrid>,
@@ -12420,6 +13940,17 @@ pub fn is_segment_clear(
     true
 }
 
+/// Performs rubber-band octilinear line-of-sight shortcutting on a [`TrackChain`],
+/// collapsing intermediate vertices whenever a direct octilinear segment between non-adjacent
+/// vertices is DRC-clear and does not bypass any pad or via anchor.
+///
+/// # Arguments
+/// * `chain` - Mutable [`TrackChain`] to straighten.
+/// * `board` - Reference to the [`Board`].
+/// * `grid` - Reference to the [`RoutingGrid`].
+///
+/// # Side Effects
+/// Replaces `chain.points` with a simplified vertex sequence.
 pub fn rubber_band_straighten(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
     if chain.points.len() < 3 {
         return;
@@ -12490,6 +14021,16 @@ pub fn rubber_band_straighten(chain: &mut TrackChain, board: &Board, grid: &Rout
     }
 }
 
+/// Replaces multi-bend staircase zig-zags along a [`TrackChain`] with canonical 1-bend
+/// 45-degree dogleg corners (`[p_i, corner, p_j]`) when DRC-clear.
+///
+/// # Arguments
+/// * `chain` - Mutable [`TrackChain`] to simplify.
+/// * `board` - Reference to the [`Board`].
+/// * `grid` - Reference to the [`RoutingGrid`].
+///
+/// # Side Effects
+/// Mutates `chain.points` in place.
 pub fn eliminate_stair_steps(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
     if chain.points.len() < 3 {
         return;
@@ -12590,6 +14131,16 @@ pub fn eliminate_stair_steps(chain: &mut TrackChain, board: &Board, grid: &Routi
     }
 }
 
+/// Collapses short lateral S-bends and micro-jogs (`<= max(2 * width, 0.30 mm)`) along a
+/// [`TrackChain`] when a direct octilinear bypass is DRC-clear.
+///
+/// # Arguments
+/// * `chain` - Mutable [`TrackChain`] to simplify.
+/// * `board` - Reference to the [`Board`].
+/// * `grid` - Reference to the [`RoutingGrid`].
+///
+/// # Side Effects
+/// Removes redundant micro-jog vertices from `chain.points`.
 pub fn reduce_jogs(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
     if chain.points.len() < 4 {
         return;
@@ -12652,6 +14203,17 @@ pub fn reduce_jogs(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
     }
 }
 
+/// Eliminates acute interior trace corners (`< 90` degrees) and 180-degree foldback spikes
+/// along a [`TrackChain`] by replacing them with direct bypasses or obtuse 45-degree miters
+/// so etching acid cannot be trapped in sharp copper wedges.
+///
+/// # Arguments
+/// * `chain` - Mutable [`TrackChain`] to clean.
+/// * `board` - Reference to the [`Board`].
+/// * `grid` - Reference to the [`RoutingGrid`].
+///
+/// # Side Effects
+/// Modifies `chain.points` in place to remove acute vertices.
 pub fn avoid_acid_traps(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
     if chain.points.len() < 3 {
         return;
@@ -12775,6 +14337,16 @@ pub fn avoid_acid_traps(chain: &mut TrackChain, board: &Board, grid: &RoutingGri
     }
 }
 
+/// Collapses 3-segment U-turns and 2-segment corners across sliding 4-point windows on a
+/// [`TrackChain`] whenever a direct octilinear shortcut is DRC-clear.
+///
+/// # Arguments
+/// * `chain` - Mutable [`TrackChain`] to simplify.
+/// * `board` - Reference to the [`Board`].
+/// * `grid` - Reference to the [`RoutingGrid`].
+///
+/// # Side Effects
+/// Removes redundant corner vertices from `chain.points`.
 pub fn reduce_corners(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
     if chain.points.len() < 4 {
         return;
@@ -12840,6 +14412,17 @@ pub fn reduce_corners(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid)
     }
 }
 
+/// Shifts axis-aligned and 45-degree diagonal segments of a [`TrackChain`] laterally by
+/// `50..150 um` away from nearby foreign obstacles when doing so strictly improves clearance
+/// according to the Euclidean distance field `grid.dist_field`.
+///
+/// # Arguments
+/// * `chain` - Mutable [`TrackChain`] whose segments are repositioned.
+/// * `board` - Reference to the [`Board`].
+/// * `grid` - Reference to the [`RoutingGrid`].
+///
+/// # Side Effects
+/// Updates interior vertex coordinates in `chain.points`.
 pub fn reposition_lines(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
     if chain.points.len() < 4 {
         return;
@@ -13010,6 +14593,16 @@ pub fn reposition_lines(chain: &mut TrackChain, board: &Board, grid: &RoutingGri
     }
 }
 
+/// Chamfers sharp 90-degree corners along a [`TrackChain`] into pairs of 135-degree
+/// (45-degree miter) bends using adaptive setbacks (`0.35x` to `1.50x` trace width).
+///
+/// # Arguments
+/// * `chain` - Mutable [`TrackChain`] to chamfer.
+/// * `board` - Reference to the [`Board`].
+/// * `grid` - Reference to the [`RoutingGrid`].
+///
+/// # Side Effects
+/// Replaces 90-degree corner vertices in `chain.points` with mitered vertex pairs.
 pub fn smoothen_corners(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
     if chain.points.len() < 3 {
         return;
@@ -13089,14 +14682,43 @@ pub fn smoothen_corners(chain: &mut TrackChain, board: &Board, grid: &RoutingGri
     chain.points = new_points;
 }
 
+/// Alias for [`smoothen_corners`] that applies adaptive 45-degree miters to 90-degree corners.
+///
+/// # Arguments
+/// * `chain` - Mutable [`TrackChain`] to miter.
+/// * `board` - Reference to the [`Board`].
+/// * `grid` - Reference to the [`RoutingGrid`].
+///
+/// # Side Effects
+/// Mutates `chain.points` in place.
 pub fn smooth_45_miters(chain: &mut TrackChain, board: &Board, grid: &RoutingGrid) {
     smoothen_corners(chain, board, grid);
 }
 
+/// Runs up to 8 iterative passes of via-pair hop elimination, single-via consolidation,
+/// and via sliding/alignment on `board` using [`RoutingConfig::default`], followed by
+/// dangling-copper pruning.
+///
+/// # Arguments
+/// * `board` - Mutable [`Board`] whose vias and tracks are simplified.
+/// * `grid` - Mutable [`RoutingGrid`].
+///
+/// # Side Effects
+/// Removes redundant vias from `board.vias` and updates `board.tracks`.
 pub fn reduce_vias(board: &mut Board, grid: &mut RoutingGrid) {
     reduce_vias_with_config(board, grid, &RoutingConfig::default());
 }
 
+/// Runs up to 8 iterative passes of via-pair hop elimination, single-via consolidation,
+/// and via sliding/alignment on `board` using the provided [`RoutingConfig`].
+///
+/// # Arguments
+/// * `board` - Mutable [`Board`] whose vias and tracks are simplified.
+/// * `grid` - Mutable [`RoutingGrid`].
+/// * `config` - [`RoutingConfig`] controlling via merge radii and detour budgets.
+///
+/// # Side Effects
+/// Mutates `board.vias` and `board.tracks`, concluding with [`prune_dangling_tracks_and_vias`].
 pub fn reduce_vias_with_config(board: &mut Board, grid: &mut RoutingGrid, config: &RoutingConfig) {
     let max_passes = 8;
     for _pass in 0..max_passes {
@@ -13110,6 +14732,15 @@ pub fn reduce_vias_with_config(board: &mut Board, grid: &mut RoutingGrid, config
     prune_dangling_tracks_and_vias(board);
 }
 
+/// Executes a single pass of via-pair elimination, single-via consolidation, and via
+/// sliding/alignment on `board` using [`RoutingConfig::default`].
+///
+/// # Arguments
+/// * `board` - Mutable [`Board`].
+/// * `grid` - Reference to the [`RoutingGrid`].
+///
+/// # Returns
+/// `true` if any via was removed, merged, or slid during the pass.
 pub fn reduce_vias_single_pass(board: &mut Board, grid: &RoutingGrid) -> bool {
     let config = RoutingConfig::default();
     let p = eliminate_via_pairs_with_config(board, grid, &config);
@@ -13118,11 +14749,29 @@ pub fn reduce_vias_single_pass(board: &mut Board, grid: &RoutingGrid) -> bool {
     p || s || l
 }
 
-/// Eliminates redundant layer-hopping via pairs (L_orig -> L_alt -> L_orig).
+/// Eliminates redundant layer-hopping via pairs (`L_orig -> L_alt -> L_orig`) and merges
+/// adjacent same-net vias using [`RoutingConfig::default`].
+///
+/// # Arguments
+/// * `board` - Mutable [`Board`].
+/// * `grid` - Reference to the [`RoutingGrid`].
+///
+/// # Returns
+/// `true` if at least one via pair was eliminated or consolidated.
 pub fn eliminate_via_pairs(board: &mut Board, grid: &RoutingGrid) -> bool {
     eliminate_via_pairs_with_config(board, grid, &RoutingConfig::default())
 }
 
+/// Eliminates redundant layer-hopping via pairs (`L_orig -> L_alt -> L_orig`) and merges
+/// adjacent same-net vias using the thresholds in `config`.
+///
+/// # Arguments
+/// * `board` - Mutable [`Board`].
+/// * `grid` - Reference to the [`RoutingGrid`].
+/// * `config` - [`RoutingConfig`] specifying `via_hop_max_detour_ratio`, `via_merge_radius_mm`, and `via_detour_budget_mm`.
+///
+/// # Returns
+/// `true` if at least one via mutation was applied across up to 20 sub-iterations.
 pub fn eliminate_via_pairs_with_config(board: &mut Board, grid: &RoutingGrid, config: &RoutingConfig) -> bool {
     let mut any_changed = false;
     for _ in 0..20 {
@@ -13134,11 +14783,28 @@ pub fn eliminate_via_pairs_with_config(board: &mut Board, grid: &RoutingGrid, co
     any_changed
 }
 
+/// Tests whether two 2D axis-aligned bounding boxes `(min_x, min_y, max_x, max_y)` overlap.
+///
+/// # Arguments
+/// * `a` - First AABB `(min_x, min_y, max_x, max_y)` in `mm`.
+/// * `b` - Second AABB `(min_x, min_y, max_x, max_y)` in `mm`.
+///
+/// # Returns
+/// `true` if `a` and `b` intersect or touch.
 #[inline]
 fn aabb_overlaps(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> bool {
     a.0 <= b.2 && a.2 >= b.0 && a.1 <= b.3 && a.3 >= b.1
 }
 
+/// Computes the 2D axis-aligned bounding box `(min_x, min_y, max_x, max_y)` enclosing `pts`,
+/// expanded outward on all sides by `margin` in `mm`.
+///
+/// # Arguments
+/// * `pts` - Non-empty slice of `(x, y)` coordinates in `mm`.
+/// * `margin` - Expansion margin in `mm`.
+///
+/// # Returns
+/// Expanded AABB tuple `(min_x, min_y, max_x, max_y)`.
 #[inline]
 fn points_expanded_aabb(pts: &[(f64, f64)], margin: f64) -> (f64, f64, f64, f64) {
     let mut min_x = f64::INFINITY;
@@ -13154,26 +14820,52 @@ fn points_expanded_aabb(pts: &[(f64, f64)], margin: f64) -> (f64, f64, f64, f64)
     (min_x - margin, min_y - margin, max_x + margin, max_y + margin)
 }
 
+/// Atomic via-reduction mutation discovered for a single net during [`eliminate_via_pair_once`].
 enum ViaPairMutation {
+    /// Promotes a layer-hopping trace chain from `l_alt` back onto `l_orig` and drops both bounding vias.
     EliminateHop {
+        /// Numeric net ID.
         net_id: usize,
+        /// Target copper layer onto which the hop is promoted.
         l_orig: usize,
+        /// Trace width in `mm`.
         track_width: f64,
+        /// Indices of existing [`TrackSegment`]s in `board.tracks` to remove.
         chain_segs: Vec<usize>,
+        /// Replacement polyline vertices `(x, y)` in `mm` on `l_orig`.
         new_pts: Vec<(f64, f64)>,
+        /// Quantized position of the first eliminated via.
         q1: (i64, i64),
+        /// Quantized position of the second eliminated via.
         q2: (i64, i64),
+        /// Expanded spatial bounding box `(min_x, min_y, max_x, max_y)` in `mm` for conflict-free batching.
         aabb: (f64, f64, f64, f64),
     },
+    /// Merges a redundant nearby same-net via (`drop_q`) into a kept via by re-anchoring incident branches.
     ConsolidateAdjacent {
+        /// Numeric net ID.
         net_id: usize,
+        /// Indices of [`TrackSegment`]s in `board.tracks` to remove.
         rem_track_indices: Vec<usize>,
+        /// Replacement [`TrackSegment`]s connecting branches to the kept via.
         new_segs: Vec<TrackSegment>,
+        /// Quantized position of the via to remove.
         drop_q: (i64, i64),
+        /// Expanded spatial bounding box `(min_x, min_y, max_x, max_y)` in `mm`.
         aabb: (f64, f64, f64, f64),
     },
 }
 
+/// Evaluates all nets in parallel to find and apply spatially disjoint [`ViaPairMutation`]s
+/// (either eliminating a `L_orig -> L_alt -> L_orig` hop or consolidating adjacent vias).
+///
+/// # Arguments
+/// * `board` - Mutable [`Board`].
+/// * `grid` - Reference to the [`RoutingGrid`].
+/// * `config` - [`RoutingConfig`] parameters.
+///
+/// # Returns
+/// `true` if at least one via mutation was committed to `board`.
 fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid, config: &RoutingConfig) -> bool {
     let is_plane_net = |nid: usize| -> bool {
         let net_name = board.nets.get(nid).map(|s| s.as_str()).unwrap_or("");
@@ -13731,10 +15423,15 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid, config: &Routi
                     }
 
                     // Trace maximal degree-2 chains starting from each incident segment of drop_pos
+                    /// Maximal degree-2 trace chain incident to a candidate via being consolidated.
                     struct IncidentChain {
+                        /// Indices of constituent [`TrackSegment`]s in `board.tracks`.
                         segs: Vec<usize>,
+                        /// Ordered chain vertices `(x, y)` in `mm` starting at `drop_pos`.
                         pts: Vec<(f64, f64)>,
+                        /// Copper layer of the chain.
                         layer: usize,
+                        /// Trace width in `mm`.
                         width: f64,
                     }
 
@@ -14074,14 +15771,22 @@ fn eliminate_via_pair_once(board: &mut Board, grid: &RoutingGrid, config: &Routi
     true
 }
 
-/// Automated BGA Escape Solver:
+/// Automated BGA Escape Solver.
+///
 /// Analyzes regular 2D grid array BGA footprints, assigns pads to 4 quadrants (NE, NW, SE, SW),
 /// and generates deterministic fanouts:
-/// - Ring 0 (outer perimeter): direct surface escape tracks shooting outward without vias
-/// - Ring 1 & inner rings: diagonal 45° dog-bone escape stubs placed at interstitial cell centers
-///   connecting pad to dog-bone via and routing out through interstitial avenue corridors
-/// - Via-in-Pad (VIPPO) fallback: centered microvia (0.30mm dia, 0.15mm drill) for pitch < 0.50mm
+/// - **Ring 0 (outer perimeter):** direct surface escape tracks shooting outward without vias.
+/// - **Ring 1 & inner rings:** diagonal 45° dog-bone escape stubs placed at interstitial cell centers
+///   connecting pad to dog-bone via and routing out through interstitial avenue corridors.
+/// - **Via-in-Pad (VIPPO) fallback:** centered microvia (`0.30 mm` dia, `0.15 mm` drill) for pitch `< 0.50 mm`
 ///   or where standard annular ring cannot clear adjacent pads.
+///
+/// # Arguments
+/// * `board` - Mutable board state where generated escape tracks and vias are appended.
+/// * `grid` - Mutable routing grid where generated escape tracks and vias are committed and distance fields refreshed.
+///
+/// # Side Effects
+/// Mutates `board.tracks`, `board.vias`, and `grid` (commits tracks/vias and recomputes distance fields).
 pub fn generate_bga_dogbone_escapes(board: &mut Board, grid: &mut RoutingGrid) {
     let num_layers = board.copper_layers().len().max(2);
 
@@ -14320,13 +16025,38 @@ pub fn generate_bga_dogbone_escapes(board: &mut Board, grid: &mut RoutingGrid) {
     grid.update_distance_fields();
 }
 
-/// Identifies connections with a single via transitioning between layers,
-/// testing whether the alternate layer segment chain can be moved/projected onto
+/// Identifies connections with a single via transitioning between layers and consolidates them onto a single layer.
+///
+/// Tests whether the alternate-layer segment chain can be moved or projected onto
 /// the primary layer without DRC violations, eliminating the solitary via.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose tracks and vias are updated.
+/// * `grid` - Routing grid used for clearance and optional GPU batch screening.
+///
+/// # Returns
+/// `true` if at least one solitary via was eliminated.
+///
+/// # Side Effects
+/// Mutates `board.tracks` and `board.vias`.
 pub fn consolidate_single_vias(board: &mut Board, grid: &RoutingGrid) -> bool {
     consolidate_single_vias_with_config(board, grid, &RoutingConfig::default())
 }
 
+/// Consolidates single-via layer transitions using an explicit [`RoutingConfig`].
+///
+/// Iteratively invokes `consolidate_single_via_once` up to 20 passes until convergence.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose tracks and vias are updated.
+/// * `grid` - Routing grid used for clearance and optional GPU batch screening.
+/// * `config` - Routing configuration controlling `via_hop_max_detour_ratio`.
+///
+/// # Returns
+/// `true` if at least one solitary via was eliminated across all passes.
+///
+/// # Side Effects
+/// Mutates `board.tracks` and `board.vias`.
 pub fn consolidate_single_vias_with_config(
     board: &mut Board,
     grid: &RoutingGrid,
@@ -14342,16 +16072,36 @@ pub fn consolidate_single_vias_with_config(
     any_changed
 }
 
+/// Validated candidate mutation for eliminating a single layer-transition via by re-projecting its incident stub chain.
 struct SingleViaConsolidation {
+    /// Net ID of the consolidated trace.
     net_id: usize,
+    /// Target primary copper layer index onto which the chain is projected.
     l_prim: usize,
+    /// Trace width in millimeters (`mm`).
     track_width: f64,
+    /// Indices of existing [`TrackSegment`] items in `board.tracks` to remove.
     chain_segs: Vec<usize>,
+    /// Replacement polyline vertices `(x, y)` in `mm` on `l_prim`.
     new_pts: Vec<(f64, f64)>,
+    /// Quantized integer coordinates `(qx, qy)` of the solitary via to remove.
     q_v: (i64, i64),
+    /// Expanded 2D AABB `(min_x, min_y, max_x, max_y)` in `mm` used for conflict-free batching.
     aabb: (f64, f64, f64, f64),
 }
 
+/// Executes a single parallelized pass of single-via consolidation across all non-overlapping nets.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose tracks and vias are updated.
+/// * `grid` - Routing grid used for clearance and optional GPU batch screening.
+/// * `config` - Routing configuration controlling detour length bounds.
+///
+/// # Returns
+/// `true` if at least one single via was consolidated in this pass.
+///
+/// # Side Effects
+/// Mutates `board.tracks` and `board.vias`, and may dispatch a GPU DRC batch query.
 fn consolidate_single_via_once(
     board: &mut Board,
     grid: &RoutingGrid,
@@ -14377,12 +16127,19 @@ fn consolidate_single_via_once(
 
     let drc_ctx = GpuDrcContext::from_board(board);
 
+    /// Candidate stub-projection option for eliminating a solitary via onto a primary layer.
     struct ViaStubOption {
+        /// Target primary copper layer index.
         l_prim: usize,
+        /// Trace width in millimeters (`mm`).
         track_width: f64,
+        /// Required netclass copper clearance in millimeters (`mm`).
         clearance: f64,
+        /// Indices of alternate-layer track segments in `board.tracks` to replace.
         chain_segs: Vec<usize>,
+        /// Ordered vertex coordinates `(x, y)` in `mm` of the alternate-layer chain.
         chain_pts: Vec<(f64, f64)>,
+        /// Candidate replacement polylines on `l_prim` (direct, projected, or 45° dogleg).
         cand_paths: Vec<Vec<(f64, f64)>>,
     }
 
@@ -14731,10 +16488,34 @@ fn consolidate_single_via_once(
 
 /// Slides and aligns signal vias along incident track vectors to eliminate micro-jogs,
 /// doglegs, reduce wirelength, and snap close vias to through-hole pads.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose tracks and vias are updated.
+/// * `grid` - Routing grid used for clearance and optional GPU batch screening.
+///
+/// # Returns
+/// `true` if at least one via was moved or snapped into a through-hole pad.
+///
+/// # Side Effects
+/// Mutates `board.vias` and `board.tracks`.
 pub fn slide_and_align_vias(board: &mut Board, grid: &RoutingGrid) -> bool {
     slide_and_align_vias_with_config(board, grid, &RoutingConfig::default())
 }
 
+/// Slides and aligns signal vias along incident track vectors using an explicit [`RoutingConfig`].
+///
+/// Iteratively runs `slide_and_align_via_once` up to 20 passes until convergence.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose tracks and vias are updated.
+/// * `grid` - Routing grid used for clearance and optional GPU batch screening.
+/// * `config` - Routing configuration controlling `via_pad_snap_dist_mm`.
+///
+/// # Returns
+/// `true` if at least one via was moved or snapped across all passes.
+///
+/// # Side Effects
+/// Mutates `board.vias` and `board.tracks`.
 pub fn slide_and_align_vias_with_config(
     board: &mut Board,
     grid: &RoutingGrid,
@@ -14750,16 +16531,36 @@ pub fn slide_and_align_vias_with_config(
     any_changed
 }
 
+/// Validated candidate mutation for sliding a via or snapping it into a nearby through-hole pad.
 struct ViaSlideAction {
+    /// Index of the via in `board.vias`.
     v_idx: usize,
+    /// Original via position `(x, y)` in millimeters (`mm`).
     v_pos: (f64, f64),
+    /// Net ID of the via and incident tracks.
     net_id: usize,
+    /// New target position `(x, y)` in millimeters (`mm`) for the via or incident track endpoints.
     target_pos: (f64, f64),
+    /// Whether the via is absorbed into a through-hole pad and should be removed from `board.vias`.
     remove_via: bool,
+    /// Indices of incident [`TrackSegment`] items in `board.tracks` whose endpoints attach to `v_pos`.
     incident_indices: Vec<usize>,
+    /// Expanded 2D AABB `(min_x, min_y, max_x, max_y)` in `mm` used for conflict-free parallel batching.
     aabb: (f64, f64, f64, f64),
 }
 
+/// Executes a single parallelized pass of via pad-snapping, micro-jog collapsing, and vector sliding.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose tracks and vias are updated.
+/// * `grid` - Routing grid used for clearance and optional GPU batch screening.
+/// * `config` - Routing configuration controlling pad snap distance.
+///
+/// # Returns
+/// `true` if at least one via was moved or absorbed into a pad in this pass.
+///
+/// # Side Effects
+/// Mutates `board.vias` and `board.tracks`.
 fn slide_and_align_via_once(
     board: &mut Board,
     grid: &RoutingGrid,
@@ -15076,7 +16877,13 @@ fn slide_and_align_via_once(
     true
 }
 
-/// Decomposes any non-octilinear segment in a track chain into standard 45° doglegs.
+/// Decomposes any non-octilinear segment in a [`TrackChain`] into standard 45° doglegs.
+///
+/// # Arguments
+/// * `chain` - Mutable track chain whose polyline vertices are regularized to 0°/45°/90° orientations.
+///
+/// # Side Effects
+/// Mutates `chain.points` in place and merges collinear vertices.
 pub fn enforce_45_grid(chain: &mut TrackChain) {
     if chain.points.len() < 2 {
         return;
@@ -15106,10 +16913,30 @@ pub fn enforce_45_grid(chain: &mut TrackChain) {
     merge_collinear_points(&mut chain.points);
 }
 
+/// Runs standard octilinear post-route track glossing across all unlocked signal nets on the board.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose unlocked tracks are glossed.
+/// * `grid` - Routing grid providing clearance data and optional GPU acceleration.
+///
+/// # Side Effects
+/// Replaces unlocked signal tracks in `board.tracks` with straightened, de-jogged, and mitered segments.
 pub fn gloss_tracks(board: &mut Board, grid: &RoutingGrid) {
     gloss_tracks_with_mode(board, grid, false);
 }
 
+/// Runs post-route track glossing in either standard 45° octilinear mode or organic any-angle tangent-arc mode.
+///
+/// When `any_angle_mode` is `true`, performs standard glossing followed by homotopic rubber-band
+/// relaxation, $G^1$-continuous tangent-arc corner replacement, and acute-junction filleting.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose tracks and arcs are updated.
+/// * `grid` - Routing grid providing clearance data and optional GPU acceleration.
+/// * `any_angle_mode` - When `true`, enables homotopic rubber-banding and tangent-arc generation.
+///
+/// # Side Effects
+/// Mutates `board.tracks` and `board.arcs`.
 pub fn gloss_tracks_with_mode(board: &mut Board, grid: &RoutingGrid, any_angle_mode: bool) {
     if any_angle_mode {
         gloss_tracks_standard(board, grid);
@@ -15121,9 +16948,21 @@ pub fn gloss_tracks_with_mode(board: &mut Board, grid: &RoutingGrid, any_angle_m
     }
 }
 
+/// Canonical lookup key `(quant_p1, quant_p2, layer, net_id)` for pre-evaluated GPU shortcut clearance queries.
 type GpuShortcutKey = ((i64, i64), (i64, i64), usize, usize);
+/// Hash map mapping a [`GpuShortcutKey`] to whether the candidate segment passed GPU DRC screening.
 type GpuShortcutMap = HashMap<GpuShortcutKey, bool>;
 
+/// Constructs an order-independent [`GpuShortcutKey`] for a candidate segment between `p1` and `p2`.
+///
+/// # Arguments
+/// * `p1` - First endpoint `(x, y)` in millimeters (`mm`).
+/// * `p2` - Second endpoint `(x, y)` in millimeters (`mm`).
+/// * `layer` - Copper layer index.
+/// * `net_id` - Net ID of the segment.
+///
+/// # Returns
+/// Canonicalized `(min_q, max_q, layer, net_id)` tuple.
 #[inline]
 fn canonical_shortcut_key(p1: (f64, f64), p2: (f64, f64), layer: usize, net_id: usize) -> GpuShortcutKey {
     let q1 = quant_point(p1);
@@ -15135,6 +16974,23 @@ fn canonical_shortcut_key(p1: (f64, f64), p2: (f64, f64), layer: usize, net_id: 
     }
 }
 
+/// Checks whether a candidate shortcut segment is DRC-clean, consulting a pre-evaluated [`GpuShortcutMap`] first.
+///
+/// If the GPU map marks the segment as colliding (`false`), returns `false` in $O(1)$ without CPU geometry checks;
+/// otherwise performs exact verification via [`is_segment_clear`].
+///
+/// # Arguments
+/// * `board` - Board state with obstacles.
+/// * `grid` - Routing grid.
+/// * `p1` - Segment start `(x, y)` in `mm`.
+/// * `p2` - Segment end `(x, y)` in `mm`.
+/// * `layer` - Copper layer index.
+/// * `net_id` - Net ID of the segment.
+/// * `width` - Trace width in `mm`.
+/// * `gpu_map` - Optional pre-evaluated GPU shortcut lookup table.
+///
+/// # Returns
+/// `true` if the segment is clear of all obstacles and DRC violations.
 #[inline]
 fn is_segment_clear_with_gpu(
     board: &Board,
@@ -15155,6 +17011,17 @@ fn is_segment_clear_with_gpu(
     is_segment_clear(board, Some(grid), p1, p2, layer, net_id, width)
 }
 
+/// Enumerates all potential octilinear and 45°-dogleg shortcut segments across `chains` for batch GPU DRC evaluation.
+///
+/// # Arguments
+/// * `chains` - Slice of track chains to inspect.
+/// * `board` - Board state used to look up netclass clearances.
+/// * `out_keys` - Output vector receiving canonical shortcut keys.
+/// * `out_cands` - Output vector receiving corresponding [`GpuDrcCandidate`] descriptors.
+/// * `seen` - Deduplication set of already-queued keys.
+///
+/// # Side Effects
+/// Appends unique keys and GPU candidate descriptors to `out_keys`, `out_cands`, and `seen`.
 fn collect_chain_shortcut_candidates(
     chains: &[TrackChain],
     board: &Board,
@@ -15220,6 +17087,16 @@ fn collect_chain_shortcut_candidates(
     }
 }
 
+/// GPU-accelerated variant of [`rubber_band_straighten`] using pre-screened shortcut results from `gpu_map`.
+///
+/// # Arguments
+/// * `chain` - Mutable track chain to straighten.
+/// * `board` - Board state with obstacles.
+/// * `grid` - Routing grid.
+/// * `gpu_map` - Optional pre-evaluated GPU shortcut clearance map.
+///
+/// # Side Effects
+/// Mutates `chain.points` in place.
 fn rubber_band_straighten_gpu(
     chain: &mut TrackChain,
     board: &Board,
@@ -15301,6 +17178,16 @@ fn rubber_band_straighten_gpu(
     }
 }
 
+/// GPU-accelerated variant of [`eliminate_stair_steps`] using pre-screened shortcut results from `gpu_map`.
+///
+/// # Arguments
+/// * `chain` - Mutable track chain whose staircase jogs are collapsed into canonical 45° doglegs.
+/// * `board` - Board state with obstacles.
+/// * `grid` - Routing grid.
+/// * `gpu_map` - Optional pre-evaluated GPU shortcut clearance map.
+///
+/// # Side Effects
+/// Mutates `chain.points` in place.
 fn eliminate_stair_steps_gpu(
     chain: &mut TrackChain,
     board: &Board,
@@ -15410,6 +17297,16 @@ fn eliminate_stair_steps_gpu(
     }
 }
 
+/// GPU-accelerated variant of [`reduce_jogs`] using pre-screened shortcut results from `gpu_map`.
+///
+/// # Arguments
+/// * `chain` - Mutable track chain whose short micro-jogs are collapsed.
+/// * `board` - Board state with obstacles.
+/// * `grid` - Routing grid.
+/// * `gpu_map` - Optional pre-evaluated GPU shortcut clearance map.
+///
+/// # Side Effects
+/// Mutates `chain.points` in place.
 fn reduce_jogs_gpu(
     chain: &mut TrackChain,
     board: &Board,
@@ -15488,6 +17385,16 @@ fn reduce_jogs_gpu(
     }
 }
 
+/// GPU-accelerated variant of [`reduce_corners`] using pre-screened shortcut results from `gpu_map`.
+///
+/// # Arguments
+/// * `chain` - Mutable track chain whose 4-point corner sequences are simplified.
+/// * `board` - Board state with obstacles.
+/// * `grid` - Routing grid.
+/// * `gpu_map` - Optional pre-evaluated GPU shortcut clearance map.
+///
+/// # Side Effects
+/// Mutates `chain.points` in place.
 fn reduce_corners_gpu(
     chain: &mut TrackChain,
     board: &Board,
@@ -15563,6 +17470,16 @@ fn reduce_corners_gpu(
     }
 }
 
+/// Extracts [`TrackChain`] polylines for a single net, enforces 45° octilinear alignment, and runs initial acid-trap avoidance.
+///
+/// # Arguments
+/// * `net_id` - Net ID being prepared for glossing.
+/// * `net_tracks` - Unlocked track segments belonging to `net_id`.
+/// * `board_without_net` - Board snapshot with the current wave's unlocked tracks removed.
+/// * `grid` - Routing grid.
+///
+/// # Returns
+/// Vector of prepared [`TrackChain`] polylines ready for shortcut evaluation and glossing.
 fn prepare_net_chains_for_gloss(
     net_id: usize,
     net_tracks: &[TrackSegment],
@@ -15582,6 +17499,20 @@ fn prepare_net_chains_for_gloss(
     chains
 }
 
+/// Runs the full sequence of chain-level glossing passes on prepared chains and decomposes them back into [`TrackSegment`] items.
+///
+/// Executes rubber-band straightening, stair-step elimination, jog reduction, corner reduction,
+/// line repositioning, 90° corner mitering, and final acid-trap avoidance.
+///
+/// # Arguments
+/// * `net_id` - Net ID of the chains.
+/// * `chains` - Prepared [`TrackChain`] polylines for `net_id`.
+/// * `board_without_net` - Board snapshot without the current wave's unlocked tracks.
+/// * `grid` - Routing grid.
+/// * `gpu_map` - Optional pre-evaluated GPU shortcut clearance map.
+///
+/// # Returns
+/// Vector of glossed [`TrackSegment`] primitives for `net_id`.
 fn finish_gloss_net_chains(
     net_id: usize,
     mut chains: Vec<TrackChain>,
@@ -15630,6 +17561,16 @@ fn finish_gloss_net_chains(
     out
 }
 
+/// Glosses all unlocked tracks of a single isolated net, optionally evaluating shortcut candidates on the GPU.
+///
+/// # Arguments
+/// * `net_id` - Net ID to gloss.
+/// * `net_tracks` - Unlocked track segments of `net_id`.
+/// * `board_without_net` - Board state with `net_tracks` removed.
+/// * `grid` - Routing grid.
+///
+/// # Returns
+/// Vector of glossed [`TrackSegment`] items.
 fn gloss_single_net_chains(net_id: usize, net_tracks: &[TrackSegment], board_without_net: &Board, grid: &RoutingGrid) -> Vec<TrackSegment> {
     let chains = prepare_net_chains_for_gloss(net_id, net_tracks, board_without_net, grid);
     let gpu_map: Option<GpuShortcutMap> = if grid.vulkan.is_some() {
@@ -15651,6 +17592,19 @@ fn gloss_single_net_chains(net_id: usize, net_tracks: &[TrackSegment], board_wit
     finish_gloss_net_chains(net_id, chains, board_without_net, grid, gpu_map.as_ref())
 }
 
+/// Runs wave-parallel octilinear track glossing across all non-differential unlocked nets on `board`.
+///
+/// Partitions nets into spatially disjoint waves using `0.60 mm`-expanded 2D AABBs so that all nets
+/// within a wave can be extracted, batch-screened on the GPU, and glossed in parallel via Rayon
+/// without mutual clearance interference. Coupled differential pairs are left untouched to preserve
+/// their phase-matched spacing.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose unlocked tracks are glossed.
+/// * `grid` - Routing grid providing clearance data and optional GPU acceleration.
+///
+/// # Side Effects
+/// Replaces unlocked non-differential tracks in `board.tracks`.
 pub fn gloss_tracks_standard(board: &mut Board, grid: &RoutingGrid) {
     let mut net_ids: Vec<usize> = board
         .tracks
@@ -15779,12 +17733,26 @@ pub fn gloss_tracks_standard(board: &mut Board, grid: &RoutingGrid) {
     }
 }
 
+/// Circular obstacle representation used during homotopic rubber-band relaxation.
 #[derive(Clone, Debug)]
 pub struct ObstacleInfo {
+    /// World-space center `(x, y)` in millimeters (`mm`) of the foreign pad or via.
     pub center: (f64, f64),
+    /// Minimum safe clearance radius in millimeters (`mm`) from `center` to a trace's centerline.
     pub safe_radius: f64,
 }
 
+/// Tests whether a 2D point lies strictly inside a simple polygon using the ray-casting (even-odd) rule.
+///
+/// Used by homotopic rubber-band relaxation to ensure a shortcut chord or triangle contraction
+/// does not jump across a foreign pad or via obstacle (preserving path homotopy).
+///
+/// # Arguments
+/// * `pt` - Query point `(x, y)` in millimeters (`mm`).
+/// * `poly` - Ordered polygon vertices `(x, y)` in millimeters (`mm`).
+///
+/// # Returns
+/// `true` if `pt` lies inside `poly`.
 pub fn point_in_polygon(pt: (f64, f64), poly: &[(f64, f64)]) -> bool {
     let mut inside = false;
     let n = poly.len();
@@ -15805,6 +17773,16 @@ pub fn point_in_polygon(pt: (f64, f64), poly: &[(f64, f64)]) -> bool {
     inside
 }
 
+/// Collects all foreign pads and vias on `layer` as circular [`ObstacleInfo`] primitives for homotopic relaxation.
+///
+/// # Arguments
+/// * `board` - Board state containing footprints and vias.
+/// * `layer` - Copper layer index.
+/// * `net_id` - Net ID of the trace being relaxed.
+/// * `track_width` - Trace width in millimeters (`mm`).
+///
+/// # Returns
+/// Vector of [`ObstacleInfo`] items with precomputed safe clearance radii.
 pub fn collect_obstacles_for_net(board: &Board, layer: usize, net_id: usize, track_width: f64) -> Vec<ObstacleInfo> {
     let net_clr = board.get_netclass_for_net(net_id).clearance;
     let half_w = track_width * 0.5;
@@ -15843,6 +17821,17 @@ pub fn collect_obstacles_for_net(board: &Board, layer: usize, net_id: usize, tra
     obstacles
 }
 
+/// Subdivides polyline segments longer than `max_seg_len` by inserting intermediate vertices.
+///
+/// Gives homotopic rubber-band relaxation intermediate degrees of freedom to bend smoothly
+/// around nearby obstacles when pulling a long segment taut.
+///
+/// # Arguments
+/// * `points` - Mutable vector of polyline vertices `(x, y)` in millimeters (`mm`).
+/// * `max_seg_len` - Maximum segment length threshold in millimeters (`mm`) before subdivision.
+///
+/// # Side Effects
+/// Mutates `points` in place (capped at 28 vertices).
 pub fn subdivide_long_segments(points: &mut Vec<(f64, f64)>, max_seg_len: f64) {
     if points.len() < 2 || max_seg_len <= 0.1 {
         return;
@@ -15865,10 +17854,28 @@ pub fn subdivide_long_segments(points: &mut Vec<(f64, f64)>, max_seg_len: f64) {
     *points = out;
 }
 
+/// Relaxes unlocked tracks across all nets on `board` into taut any-angle homotopic rubber-band polylines.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose unlocked tracks are relaxed.
+///
+/// # Side Effects
+/// Replaces unlocked non-differential tracks in `board.tracks`.
 pub fn relax_homotopic_rubber_bands(board: &mut Board) {
     relax_homotopic_rubber_bands_with_grid(board, None);
 }
 
+/// Relaxes unlocked tracks across all nets on `board` into taut any-angle homotopic rubber-band polylines,
+/// using optional GPU DRC acceleration from `grid`.
+///
+/// Also widens power/ground chains toward their netclass target width where clearance permits.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose unlocked tracks are relaxed.
+/// * `grid` - Optional routing grid providing a Vulkan compute engine for GPU shortcut screening.
+///
+/// # Side Effects
+/// Mutates `board.tracks`.
 pub fn relax_homotopic_rubber_bands_with_grid(board: &mut Board, grid: Option<&RoutingGrid>) {
     let mut net_ids: Vec<usize> = board
         .tracks
@@ -15946,10 +17953,35 @@ pub fn relax_homotopic_rubber_bands_with_grid(board: &mut Board, grid: Option<&R
     }
 }
 
+/// Relaxes a single [`TrackChain`] into a taut homotopic rubber-band polyline while preserving obstacle topology.
+///
+/// # Arguments
+/// * `chain` - Mutable track chain to relax.
+/// * `board` - Board state with obstacles.
+///
+/// # Side Effects
+/// Mutates `chain.points` and `chain.width` in place.
 pub fn relax_chain_homotopic(chain: &mut TrackChain, board: &Board) {
     relax_chain_homotopic_with_gpu(chain, board, None, None);
 }
 
+/// Internal implementation of homotopic rubber-band chain relaxation with optional GPU DRC batch screening.
+///
+/// Performs 5 stages per pass:
+/// 1. Homotopic triangle shortcutting (collapsing 3-vertex bends if no obstacle lies inside the triangle).
+/// 2. Multi-point chord shortcutting (collapsing sub-chains if no obstacle lies inside the enclosed polygon).
+/// 3. Obstacle tangent apex contraction (pulling vertices radially onto the safe clearance boundary of blocking obstacles).
+/// 4. Binary-search taut relaxation toward neighbor midpoints.
+/// 5. Netclass channel centering for wide power traces.
+///
+/// # Arguments
+/// * `chain` - Mutable track chain to relax.
+/// * `board` - Board state with obstacles.
+/// * `grid` - Optional routing grid.
+/// * `drc_ctx` - Optional GPU DRC context for batch shortcut screening.
+///
+/// # Side Effects
+/// Mutates `chain.points` and `chain.width` in place.
 fn relax_chain_homotopic_with_gpu(
     chain: &mut TrackChain,
     board: &Board,
@@ -16258,6 +18290,17 @@ fn relax_chain_homotopic_with_gpu(
     }
 }
 
+/// Checks whether an [`ArcSegment`] satisfies all board boundary, foreign pad, via, keepout, track, and arc clearances.
+///
+/// Discretizes the arc into chord segments and enforces symmetric bidirectional netclass copper
+/// and drill-hole clearances against all board obstacles.
+///
+/// # Arguments
+/// * `board` - Board state containing obstacles and netclasses.
+/// * `arc` - Candidate [`ArcSegment`] to validate.
+///
+/// # Returns
+/// `true` if the arc is completely free of DRC violations.
 pub fn is_arc_clear(board: &Board, arc: &ArcSegment) -> bool {
     let clearance = board.get_netclass_for_net(arc.net_id).clearance;
     let half_w = arc.width * 0.5;
@@ -16457,8 +18500,16 @@ pub fn is_arc_clear(board: &Board, arc: &ArcSegment) -> bool {
     true
 }
 
-/// Batch-screens candidate `ArcSegment` primitives on the GPU (`GpuDrcContext`, 8 chords per arc)
-/// and verifies all GPU-passing candidates in parallel via `is_arc_clear`.
+/// Batch-screens candidate [`ArcSegment`] primitives on the GPU ([`GpuDrcContext`], 8 chords per arc)
+/// and verifies all GPU-passing candidates in parallel via [`is_arc_clear`].
+///
+/// # Arguments
+/// * `board` - Board state with obstacles and netclasses.
+/// * `drc_ctx` - GPU DRC snapshot used for hardware-accelerated screening.
+/// * `arcs` - Slice of candidate [`ArcSegment`] items to validate.
+///
+/// # Returns
+/// Vector of booleans (one per element of `arcs`) indicating whether each arc is DRC-clean.
 pub fn batch_validate_arcs_gpu(
     board: &Board,
     drc_ctx: &GpuDrcContext,
@@ -16512,16 +18563,27 @@ pub fn batch_validate_arcs_gpu(
 
 /// Cubic Bézier curve $B(t) = (1-t)^3 P_0 + 3(1-t)^2 t P_1 + 3(1-t) t^2 P_2 + t^3 P_3$
 /// used to represent $G^1$-continuous organic track corners and arches before decomposing
-/// into strictly tangent KiCad circular `ArcSegment` primitives.
+/// into strictly tangent KiCad circular [`ArcSegment`] primitives.
 #[derive(Debug, Clone, Copy)]
 pub struct CubicBezier {
+    /// Start endpoint $P_0 = (x, y)$ in millimeters (`mm`) at $t = 0$.
     pub p0: (f64, f64),
+    /// First interior control point $P_1 = (x, y)$ in millimeters (`mm`) governing the entry tangent $P_1 - P_0$.
     pub p1: (f64, f64),
+    /// Second interior control point $P_2 = (x, y)$ in millimeters (`mm`) governing the exit tangent $P_3 - P_2$.
     pub p2: (f64, f64),
+    /// End endpoint $P_3 = (x, y)$ in millimeters (`mm`) at $t = 1$.
     pub p3: (f64, f64),
 }
 
 impl CubicBezier {
+    /// Evaluates the point $B(t)$ on the cubic Bézier curve at parameter `t` in `[0.0, 1.0]`.
+    ///
+    /// # Arguments
+    /// * `t` - Curve parameter in `[0.0, 1.0]`.
+    ///
+    /// # Returns
+    /// World coordinates `(x, y)` in millimeters (`mm`).
     pub fn eval(&self, t: f64) -> (f64, f64) {
         let u = 1.0 - t;
         let b0 = u * u * u;
@@ -16534,6 +18596,13 @@ impl CubicBezier {
         )
     }
 
+    /// Evaluates the first derivative vector $B'(t)$ of the cubic Bézier curve at parameter `t` in `[0.0, 1.0]`.
+    ///
+    /// # Arguments
+    /// * `t` - Curve parameter in `[0.0, 1.0]`.
+    ///
+    /// # Returns
+    /// Tangent derivative vector `(dx/dt, dy/dt)` in millimeters (`mm`).
     pub fn derivative(&self, t: f64) -> (f64, f64) {
         let u = 1.0 - t;
         let d0 = 3.0 * u * u;
@@ -16546,8 +18615,17 @@ impl CubicBezier {
     }
 
     /// Constructs a $G^1$-tangent corner Bézier curve from entry point `t_in`, corner apex `p_corner`,
-    /// and exit point `t_out`. The tangents at $t=0$ and $t=1$ point strictly along `p_corner - t_in`
-    /// and `t_out - p_corner`.
+    /// and exit point `t_out`.
+    ///
+    /// The tangents at $t=0$ and $t=1$ point strictly along `p_corner - t_in` and `t_out - p_corner`.
+    ///
+    /// # Arguments
+    /// * `t_in` - Entry tangent point `(x, y)` in `mm` on the incoming arm.
+    /// * `p_corner` - Sharp corner apex `(x, y)` in `mm`.
+    /// * `t_out` - Exit tangent point `(x, y)` in `mm` on the outgoing arm.
+    ///
+    /// # Returns
+    /// A [`CubicBezier`] curve smoothly rounding the corner at `p_corner`.
     pub fn from_corner(t_in: (f64, f64), p_corner: (f64, f64), t_out: (f64, f64)) -> Self {
         const KAPPA: f64 = 0.5522847498;
         let p1 = (
@@ -16568,6 +18646,14 @@ impl CubicBezier {
 
     /// Constructs a smooth single-span arch Bézier between `start` and `end` with midpoint normal
     /// deflection `normal_offset`.
+    ///
+    /// # Arguments
+    /// * `start` - Start point `(x, y)` in `mm`.
+    /// * `end` - End point `(x, y)` in `mm`.
+    /// * `normal_offset` - Signed perpendicular bow deflection in `mm` at the curve midpoint.
+    ///
+    /// # Returns
+    /// A [`CubicBezier`] arch connecting `start` and `end`.
     pub fn from_arch(start: (f64, f64), end: (f64, f64), normal_offset: f64) -> Self {
         let dx = end.0 - start.0;
         let dy = end.1 - start.1;
@@ -16586,8 +18672,16 @@ impl CubicBezier {
     }
 
     /// Decomposes the cubic Bézier curve into 1 (symmetric) or 2 (asymmetric $G^1$ biarc) KiCad
-    /// `ArcSegment` primitives whose tangents at `p0`, the interior biarc join, and `p3` are
+    /// [`ArcSegment`] primitives whose tangents at `p0`, the interior biarc join, and `p3` are
     /// strictly $G^1$-continuous ($0.0^\circ$ kink).
+    ///
+    /// # Arguments
+    /// * `width` - Trace width in millimeters (`mm`).
+    /// * `layer` - Copper layer index.
+    /// * `net_id` - Net ID of the arc(s).
+    ///
+    /// # Returns
+    /// Vector of 1 or 2 tangent [`ArcSegment`] primitives (or empty if degenerate).
     pub fn to_kicad_arcs(&self, width: f64, layer: usize, net_id: usize) -> Vec<ArcSegment> {
         let v_in = (self.p1.0 - self.p0.0, self.p1.1 - self.p0.1);
         let v_out = (self.p2.0 - self.p3.0, self.p2.1 - self.p3.1);
@@ -16693,8 +18787,23 @@ impl CubicBezier {
     }
 }
 
-/// Fits a $G^1$-continuous asymmetric `CubicBezier` corner curve at `p_curr` when one leg is longer
+/// Fits a $G^1$-continuous asymmetric [`CubicBezier`] corner curve at `p_curr` when one leg is longer
 /// than the other, decomposing it into two tangent circular arcs.
+///
+/// # Arguments
+/// * `board` - Board state with obstacles.
+/// * `drc_ctx` - GPU DRC snapshot for batch arc validation.
+/// * `p_curr` - Corner apex `(x, y)` in `mm`.
+/// * `u1` - Unit vector pointing from `p_curr` along the incoming leg.
+/// * `u2` - Unit vector pointing from `p_curr` along the outgoing leg.
+/// * `avail_a` - Available length in `mm` along `u1`.
+/// * `avail_b` - Available length in `mm` along `u2`.
+/// * `width` - Trace width in `mm`.
+/// * `layer` - Copper layer index.
+/// * `net_id` - Net ID of the trace.
+///
+/// # Returns
+/// `Some((t_in, t_out, bi_arcs, used_b))` if a DRC-clean biarc fits, or `None` if blocked or too short.
 fn try_fit_asymmetric_corner_biarc(
     board: &Board,
     drc_ctx: &GpuDrcContext,
@@ -16747,8 +18856,21 @@ fn try_fit_asymmetric_corner_biarc(
     None
 }
 
-/// Fits a single smooth `CubicBezier::from_arch` arc directly from `start_pt` to `end_pt` for
+/// Fits a single smooth [`CubicBezier::from_arch`] arc directly from `start_pt` to `end_pt` for
 /// standalone 2-point chains with no straight end stubs (so there are zero stub-to-arc kinks).
+///
+/// # Arguments
+/// * `board` - Board state with obstacles.
+/// * `drc_ctx` - GPU DRC snapshot for batch arc validation.
+/// * `start_pt` - Start endpoint `(x, y)` in `mm`.
+/// * `end_pt` - End endpoint `(x, y)` in `mm`.
+/// * `width` - Trace width in `mm`.
+/// * `layer` - Copper layer index.
+/// * `net_id` - Net ID of the trace.
+/// * `pref_sign` - Preferred perpendicular bow sign (`1.0` or `-1.0`).
+///
+/// # Returns
+/// `Some(arc)` if a DRC-clean gentle arch fits between `start_pt` and `end_pt`, or `None`.
 fn try_fit_standalone_arch(
     board: &Board,
     drc_ctx: &GpuDrcContext,
@@ -16784,10 +18906,26 @@ fn try_fit_standalone_arch(
     None
 }
 
+/// Replaces interior polyline bends across all unlocked tracks with $G^1$-tangent circular [`ArcSegment`] fillets (`1.0 mm` target radius).
+///
+/// # Arguments
+/// * `board` - Mutable board state whose unlocked tracks are rounded with tangent arcs.
+///
+/// # Side Effects
+/// Mutates `board.tracks` and `board.arcs`.
 pub fn apply_any_angle_tangent_arcs(board: &mut Board) {
     apply_tangent_arcs_with_options(board, 1.0, false);
 }
 
+/// Internal tangent-arc fitting engine supporting both standard radiused corners and wide organic biarcs/arches.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose unlocked tracks and arcs are updated.
+/// * `target_radius` - Target fillet radius in millimeters (`mm`).
+/// * `organic_mode` - When `true`, also fits asymmetric corner biarcs and standalone 2-point arches.
+///
+/// # Side Effects
+/// Mutates `board.tracks` and `board.arcs`.
 fn apply_tangent_arcs_with_options(board: &mut Board, target_radius: f64, organic_mode: bool) {
     let mut net_ids: Vec<usize> = board
         .tracks
@@ -17009,11 +19147,32 @@ fn apply_tangent_arcs_with_options(board: &mut Board, target_radius: f64, organi
 }
 
 /// Converts a routed board's unlocked tracks into hand-drawn-like organic traces
-/// using homotopic rubber-band relaxation and $G^1$-continuous `CubicBezier` corner curves.
+/// using homotopic rubber-band relaxation and $G^1$-continuous [`CubicBezier`] corner curves.
+///
+/// Uses `default_acid_trap_fillet_radius` for acute-junction filleting.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose unlocked tracks and arcs are converted.
+///
+/// # Side Effects
+/// Mutates `board.tracks`, `board.arcs`, and `board.vias` (with per-stage electrical connectivity rollback).
 pub fn convert_tracks_to_organic(board: &mut Board) {
     convert_tracks_to_organic_with_fillet_radius(board, default_acid_trap_fillet_radius());
 }
 
+/// Converts a routed board's unlocked tracks into organic curved traces with an explicit acute-junction `fillet_radius`.
+///
+/// Snapshot-verifies electrical connectivity after each transformation stage (arc reconstruction,
+/// T-junction splitting, homotopic relaxation, tangent-arc fitting, acute-junction filleting,
+/// netclass widening, and dangling stub pruning) and automatically restores any net whose
+/// pad-to-pad connectivity would be broken.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose unlocked tracks, arcs, and vias are updated.
+/// * `fillet_radius` - Target fillet radius in millimeters (`mm`) for acute-angle junctions (`<= 0.0` skips filleting).
+///
+/// # Side Effects
+/// Mutates `board.tracks`, `board.arcs`, and `board.vias`.
 pub fn convert_tracks_to_organic_with_fillet_radius(board: &mut Board, fillet_radius: f64) {
     let conns = AutoRouter::new(1).extract_connections(board);
     let pre_connected: Vec<bool> = conns
@@ -17240,15 +19399,28 @@ pub fn convert_tracks_to_organic_with_fillet_radius(board: &mut Board, fillet_ra
     crate::memlog::checkpoint_board("convert_tracks_to_organic::done", board);
 }
 
-/// Unit direction leaving `arc` at its start (`at_start`) or end point, along the arc.
+/// Computes the unit tangent direction vector leaving `arc` at its start (`at_start == true`) or end point, pointing into the arc interior.
+///
+/// # Arguments
+/// * `arc` - Circular arc segment.
+/// * `at_start` - `true` to query the tangent at `arc.start()`, `false` for `arc.end()`.
+///
+/// # Returns
+/// Unit direction vector `(ux, uy)` pointing along the arc away from the queried endpoint.
 pub fn arc_arm_dir(arc: &ArcSegment, at_start: bool) -> (f64, f64) {
     let sweep = (arc.end_angle_rad - arc.start_angle_rad).signum();
     let (th, s) = if at_start { (arc.start_angle_rad, sweep) } else { (arc.end_angle_rad, -sweep) };
     (-th.sin() * s, th.cos() * s)
 }
 
-/// Replace arcs meeting a same-net junction at < 90 deg with chords, so the track-based
-/// filleting below can see (and round off) forks whose acute side is formed by an arc.
+/// Replaces unlocked arcs meeting a same-net junction at `< 90°` with straight chords so
+/// track-based acute-junction filleting can see and round off forks whose acute side was formed by an arc.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose acute junction arcs are exploded into chord [`TrackSegment`] items.
+///
+/// # Side Effects
+/// Removes qualifying [`ArcSegment`] items from `board.arcs` and appends replacement [`TrackSegment`] chords to `board.tracks`.
 fn explode_arcs_at_acute_junctions(board: &mut Board) {
     let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).hypot(a.1 - b.1) < 2e-3;
     let mut explode = Vec::new();
@@ -17310,28 +19482,43 @@ fn explode_arcs_at_acute_junctions(board: &mut Board) {
     }
 }
 
-/// A pad corner used as a track exit, with the pad's local frame (cos, sin) and corner signs.
+/// A rectangular pad corner used as a diagonal track exit, storing the pad's local frame `(cos, sin)` and corner quadrant signs.
 #[derive(Clone, Copy, Debug)]
 struct CornerPort {
+    /// World coordinates `(x, y)` in `mm` of the pad corner.
     corner: (f64, f64),
+    /// Cosine of the pad's world rotation angle.
     cs: f64,
+    /// Sine of the pad's world rotation angle.
     sn: f64,
+    /// Local X quadrant sign (`-1` or `+1`) of the corner.
     cx: i8,
+    /// Local Y quadrant sign (`-1` or `+1`) of the corner.
     cy: i8,
 }
 
 /// Exit "ports" of a rectangular pad in its local frame: sides (outward normal) or corners.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PadPort {
+    /// Orthogonal exit through a pad edge with local outward normal `(nx, ny)`.
     Side(i8, i8),
+    /// Diagonal exit through a pad corner in local quadrant `(cx, cy)`.
     Corner(i8, i8),
 }
 
-/// Re-anchor tracks at rectangular pads so each leaves cleanly: perpendicular through a side, or
-/// with its centreline through a corner (heading inside that corner's 90 deg cone), one track per
-/// port. Then neither copper edge meets the pad outline at < 90 deg and two tracks never leave a
-/// wedge between them outside the pad. Pad-centre vertices are skipped by the fillet pass, so this
-/// is the acid-trap treatment for pad entries.
+/// Re-anchors tracks at rectangular pads so each leaves cleanly: perpendicular through a side, or
+/// with its centerline through a corner (heading inside that corner's 90° cone), one track per
+/// port.
+///
+/// Ensures neither copper edge meets the pad outline at `< 90°` and two tracks never leave an
+/// acute wedge between them outside the pad. Pad-center vertices are skipped by the fillet pass,
+/// so this provides the acid-trap treatment for pad entries.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose pad-incident tracks are re-anchored.
+///
+/// # Side Effects
+/// Mutates `board.tracks` in place.
 // ponytail: tracks only; arcs ending on pads and oval/circle pads (radial exits are already clean) are left alone.
 fn align_pad_exits(board: &mut Board) {
     const AXIS_SIN: f64 = 0.035; // ~2 deg
@@ -17491,6 +19678,7 @@ fn align_pad_exits(board: &mut Board) {
     // A pad-to-pad track can be re-anchored at both ends: merge edits per track into one polyline.
     // A corner exit must aim at whatever the track now reaches on its other end (the other pad's
     // corner or leg point), so re-aim it and drop it if that leaves the corner's cone.
+    /// Re-anchored endpoint descriptor `(pad_end_pt, optional_leg_pt, optional_corner_port)`.
     type End = ((f64, f64), Option<(f64, f64)>, Option<CornerPort>);
     let mut per_track: HashMap<usize, [Option<End>; 2]> = HashMap::new();
     for (k, at_start, pad_end, leg, corner) in edits {
@@ -17566,7 +19754,14 @@ fn align_pad_exits(board: &mut Board) {
 ///   branch is bent with radius up to `fillet_radius` so it lands on the trunk at $90^\circ$ (a
 ///   tangential merge would still leave an acute notch at the copper edges).
 /// - At a degree-2 acute corner $A \to P \to B$ ($\theta < 90^\circ$), the sharp apex $P$ is replaced
-///   by a $G^1$-tangent circular fillet `ArcSegment` (or a mitered obtuse bridge if an arc is blocked).
+///   by a $G^1$-tangent circular fillet [`ArcSegment`] (or a mitered obtuse bridge if an arc is blocked).
+///
+/// # Arguments
+/// * `board` - Mutable board state whose tracks and arcs are filleted.
+/// * `fillet_radius` - Target fillet radius in millimeters (`mm`).
+///
+/// # Side Effects
+/// Mutates `board.tracks` and `board.arcs`.
 pub fn fillet_acute_angle_junctions(board: &mut Board, fillet_radius: f64) {
     if fillet_radius <= 1e-4 {
         return;
@@ -18047,6 +20242,19 @@ pub fn fillet_acute_angle_junctions(board: &mut Board, fillet_radius: f64) {
     }
 }
 
+/// Adjusts unlocked track and arc widths across `board` to match netclass target widths while respecting DRC clearances.
+///
+/// Performs four stages:
+/// 1. Necks down any segment or arc whose current width violates copper or drill-hole clearance.
+/// 2. Micro-nudges vias and interior vertices that slightly encroach on clearances.
+/// 3. Widens wide power/ground traces (`target_width > 0.25 mm`) up toward their netclass width where clearance allows.
+/// 4. Harmonizes widths across connected components on each `(net_id, layer)` so traces maintain a uniform body width (allowing only short terminal pad-entry stubs to remain necked).
+///
+/// # Arguments
+/// * `board` - Mutable board state whose tracks, arcs, and vias are adjusted.
+///
+/// # Side Effects
+/// Mutates `board.tracks`, `board.arcs`, and `board.vias`.
 fn widen_tracks_and_arcs_to_netclass(board: &mut Board) {
     // 1. Neck down any track or arc whose current width violates netclass or hole clearance
     let drc_ctx = GpuDrcContext::from_board(board);
@@ -18602,6 +20810,17 @@ fn widen_tracks_and_arcs_to_netclass(board: &mut Board) {
 }
 
 /// Converts a board's organic curved/any-angle traces back into standard 45°/90° octilinear straight tracks.
+///
+/// Replaces all unlocked [`ArcSegment`] items with straight chords or discretized segments,
+/// enforces the 45° octilinear dogleg grid across all chains, runs standard octilinear glossing,
+/// harmonizes netclass trace widths, and prunes dangling stubs.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose unlocked arcs and tracks are converted to straight octilinear segments.
+/// * `grid` - Routing grid used for clearance validation during conversion and glossing.
+///
+/// # Side Effects
+/// Mutates `board.arcs`, `board.tracks`, and `board.vias`.
 pub fn convert_tracks_to_straight(board: &mut Board, grid: &RoutingGrid) {
     let unlocked_arcs: Vec<ArcSegment> = board.arcs.iter().filter(|a| !a.is_locked).cloned().collect();
     board.arcs.retain(|a| a.is_locked);
@@ -18672,24 +20891,47 @@ pub fn convert_tracks_to_straight(board: &mut Board, grid: &RoutingGrid) {
 
 /// Flat GPU-ready copper obstacle snapshot for batch DRC clearance evaluation.
 pub struct GpuDrcContext {
+    /// Flat array of pad obstacles in `#[repr(C)]` GPU layout.
     pub pads: Vec<GpuDrcPad>,
+    /// Flat array of track segment obstacles in `#[repr(C)]` GPU layout.
     pub tracks: Vec<GpuDrcTrack>,
+    /// Flat array of via obstacles in `#[repr(C)]` GPU layout.
     pub vias: Vec<GpuDrcVia>,
 }
 
 impl GpuDrcContext {
     /// Extracts all pads, tracks, and vias from `board` into flat `#[repr(C)]` POD arrays
     /// suitable for CUDA (`batch_drc_eval_kernel`) or Vulkan (`BATCH_DRC_EVAL_WGSL`).
+    ///
+    /// # Arguments
+    /// * `board` - Board state to snapshot.
+    ///
+    /// # Returns
+    /// A populated [`GpuDrcContext`] with netclass copper clearances attached to each primitive.
     pub fn from_board(board: &Board) -> Self {
         Self::build(board, false)
     }
 
     /// Extracts all pads, tracks, and vias with `clearance = 0.0` for physical copper
-    /// short-circuit detection (`validate_and_clean_copper`).
+    /// short-circuit detection ([`validate_and_clean_copper`]).
+    ///
+    /// # Arguments
+    /// * `board` - Board state to snapshot.
+    ///
+    /// # Returns
+    /// A populated [`GpuDrcContext`] with zero clearance margins (detecting only direct copper overlap).
     pub fn from_board_with_zero_clearance(board: &Board) -> Self {
         Self::build(board, true)
     }
 
+    /// Internal builder converting `board` pads, tracks, and vias into `#[repr(C)]` GPU obstacle buffers.
+    ///
+    /// # Arguments
+    /// * `board` - Board state to snapshot.
+    /// * `zero_clearance` - When `true`, sets all obstacle clearances to `0.0 mm`.
+    ///
+    /// # Returns
+    /// A populated [`GpuDrcContext`].
     fn build(board: &Board, zero_clearance: bool) -> Self {
         let mut net_clearances = HashMap::with_capacity(board.netclasses.len() * 4 + 8);
         let default_clr = if zero_clearance {
@@ -18774,6 +21016,13 @@ impl GpuDrcContext {
     }
 
     /// Evaluates a batch of candidate vias/segments on the GPU (preferring CUDA, falling back to Vulkan).
+    ///
+    /// # Arguments
+    /// * `vulkan` - Optional Vulkan compute engine fallback when CUDA is unavailable.
+    /// * `candidates` - Slice of candidate vias/segments to evaluate against `self.pads`, `self.tracks`, and `self.vias`.
+    ///
+    /// # Returns
+    /// `Some(flags)` where `flags[i] != 0` indicates candidate `i` passed GPU DRC screening, or `None` if no GPU backend is active.
     pub fn evaluate(
         &self,
         vulkan: Option<&Arc<VulkanEngine>>,
@@ -18794,12 +21043,31 @@ impl GpuDrcContext {
     }
 }
 
-/// Computes the Euclidean distance from a point `p` to a line segment `(a, b)`.
+/// Computes the Euclidean distance in millimeters (`mm`) from a point `p` to a line segment `(a, b)`.
+///
+/// # Arguments
+/// * `p` - Query point `(x, y)` in `mm`.
+/// * `a` - Segment start `(x, y)` in `mm`.
+/// * `b` - Segment end `(x, y)` in `mm`.
+///
+/// # Returns
+/// Minimum Euclidean distance in `mm` from `p` to segment `ab`.
 pub fn dist_point_to_segment(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
     dist_to_segment(p.0, p.1, a.0, a.1, b.0, b.1)
 }
 
-/// Computes the minimum distance from point `pt` to the copper area of `pad`.
+/// Computes the minimum Euclidean distance in millimeters (`mm`) from point `pt` to the copper area of `pad`.
+///
+/// Accounts for circular, oval (capsule), and rotated rectangular pad shapes as well as footprint
+/// bottom-layer mirroring. Returns `0.0` if `pt` lies inside the pad's copper outline.
+///
+/// # Arguments
+/// * `pt` - Query point `(x, y)` in `mm`.
+/// * `fp` - Parent footprint providing world position, rotation, and layer flip state.
+/// * `pad` - Pad whose copper shape is queried.
+///
+/// # Returns
+/// Minimum distance in `mm` from `pt` to the pad copper boundary (`0.0` if inside).
 pub fn dist_point_to_pad(pt: (f64, f64), fp: &Footprint, pad: &Pad) -> f64 {
     let (px, py) = fp.pad_absolute_position(pad);
     if pad.shape == "circle" {
@@ -18838,7 +21106,19 @@ pub fn dist_point_to_pad(pt: (f64, f64), fp: &Footprint, pad: &Pad) -> f64 {
     }
 }
 
-/// Computes the minimum distance from line segment `(s, e)` to the copper area of `pad`.
+/// Computes the minimum Euclidean distance in millimeters (`mm`) from line segment `(s, e)` to the copper area of `pad`.
+///
+/// Accounts for circular and rotated rectangular/oval pad shapes as well as footprint bottom-layer mirroring.
+/// Returns `0.0` if segment `(s, e)` intersects or lies inside the pad's copper outline.
+///
+/// # Arguments
+/// * `s` - Segment start `(x, y)` in `mm`.
+/// * `e` - Segment end `(x, y)` in `mm`.
+/// * `fp` - Parent footprint providing world position, rotation, and layer flip state.
+/// * `pad` - Pad whose copper shape is queried.
+///
+/// # Returns
+/// Minimum distance in `mm` from segment `(s, e)` to the pad copper boundary (`0.0` if intersecting).
 pub fn dist_segment_to_pad(s: (f64, f64), e: (f64, f64), fp: &Footprint, pad: &Pad) -> f64 {
     let (px, py) = fp.pad_absolute_position(pad);
     if pad.shape == "circle" {
@@ -18892,10 +21172,22 @@ pub fn dist_segment_to_pad(s: (f64, f64), e: (f64, f64), fp: &Footprint, pad: &P
 }
 
 /// Verifies whether candidate via location `pos` is completely legal and clearance-free
-/// against all foreign pads, tracks, vias, board boundary, and keepouts, as well as
-/// preventing overlapping or violating clearance against same-net SMD pads.
+/// against all foreign pads, tracks, vias, arcs, board boundary, and keepouts, as well as
+/// preventing overlapping or violating clearance against same-net SMD pads and drill holes.
+///
 /// An optional `ignore_pos` can be supplied to skip drill and proximity collision with
 /// an existing via undergoing repositioning or sliding.
+///
+/// # Arguments
+/// * `board` - Board state with obstacles and netclasses.
+/// * `pos` - Candidate via center `(x, y)` in millimeters (`mm`).
+/// * `via_dia` - Via outer annular ring diameter in millimeters (`mm`).
+/// * `net_id` - Net ID of the via.
+/// * `clearance` - Minimum copper clearance in millimeters (`mm`).
+/// * `ignore_pos` - Optional existing via coordinate `(x, y)` in `mm` to exclude from self-collision checks.
+///
+/// # Returns
+/// `true` if placing a via of diameter `via_dia` at `pos` satisfies all copper, hole, and edge DRC rules.
 pub fn is_via_location_legal_ignoring(
     board: &Board,
     pos: (f64, f64),
@@ -19094,8 +21386,18 @@ pub fn is_via_location_legal_ignoring(
 }
 
 /// Verifies whether candidate via location `pos` is completely legal and clearance-free
-/// against all foreign pads, tracks, vias, board boundary, and keepouts, as well as
-/// preventing overlapping or violating clearance against same-net SMD pads.
+/// against all foreign pads, tracks, vias, arcs, board boundary, and keepouts, as well as
+/// preventing overlapping or violating clearance against same-net SMD pads and drill holes.
+///
+/// # Arguments
+/// * `board` - Board state with obstacles and netclasses.
+/// * `pos` - Candidate via center `(x, y)` in millimeters (`mm`).
+/// * `via_dia` - Via outer annular ring diameter in millimeters (`mm`).
+/// * `net_id` - Net ID of the via.
+/// * `clearance` - Minimum copper clearance in millimeters (`mm`).
+///
+/// # Returns
+/// `true` if placing a via of diameter `via_dia` at `pos` satisfies all copper, hole, and edge DRC rules.
 pub fn is_via_location_legal(
     board: &Board,
     pos: (f64, f64),
@@ -19106,7 +21408,19 @@ pub fn is_via_location_legal(
     is_via_location_legal_ignoring(board, pos, via_dia, net_id, clearance, None)
 }
 
-/// Verifies whether a candidate track segment is legal and clearance-free against foreign copper and keepouts.
+/// Verifies whether a candidate track segment is legal and clearance-free against foreign copper, drill holes, board edges, and keepouts.
+///
+/// # Arguments
+/// * `board` - Board state with obstacles and netclasses.
+/// * `start` - Segment start `(x, y)` in millimeters (`mm`).
+/// * `end` - Segment end `(x, y)` in millimeters (`mm`).
+/// * `width` - Trace width in millimeters (`mm`).
+/// * `layer` - Copper layer index.
+/// * `net_id` - Net ID of the segment.
+/// * `clearance` - Minimum copper clearance in millimeters (`mm`).
+///
+/// # Returns
+/// `true` if the segment satisfies all copper, drill-hole, keepout, and board-edge DRC rules.
 pub fn is_track_segment_legal(
     board: &Board,
     start: (f64, f64),
@@ -19285,6 +21599,12 @@ pub fn is_track_segment_legal(
 
 /// Splits unlocked same-net tracks at interior intersections, T-junctions, and pad/via centers,
 /// bridges off-center pad touches, and deduplicates identical collinear segments.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose unlocked tracks are split and deduplicated.
+///
+/// # Side Effects
+/// Replaces `board.tracks` with split and deduplicated segments.
 fn split_and_dedup_same_net_tracks(board: &mut Board) {
     board.tracks.retain(|t| t.is_locked || (t.start.0 - t.end.0).hypot(t.start.1 - t.end.1) > 1e-4);
     if board.tracks.is_empty() {
@@ -19471,6 +21791,15 @@ fn split_and_dedup_same_net_tracks(board: &mut Board) {
 
 /// Prunes redundant parallel tracks, multi-via duplicate bridges, and single-pad loops
 /// by extracting a minimal-cost Steiner tree over each net's pads and plane vias.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose redundant net cycles are removed.
+///
+/// # Returns
+/// `true` if at least one redundant track segment was pruned.
+///
+/// # Side Effects
+/// Removes non-tree unlocked [`TrackSegment`] items from `board.tracks`.
 fn prune_redundant_net_cycles(board: &mut Board) -> bool {
     if board.footprints.is_empty() || board.tracks.len() < 2 {
         return false;
@@ -19777,8 +22106,17 @@ fn prune_redundant_net_cycles(board: &mut Board) -> bool {
     any_dropped
 }
 
-/// Automated dangling track & via pruning.
-/// Iteratively removes dead-end degree-1 track segments (antennas), redundant cycles, and unconnected/single-layer vias.
+/// Automated dangling track, arc, and via pruning.
+///
+/// Iteratively removes dead-end degree-1 track and arc segments (antennas), redundant cycles
+/// (via `prune_redundant_net_cycles`), unconnected or single-layer vias, and floating copper
+/// islands (via `prune_orphan_components`).
+///
+/// # Arguments
+/// * `board` - Mutable board state whose dangling tracks, arcs, and vias are pruned.
+///
+/// # Side Effects
+/// Mutates `board.tracks`, `board.arcs`, and `board.vias`.
 pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
     if board.footprints.is_empty() {
         return;
@@ -20163,7 +22501,13 @@ pub fn prune_dangling_tracks_and_vias(board: &mut Board) {
     prune_orphan_components(board);
 }
 
-/// Prunes disconnected islands of copper that do not connect to any pad or plane.
+/// Prunes disconnected islands of copper (tracks, arcs, and vias) that have no electrical path to any pad, locked primitive, or reference plane.
+///
+/// # Arguments
+/// * `board` - Mutable board state whose floating copper islands are removed.
+///
+/// # Side Effects
+/// Retains only pad-anchored or plane-anchored connected components in `board.tracks`, `board.arcs`, and `board.vias`.
 fn prune_orphan_components(board: &mut Board) {
     if board.tracks.is_empty() && board.arcs.is_empty() {
         return;
@@ -20453,14 +22797,29 @@ fn prune_orphan_components(board: &mut Board) {
     board.vias = new_vias;
 }
 
-/// Automated DFM Teardrop Generator:
+/// Automated DFM teardrop generator hook.
+///
 /// Teardrops are natively and parametrically generated by KiCad's EDA engine on board load/save.
+///
+/// # Arguments
+/// * `_board` - Mutable board reference (no-op; delegated to KiCad parametric teardrops).
 pub fn add_teardrops(_board: &mut Board) {
     // Delegated to KiCad native parametric teardrop engine (Edit -> Teardrops...)
 }
 
-/// Comprehensive pre-export DRC validation: detects and eliminates any residual shorts
-/// or clearance violations between tracks, vias, and pads of different nets.
+/// Comprehensive pre-export DRC validation and copper cleanup.
+///
+/// Enforces minimum via annular ring widths, adds short pad-entry stubs for shallow arcs touching
+/// rectangular pads (working around KiCad 10's `SHAPE_ARC::Collide` quirk), detects and removes
+/// any residual short-circuits or board-edge violations between tracks, vias, and pads of different
+/// nets (using GPU batch screening when available), merges overlapping same-net vias, and prunes
+/// resulting dangling stubs.
+///
+/// # Arguments
+/// * `board` - Mutable board state to validate and clean before export.
+///
+/// # Side Effects
+/// Mutates `board.raw_content`, `board.vias`, `board.tracks`, and `board.arcs`.
 pub fn validate_and_clean_copper(board: &mut Board) {
     if let Some(nc_idx) = board.raw_content.find("\n  (net_class \"") {
         let max_fp_end = board
@@ -20958,22 +23317,40 @@ pub fn validate_and_clean_copper(board: &mut Board) {
     }
 }
 
-/// Represents an SI violation where parallel trace coupling between two nets exceeds the permitted threshold.
+/// Signal-integrity (SI) violation report indicating that parallel trace coupling between two nets exceeds the permitted threshold.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CouplingViolation {
+    /// Net ID of the first coupled net (smaller net ID).
     pub net_a: usize,
+    /// Net ID of the second coupled net (larger net ID).
     pub net_b: usize,
+    /// Schematic net name of `net_a`.
     pub net_a_name: String,
+    /// Schematic net name of `net_b`.
     pub net_b_name: String,
+    /// Total accumulated parallel coupled length in millimeters (`mm`).
     pub coupled_length_mm: f64,
+    /// Maximum allowed parallel coupled length in millimeters (`mm`) from the stricter netclass.
     pub max_allowed_mm: f64,
+    /// Bounding-box minimum corner `(min_x, min_y)` in millimeters (`mm`) of the coupled span.
     pub span_start: (f64, f64),
+    /// Bounding-box maximum corner `(max_x, max_y)` in millimeters (`mm`) of the coupled span.
     pub span_end: (f64, f64),
 }
 
-/// Evaluates post-routing parallel trace coupling between every net pair on each copper layer.
-/// Identifies parallel runs where centerline separation d <= (W_a + W_b)/2 + 2 * max(C_a, C_b) + 0.05 mm,
-/// accumulates coupled length, and emits warnings and violations when exceeding max_coupled_length_mm.
+/// Evaluates post-routing parallel trace coupling between every non-differential net pair on each copper layer.
+///
+/// Uses an LBVH spatial index (`build_gpu_lbvh`) to accelerate broad-phase pair queries, identifies
+/// parallel runs where centerline separation satisfies
+/// $d \le \frac{W_a + W_b}{2} + 2 \max(C_a, C_b) + 0.05\text{ mm}$,
+/// accumulates total coupled length per net pair, and emits warnings and [`CouplingViolation`] records
+/// when exceeding `max_coupled_length_mm`.
+///
+/// # Arguments
+/// * `board` - Board state whose routed tracks and netclasses are analyzed.
+///
+/// # Returns
+/// Vector of [`CouplingViolation`] records for all net pairs exceeding their coupled length budget.
 pub fn validate_crosstalk_and_coupling(board: &Board) -> Vec<CouplingViolation> {
     let mut violations = Vec::new();
     let track_count = board.tracks.len();
@@ -21182,8 +23559,17 @@ pub fn validate_crosstalk_and_coupling(board: &Board) -> Vec<CouplingViolation> 
     violations
 }
 
-/// Generates the parallel equidistant track segments for all nets in a BusBundle along its guide polyline.
-/// Handles corner mitering (concentric 45° chamfers) and terminal pad fan-in/fan-out.
+/// Generates the parallel equidistant [`TrackSegment`] lanes for all nets in a [`BusBundle`] along its guide polyline.
+///
+/// Handles corner mitering (concentric 45° chamfers) and terminal pad fan-in/fan-out doglegs.
+///
+/// # Arguments
+/// * `board` - Board state used to locate terminal footprint pads for each net in the bundle.
+/// * `bundle` - Bus bundle definition containing net IDs, guide polyline, layer, and track width.
+/// * `spacing` - Edge-to-edge copper spacing in millimeters (`mm`) between adjacent lanes in the bundle.
+///
+/// # Returns
+/// Vector of generated [`TrackSegment`] primitives for all lanes in the bundle.
 pub fn generate_bundle_tracks(
     board: &Board,
     bundle: &BusBundle,
@@ -21445,9 +23831,22 @@ pub fn generate_bundle_tracks(
     all_tracks
 }
 
-/// Routes an entire bus bundle along a user-sketched guide polyline using equidistant river routing.
+/// Routes an entire [`BusBundle`] along a user-sketched guide polyline using equidistant river routing.
+///
 /// Offsets each net symmetrically from the guide spine, applies 45° concentric corner miters,
-/// connects terminal endpoints to component pads, and runs DRC checks with dynamic bottleneck compression.
+/// connects terminal endpoints to component pads, and runs DRC checks with dynamic bottleneck
+/// spacing compression down to the netclass minimum clearance.
+///
+/// # Arguments
+/// * `board` - Mutable board state where legal bundle tracks and bundle metadata are committed.
+/// * `grid` - Mutable routing grid re-rasterized after committing the bundle tracks.
+/// * `bundle` - Bus bundle specification to route.
+///
+/// # Returns
+/// `true` if a DRC-legal spacing was found and the bundle tracks were committed to `board` and `grid`.
+///
+/// # Side Effects
+/// Appends generated tracks to `board.tracks`, records `bundle` in `board.bundles`, and re-rasterizes `grid`.
 pub fn route_bundle_along_guide(
     board: &mut Board,
     grid: &mut RoutingGrid,
