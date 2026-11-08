@@ -1800,16 +1800,6 @@ pub fn legalize_placement(
     if initial.overlaps == 0 && initial.boundary_violations == 0 {
         return initial;
     }
-    let num_threads = rayon::current_num_threads().max(2);
-    if let Some(st) = live {
-        if let Ok(mut g) = st.lock() {
-            g.phase = TrialPhase::Legalizing;
-            g.push_log(format!(
-                "[Legalizer] Resolving {} initial courtyard overlaps across {} CPU cores...",
-                initial.overlaps, num_threads
-            ));
-        }
-    }
 
     let movable: Vec<usize> = board
         .footprints
@@ -1842,123 +1832,157 @@ pub fn legalize_placement(
     }
 
     if let Some(ref vk) = config.vulkan {
-        let (fp_descs, edges, courtyards) =
-            build_gpu_sa_descriptors(board, config, &ties, &initial);
-        let nf = board.footprints.len();
-        let ne = edges.len() / 2;
-        let (num_chains, steps_per_pass, num_passes): (u32, u32, u32) = if nf > 8 {
-            (1024, 24, 4)
-        } else {
-            (128, 12, 3)
-        };
-        let mut init_poses = Vec::with_capacity((num_chains as usize) * nf);
-        for _ in 0..num_chains {
-            for i in 0..nf {
-                init_poses.push([
-                    initial.positions[i].x as f32,
-                    initial.positions[i].y as f32,
-                    initial.rotations[i] as f32,
-                    initial.layers[i] as f32,
-                ]);
+        if let Some(st) = live {
+            if let Ok(mut g) = st.lock() {
+                g.phase = TrialPhase::Legalizing;
+                g.push_log(format!(
+                    "[Legalizer] Resolving {} initial courtyard overlaps on GPU ({})...",
+                    initial.overlaps,
+                    vk.device_name
+                ));
             }
         }
-        let sa_params = GpuSaParams {
-            num_chains,
-            num_footprints: nf as u32,
-            num_edges: ne as u32,
-            steps_per_pass,
-            seed: 0x517C_C1B7u32,
-            _pad0: 0,
-            corridor_congestion_weight: config.corridor_congestion_weight as f32,
-            flow_alignment_weight: config.flow_alignment_weight as f32,
-            board_min_x: boundary.min_x as f32,
-            board_min_y: boundary.min_y as f32,
-            board_max_x: boundary.max_x as f32,
-            board_max_y: boundary.max_y as f32,
-            grid_step: config.grid_step_mm as f32,
-            wirelength_weight: config.wirelength_weight as f32,
-            crossing_weight: config.crossing_weight as f32,
-            overlap_penalty: (config.overlap_penalty * 4.0).max(100_000.0) as f32,
-            boundary_penalty: (config.boundary_penalty * 4.0).max(200_000.0) as f32,
-            passive_affinity_weight: config.passive_affinity_weight as f32,
-            passive_max_dist: config.passive_max_dist as f32,
-            base_temp: 12.0,
+        let (fp_descs, full_edges, courtyards) =
+            build_gpu_sa_descriptors(board, config, &ties, &initial);
+        // Retain only passive/decoupling affinity edges (or a compact subset) during legalization
+        // so the GPU kernels focus compute throughput on courtyard overlap repulsion rather than
+        // O(Ne^2) ratsnest crossing checks.
+        let mut legal_edges = Vec::new();
+        for pair in full_edges.chunks_exact(2) {
+            if pair[0][3] > 0.5 && pair[0][3] < 2.5 && legal_edges.len() < 64 {
+                legal_edges.push(pair[0]);
+                legal_edges.push(pair[1]);
+            }
+        }
+        let nf = board.footprints.len();
+        let ne = legal_edges.len() / 2;
+        let engines = vk.all_engines();
+        let (num_chains, steps_per_pass, num_passes): (u32, u32, u32) = if nf > 8 {
+            (1024, 40, 5)
+        } else {
+            (256, 24, 4)
         };
-        if let Some((best_poses, best_scores)) = vk.run_gpu_sa_placer_chains(
-            &fp_descs,
-            &edges,
-            &init_poses,
-            &sa_params,
-            num_passes,
-            Some(&courtyards),
-        ) {
-            let mut ranked: Vec<(usize, f32, f32)> = best_scores
-                .iter()
-                .enumerate()
-                .map(|(i, s)| (i, s[2], s[1]))
-                .collect();
-            ranked.sort_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
-            });
-            let mut best_gpu: Option<PlacementState> = None;
-            for &(chain_idx, _, _) in ranked.iter().take(8) {
-                let mut cand = initial.clone();
-                let c_base = chain_idx * nf;
+        let mut seed_states: Vec<PlacementState> = vec![initial.clone()];
+
+        for round in 0..3u32 {
+            let mut init_poses = Vec::with_capacity((num_chains as usize) * nf);
+            for c in 0..(num_chains as usize) {
+                let src = &seed_states[c % seed_states.len()];
                 for i in 0..nf {
-                    if !board.footprints[i].is_locked {
-                        let p = best_poses[c_base + i];
-                        let rot = p[2] as f64;
-                        let (cx_min, cx_max, cy_min, cy_max) =
-                            board.footprints[i].origin_clamp_range(
-                                rot,
-                                cand.layers[i],
-                                config.min_spacing_mm,
-                                &boundary,
-                            );
-                        cand.positions[i] = Point::new(
-                            snap_to_grid((p[0] as f64).clamp(cx_min, cx_max), config.grid_step_mm),
-                            snap_to_grid((p[1] as f64).clamp(cy_min, cy_max), config.grid_step_mm),
-                        );
-                        cand.rotations[i] = rot;
-                        cand.update_component(i, board, config);
-                    }
+                    init_poses.push([
+                        src.positions[i].x as f32,
+                        src.positions[i].y as f32,
+                        src.rotations[i] as f32,
+                        src.layers[i] as f32,
+                    ]);
                 }
-                cand.evaluate(board, config, &ties);
-                if cand.overlaps == 0 && cand.boundary_violations == 0 {
-                    if let Some(st) = live {
-                        if let Ok(mut g) = st.lock() {
-                            g.push_log(format!(
-                                "[Legalizer] GPU SA pre-pass resolved all overlaps across {} chains",
-                                num_chains
-                            ));
+            }
+            let sa_params = GpuSaParams {
+                num_chains,
+                num_footprints: nf as u32,
+                num_edges: ne as u32,
+                steps_per_pass,
+                seed: 0x517C_C1B7u32.wrapping_add(round.wrapping_mul(0x9E37_79B9)),
+                _pad0: 0,
+                corridor_congestion_weight: 0.0,
+                flow_alignment_weight: 0.0,
+                board_min_x: boundary.min_x as f32,
+                board_min_y: boundary.min_y as f32,
+                board_max_x: boundary.max_x as f32,
+                board_max_y: boundary.max_y as f32,
+                grid_step: config.grid_step_mm as f32,
+                wirelength_weight: config.wirelength_weight as f32,
+                crossing_weight: 0.0,
+                overlap_penalty: (config.overlap_penalty * 8.0).max(200_000.0) as f32,
+                boundary_penalty: (config.boundary_penalty * 8.0).max(400_000.0) as f32,
+                passive_affinity_weight: config.passive_affinity_weight as f32,
+                passive_max_dist: config.passive_max_dist as f32,
+                base_temp: 10.0 / ((round + 1) as f32),
+            };
+
+            let engine = &engines[(round as usize) % engines.len()];
+            if let Some((best_poses, best_scores)) = engine.run_gpu_sa_placer_chains(
+                &fp_descs,
+                &legal_edges,
+                &init_poses,
+                &sa_params,
+                num_passes,
+                Some(&courtyards),
+            ) {
+                let mut ranked: Vec<(usize, f32, f32)> = best_scores
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (i, s[2], s[1]))
+                    .collect();
+                ranked.sort_by(|a, b| {
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+                });
+                let mut next_seeds = Vec::new();
+                for &(chain_idx, _, _) in ranked.iter().take(12) {
+                    let mut cand = initial.clone();
+                    let c_base = chain_idx * nf;
+                    for i in 0..nf {
+                        if !board.footprints[i].is_locked {
+                            let p = best_poses[c_base + i];
+                            let rot = p[2] as f64;
+                            let (cx_min, cx_max, cy_min, cy_max) =
+                                board.footprints[i].origin_clamp_range(
+                                    rot,
+                                    cand.layers[i],
+                                    config.min_spacing_mm,
+                                    &boundary,
+                                );
+                            cand.positions[i] = Point::new(
+                                snap_to_grid((p[0] as f64).clamp(cx_min, cx_max), config.grid_step_mm),
+                                snap_to_grid((p[1] as f64).clamp(cy_min, cy_max), config.grid_step_mm),
+                            );
+                            cand.rotations[i] = rot;
+                            cand.update_component(i, board, config);
                         }
                     }
-                    return cand;
+                    cand.evaluate(board, config, &ties);
+                    if cand.overlaps == 0 && cand.boundary_violations == 0 {
+                        if let Some(st) = live {
+                            if let Ok(mut g) = st.lock() {
+                                g.push_log(format!(
+                                    "[Legalizer] GPU resolved all initial courtyard overlaps across {} chains (round {})",
+                                    num_chains,
+                                    round + 1
+                                ));
+                            }
+                        }
+                        return cand;
+                    }
+                    if cand.boundary_violations < initial.boundary_violations
+                        || (cand.boundary_violations == initial.boundary_violations
+                            && cand.overlaps < initial.overlaps)
+                        || (cand.boundary_violations == initial.boundary_violations
+                            && cand.overlaps == initial.overlaps
+                            && cand.cost < initial.cost)
+                    {
+                        initial = cand.clone();
+                    }
+                    if next_seeds.len() < 4 {
+                        next_seeds.push(cand);
+                    }
                 }
-                if best_gpu.as_ref().is_none_or(|b| {
-                    cand.boundary_violations < b.boundary_violations
-                        || (cand.boundary_violations == b.boundary_violations
-                            && cand.overlaps < b.overlaps)
-                        || (cand.boundary_violations == b.boundary_violations
-                            && cand.overlaps == b.overlaps
-                            && cand.cost < b.cost)
-                }) {
-                    best_gpu = Some(cand);
+                if !next_seeds.is_empty() {
+                    seed_states = next_seeds;
                 }
             }
-            if let Some(gpu_cand) = best_gpu {
-                if gpu_cand.boundary_violations < initial.boundary_violations
-                    || (gpu_cand.boundary_violations == initial.boundary_violations
-                        && gpu_cand.overlaps < initial.overlaps)
-                    || (gpu_cand.boundary_violations == initial.boundary_violations
-                        && gpu_cand.overlaps == initial.overlaps
-                        && gpu_cand.cost < initial.cost)
-                {
-                    initial = gpu_cand;
-                }
-            }
+        }
+    }
+
+    let num_threads = rayon::current_num_threads().max(2);
+    if let Some(st) = live {
+        if let Ok(mut g) = st.lock() {
+            g.phase = TrialPhase::Legalizing;
+            g.push_log(format!(
+                "[Legalizer] Resolving {} courtyard overlaps across {} CPU cores...",
+                initial.overlaps, num_threads
+            ));
         }
     }
 
@@ -2225,6 +2249,8 @@ pub fn prioritize_and_position_initial_components(
         .find(|(i, fp)| placed[*i] && fp.pads.iter().any(|p| diff_nets.contains(&p.net_id)))
         .map(|(i, _)| i);
 
+    let mut spatial_index = PlacedBoardSpatialIndex::from_board(board, config.min_spacing_mm);
+
     for &diff_idx in &diff_pair_fps {
         if placed[diff_idx] {
             continue;
@@ -2236,25 +2262,58 @@ pub fn prioritize_and_position_initial_components(
             } else {
                 (anchor_pos.x + 12.0, anchor_pos.y)
             };
-            let (cx_min, cx_max, cy_min, cy_max) = board.footprints[diff_idx].origin_clamp_range(
-                board.footprints[diff_idx].rotation,
-                board.footprints[diff_idx].layer,
-                config.min_spacing_mm,
-                &boundary,
-            );
-            board.footprints[diff_idx].x = snap_to_grid(
-                target_x.clamp(cx_min, cx_max),
-                config.grid_step_mm,
-            );
-            board.footprints[diff_idx].y = snap_to_grid(
-                target_y.clamp(cy_min, cy_max),
-                config.grid_step_mm,
-            );
+            let target_pt = Point::new(target_x, target_y);
+            let diff_fp = &board.footprints[diff_idx];
+            let layer = diff_fp.layer;
+            let rotations = [diff_fp.rotation, 0.0, 90.0, 180.0, 270.0];
+            let offsets_x = [0.0, -2.5, 2.5, -5.0, 5.0, -7.5, 7.5];
+            let offsets_y = [0.0, -2.5, 2.5, -5.0, 5.0, -7.5, 7.5];
+            let mut legal_cands: Vec<(Point, f64, usize)> = Vec::new();
+            for &dy in &offsets_y {
+                for &dx in &offsets_x {
+                    for &rot in &rotations {
+                        let (cx_min, cx_max, cy_min, cy_max) =
+                            diff_fp.origin_clamp_range(rot, layer, config.min_spacing_mm, &boundary);
+                        let cx = snap_to_grid((target_x + dx).clamp(cx_min, cx_max), config.grid_step_mm);
+                        let cy = snap_to_grid((target_y + dy).clamp(cy_min, cy_max), config.grid_step_mm);
+                        let c_pos = Point::new(cx, cy);
+                        if spatial_index.is_placement_legal(board, diff_fp, c_pos, rot, layer) {
+                            legal_cands.push((c_pos, rot, layer));
+                        }
+                    }
+                }
+            }
+            if let Some(&(best_pos, best_rot, _)) = legal_cands
+                .iter()
+                .min_by(|a, b| {
+                    a.0.distance_to(&target_pt)
+                        .partial_cmp(&b.0.distance_to(&target_pt))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            {
+                board.footprints[diff_idx].x = best_pos.x;
+                board.footprints[diff_idx].y = best_pos.y;
+                board.footprints[diff_idx].rotation = best_rot;
+            } else {
+                let (cx_min, cx_max, cy_min, cy_max) = board.footprints[diff_idx].origin_clamp_range(
+                    board.footprints[diff_idx].rotation,
+                    board.footprints[diff_idx].layer,
+                    config.min_spacing_mm,
+                    &boundary,
+                );
+                board.footprints[diff_idx].x = snap_to_grid(
+                    target_x.clamp(cx_min, cx_max),
+                    config.grid_step_mm,
+                );
+                board.footprints[diff_idx].y = snap_to_grid(
+                    target_y.clamp(cy_min, cy_max),
+                    config.grid_step_mm,
+                );
+            }
+            spatial_index.update_footprint(board, diff_idx);
         }
         placed[diff_idx] = true;
     }
-
-    let mut spatial_index = PlacedBoardSpatialIndex::from_board(board, config.min_spacing_mm);
 
     // 2. Priority 2: Decoupling capacitors — situating them as close to the connected non-ground pin as possible!
     for tie in &ties {
@@ -2287,27 +2346,6 @@ pub fn prioritize_and_position_initial_components(
         }
         let base_angle = dy.atan2(dx);
 
-        let mut placed_courtyards: Vec<(AABB, Vec<Polygon>)> = Vec::new();
-        for (i, fp) in board.footprints.iter().enumerate() {
-            if placed[i] && i != cap_idx {
-                let polys = fp.transformed_courtyards_layered(
-                    Point::new(fp.x, fp.y),
-                    fp.rotation,
-                    fp.layer,
-                    fp.effective_spacing(config),
-                );
-                let mut aabb = AABB::new(f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-                for p in &polys {
-                    let pa = p.aabb();
-                    aabb.min_x = aabb.min_x.min(pa.min_x);
-                    aabb.min_y = aabb.min_y.min(pa.min_y);
-                    aabb.max_x = aabb.max_x.max(pa.max_x);
-                    aabb.max_y = aabb.max_y.max(pa.max_y);
-                }
-                placed_courtyards.push((aabb, polys));
-            }
-        }
-
         let mut best_cand: Option<(f64, f64, f64, f64)> = None;
 
         let dist_steps = [0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.3, 2.6, 3.0, 3.5, 4.0];
@@ -2317,7 +2355,6 @@ pub fn prioritize_and_position_initial_components(
         let rotations = [0.0, 90.0, 180.0, 270.0];
 
         let cap = &board.footprints[cap_idx];
-        let cap_spacing = cap.effective_spacing(config);
         let anchor_escape = if config.enable_escape_clearance {
             dev.escape_margin * config.escape_margin_mult
         } else {
@@ -2341,27 +2378,7 @@ pub fn prioritize_and_position_initial_components(
                     );
                     let c_pos = Point::new(cx, cy);
 
-                    if !spatial_index.is_placement_legal(board, cap, c_pos, rot, cap.layer) {
-                        continue;
-                    }
-
-                    let polys =
-                        cap.transformed_courtyards_layered(c_pos, rot, cap.layer, cap_spacing);
-                    let mut collides = false;
-                    'check: for (group_aabb, group) in &placed_courtyards {
-                        for p_cand in &polys {
-                            if !p_cand.aabb().overlaps(group_aabb) {
-                                continue;
-                            }
-                            for p_placed in group {
-                                if p_cand.intersects_convex(p_placed) {
-                                    collides = true;
-                                    break 'check;
-                                }
-                            }
-                        }
-                    }
-                    if !collides {
+                    if spatial_index.is_placement_legal(board, cap, c_pos, rot, cap.layer) {
                         legal_cands.push((c_pos, rot, cap.layer));
                     }
                 }
@@ -3051,8 +3068,43 @@ pub fn score_candidate_poses_gpu(
     let b0 = union_aabb(&base_polys, Point::new(0.0, 0.0));
     let hw = ((b0.max_x - b0.min_x) * 0.5).max(0.4) as f32;
     let hh = ((b0.max_y - b0.min_y) * 0.5).max(0.4) as f32;
+    let boundary = board.boundary_aabb();
+    let b_min_x = boundary.min_x as f32;
+    let b_min_y = boundary.min_y as f32;
+    let b_max_x = boundary.max_x as f32;
+    let b_max_y = boundary.max_y as f32;
 
-    let mut boxes = Vec::with_capacity(nc);
+    // Precompute clamped courtyard AABBs for placed footprints on `board` so GPU batch scoring
+    // penalizes candidate poses that overlap existing components.
+    let fp_is_smd = fp.is_smd_only();
+    let mut placed_aabbs: Vec<([f32; 4], usize, bool)> = Vec::with_capacity(board.footprints.len());
+    for other in &board.footprints {
+        if other.reference == fp.reference {
+            continue;
+        }
+        let o_polys = other.transformed_courtyards_layered(
+            Point::new(other.x, other.y),
+            other.rotation,
+            other.layer,
+            other.effective_spacing(config),
+        );
+        let ob = union_aabb(&o_polys, Point::new(other.x, other.y));
+        placed_aabbs.push((
+            [
+                (ob.min_x as f32).clamp(b_min_x, b_max_x),
+                (ob.min_y as f32).clamp(b_min_y, b_max_y),
+                (ob.max_x as f32).clamp(b_min_x, b_max_x),
+                (ob.max_y as f32).clamp(b_min_y, b_max_y),
+            ],
+            other.layer,
+            other.is_smd_only(),
+        ));
+    }
+
+    const MAX_OBS_PER_CAND: usize = 4;
+    let mut cand_boxes: Vec<[f32; 4]> = Vec::with_capacity(nc);
+    let mut cand_obs: Vec<Vec<[f32; 4]>> = Vec::with_capacity(nc);
+    let mut max_obs_used = 0usize;
     let mut segs = Vec::with_capacity(nc * ns);
     for &(pos, rot, layer) in candidates {
         let rad = (rot as f32).to_radians();
@@ -3062,7 +3114,24 @@ pub fn score_candidate_poses_gpu(
         let r_hh = hw * s + hh * c;
         let px = pos.x as f32;
         let py = pos.y as f32;
-        boxes.push([px - r_hw, py - r_hh, px + r_hw, py + r_hh]);
+        let cbox = [px - r_hw, py - r_hh, px + r_hw, py + r_hh];
+        cand_boxes.push(cbox);
+
+        let mut hits = Vec::new();
+        for &(obox, o_layer, o_smd) in &placed_aabbs {
+            if fp_is_smd && o_smd && layer != o_layer {
+                continue;
+            }
+            if cbox[2] > obox[0] && cbox[0] < obox[2] && cbox[3] > obox[1] && cbox[1] < obox[3] {
+                hits.push(obox);
+                if hits.len() == MAX_OBS_PER_CAND {
+                    break;
+                }
+            }
+        }
+        max_obs_used = max_obs_used.max(hits.len());
+        cand_obs.push(hits);
+
         for &(pidx, target_pt, _) in targets.iter().take(ns) {
             let pad_pt = fp.pad_world_point_layered(pidx, pos, rot, layer);
             segs.push([
@@ -3074,16 +3143,25 @@ pub fn score_candidate_poses_gpu(
         }
     }
 
-    let boundary = board.boundary_aabb();
+    let nf = 1 + max_obs_used;
+    let sentinel_box = [b_max_x, b_max_y, b_min_x, b_min_y];
+    let mut boxes = Vec::with_capacity(nc * nf);
+    for i in 0..nc {
+        boxes.push(cand_boxes[i]);
+        for k in 0..max_obs_used {
+            boxes.push(cand_obs[i].get(k).copied().unwrap_or(sentinel_box));
+        }
+    }
+
     let params = PlacementBatchParams {
         num_candidates: nc as u32,
-        num_footprints: 1,
+        num_footprints: nf as u32,
         num_segments: ns as u32,
         _pad: 0,
-        board_min_x: boundary.min_x as f32,
-        board_min_y: boundary.min_y as f32,
-        board_max_x: boundary.max_x as f32,
-        board_max_y: boundary.max_y as f32,
+        board_min_x: b_min_x,
+        board_min_y: b_min_y,
+        board_max_x: b_max_x,
+        board_max_y: b_max_y,
         wirelength_weight: config.wirelength_weight as f32,
         crossing_weight: config.crossing_weight as f32,
         overlap_penalty: config.overlap_penalty as f32,
@@ -6862,6 +6940,165 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_gpu_initial_courtyard_overlap_detection_and_legalization() {
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 60.0;
+        board.max_y = 40.0;
+        board.nets = vec![
+            "".to_string(),
+            "GND".to_string(),
+            "VCC".to_string(),
+            "USB_DP".to_string(),
+            "USB_DM".to_string(),
+        ];
+
+        // Locked USB connector and two diff-pair components initially stacked on top of each other,
+        // plus two overlapping ICs and a decoupling cap.
+        let j1 = make_test_fp(
+            "J1",
+            55.0,
+            20.0,
+            true,
+            vec![
+                Pad::new("1", -0.5, -0.5, 0.4, 0.4, 3, "USB_DP", false),
+                Pad::new("2", -0.5, 0.5, 0.4, 0.4, 4, "USB_DM", false),
+            ],
+        );
+        let d1 = make_test_fp(
+            "D1",
+            25.0,
+            20.0,
+            false,
+            vec![
+                Pad::new("1", -0.5, 0.0, 0.4, 0.4, 3, "USB_DP", false),
+                Pad::new("2", 0.5, 0.0, 0.4, 0.4, 1, "GND", false),
+            ],
+        );
+        let d2 = make_test_fp(
+            "D2",
+            25.0,
+            20.0,
+            false,
+            vec![
+                Pad::new("1", -0.5, 0.0, 0.4, 0.4, 4, "USB_DM", false),
+                Pad::new("2", 0.5, 0.0, 0.4, 0.4, 1, "GND", false),
+            ],
+        );
+        let u1 = make_test_fp(
+            "U1",
+            25.5,
+            20.2,
+            false,
+            vec![
+                Pad::new("1", -1.5, -1.0, 0.5, 0.5, 2, "VCC", false),
+                Pad::new("2", -1.5, 1.0, 0.5, 0.5, 1, "GND", false),
+                Pad::new("3", 1.5, -1.0, 0.5, 0.5, 3, "USB_DP", false),
+                Pad::new("4", 1.5, 1.0, 0.5, 0.5, 4, "USB_DM", false),
+            ],
+        );
+        let mut c1 = make_test_fp(
+            "C1",
+            25.2,
+            20.0,
+            false,
+            vec![
+                Pad::new("1", -0.5, 0.0, 0.5, 0.5, 2, "VCC", false),
+                Pad::new("2", 0.5, 0.0, 0.5, 0.5, 1, "GND", false),
+            ],
+        );
+        c1.value = "100nF".to_string();
+
+        board.footprints = vec![j1, d1, d2, u1, c1];
+
+        let vk = VulkanEngine::new().expect("VulkanEngine required for GPU courtyard overlap test");
+        let cfg = PlacementConfig {
+            vulkan: Some(vk.clone()),
+            ..PlacementConfig::default()
+        };
+
+        // 1. Verify GPU initial courtyard overlap evaluation matches CPU exact SAT overlap count
+        let initial = PlacementState::from_board(&board, &cfg);
+        assert!(initial.overlaps >= 4, "Expected stacked components to have >= 4 overlaps, got {}", initial.overlaps);
+        let ties = build_passive_ties(&board);
+        let (fp_descs, _edges, courtyards) = build_gpu_sa_descriptors(&board, &cfg, &ties, &initial);
+        let nf = board.footprints.len();
+        let poses: Vec<[f32; 4]> = (0..nf)
+            .map(|i| {
+                [
+                    initial.positions[i].x as f32,
+                    initial.positions[i].y as f32,
+                    initial.rotations[i] as f32,
+                    initial.layers[i] as f32,
+                ]
+            })
+            .collect();
+        let boundary = board.boundary_aabb();
+        let gpu_ov = vk
+            .evaluate_courtyard_overlaps_gpu(
+                &fp_descs,
+                &poses,
+                &courtyards,
+                [
+                    boundary.min_x as f32,
+                    boundary.min_y as f32,
+                    boundary.max_x as f32,
+                    boundary.max_y as f32,
+                ],
+                cfg.overlap_penalty as f32,
+                cfg.boundary_penalty as f32,
+            )
+            .expect("GPU courtyard overlap evaluation should succeed");
+        assert_eq!(gpu_ov.len(), 1);
+        assert_eq!(gpu_ov[0].0 as usize, initial.overlaps);
+
+        // 2. Verify score_candidate_poses_gpu penalizes candidate poses that overlap placed footprints
+        let cands = vec![
+            (Point::new(55.0, 20.0), 0.0, 0), // directly overlapping locked J1 at (55, 20)
+            (Point::new(10.0, 10.0), 0.0, 0), // clear open space
+        ];
+        let scores = score_candidate_poses_gpu(
+            &vk,
+            &board,
+            &board.footprints[1],
+            &cands,
+            &[(0, Point::new(30.0, 20.0), 1.0)],
+            &cfg,
+        )
+        .expect("GPU candidate scoring should succeed");
+        assert!(
+            scores[0] > scores[1] + (cfg.overlap_penalty as f32) * 0.5,
+            "Overlapping candidate pose score ({}) must include overlap penalty vs clear pose ({})",
+            scores[0],
+            scores[1]
+        );
+
+        // 3. Verify GPU legalize_placement resolves all initial overlaps on the GPU
+        let live = Arc::new(Mutex::new(LiveTrialState::new(board.clone())));
+        let legalized = legalize_placement(&board, &cfg, initial, Some(&live));
+        assert_eq!(legalized.overlaps, 0, "GPU legalize_placement must resolve all overlaps");
+        assert_eq!(legalized.boundary_violations, 0, "GPU legalize_placement must have 0 boundary violations");
+        let logs = live.lock().unwrap().log_lines.clone();
+        assert!(
+            logs.iter().any(|l| l.contains("GPU resolved all initial courtyard overlaps")),
+            "Expected GPU legalizer completion log, got: {:?}",
+            logs
+        );
+
+        // 4. Verify prioritize_and_position_initial_components places multiple diff-pair components without stacking them
+        prioritize_and_position_initial_components(&mut board, &cfg, None);
+        let d1_pos = Point::new(board.footprints[1].x, board.footprints[1].y);
+        let d2_pos = Point::new(board.footprints[2].x, board.footprints[2].y);
+        assert!(
+            d1_pos.distance_to(&d2_pos) > 1.5,
+            "Priority 1 diff-pair components D1 {:?} and D2 {:?} must not be stacked at the same position",
+            d1_pos,
+            d2_pos
+        );
     }
 }
 

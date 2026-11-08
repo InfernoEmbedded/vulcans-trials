@@ -930,6 +930,25 @@ fn evaluate_chain_delta_e(
     return vec2<f32>(delta_cost, delta_ov);
 }
 
+fn clamp_pose_to_board_aabb(pose: vec4<f32>, desc: vec4<f32>) -> vec4<f32> {
+    let rad = pose.z * 0.0174532925;
+    let bi = pose_aabb(pose, desc, sin(rad), cos(rad));
+    let dx_min = pose.x - bi.x;
+    let dx_max = bi.z - pose.x;
+    let dy_min = pose.y - bi.y;
+    let dy_max = bi.w - pose.y;
+    let cx_min = params.board_min_x + dx_min;
+    let cx_max = max(params.board_max_x - dx_max, cx_min);
+    let cy_min = params.board_min_y + dy_min;
+    let cy_max = max(params.board_max_y - dy_max, cy_min);
+    return vec4<f32>(
+        clamp(snap_grid(pose.x, params.grid_step), cx_min, cx_max),
+        clamp(snap_grid(pose.y, params.grid_step), cy_min, cy_max),
+        pose.z,
+        pose.w
+    );
+}
+
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
@@ -943,68 +962,163 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let best_base = (params.num_chains + c) * nf;
 
     var score = chain_scores[c];
+    var cur_cost = score.x;
+    var best_cost = score.y;
+    var best_ov = score.z;
+    var cur_ov: f32 = 0.0;
+    var pass_idx: f32 = 1.0;
+
     var rng = params.seed ^ (c * 747796405u + 2891336453u) ^ u32(score.w * 1664525.0);
     _ = pcg_next(&rng);
 
-    if (score.y <= 0.0) {
+    if (score.w <= 0.0) {
         let init_ev = evaluate_chain_state(c_base, nf, ne);
-        score = vec4<f32>(init_ev.x, init_ev.x, init_ev.y, 1.0);
+        cur_cost = init_ev.x;
+        best_cost = init_ev.x;
+        cur_ov = init_ev.y;
+        best_ov = init_ev.y;
+        pass_idx = 1.0;
         for (var i: u32 = 0u; i < nf; i = i + 1u) {
             chain_poses[best_base + i] = chain_poses[c_base + i];
         }
     } else {
-        score.w = score.w + 1.0;
+        cur_ov = floor(score.w / 1024.0);
+        pass_idx = (score.w - cur_ov * 1024.0) + 1.0;
     }
 
     let temp_ratio = f32(c & 63u) / 63.0;
     let temp = max(params.base_temp * pow(35.0, temp_ratio), 0.2);
 
     for (var step: u32 = 0u; step < params.steps_per_pass; step = step + 1u) {
-        var idx: u32 = pcg_next(&rng) % nf;
-        for (var tries: u32 = 0u; tries < 8u; tries = tries + 1u) {
-            if (fp_descs[idx].z < 0.5) {
-                break;
+        var idx: u32 = 0u;
+        var old_pose = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        var new_pose = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        var proposed = false;
+
+        if (cur_ov > 0.0 && rand_f32(&rng) < 0.88) {
+            let start_i = pcg_next(&rng) % nf;
+            var found_idx: u32 = 0xFFFFFFFFu;
+            var found_other: u32 = 0xFFFFFFFFu;
+            for (var ti: u32 = 0u; ti < nf; ti = ti + 1u) {
+                let i = (start_i + ti) % nf;
+                if (fp_descs[i].z > 0.5) {
+                    continue;
+                }
+                let bi = fp_aabb(c_base, i);
+                let pose_i = chain_poses[c_base + i];
+                let start_j = pcg_next(&rng) % nf;
+                for (var tj: u32 = 0u; tj < nf; tj = tj + 1u) {
+                    let j = (start_j + tj) % nf;
+                    if (j == i) {
+                        continue;
+                    }
+                    let bj = fp_aabb(c_base, j);
+                    if (bi.z > bj.x && bi.x < bj.z && bi.w > bj.y && bi.y < bj.w) {
+                        let pose_j = chain_poses[c_base + j];
+                        if (footprints_courtyards_intersect(i, pose_i, j, pose_j)) {
+                            found_idx = i;
+                            found_other = j;
+                            break;
+                        }
+                    }
+                }
+                if (found_idx != 0xFFFFFFFFu) {
+                    break;
+                }
             }
-            idx = (idx + 1u) % nf;
-        }
-        if (fp_descs[idx].z > 0.5) {
-            break;
+
+            if (found_idx != 0xFFFFFFFFu) {
+                idx = found_idx;
+                old_pose = chain_poses[c_base + idx];
+                let other_pose = chain_poses[c_base + found_other];
+                new_pose = old_pose;
+                let roll = rand_f32(&rng);
+                if (roll < 0.65) {
+                    let dx = old_pose.x - other_pose.x;
+                    let dy = old_pose.y - other_pose.y;
+                    let dist = sqrt(dx * dx + dy * dy);
+                    var ux: f32;
+                    var uy: f32;
+                    if (dist > 1e-3) {
+                        ux = dx / dist;
+                        uy = dy / dist;
+                    } else {
+                        let ang = rand_f32(&rng) * 6.2831853;
+                        ux = cos(ang);
+                        uy = sin(ang);
+                    }
+                    let fan = (rand_f32(&rng) * 2.0 - 1.0) * 0.785398;
+                    let cf = cos(fan);
+                    let sf = sin(fan);
+                    let rx = ux * cf - uy * sf;
+                    let ry = ux * sf + uy * cf;
+                    let push_dist = 0.6 + rand_f32(&rng) * 11.4;
+                    new_pose.x = old_pose.x + rx * push_dist;
+                    new_pose.y = old_pose.y + ry * push_dist;
+                } else if (roll < 0.85) {
+                    let r = 2.0 + rand_f32(&rng) * 8.0;
+                    new_pose.x = old_pose.x + (rand_f32(&rng) * 2.0 - 1.0) * r;
+                    new_pose.y = old_pose.y + (rand_f32(&rng) * 2.0 - 1.0) * r;
+                } else {
+                    let rot_step = f32((pcg_next(&rng) % 3u) + 1u) * 90.0;
+                    new_pose.z = (old_pose.z + rot_step) % 360.0;
+                }
+                new_pose = clamp_pose_to_board_aabb(new_pose, fp_descs[idx]);
+                proposed = true;
+            }
         }
 
-        let old_pose = chain_poses[c_base + idx];
-        var new_pose = old_pose;
-        let move_r = rand_f32(&rng);
-        if (move_r < 0.72) {
-            let shift = max(temp * 0.15, params.grid_step * 2.0);
-            let dx = (rand_f32(&rng) * 2.0 - 1.0) * shift;
-            let dy = (rand_f32(&rng) * 2.0 - 1.0) * shift;
-            new_pose.x = snap_grid(
-                clamp(old_pose.x + dx, params.board_min_x + 1.2, params.board_max_x - 1.2),
-                params.grid_step
-            );
-            new_pose.y = snap_grid(
-                clamp(old_pose.y + dy, params.board_min_y + 1.2, params.board_max_y - 1.2),
-                params.grid_step
-            );
-        } else {
-            let rot_step = f32((pcg_next(&rng) % 3u) + 1u) * 90.0;
-            new_pose.z = (old_pose.z + rot_step) % 360.0;
+        if (!proposed) {
+            idx = pcg_next(&rng) % nf;
+            for (var tries: u32 = 0u; tries < 8u; tries = tries + 1u) {
+                if (fp_descs[idx].z < 0.5) {
+                    break;
+                }
+                idx = (idx + 1u) % nf;
+            }
+            if (fp_descs[idx].z > 0.5) {
+                break;
+            }
+
+            old_pose = chain_poses[c_base + idx];
+            new_pose = old_pose;
+            let move_r = rand_f32(&rng);
+            if (move_r < 0.72) {
+                let shift = max(temp * 0.15, params.grid_step * 2.0);
+                let dx = (rand_f32(&rng) * 2.0 - 1.0) * shift;
+                let dy = (rand_f32(&rng) * 2.0 - 1.0) * shift;
+                new_pose.x = snap_grid(
+                    clamp(old_pose.x + dx, params.board_min_x + 1.2, params.board_max_x - 1.2),
+                    params.grid_step
+                );
+                new_pose.y = snap_grid(
+                    clamp(old_pose.y + dy, params.board_min_y + 1.2, params.board_max_y - 1.2),
+                    params.grid_step
+                );
+            } else {
+                let rot_step = f32((pcg_next(&rng) % 3u) + 1u) * 90.0;
+                new_pose.z = (old_pose.z + rot_step) % 360.0;
+            }
+            if (cur_ov > 0.0) {
+                new_pose = clamp_pose_to_board_aabb(new_pose, fp_descs[idx]);
+            }
         }
 
         let d_ev = evaluate_chain_delta_e(c_base, nf, ne, idx, old_pose, new_pose);
         let delta = d_ev.x;
-        let new_cost = score.x + delta;
-        let new_ov = max(round(score.z + d_ev.y), 0.0);
+        let new_cost = cur_cost + delta;
+        let new_ov = max(round(cur_ov + d_ev.y), 0.0);
 
-        let accept = (new_ov < score.z) ||
-            (new_ov == score.z && (delta <= 0.0 || rand_f32(&rng) < exp(-delta / temp)));
+        let accept = (new_ov < cur_ov) ||
+            (new_ov == cur_ov && (delta <= 0.0 || rand_f32(&rng) < exp(-delta / temp)));
 
         if (accept) {
             chain_poses[c_base + idx] = new_pose;
-            score.x = new_cost;
-            score.z = new_ov;
-            if ((new_ov == 0.0 || score.y > params.overlap_penalty) && new_cost < score.y) {
-                score.y = new_cost;
+            cur_cost = new_cost;
+            cur_ov = new_ov;
+            if (new_ov < best_ov || (new_ov == best_ov && new_cost < best_cost)) {
+                best_cost = new_cost;
+                best_ov = new_ov;
                 for (var i: u32 = 0u; i < nf; i = i + 1u) {
                     chain_poses[best_base + i] = chain_poses[c_base + i];
                 }
@@ -1013,16 +1127,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let ref_ev = evaluate_chain_state(c_base, nf, ne);
-    score.x = ref_ev.x;
-    score.z = ref_ev.y;
-    if ((ref_ev.y == 0.0 || score.y > params.overlap_penalty) && ref_ev.x < score.y) {
-        score.y = ref_ev.x;
+    cur_cost = ref_ev.x;
+    cur_ov = ref_ev.y;
+    if (cur_ov < best_ov || (cur_ov == best_ov && cur_cost < best_cost)) {
+        best_cost = cur_cost;
+        best_ov = cur_ov;
         for (var i: u32 = 0u; i < nf; i = i + 1u) {
             chain_poses[best_base + i] = chain_poses[c_base + i];
         }
     }
 
-    chain_scores[c] = score;
+    chain_scores[c] = vec4<f32>(cur_cost, best_cost, best_ov, round(cur_ov) * 1024.0 + pass_idx);
 }
 "#;
 
@@ -5013,6 +5128,81 @@ impl VulkanEngine {
         verts_buf.destroy();
 
         result
+    }
+
+    /// Evaluates the exact number of pairwise courtyard polygon overlaps and total overlap/boundary cost
+    /// for one or more board placement configurations on the GPU.
+    ///
+    /// Dispatches a zero-step (`steps_per_pass = 0`) pass of [`Self::run_gpu_sa_placer_chains`] so the
+    /// GPU executes `evaluate_chain_state` / `evaluate_chain_state_fast` (with AABB pruning, rectilinear
+    /// slab fast-paths, opposite-side SMD isolation, and exact Separating Axis Theorem convex polygon checks)
+    /// across all `num_configs` placement states in parallel.
+    ///
+    /// # Arguments
+    /// * `fp_descs` - Per-footprint descriptor slice (`[hw, hh, locked, packed_center]`, length `nf`).
+    /// * `poses` - Flattened footprint poses (`[x, y, rot_deg, layer]`, length `num_configs * nf`).
+    /// * `courtyards` - Flattened local-space courtyard polygon buffers ([`GpuCourtyardBuffers`]).
+    /// * `board_bounds` - Board outline bounding box `[min_x, min_y, max_x, max_y]` in millimeters (`mm`).
+    /// * `overlap_penalty` - Penalty weight per overlapping courtyard pair.
+    /// * `boundary_penalty` - Penalty weight for board outline excursions.
+    ///
+    /// # Returns
+    /// `Some(Vec<(usize, f32)>)` of length `num_configs` containing `(overlap_count, total_penalty_cost)`
+    /// for each configuration, or `None` if `fp_descs` is empty, `poses.len()` is not a multiple of
+    /// `fp_descs.len()`, or GPU dispatch fails.
+    ///
+    /// # Side Effects
+    /// Uploads descriptor and courtyard buffers to the GPU, executes a single compute pass, and updates `self.compute_busy_ns`.
+    pub fn evaluate_courtyard_overlaps_gpu(
+        &self,
+        fp_descs: &[[f32; 4]],
+        poses: &[[f32; 4]],
+        courtyards: &GpuCourtyardBuffers,
+        board_bounds: [f32; 4],
+        overlap_penalty: f32,
+        boundary_penalty: f32,
+    ) -> Option<Vec<(usize, f32)>> {
+        let nf = fp_descs.len();
+        if nf == 0 || poses.is_empty() || poses.len() % nf != 0 {
+            return None;
+        }
+        let num_configs = (poses.len() / nf) as u32;
+        let params = GpuSaParams {
+            num_chains: num_configs,
+            num_footprints: nf as u32,
+            num_edges: 0,
+            steps_per_pass: 0,
+            seed: 0xC001_D00Du32,
+            _pad0: 0,
+            corridor_congestion_weight: 0.0,
+            flow_alignment_weight: 0.0,
+            board_min_x: board_bounds[0],
+            board_min_y: board_bounds[1],
+            board_max_x: board_bounds[2],
+            board_max_y: board_bounds[3],
+            grid_step: 0.1,
+            wirelength_weight: 0.0,
+            crossing_weight: 0.0,
+            overlap_penalty,
+            boundary_penalty,
+            passive_affinity_weight: 0.0,
+            passive_max_dist: 3.5,
+            base_temp: 1.0,
+        };
+        let (_, scores) = self.run_gpu_sa_placer_chains(
+            fp_descs,
+            &[],
+            poses,
+            &params,
+            1,
+            Some(courtyards),
+        )?;
+        Some(
+            scores
+                .into_iter()
+                .map(|s| (s[2].round().max(0.0) as usize, s[0]))
+                .collect(),
+        )
     }
 
     /// Evaluates per-cell 3D routing traversal costs across all copper layers for a single net.

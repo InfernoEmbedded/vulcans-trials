@@ -1270,6 +1270,133 @@ __device__ float2 evaluate_chain_state_fast(
     return make_float2(total_cost, overlaps);
 }
 
+__device__ __forceinline__ float4 clamp_pose_to_board_aabb(
+    float4 pose,
+    float4 desc,
+    float b_min_x,
+    float b_min_y,
+    float b_max_x,
+    float b_max_y,
+    float grid_step
+) {
+    float s, c;
+    __sincosf(pose.z * 0.0174532925f, &s, &c);
+    float4 bi = pose_aabb_fast(pose, desc, s, c);
+    float dx_min = pose.x - bi.x;
+    float dx_max = bi.z - pose.x;
+    float dy_min = pose.y - bi.y;
+    float dy_max = bi.w - pose.y;
+    float cx_min = b_min_x + dx_min;
+    float cx_max = fmaxf(b_max_x - dx_max, cx_min);
+    float cy_min = b_min_y + dy_min;
+    float cy_max = fmaxf(b_max_y - dy_max, cy_min);
+    pose.x = fminf(fmaxf(snap_grid(pose.x, grid_step), cx_min), cx_max);
+    pose.y = fminf(fmaxf(snap_grid(pose.y, grid_step), cy_min), cy_max);
+    return pose;
+}
+
+__device__ __forceinline__ bool propose_overlap_repulsion_move(
+    const float4* __restrict__ active_poses,
+    const float4* __restrict__ active_fp_descs,
+    const uint4* __restrict__ active_fp_poly_ranges,
+    const uint4* __restrict__ courtyard_polys,
+    const float2* __restrict__ courtyard_vertices,
+    unsigned int active_c_base,
+    unsigned int nf,
+    float b_min_x,
+    float b_min_y,
+    float b_max_x,
+    float b_max_y,
+    float grid_step,
+    unsigned int* rng,
+    unsigned int* out_idx,
+    float4* out_old_pose,
+    float4* out_new_pose
+) {
+    unsigned int start_i = pcg_next(rng) % nf;
+    unsigned int found_idx = 0xFFFFFFFFu;
+    unsigned int found_other = 0xFFFFFFFFu;
+
+    for (unsigned int ti = 0u; ti < nf; ++ti) {
+        unsigned int i = (start_i + ti) % nf;
+        if (active_fp_descs[i].z > 0.5f) {
+            continue;
+        }
+        float4 bi = fp_aabb(active_poses, active_fp_descs, active_c_base, i);
+        float4 pose_i = active_poses[active_c_base + i];
+        unsigned int start_j = pcg_next(rng) % nf;
+        for (unsigned int tj = 0u; tj < nf; ++tj) {
+            unsigned int j = (start_j + tj) % nf;
+            if (j == i) {
+                continue;
+            }
+            float4 bj = fp_aabb(active_poses, active_fp_descs, active_c_base, j);
+            if (bi.z > bj.x && bi.x < bj.z && bi.w > bj.y && bi.y < bj.w) {
+                float4 pose_j = active_poses[active_c_base + j];
+                if (footprints_courtyards_intersect(
+                        i, pose_i, j, pose_j,
+                        active_fp_poly_ranges, courtyard_polys, courtyard_vertices)) {
+                    found_idx = i;
+                    found_other = j;
+                    break;
+                }
+            }
+        }
+        if (found_idx != 0xFFFFFFFFu) {
+            break;
+        }
+    }
+
+    if (found_idx == 0xFFFFFFFFu) {
+        return false;
+    }
+
+    float4 old_pose = active_poses[active_c_base + found_idx];
+    float4 other_pose = active_poses[active_c_base + found_other];
+    float4 desc_i = active_fp_descs[found_idx];
+    float4 new_pose = old_pose;
+
+    float roll = rand_f32(rng);
+    if (roll < 0.65f) {
+        float dx = old_pose.x - other_pose.x;
+        float dy = old_pose.y - other_pose.y;
+        float dist = hypotf(dx, dy);
+        float ux, uy;
+        if (dist > 1e-3f) {
+            ux = dx / dist;
+            uy = dy / dist;
+        } else {
+            float ang = rand_f32(rng) * 6.2831853f;
+            __sincosf(ang, &uy, &ux);
+        }
+        float fan = (rand_f32(rng) * 2.0f - 1.0f) * 0.785398f;
+        float sf, cf;
+        __sincosf(fan, &sf, &cf);
+        float rx = ux * cf - uy * sf;
+        float ry = ux * sf + uy * cf;
+        float push_dist = 0.6f + rand_f32(rng) * 11.4f;
+        new_pose.x = old_pose.x + rx * push_dist;
+        new_pose.y = old_pose.y + ry * push_dist;
+    } else if (roll < 0.85f) {
+        float r = 2.0f + rand_f32(rng) * 8.0f;
+        new_pose.x = old_pose.x + (rand_f32(rng) * 2.0f - 1.0f) * r;
+        new_pose.y = old_pose.y + (rand_f32(rng) * 2.0f - 1.0f) * r;
+    } else {
+        float rot_step = (float)((pcg_next(rng) % 3u) + 1u) * 90.0f;
+        float nz = old_pose.z + rot_step;
+        if (nz >= 360.0f) {
+            nz -= 360.0f;
+        }
+        new_pose.z = nz;
+    }
+
+    new_pose = clamp_pose_to_board_aabb(new_pose, desc_i, b_min_x, b_min_y, b_max_x, b_max_y, grid_step);
+    *out_idx = found_idx;
+    *out_old_pose = old_pose;
+    *out_new_pose = new_pose;
+    return true;
+}
+
 __global__ void gpu_sa_placer_kernel(
     const float4* __restrict__ fp_descs,
     const float4* __restrict__ edges,
@@ -1308,7 +1435,8 @@ __global__ void gpu_sa_placer_kernel(
     unsigned int rng = params.seed ^ (c * 747796405u + 2891336453u) ^ (unsigned int)(score.w * 1664525.0f);
     pcg_next(&rng);
 
-    if (score.y <= 0.0f) {
+    float best_ov = score.z;
+    if (score.w <= 0.0f) {
         float2 init_ev = evaluate_chain_state_fast(
             chain_poses, fp_descs, edges, c_base, nf, ne,
             b_min_x, b_min_y, b_max_x, b_max_y,
@@ -1317,6 +1445,7 @@ __global__ void gpu_sa_placer_kernel(
             fp_poly_ranges, courtyard_polys, courtyard_vertices
         );
         score = make_float4(init_ev.x, init_ev.x, init_ev.y, 1.0f);
+        best_ov = init_ev.y;
         for (unsigned int i = 0u; i < nf; ++i) {
             chain_poses[best_base + i] = chain_poses[c_base + i];
         }
@@ -1329,35 +1458,55 @@ __global__ void gpu_sa_placer_kernel(
 
     for (unsigned int p = 0; p < num_passes; ++p) {
         for (unsigned int step = 0u; step < params.steps_per_pass; ++step) {
-            unsigned int idx = pcg_next(&rng) % nf;
-            for (unsigned int tries = 0u; tries < 8u; ++tries) {
-                if (fp_descs[idx].z < 0.5f) {
-                    break;
-                }
-                idx = (idx + 1u) % nf;
-            }
-            if (fp_descs[idx].z > 0.5f) {
-                break;
+            unsigned int idx = 0u;
+            float4 old_pose;
+            float4 new_pose;
+            bool proposed = false;
+
+            if (score.z > 0.0f && rand_f32(&rng) < 0.88f) {
+                proposed = propose_overlap_repulsion_move(
+                    chain_poses, fp_descs, fp_poly_ranges, courtyard_polys, courtyard_vertices,
+                    c_base, nf, b_min_x, b_min_y, b_max_x, b_max_y, params.grid_step,
+                    &rng, &idx, &old_pose, &new_pose
+                );
             }
 
-            float4 old_pose = chain_poses[c_base + idx];
-            float4 new_pose = old_pose;
-            float move_r = rand_f32(&rng);
-            if (move_r < 0.72f) {
-                float shift = fmaxf(temp * 0.15f, params.grid_step * 2.0f);
-                float dx = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
-                float dy = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
-                new_pose.x = snap_grid(
-                    fminf(fmaxf(old_pose.x + dx, b_min_x + 1.2f), b_max_x - 1.2f),
-                    params.grid_step
-                );
-                new_pose.y = snap_grid(
-                    fminf(fmaxf(old_pose.y + dy, b_min_y + 1.2f), b_max_y - 1.2f),
-                    params.grid_step
-                );
-            } else {
-                float rot_step = (float)((pcg_next(&rng) % 3u) + 1u) * 90.0f;
-                new_pose.z = fmodf(old_pose.z + rot_step, 360.0f);
+            if (!proposed) {
+                idx = pcg_next(&rng) % nf;
+                for (unsigned int tries = 0u; tries < 8u; ++tries) {
+                    if (fp_descs[idx].z < 0.5f) {
+                        break;
+                    }
+                    idx = (idx + 1u) % nf;
+                }
+                if (fp_descs[idx].z > 0.5f) {
+                    break;
+                }
+
+                old_pose = chain_poses[c_base + idx];
+                new_pose = old_pose;
+                float move_r = rand_f32(&rng);
+                if (move_r < 0.72f) {
+                    float shift = fmaxf(temp * 0.15f, params.grid_step * 2.0f);
+                    float dx = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
+                    float dy = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
+                    new_pose.x = snap_grid(
+                        fminf(fmaxf(old_pose.x + dx, b_min_x + 1.2f), b_max_x - 1.2f),
+                        params.grid_step
+                    );
+                    new_pose.y = snap_grid(
+                        fminf(fmaxf(old_pose.y + dy, b_min_y + 1.2f), b_max_y - 1.2f),
+                        params.grid_step
+                    );
+                } else {
+                    float rot_step = (float)((pcg_next(&rng) % 3u) + 1u) * 90.0f;
+                    new_pose.z = fmodf(old_pose.z + rot_step, 360.0f);
+                }
+                if (score.z > 0.0f) {
+                    new_pose = clamp_pose_to_board_aabb(
+                        new_pose, fp_descs[idx], b_min_x, b_min_y, b_max_x, b_max_y, params.grid_step
+                    );
+                }
             }
 
             chain_poses[c_base + idx] = new_pose;
@@ -1378,8 +1527,9 @@ __global__ void gpu_sa_placer_kernel(
             if (accept) {
                 score.x = new_cost;
                 score.z = new_ov;
-                if ((new_ov == 0.0f || score.y > ov_penalty) && new_cost < score.y) {
+                if (new_ov < best_ov || (new_ov == best_ov && new_cost < score.y)) {
                     score.y = new_cost;
+                    best_ov = new_ov;
                     for (unsigned int i = 0u; i < nf; ++i) {
                         chain_poses[best_base + i] = chain_poses[c_base + i];
                     }
@@ -1390,6 +1540,7 @@ __global__ void gpu_sa_placer_kernel(
         }
     }
 
+    score.z = best_ov;
     chain_scores[c] = score;
 }
 
@@ -1782,7 +1933,8 @@ __global__ void gpu_sa_placer_delta_e_kernel(
     unsigned int rng = params.seed ^ (c * 747796405u + 2891336453u) ^ (unsigned int)(score.w * 1664525.0f);
     pcg_next(&rng);
 
-    if (score.y <= 0.0f) {
+    float best_ov = score.z;
+    if (score.w <= 0.0f) {
         float2 init_ev = evaluate_chain_state_fast(
             active_poses, active_fp_descs, active_edges, active_c_base, nf, ne,
             b_min_x, b_min_y, b_max_x, b_max_y,
@@ -1791,6 +1943,7 @@ __global__ void gpu_sa_placer_delta_e_kernel(
             active_fp_poly_ranges, courtyard_polys, courtyard_vertices
         );
         score = make_float4(init_ev.x, init_ev.x, init_ev.y, 1.0f);
+        best_ov = init_ev.y;
         for (unsigned int i = 0u; i < nf; ++i) {
             chain_poses[best_base + i] = active_poses[active_c_base + i];
         }
@@ -1803,43 +1956,63 @@ __global__ void gpu_sa_placer_delta_e_kernel(
 
     for (unsigned int p = 0; p < num_passes; ++p) {
         for (unsigned int step = 0u; step < params.steps_per_pass; ++step) {
-            // Select a warp-uniform movable footprint index idx so all 32 lanes in the warp
-            // traverse the exact same incident edge list with zero SIMT branch divergence,
-            // while each chain proposes its own independent random displacement and Metropolis test.
-            unsigned int raw_idx = pcg_next(&rng) % nf;
-            unsigned int idx = __shfl_sync(0xFFFFFFFFu, raw_idx, 0);
-            for (unsigned int tries = 0u; tries < 8u; ++tries) {
-                if (active_fp_descs[idx].z < 0.5f) {
-                    break;
-                }
-                idx = (idx + 1u) % nf;
-            }
-            if (active_fp_descs[idx].z > 0.5f) {
-                break;
+            unsigned int idx = 0u;
+            float4 old_pose;
+            float4 new_pose;
+            bool proposed = false;
+
+            if (score.z > 0.0f && rand_f32(&rng) < 0.88f) {
+                proposed = propose_overlap_repulsion_move(
+                    active_poses, active_fp_descs, active_fp_poly_ranges, courtyard_polys, courtyard_vertices,
+                    active_c_base, nf, b_min_x, b_min_y, b_max_x, b_max_y, params.grid_step,
+                    &rng, &idx, &old_pose, &new_pose
+                );
             }
 
-            float4 old_pose = active_poses[active_c_base + idx];
-            float4 new_pose = old_pose;
-            float move_r = rand_f32(&rng);
-            if (move_r < 0.72f) {
-                float shift = fmaxf(temp * 0.15f, params.grid_step * 2.0f);
-                float dx = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
-                float dy = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
-                new_pose.x = snap_grid(
-                    fminf(fmaxf(old_pose.x + dx, b_min_x + 1.2f), b_max_x - 1.2f),
-                    params.grid_step
-                );
-                new_pose.y = snap_grid(
-                    fminf(fmaxf(old_pose.y + dy, b_min_y + 1.2f), b_max_y - 1.2f),
-                    params.grid_step
-                );
-            } else {
-                float rot_step = (float)((pcg_next(&rng) % 3u) + 1u) * 90.0f;
-                float nz = old_pose.z + rot_step;
-                if (nz >= 360.0f) {
-                    nz -= 360.0f;
+            if (!proposed) {
+                // Select a warp-uniform movable footprint index idx so all 32 lanes in the warp
+                // traverse the exact same incident edge list with zero SIMT branch divergence,
+                // while each chain proposes its own independent random displacement and Metropolis test.
+                unsigned int raw_idx = pcg_next(&rng) % nf;
+                idx = (score.z > 0.0f) ? raw_idx : __shfl_sync(0xFFFFFFFFu, raw_idx, 0);
+                for (unsigned int tries = 0u; tries < 8u; ++tries) {
+                    if (active_fp_descs[idx].z < 0.5f) {
+                        break;
+                    }
+                    idx = (idx + 1u) % nf;
                 }
-                new_pose.z = nz;
+                if (active_fp_descs[idx].z > 0.5f) {
+                    break;
+                }
+
+                old_pose = active_poses[active_c_base + idx];
+                new_pose = old_pose;
+                float move_r = rand_f32(&rng);
+                if (move_r < 0.72f) {
+                    float shift = fmaxf(temp * 0.15f, params.grid_step * 2.0f);
+                    float dx = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
+                    float dy = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
+                    new_pose.x = snap_grid(
+                        fminf(fmaxf(old_pose.x + dx, b_min_x + 1.2f), b_max_x - 1.2f),
+                        params.grid_step
+                    );
+                    new_pose.y = snap_grid(
+                        fminf(fmaxf(old_pose.y + dy, b_min_y + 1.2f), b_max_y - 1.2f),
+                        params.grid_step
+                    );
+                } else {
+                    float rot_step = (float)((pcg_next(&rng) % 3u) + 1u) * 90.0f;
+                    float nz = old_pose.z + rot_step;
+                    if (nz >= 360.0f) {
+                        nz -= 360.0f;
+                    }
+                    new_pose.z = nz;
+                }
+                if (score.z > 0.0f) {
+                    new_pose = clamp_pose_to_board_aabb(
+                        new_pose, active_fp_descs[idx], b_min_x, b_min_y, b_max_x, b_max_y, params.grid_step
+                    );
+                }
             }
 
             float2 d_ev = evaluate_chain_delta_e(
@@ -1861,8 +2034,9 @@ __global__ void gpu_sa_placer_delta_e_kernel(
                 active_poses[active_c_base + idx] = new_pose;
                 score.x = new_cost;
                 score.z = new_ov;
-                if ((new_ov == 0.0f || score.y > ov_penalty) && new_cost < score.y) {
+                if (new_ov < best_ov || (new_ov == best_ov && new_cost < score.y)) {
                     score.y = new_cost;
+                    best_ov = new_ov;
                     for (unsigned int i = 0u; i < nf; ++i) {
                         chain_poses[best_base + i] = active_poses[active_c_base + i];
                     }
@@ -1877,6 +2051,7 @@ __global__ void gpu_sa_placer_delta_e_kernel(
         }
     }
 
+    score.z = best_ov;
     chain_scores[c] = score;
 }
 
@@ -1949,8 +2124,9 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
     unsigned int rng = params.seed ^ (c * 747796405u + 2891336453u) ^ (unsigned int)(score.w * 1664525.0f);
     pcg_next(&rng);
 
+    float best_ov = score.z;
     if (c_valid && nf > 0u) {
-        if (score.y <= 0.0f) {
+        if (score.w <= 0.0f) {
             float2 init_ev = evaluate_chain_state_fast(
                 active_poses, active_fp_descs, active_edges, active_c_base, nf, ne,
                 b_min_x, b_min_y, b_max_x, b_max_y,
@@ -1959,6 +2135,7 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
                 active_fp_poly_ranges, courtyard_polys, courtyard_vertices
             );
             score = make_float4(init_ev.x, init_ev.x, init_ev.y, 1.0f);
+            best_ov = init_ev.y;
             for (unsigned int i = 0u; i < nf; ++i) {
                 chain_poses[best_base + i] = active_poses[active_c_base + i];
             }
@@ -1979,36 +2156,57 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
             float4 new_pose = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 
             if (c_valid && nf > 0u) {
-                for (unsigned int tries = 0u; tries < 8u; ++tries) {
-                    if (active_fp_descs[idx].z < 0.5f) {
-                        break;
+                bool proposed = false;
+                if (score.z > 0.0f && rand_f32(&rng) < 0.88f) {
+                    proposed = propose_overlap_repulsion_move(
+                        active_poses, active_fp_descs, active_fp_poly_ranges, courtyard_polys, courtyard_vertices,
+                        active_c_base, nf, b_min_x, b_min_y, b_max_x, b_max_y, params.grid_step,
+                        &rng, &idx, &old_pose, &new_pose
+                    );
+                    if (proposed) {
+                        step_active = true;
                     }
-                    idx = (idx + 1u) % nf;
                 }
-                if (active_fp_descs[idx].z < 0.5f) {
-                    step_active = true;
-                    old_pose = active_poses[active_c_base + idx];
-                    new_pose = old_pose;
-                    float move_r = rand_f32(&rng);
-                    if (move_r < 0.72f) {
-                        float shift = fmaxf(temp * 0.15f, params.grid_step * 2.0f);
-                        float dx = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
-                        float dy = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
-                        new_pose.x = snap_grid(
-                            fminf(fmaxf(old_pose.x + dx, b_min_x + 1.2f), b_max_x - 1.2f),
-                            params.grid_step
-                        );
-                        new_pose.y = snap_grid(
-                            fminf(fmaxf(old_pose.y + dy, b_min_y + 1.2f), b_max_y - 1.2f),
-                            params.grid_step
-                        );
-                    } else {
-                        float rot_step = (float)((pcg_next(&rng) % 3u) + 1u) * 90.0f;
-                        float nz = old_pose.z + rot_step;
-                        if (nz >= 360.0f) {
-                            nz -= 360.0f;
+                if (!proposed) {
+                    if (score.z > 0.0f) {
+                        idx = raw_idx;
+                    }
+                    for (unsigned int tries = 0u; tries < 8u; ++tries) {
+                        if (active_fp_descs[idx].z < 0.5f) {
+                            break;
                         }
-                        new_pose.z = nz;
+                        idx = (idx + 1u) % nf;
+                    }
+                    if (active_fp_descs[idx].z < 0.5f) {
+                        step_active = true;
+                        old_pose = active_poses[active_c_base + idx];
+                        new_pose = old_pose;
+                        float move_r = rand_f32(&rng);
+                        if (move_r < 0.72f) {
+                            float shift = fmaxf(temp * 0.15f, params.grid_step * 2.0f);
+                            float dx = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
+                            float dy = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
+                            new_pose.x = snap_grid(
+                                fminf(fmaxf(old_pose.x + dx, b_min_x + 1.2f), b_max_x - 1.2f),
+                                params.grid_step
+                            );
+                            new_pose.y = snap_grid(
+                                fminf(fmaxf(old_pose.y + dy, b_min_y + 1.2f), b_max_y - 1.2f),
+                                params.grid_step
+                            );
+                        } else {
+                            float rot_step = (float)((pcg_next(&rng) % 3u) + 1u) * 90.0f;
+                            float nz = old_pose.z + rot_step;
+                            if (nz >= 360.0f) {
+                                nz -= 360.0f;
+                            }
+                            new_pose.z = nz;
+                        }
+                        if (score.z > 0.0f) {
+                            new_pose = clamp_pose_to_board_aabb(
+                                new_pose, active_fp_descs[idx], b_min_x, b_min_y, b_max_x, b_max_y, params.grid_step
+                            );
+                        }
                     }
                 }
             }
@@ -2054,8 +2252,9 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
                     active_poses[active_c_base + idx] = new_pose;
                     score.x = new_cost;
                     score.z = new_ov;
-                    if ((new_ov == 0.0f || score.y > ov_penalty) && new_cost < score.y) {
+                    if (new_ov < best_ov || (new_ov == best_ov && new_cost < score.y)) {
                         score.y = new_cost;
+                        best_ov = new_ov;
                         for (unsigned int i = 0u; i < nf; ++i) {
                             chain_poses[best_base + i] = active_poses[active_c_base + i];
                         }
@@ -2072,6 +2271,7 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
     }
 
     if (c_valid) {
+        score.z = best_ov;
         chain_scores[c] = score;
     }
 }

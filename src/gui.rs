@@ -4003,6 +4003,7 @@ impl VulcansTrialsApp {
                             let cfg = PlacementConfig {
                                 min_spacing_mm: self.min_spacing_mm,
                                 allow_layer_flip: self.allow_layer_flip,
+                                vulkan: self.vulkan.clone(),
                                 ..PlacementConfig::default()
                             };
                             let mut g = self.live.lock().unwrap();
@@ -4076,6 +4077,7 @@ impl VulcansTrialsApp {
                                 let cfg = PlacementConfig {
                                     min_spacing_mm: self.min_spacing_mm,
                                     allow_layer_flip: self.allow_layer_flip,
+                                    vulkan: self.vulkan.clone(),
                                     ..PlacementConfig::default()
                                 };
                                 let mut g = self.live.lock().unwrap();

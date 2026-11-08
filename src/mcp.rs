@@ -551,11 +551,13 @@ impl McpServer {
 
             "legalize_placement" => {
                 let mut guard = self.state.lock().unwrap();
+                let vulkan = guard.vulkan.clone();
                 let board = guard.board.as_mut().ok_or("No board currently loaded")?;
                 let min_spacing = args.get("min_spacing_mm").and_then(|v| v.as_f64()).unwrap_or(0.25);
 
                 let cfg = PlacementConfig {
                     min_spacing_mm: min_spacing,
+                    vulkan,
                     ..PlacementConfig::default()
                 };
 
@@ -577,8 +579,12 @@ impl McpServer {
 
             "pin_and_gate_swap" => {
                 let mut guard = self.state.lock().unwrap();
+                let vulkan = guard.vulkan.clone();
                 let board = guard.board.as_mut().ok_or("No board currently loaded")?;
-                let cfg = PlacementConfig::default();
+                let cfg = PlacementConfig {
+                    vulkan,
+                    ..PlacementConfig::default()
+                };
                 let swaps_count = optimize_pin_and_gate_swapping(board, &cfg);
 
                 let history_json: Vec<Value> = board
