@@ -3271,12 +3271,6 @@ pub struct CachedWavefrontBuffers {
     pub path_out_buf: wgpu::Buffer,
     /// Single-`u32` device storage buffer receiving the backtracked path length.
     pub path_len_buf: wgpu::Buffer,
-    /// Host-mappable staging buffer for reading back full 3D wavefront distance fields (`[total_cells]`).
-    pub staging_buf: wgpu::Buffer,
-    /// Host-mappable staging buffer for reading back `path_len_buf` (`4` bytes).
-    pub staging_len_buf: wgpu::Buffer,
-    /// Host-mappable staging buffer for reading back `path_out_buf` (`[max_path_len * 3]`).
-    pub staging_path_buf: wgpu::Buffer,
     /// Number of times this buffer pool was (re)allocated due to grid dimension changes.
     pub alloc_count: usize,
     /// Number of times existing buffers in this pool were reused without reallocation.
@@ -4508,6 +4502,138 @@ impl VulkanEngine {
         nodes
     }
 
+    /// Allocates a temporary `MAP_READ | COPY_DST` staging buffer, encodes a buffer-to-buffer copy
+    /// from `src_buf`, submits `encoder` to the device queue, synchronously maps and reads back
+    /// `Vec<T>`, destroys the staging buffer, and records elapsed GPU time in `self.compute_busy_ns`.
+    ///
+    /// # Arguments
+    /// * `encoder` - Command encoder containing the compute pass(es) producing `src_buf`.
+    /// * `src_buf` - Source GPU storage buffer (must have `wgpu::BufferUsages::COPY_SRC`).
+    /// * `src_offset` - Byte offset into `src_buf` where the copy begins.
+    /// * `byte_len` - Number of bytes to copy and read back.
+    /// * `label` - Debug label for the temporary staging buffer.
+    ///
+    /// # Returns
+    /// `Some(Vec<T>)` containing the read-back elements, or `None` if `map_async` fails.
+    ///
+    /// # Side Effects
+    /// Creates and destroys a transient staging buffer, submits `encoder` to `self.queue`, blocks
+    /// on `self.device.poll(wgpu::Maintain::Wait)`, and increments `self.compute_busy_ns`.
+    fn submit_and_readback_buffer<T: bytemuck::Pod>(
+        &self,
+        mut encoder: wgpu::CommandEncoder,
+        src_buf: &wgpu::Buffer,
+        src_offset: u64,
+        byte_len: u64,
+        label: &str,
+    ) -> Option<Vec<T>> {
+        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: byte_len,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(src_buf, src_offset, &staging_buf, 0, byte_len);
+        let start_t = Instant::now();
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging_buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        let elapsed_ns = (start_t.elapsed().as_nanos() as u64).max(1);
+        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+        let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
+            let data = slice.get_mapped_range();
+            let vec: Vec<T> = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            staging_buf.unmap();
+            Some(vec)
+        } else {
+            None
+        };
+        staging_buf.destroy();
+        result
+    }
+
+    /// Allocates two temporary `MAP_READ | COPY_DST` staging buffers, encodes buffer-to-buffer copies
+    /// from `src1` and `src2`, submits `encoder` to the device queue, synchronously maps and reads back
+    /// `(Vec<T1>, Vec<T2>)`, destroys both staging buffers, and records elapsed GPU time in `self.compute_busy_ns`.
+    ///
+    /// # Arguments
+    /// * `encoder` - Command encoder containing the compute pass(es) producing both output buffers.
+    /// * `src1` - Tuple `(buffer, src_offset, byte_len)` for the first GPU storage buffer.
+    /// * `src2` - Tuple `(buffer, src_offset, byte_len)` for the second GPU storage buffer.
+    /// * `label` - Debug label prefix for the temporary staging buffers.
+    ///
+    /// # Returns
+    /// `Some((Vec<T1>, Vec<T2>))` containing the read-back slices, or `None` if mapping fails.
+    ///
+    /// # Side Effects
+    /// Creates and destroys two transient staging buffers, submits `encoder` to `self.queue`, blocks
+    /// on `self.device.poll(wgpu::Maintain::Wait)`, and increments `self.compute_busy_ns`.
+    fn submit_and_readback_two_buffers<T1: bytemuck::Pod, T2: bytemuck::Pod>(
+        &self,
+        mut encoder: wgpu::CommandEncoder,
+        src1: (&wgpu::Buffer, u64, u64),
+        src2: (&wgpu::Buffer, u64, u64),
+        label: &str,
+    ) -> Option<(Vec<T1>, Vec<T2>)> {
+        let staging1 = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: src1.2,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let staging2 = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: src2.2,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(src1.0, src1.1, &staging1, 0, src1.2);
+        encoder.copy_buffer_to_buffer(src2.0, src2.1, &staging2, 0, src2.2);
+
+        let start_t = Instant::now();
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice1 = staging1.slice(..);
+        let slice2 = staging2.slice(..);
+        let (tx1, rx1) = std::sync::mpsc::channel();
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        slice1.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx1.send(res);
+        });
+        slice2.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx2.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        let elapsed_ns = (start_t.elapsed().as_nanos() as u64).max(1);
+        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+        let result = if rx1.recv().ok().and_then(|r| r.ok()).is_some()
+            && rx2.recv().ok().and_then(|r| r.ok()).is_some()
+        {
+            let d1 = slice1.get_mapped_range();
+            let d2 = slice2.get_mapped_range();
+            let v1: Vec<T1> = bytemuck::cast_slice(&d1).to_vec();
+            let v2: Vec<T2> = bytemuck::cast_slice(&d2).to_vec();
+            drop(d1);
+            drop(d2);
+            staging1.unmap();
+            staging2.unmap();
+            Some((v1, v2))
+        } else {
+            None
+        };
+        staging1.destroy();
+        staging2.destroy();
+        result
+    }
+
     /// Computes a single-layer 2D Euclidean Distance Field (EDF) on the GPU for an obstacle grid.
     ///
     /// Dispatches to the CUDA PTX kernel (`CudaEngine::compute_distance_field`) when
@@ -4600,13 +4726,6 @@ impl VulkanEngine {
             mapped_at_creation: false,
         });
 
-        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Staging Buffer"),
-            size: byte_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let params = GridParams {
             width,
             height,
@@ -4669,30 +4788,8 @@ impl VulkanEngine {
             cpass_v.dispatch_workgroups(wg_x, wg_y, wg_z);
         }
 
-        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging_buf, 0, byte_size);
-        let start_t = Instant::now();
-        self.queue.submit(Some(encoder.finish()));
+        let result = self.submit_and_readback_buffer(encoder, &out_buf, 0, byte_size, "Staging Buffer");
 
-        let slice = staging_buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        let elapsed_ns = (start_t.elapsed().as_nanos() as u64).max(1);
-        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-
-        let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
-            let data = slice.get_mapped_range();
-            let vec: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
-            drop(data);
-            staging_buf.unmap();
-            Some(vec)
-        } else {
-            None
-        };
-
-        staging_buf.destroy();
         out_buf.destroy();
         temp_h_buf.destroy();
         obs_buf.destroy();
@@ -4810,13 +4907,6 @@ impl VulkanEngine {
             mapped_at_creation: false,
         });
 
-        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Placement Costs Staging Buffer"),
-            size: out_byte_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("PlacementBatchParams Uniform"),
             contents: bytemuck::bytes_of(params),
@@ -4861,30 +4951,14 @@ impl VulkanEngine {
             cpass.dispatch_workgroups(wg_x, 1, 1);
         }
 
-        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging_buf, 0, out_byte_size);
-        let start_t = Instant::now();
-        self.queue.submit(Some(encoder.finish()));
+        let result = self.submit_and_readback_buffer(
+            encoder,
+            &out_buf,
+            0,
+            out_byte_size,
+            "Placement Costs Staging Buffer",
+        );
 
-        let slice = staging_buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
-        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-
-        let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
-            let data = slice.get_mapped_range();
-            let vec: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
-            drop(data);
-            staging_buf.unmap();
-            Some(vec)
-        } else {
-            None
-        };
-
-        staging_buf.destroy();
         out_buf.destroy();
         boxes_buf.destroy();
         segs_buf.destroy();
@@ -5012,20 +5086,6 @@ impl VulkanEngine {
         let best_poses_bytes = (nc * nf * std::mem::size_of::<[f32; 4]>()) as u64;
         let scores_bytes = (nc * std::mem::size_of::<[f32; 4]>()) as u64;
 
-        let poses_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("SA Best Poses Staging"),
-            size: best_poses_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let scores_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("SA Scores Staging"),
-            size: scores_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("GpuSaPlacer BindGroup"),
             layout: &self.sa_bgl,
@@ -5080,44 +5140,13 @@ impl VulkanEngine {
             cpass.dispatch_workgroups(wg_x, 1, 1);
         }
 
-        encoder.copy_buffer_to_buffer(&poses_buf, best_poses_bytes, &poses_staging, 0, best_poses_bytes);
-        encoder.copy_buffer_to_buffer(&scores_buf, 0, &scores_staging, 0, scores_bytes);
+        let result = self.submit_and_readback_two_buffers(
+            encoder,
+            (&poses_buf, best_poses_bytes, best_poses_bytes),
+            (&scores_buf, 0, scores_bytes),
+            "GpuSaPlacer Staging",
+        );
 
-        let start_t = Instant::now();
-        self.queue.submit(Some(encoder.finish()));
-
-        let poses_slice = poses_staging.slice(..);
-        let scores_slice = scores_staging.slice(..);
-        let (tx1, rx1) = std::sync::mpsc::channel();
-        let (tx2, rx2) = std::sync::mpsc::channel();
-        poses_slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx1.send(res);
-        });
-        scores_slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx2.send(res);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
-        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-
-        let result = if rx1.recv().ok().and_then(|r| r.ok()).is_some()
-            && rx2.recv().ok().and_then(|r| r.ok()).is_some()
-        {
-            let p_data = poses_slice.get_mapped_range();
-            let s_data = scores_slice.get_mapped_range();
-            let best_poses: Vec<[f32; 4]> = bytemuck::cast_slice(&p_data).to_vec();
-            let best_scores: Vec<[f32; 4]> = bytemuck::cast_slice(&s_data).to_vec();
-            drop(p_data);
-            drop(s_data);
-            poses_staging.unmap();
-            scores_staging.unmap();
-            Some((best_poses, best_scores))
-        } else {
-            None
-        };
-
-        poses_staging.destroy();
-        scores_staging.destroy();
         poses_buf.destroy();
         scores_buf.destroy();
         fp_buf.destroy();
@@ -5308,12 +5337,6 @@ impl VulkanEngine {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("3D Route Cost Staging Buffer"),
-            size: byte_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("GpuRouteCostParams Uniform"),
             contents: bytemuck::bytes_of(params),
@@ -5368,30 +5391,14 @@ impl VulkanEngine {
             cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
         }
 
-        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging_buf, 0, byte_size);
-        let start_t = Instant::now();
-        self.queue.submit(Some(encoder.finish()));
+        let result = self.submit_and_readback_buffer(
+            encoder,
+            &out_buf,
+            0,
+            byte_size,
+            "3D Route Cost Staging Buffer",
+        );
 
-        let slice = staging_buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
-        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-
-        let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
-            let data = slice.get_mapped_range();
-            let vec: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
-            drop(data);
-            staging_buf.unmap();
-            Some(vec)
-        } else {
-            None
-        };
-
-        staging_buf.destroy();
         out_buf.destroy();
         obs_buf.destroy();
         df_buf.destroy();
@@ -5563,9 +5570,6 @@ impl VulkanEngine {
                 old.dist_b_buf.destroy();
                 old.path_out_buf.destroy();
                 old.path_len_buf.destroy();
-                old.staging_buf.destroy();
-                old.staging_len_buf.destroy();
-                old.staging_path_buf.destroy();
                 old.alloc_count
             } else {
                 0
@@ -5575,7 +5579,6 @@ impl VulkanEngine {
             let f32_byte_size = (total * std::mem::size_of::<f32>()) as u64;
             let max_path_len = total.min(65536).max(64) as u32;
             let path_byte_size = (max_path_len as usize * 3 * std::mem::size_of::<u32>()) as u64;
-            let len_byte_size = std::mem::size_of::<u32>() as u64;
 
             let zero_f32 = vec![0.0f32; total];
             let zero_u32 = vec![0u32; total];
@@ -5636,24 +5639,6 @@ impl VulkanEngine {
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST,
             });
-            let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("CachedWavefront Staging Buffer"),
-                size: f32_byte_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let staging_len_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("CachedWavefront Staging PathLen Buffer"),
-                size: len_byte_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let staging_path_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("CachedWavefront Staging Path Buffer"),
-                size: path_byte_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
 
             *guard = Some(CachedWavefrontBuffers {
                 total_cells: total,
@@ -5667,9 +5652,6 @@ impl VulkanEngine {
                 dist_b_buf,
                 path_out_buf,
                 path_len_buf,
-                staging_buf,
-                staging_len_buf,
-                staging_path_buf,
                 alloc_count: prev_alloc + 1,
                 reuse_count: 0,
             });
@@ -5808,29 +5790,13 @@ impl VulkanEngine {
             }
 
             let final_buf = if iterations % 2 == 1 { &pool.dist_b_buf } else { &pool.dist_a_buf };
-            encoder.copy_buffer_to_buffer(final_buf, 0, &pool.staging_buf, 0, byte_size);
-
-            let start_t = Instant::now();
-            self.queue.submit(Some(encoder.finish()));
-
-            let slice = pool.staging_buf.slice(..);
-            let (tx, rx) = std::sync::mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |res| {
-                let _ = tx.send(res);
-            });
-            self.device.poll(wgpu::Maintain::Wait);
-            let elapsed_ns = (start_t.elapsed().as_nanos() as u64).max(1);
-            self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-
-            let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
-                let data = slice.get_mapped_range();
-                let vec: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
-                drop(data);
-                pool.staging_buf.unmap();
-                Some(vec)
-            } else {
-                None
-            };
+            let result = self.submit_and_readback_buffer(
+                encoder,
+                final_buf,
+                0,
+                byte_size,
+                "CachedWavefront Staging Buffer",
+            );
 
             param_buf.destroy();
             result
@@ -6222,45 +6188,22 @@ impl VulkanEngine {
                 cpass.dispatch_workgroups(1, 1, 1);
             }
 
-            encoder.copy_buffer_to_buffer(&pool.path_len_buf, 0, &pool.staging_len_buf, 0, len_byte_size);
-            encoder.copy_buffer_to_buffer(&pool.path_out_buf, 0, &pool.staging_path_buf, 0, path_byte_size);
-
-            let start_t = Instant::now();
-            self.queue.submit(Some(encoder.finish()));
-
-            let len_slice = pool.staging_len_buf.slice(..);
-            let path_slice = pool.staging_path_buf.slice(..);
-            let (tx1, rx1) = std::sync::mpsc::channel();
-            let (tx2, rx2) = std::sync::mpsc::channel();
-            len_slice.map_async(wgpu::MapMode::Read, move |res| {
-                let _ = tx1.send(res);
-            });
-            path_slice.map_async(wgpu::MapMode::Read, move |res| {
-                let _ = tx2.send(res);
-            });
-            self.device.poll(wgpu::Maintain::Wait);
-            let elapsed_ns = (start_t.elapsed().as_nanos() as u64).max(1);
-            self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-
             let mut result = None;
-            if rx1.recv().ok().and_then(|r| r.ok()).is_some()
-                && rx2.recv().ok().and_then(|r| r.ok()).is_some()
-            {
-                let len_data = len_slice.get_mapped_range();
-                let path_len = bytemuck::cast_slice::<u8, u32>(&len_data)[0];
-                drop(len_data);
-                pool.staging_len_buf.unmap();
-
+            if let Some((len_vec, path_words)) = self.submit_and_readback_two_buffers::<u32, u32>(
+                encoder,
+                (&pool.path_len_buf, 0, len_byte_size),
+                (&pool.path_out_buf, 0, path_byte_size),
+                "WavefrontSolve Staging",
+            ) {
+                let path_len = len_vec[0];
                 if path_len > 0 && path_len <= max_path_len {
-                    let path_data = path_slice.get_mapped_range();
-                    let words = &bytemuck::cast_slice::<u8, u32>(&path_data)[..(path_len as usize * 3)];
+                    let words = &path_words[..(path_len as usize * 3)];
                     let mut path = Vec::with_capacity(path_len as usize);
                     for c in words.chunks_exact(3) {
                         path.push((c[0] as usize, c[1] as usize, c[2] as usize));
                     }
                     result = Some(path);
                 }
-                pool.staging_path_buf.unmap();
             }
 
             bt_param_buf.destroy();
@@ -6449,12 +6392,6 @@ impl VulkanEngine {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("RtBvhCrossings Staging Buffer"),
-            size: out_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let q_params = BvhQueryParams {
             count: n as u32,
             _pad0: 0,
@@ -6503,31 +6440,14 @@ impl VulkanEngine {
             let wg_x = (n as u32 + 63) / 64;
             cpass.dispatch_workgroups(wg_x, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging_buf, 0, out_bytes);
+        let result = self.submit_and_readback_buffer(
+            encoder,
+            &out_buf,
+            0,
+            out_bytes,
+            "RtBvhCrossings Staging Buffer",
+        );
 
-        let start_t = Instant::now();
-        self.queue.submit(Some(encoder.finish()));
-
-        let slice = staging_buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
-        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-
-        let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
-            let data = slice.get_mapped_range();
-            let vec: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
-            drop(data);
-            staging_buf.unmap();
-            Some(vec)
-        } else {
-            None
-        };
-
-        staging_buf.destroy();
         out_buf.destroy();
         segs_buf.destroy();
         bvh_buf.destroy();
@@ -6619,12 +6539,6 @@ impl VulkanEngine {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("RtBvhCorridorCuts Staging Buffer"),
-            size: out_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let q_params = BvhQueryParams {
             count: num_cuts as u32,
             _pad0: 0,
@@ -6677,31 +6591,14 @@ impl VulkanEngine {
             let wg_x = (num_cuts as u32 + 63) / 64;
             cpass.dispatch_workgroups(wg_x, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging_buf, 0, out_bytes);
+        let result = self.submit_and_readback_buffer(
+            encoder,
+            &out_buf,
+            0,
+            out_bytes,
+            "RtBvhCorridorCuts Staging Buffer",
+        );
 
-        let start_t = Instant::now();
-        self.queue.submit(Some(encoder.finish()));
-
-        let slice = staging_buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
-        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-
-        let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
-            let data = slice.get_mapped_range();
-            let vec: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
-            drop(data);
-            staging_buf.unmap();
-            Some(vec)
-        } else {
-            None
-        };
-
-        staging_buf.destroy();
         out_buf.destroy();
         segs_buf.destroy();
         bvh_buf.destroy();
@@ -6785,12 +6682,6 @@ impl VulkanEngine {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("RtBvhDrc Staging Buffer"),
-            size: out_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let q_params = BvhQueryParams {
             count: nq as u32,
             _pad0: 0,
@@ -6839,31 +6730,14 @@ impl VulkanEngine {
             let wg_x = (nq as u32 + 63) / 64;
             cpass.dispatch_workgroups(wg_x, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging_buf, 0, out_bytes);
+        let result = self.submit_and_readback_buffer(
+            encoder,
+            &out_buf,
+            0,
+            out_bytes,
+            "RtBvhDrc Staging Buffer",
+        );
 
-        let start_t = Instant::now();
-        self.queue.submit(Some(encoder.finish()));
-
-        let slice = staging_buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
-        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-
-        let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
-            let data = slice.get_mapped_range();
-            let vec: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
-            drop(data);
-            staging_buf.unmap();
-            Some(vec)
-        } else {
-            None
-        };
-
-        staging_buf.destroy();
         out_buf.destroy();
         bvh_buf.destroy();
         queries_buf.destroy();
@@ -7080,13 +6954,6 @@ impl VulkanEngine {
             mapped_at_creation: false,
         });
 
-        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("DRC Results Staging Buffer"),
-            size: out_byte_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let params = DrcBatchParams {
             num_pads: pads.len() as u32,
             num_tracks: tracks.len() as u32,
@@ -7145,30 +7012,14 @@ impl VulkanEngine {
             cpass.dispatch_workgroups(wg_x, 1, 1);
         }
 
-        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging_buf, 0, out_byte_size);
-        let start_t = Instant::now();
-        self.queue.submit(Some(encoder.finish()));
+        let result = self.submit_and_readback_buffer(
+            encoder,
+            &out_buf,
+            0,
+            out_byte_size,
+            "DRC Results Staging Buffer",
+        );
 
-        let slice = staging_buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        let elapsed_ns = start_t.elapsed().as_nanos() as u64;
-        self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-
-        let result = if rx.recv().ok().and_then(|r| r.ok()).is_some() {
-            let data = slice.get_mapped_range();
-            let vec: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
-            drop(data);
-            staging_buf.unmap();
-            Some(vec)
-        } else {
-            None
-        };
-
-        staging_buf.destroy();
         out_buf.destroy();
         pads_buf.destroy();
         tracks_buf.destroy();

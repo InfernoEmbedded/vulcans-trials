@@ -695,7 +695,7 @@ __device__ __forceinline__ bool segments_cross(float4 s1, float4 s2) {
             ((d3 > 0.0f && d4 < 0.0f) || (d3 < 0.0f && d4 > 0.0f)));
 }
 
-__global__ void batch_placement_eval_kernel(
+__device__ void batch_placement_eval_device(
     const float4* __restrict__ boxes,
     const float4* __restrict__ segs,
     float* __restrict__ costs_out,
@@ -721,95 +721,6 @@ __global__ void batch_placement_eval_kernel(
     const float bd_penalty = params.boundary_penalty;
 
     float wl = 0.0f;
-    unsigned int crossings = 0u;
-    for (unsigned int i = 0u; i < ns; ++i) {
-        float4 s1 = segs[s_base + i];
-        float dx = s1.z - s1.x;
-        float dy = s1.w - s1.y;
-        wl += sqrtf(dx * dx + dy * dy);
-        for (unsigned int j = i + 1u; j < ns; ++j) {
-            if (segments_cross(s1, segs[s_base + j])) {
-                crossings += 1u;
-            }
-        }
-    }
-
-    float overlap_cost = 0.0f;
-    float boundary_cost = 0.0f;
-    for (unsigned int i = 0u; i < nf; ++i) {
-        float4 bi = boxes[b_base + i];
-        float out_x = fmaxf(b_min_x - bi.x, 0.0f) + fmaxf(bi.z - b_max_x, 0.0f);
-        float out_y = fmaxf(b_min_y - bi.y, 0.0f) + fmaxf(bi.w - b_max_y, 0.0f);
-        if (out_x > 0.0f || out_y > 0.0f) {
-            boundary_cost += bd_penalty * (1.0f + out_x + out_y);
-        }
-        for (unsigned int j = i + 1u; j < nf; ++j) {
-            float4 bj = boxes[b_base + j];
-            if (bi.z > bj.x && bi.x < bj.z && bi.w > bj.y && bi.y < bj.w) {
-                float ox = fmaxf(fminf(bi.z, bj.z) - fmaxf(bi.x, bj.x), 0.1f);
-                float oy = fmaxf(fminf(bi.w, bj.w) - fmaxf(bi.y, bj.y), 0.1f);
-                overlap_cost += ov_penalty * (1.0f + ox * oy);
-            }
-        }
-    }
-
-    costs_out[c] = wl * wl_weight
-        + (float)crossings * cr_weight
-        + overlap_cost
-        + boundary_cost;
-}
-
-// Ampere Tensor Core (mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32) Batch Placement Evaluation Kernel
-__global__ void batch_placement_tensor_core_kernel(
-    const float4* __restrict__ boxes,
-    const float4* __restrict__ segs,
-    float* __restrict__ costs_out,
-    PlacementBatchParams params
-) {
-    unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
-    bool c_valid = (c < params.num_candidates);
-    unsigned int c_safe = c_valid ? c : 0u;
-
-    const unsigned int nf = params.num_footprints;
-    const unsigned int ns = params.num_segments;
-    const unsigned int b_base = c_safe * nf;
-    const unsigned int s_base = c_safe * ns;
-
-    const float b_min_x = params.board_min_x;
-    const float b_min_y = params.board_min_y;
-    const float b_max_x = params.board_max_x;
-    const float b_max_y = params.board_max_y;
-    const float wl_weight = params.wirelength_weight;
-    const float cr_weight = params.crossing_weight;
-    const float ov_penalty = params.overlap_penalty;
-    const float bd_penalty = params.boundary_penalty;
-
-    // Warp-cooperative Tensor Core (mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32)
-    // coordinate projection across the candidate batch before per-candidate evaluation
-    float4 b0 = (c_valid && nf > 0u) ? __ldg(&boxes[b_base]) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
-#if __CUDA_ARCH__ >= 800
-    unsigned int a0 = __float_as_uint(b0.x) & 0xFFFFE000u;
-    unsigned int a1 = __float_as_uint(b0.y) & 0xFFFFE000u;
-    unsigned int a2 = __float_as_uint(b0.z) & 0xFFFFE000u;
-    unsigned int a3 = __float_as_uint(b0.w) & 0xFFFFE000u;
-    unsigned int tf32_one = 0x3F800000u;
-    asm volatile(
-        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
-        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
-        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-          "r"(tf32_one), "r"(tf32_one),
-          "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f)
-    );
-#else
-    d0 = b0.x + b0.y + b0.z + b0.w;
-#endif
-    if (!c_valid) {
-        return;
-    }
-
-    float wl = (d0 + d1 + d2 + d3) * 0.0f;
     unsigned int crossings = 0u;
     for (unsigned int i = 0u; i < ns; ++i) {
         float4 s1 = __ldg(&segs[s_base + i]);
@@ -854,6 +765,24 @@ __global__ void batch_placement_tensor_core_kernel(
         + (float)crossings * cr_weight
         + overlap_cost
         + boundary_cost;
+}
+
+__global__ void batch_placement_eval_kernel(
+    const float4* __restrict__ boxes,
+    const float4* __restrict__ segs,
+    float* __restrict__ costs_out,
+    PlacementBatchParams params
+) {
+    batch_placement_eval_device(boxes, segs, costs_out, params);
+}
+
+__global__ void batch_placement_tensor_core_kernel(
+    const float4* __restrict__ boxes,
+    const float4* __restrict__ segs,
+    float* __restrict__ costs_out,
+    PlacementBatchParams params
+) {
+    batch_placement_eval_device(boxes, segs, costs_out, params);
 }
 
 // -----------------------------------------------------------------------------
@@ -1860,8 +1789,8 @@ __device__ float2 evaluate_chain_delta_e(
     return make_float2(delta_cost, delta_ov);
 }
 
-// Incremental Delta-E Simulated Annealing MCMC Placer Kernel
-__global__ void gpu_sa_placer_delta_e_kernel(
+// Incremental Delta-E Simulated Annealing MCMC Placer Device Helper
+__device__ void gpu_sa_placer_delta_e_device(
     const float4* __restrict__ fp_descs,
     const float4* __restrict__ edges,
     float4* __restrict__ chain_poses,
@@ -2055,7 +1984,23 @@ __global__ void gpu_sa_placer_delta_e_kernel(
     chain_scores[c] = score;
 }
 
-// Ampere Tensor Core (mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32) + Shared-Memory Incremental Delta-E SA MCMC Placer Kernel
+__global__ void gpu_sa_placer_delta_e_kernel(
+    const float4* __restrict__ fp_descs,
+    const float4* __restrict__ edges,
+    float4* __restrict__ chain_poses,
+    float4* __restrict__ chain_scores,
+    GpuSaParams params,
+    unsigned int num_passes,
+    const uint4* __restrict__ fp_poly_ranges,
+    const uint4* __restrict__ courtyard_polys,
+    const float2* __restrict__ courtyard_vertices
+) {
+    gpu_sa_placer_delta_e_device(
+        fp_descs, edges, chain_poses, chain_scores, params, num_passes,
+        fp_poly_ranges, courtyard_polys, courtyard_vertices
+    );
+}
+
 __global__ void gpu_sa_placer_tensor_core_kernel(
     const float4* __restrict__ fp_descs,
     const float4* __restrict__ edges,
@@ -2067,213 +2012,10 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
     const uint4* __restrict__ courtyard_polys,
     const float2* __restrict__ courtyard_vertices
 ) {
-    __shared__ float4 s_fp_descs[128];
-    __shared__ uint4 s_fp_poly_ranges[128];
-    __shared__ float4 s_edges[512];
-    __shared__ float4 s_poses[2048];
-
-    const unsigned int nf = params.num_footprints;
-    const unsigned int ne = params.num_edges;
-    const bool use_smem = (nf <= 128u && ne <= 256u);
-    const bool use_pose_smem = (blockDim.x <= 64u && nf > 0u && nf <= 32u);
-
-    if (use_smem) {
-        for (unsigned int i = threadIdx.x; i < nf; i += blockDim.x) {
-            s_fp_descs[i] = fp_descs[i];
-            s_fp_poly_ranges[i] = fp_poly_ranges[i];
-        }
-        for (unsigned int i = threadIdx.x; i < ne * 2u; i += blockDim.x) {
-            s_edges[i] = edges[i];
-        }
-    }
-
-    unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
-    bool c_valid = (c < params.num_chains);
-    unsigned int c_safe = c_valid ? c : 0u;
-
-    const unsigned int global_c_base = c_safe * nf;
-    const unsigned int best_base = (params.num_chains + c_safe) * nf;
-    const unsigned int active_c_base = use_pose_smem ? (threadIdx.x * nf) : global_c_base;
-
-    if (use_pose_smem && c_valid) {
-        for (unsigned int i = 0u; i < nf; ++i) {
-            s_poses[active_c_base + i] = chain_poses[global_c_base + i];
-        }
-    }
-    __syncthreads();
-
-    const float4* active_fp_descs = use_smem ? s_fp_descs : fp_descs;
-    const uint4* active_fp_poly_ranges = use_smem ? s_fp_poly_ranges : fp_poly_ranges;
-    const float4* active_edges = use_smem ? s_edges : edges;
-    float4* active_poses = use_pose_smem ? s_poses : chain_poses;
-
-    const float b_min_x = params.board_min_x;
-    const float b_min_y = params.board_min_y;
-    const float b_max_x = params.board_max_x;
-    const float b_max_y = params.board_max_y;
-    const float wl_weight = params.wirelength_weight;
-    const float cr_weight = params.crossing_weight;
-    const float ov_penalty = params.overlap_penalty;
-    const float bd_penalty = params.boundary_penalty;
-    const float pass_aff_weight = params.passive_affinity_weight;
-    const float pass_max_d = params.passive_max_dist;
-    const float corr_weight = params.corridor_congestion_weight;
-    const float flow_weight = params.flow_alignment_weight;
-
-    float4 score = c_valid ? chain_scores[c] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    unsigned int rng = params.seed ^ (c * 747796405u + 2891336453u) ^ (unsigned int)(score.w * 1664525.0f);
-    pcg_next(&rng);
-
-    float best_ov = score.z;
-    if (c_valid && nf > 0u) {
-        if (score.w <= 0.0f) {
-            float2 init_ev = evaluate_chain_state_fast(
-                active_poses, active_fp_descs, active_edges, active_c_base, nf, ne,
-                b_min_x, b_min_y, b_max_x, b_max_y,
-                wl_weight, cr_weight, ov_penalty, bd_penalty,
-                pass_aff_weight, pass_max_d, corr_weight, flow_weight,
-                active_fp_poly_ranges, courtyard_polys, courtyard_vertices
-            );
-            score = make_float4(init_ev.x, init_ev.x, init_ev.y, 1.0f);
-            best_ov = init_ev.y;
-            for (unsigned int i = 0u; i < nf; ++i) {
-                chain_poses[best_base + i] = active_poses[active_c_base + i];
-            }
-        } else {
-            score.w += 1.0f;
-        }
-    }
-
-    float temp_ratio = (float)(c_safe & 63u) / 63.0f;
-    float temp = fmaxf(params.base_temp * __powf(35.0f, temp_ratio), 0.2f);
-
-    for (unsigned int p = 0; p < num_passes; ++p) {
-        for (unsigned int step = 0u; step < params.steps_per_pass; ++step) {
-            unsigned int raw_idx = (nf > 0u) ? (pcg_next(&rng) % nf) : 0u;
-            unsigned int idx = __shfl_sync(0xFFFFFFFFu, raw_idx, 0);
-            bool step_active = false;
-            float4 old_pose = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            float4 new_pose = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-
-            if (c_valid && nf > 0u) {
-                bool proposed = false;
-                if (score.z > 0.0f && rand_f32(&rng) < 0.88f) {
-                    proposed = propose_overlap_repulsion_move(
-                        active_poses, active_fp_descs, active_fp_poly_ranges, courtyard_polys, courtyard_vertices,
-                        active_c_base, nf, b_min_x, b_min_y, b_max_x, b_max_y, params.grid_step,
-                        &rng, &idx, &old_pose, &new_pose
-                    );
-                    if (proposed) {
-                        step_active = true;
-                    }
-                }
-                if (!proposed) {
-                    if (score.z > 0.0f) {
-                        idx = raw_idx;
-                    }
-                    for (unsigned int tries = 0u; tries < 8u; ++tries) {
-                        if (active_fp_descs[idx].z < 0.5f) {
-                            break;
-                        }
-                        idx = (idx + 1u) % nf;
-                    }
-                    if (active_fp_descs[idx].z < 0.5f) {
-                        step_active = true;
-                        old_pose = active_poses[active_c_base + idx];
-                        new_pose = old_pose;
-                        float move_r = rand_f32(&rng);
-                        if (move_r < 0.72f) {
-                            float shift = fmaxf(temp * 0.15f, params.grid_step * 2.0f);
-                            float dx = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
-                            float dy = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
-                            new_pose.x = snap_grid(
-                                fminf(fmaxf(old_pose.x + dx, b_min_x + 1.2f), b_max_x - 1.2f),
-                                params.grid_step
-                            );
-                            new_pose.y = snap_grid(
-                                fminf(fmaxf(old_pose.y + dy, b_min_y + 1.2f), b_max_y - 1.2f),
-                                params.grid_step
-                            );
-                        } else {
-                            float rot_step = (float)((pcg_next(&rng) % 3u) + 1u) * 90.0f;
-                            float nz = old_pose.z + rot_step;
-                            if (nz >= 360.0f) {
-                                nz -= 360.0f;
-                            }
-                            new_pose.z = nz;
-                        }
-                        if (score.z > 0.0f) {
-                            new_pose = clamp_pose_to_board_aabb(
-                                new_pose, active_fp_descs[idx], b_min_x, b_min_y, b_max_x, b_max_y, params.grid_step
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Warp-cooperative Tensor Core (mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32)
-            // pose displacement and Gram distance projection across the 32-lane warp
-            float tc_d0 = 0.0f, tc_d1 = 0.0f, tc_d2 = 0.0f, tc_d3 = 0.0f;
-#if __CUDA_ARCH__ >= 800
-            unsigned int a0 = __float_as_uint(new_pose.x - old_pose.x) & 0xFFFFE000u;
-            unsigned int a1 = __float_as_uint(new_pose.y - old_pose.y) & 0xFFFFE000u;
-            unsigned int a2 = __float_as_uint(new_pose.z) & 0xFFFFE000u;
-            unsigned int a3 = __float_as_uint(old_pose.z) & 0xFFFFE000u;
-            unsigned int tf32_one = 0x3F800000u;
-            asm volatile(
-                "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
-                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
-                : "=f"(tc_d0), "=f"(tc_d1), "=f"(tc_d2), "=f"(tc_d3)
-                : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-                  "r"(tf32_one), "r"(tf32_one),
-                  "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f)
-            );
-#else
-            tc_d0 = (new_pose.x - old_pose.x) + (new_pose.y - old_pose.y);
-#endif
-
-            if (step_active) {
-                float2 d_ev = evaluate_chain_delta_e(
-                    active_poses, active_fp_descs, active_edges, active_c_base, nf, ne,
-                    idx, old_pose, new_pose,
-                    b_min_x, b_min_y, b_max_x, b_max_y,
-                    wl_weight, cr_weight, ov_penalty, bd_penalty,
-                    pass_aff_weight, pass_max_d, corr_weight, flow_weight,
-                    active_fp_poly_ranges, courtyard_polys, courtyard_vertices
-                );
-                float delta = d_ev.x + (tc_d0 + tc_d1 + tc_d2 + tc_d3) * 0.0f;
-                float new_cost = score.x + delta;
-                float new_ov = fmaxf(roundf(score.z + d_ev.y), 0.0f);
-
-                bool accept = (new_ov < score.z) ||
-                    (new_ov == score.z && (delta <= 0.0f || rand_f32(&rng) < __expf(-delta / temp)));
-
-                if (accept) {
-                    active_poses[active_c_base + idx] = new_pose;
-                    score.x = new_cost;
-                    score.z = new_ov;
-                    if (new_ov < best_ov || (new_ov == best_ov && new_cost < score.y)) {
-                        score.y = new_cost;
-                        best_ov = new_ov;
-                        for (unsigned int i = 0u; i < nf; ++i) {
-                            chain_poses[best_base + i] = active_poses[active_c_base + i];
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if (c_valid && nf > 0u && use_pose_smem) {
-        for (unsigned int i = 0u; i < nf; ++i) {
-            chain_poses[global_c_base + i] = s_poses[active_c_base + i];
-        }
-    }
-
-    if (c_valid) {
-        score.z = best_ov;
-        chain_scores[c] = score;
-    }
+    gpu_sa_placer_delta_e_device(
+        fp_descs, edges, chain_poses, chain_scores, params, num_passes,
+        fp_poly_ranges, courtyard_polys, courtyard_vertices
+    );
 }
 
 struct GpuRouteCostParams {

@@ -4557,7 +4557,7 @@ pub fn run_auto_placer(
                 step += 0.25;
             }
             if !resolved {
-                // ponytail: In extreme geometries fallback to clamped boundary
+                // ponytail: fallback to clamped board boundary when all grid candidates collide. ceiling: extreme over-constrained boards with zero legal grid candidates. upgrade: invoke legalize_placement shove pass when fallback is taken.
                 final_best.positions[i] = Point::new(clamped_x, clamped_y);
                 final_best.update_component(i, board, config);
             }
