@@ -1001,7 +1001,7 @@ fn snap_to_grid(v: f64, step: f64) -> f64 {
     }
 }
 
-fn build_gpu_sa_descriptors(
+pub fn build_gpu_sa_descriptors(
     board: &Board,
     config: &PlacementConfig,
     ties: &[PassiveTie],
@@ -1014,41 +1014,92 @@ fn build_gpu_sa_descriptors(
 
     for (i, fp) in board.footprints.iter().enumerate() {
         let spacing = fp.effective_spacing(config);
-        let polys = fp.transformed_courtyards(Point::new(0.0, 0.0), 0.0, spacing);
+        let polys = fp.transformed_courtyards_layered(Point::new(0.0, 0.0), 0.0, fp.orig_layer, spacing);
         let b = union_aabb(&polys, Point::new(0.0, 0.0));
-        let hw = ((b.max_x - b.min_x) * 0.5).max(0.4) as f32;
-        let hh = ((b.max_y - b.min_y) * 0.5).max(0.4) as f32;
+        let raw_hw = ((b.max_x - b.min_x) * 0.5) as f32;
+        let raw_hh = ((b.max_y - b.min_y) * 0.5) as f32;
+        let cx = ((b.min_x + b.max_x) * 0.5) as f32;
+        let cy_orig = ((b.min_y + b.max_y) * 0.5) as f32;
+        let cy_eff = if fp.layer != fp.orig_layer { -cy_orig } else { cy_orig };
+
+        let (packed_center, pad_x, pad_y, center_exact) = if cx.abs() > 1e-2 || cy_eff.abs() > 1e-2 {
+            let qx = (cx * 20.0).round().clamp(-500.0, 500.0);
+            let qy = (cy_eff * 20.0).round().clamp(-500.0, 500.0);
+            let rx = (cx - qx * 0.05).abs();
+            let ry = (cy_eff - qy * 0.05).abs();
+            (
+                (qx + 512.0) * 1024.0 + (qy + 512.0),
+                rx,
+                ry,
+                rx <= 1e-2 && ry <= 1e-2,
+            )
+        } else {
+            (0.0f32, cx.abs(), cy_eff.abs(), true)
+        };
+
+        let hw = (raw_hw + pad_x).max(0.4);
+        let hh = (raw_hh + pad_y).max(0.4);
         let locked = if fp.is_locked { 1.0 } else { 0.0 };
-        fp_descs.push([hw, hh, locked, 0.0]);
+        fp_descs.push([hw, hh, locked, packed_center]);
 
         let is_smd = if fp.is_smd_only() { 1u32 } else { 0u32 };
         let orig_layer = fp.orig_layer as u32;
         let poly_start = courtyard_polys.len() as u32;
 
         let mut valid_poly_count = 0u32;
+        let mut all_polys_rect = true;
         for poly in polys {
             if poly.vertices.len() >= 3 {
                 let v_start = courtyard_vertices.len() as u32;
-                let v_count = (poly.vertices.len() as u32).min(16);
-                for v in &poly.vertices[..v_count as usize] {
-                    courtyard_vertices.push([v.x as f32, v.y as f32]);
+                let pb = poly.aabb();
+                let is_poly_rect = poly.vertices.len() == 4
+                    && poly.vertices.iter().all(|v| {
+                        ((v.x - pb.min_x).abs() <= 1e-3 || (v.x - pb.max_x).abs() <= 1e-3)
+                            && ((v.y - pb.min_y).abs() <= 1e-3 || (v.y - pb.max_y).abs() <= 1e-3)
+                    });
+                if is_poly_rect {
+                    courtyard_vertices.push([pb.min_x as f32, pb.min_y as f32]);
+                    courtyard_vertices.push([pb.max_x as f32, pb.min_y as f32]);
+                    courtyard_vertices.push([pb.max_x as f32, pb.max_y as f32]);
+                    courtyard_vertices.push([pb.min_x as f32, pb.max_y as f32]);
+                    courtyard_polys.push([v_start, 4, i as u32, 1]);
+                } else {
+                    all_polys_rect = false;
+                    let v_count = (poly.vertices.len() as u32).min(16);
+                    for v in &poly.vertices[..v_count as usize] {
+                        courtyard_vertices.push([v.x as f32, v.y as f32]);
+                    }
+                    courtyard_polys.push([v_start, v_count, i as u32, 0]);
                 }
-                courtyard_polys.push([v_start, v_count, i as u32, 0]);
                 valid_poly_count += 1;
             }
         }
 
+        let mut flags = is_smd;
         if valid_poly_count == 0 {
             let v_start = courtyard_vertices.len() as u32;
             courtyard_vertices.push([-hw, -hh]);
             courtyard_vertices.push([hw, -hh]);
             courtyard_vertices.push([hw, hh]);
             courtyard_vertices.push([-hw, hh]);
-            courtyard_polys.push([v_start, 4, i as u32, 0]);
+            courtyard_polys.push([v_start, 4, i as u32, 1]);
             valid_poly_count = 1;
+            flags |= 4u32;
+        } else {
+            if all_polys_rect {
+                flags |= 4u32;
+            }
+            let is_single_exact_rect = valid_poly_count == 1
+                && all_polys_rect
+                && center_exact
+                && (raw_hw - hw).abs() <= 1e-2
+                && (raw_hh - hh).abs() <= 1e-2;
+            if !is_single_exact_rect {
+                flags |= 2u32;
+            }
         }
 
-        fp_poly_ranges.push([poly_start, valid_poly_count, is_smd, orig_layer]);
+        fp_poly_ranges.push([poly_start, valid_poly_count, flags, orig_layer]);
     }
 
     let mut net_pads: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
@@ -1105,6 +1156,35 @@ fn build_gpu_sa_descriptors(
         }
     }
 
+    // Place corridor cut segments (tag = 3.0) immediately after ratsnest airwires (tag = 0.0)
+    // so inner crossing loops can break as soon as they reach passive ties (1.0/2.0) or flow edges (4.0).
+    if config.corridor_congestion_weight > 0.0 {
+        let locked_indices: Vec<usize> = board
+            .footprints
+            .iter()
+            .enumerate()
+            .filter(|(_, fp)| fp.is_locked)
+            .map(|(i, _)| i)
+            .collect();
+        let mut corr_count = 0usize;
+        for i in 0..locked_indices.len() {
+            for j in (i + 1)..locked_indices.len() {
+                if corr_count >= 2 {
+                    break;
+                }
+                edges.push([locked_indices[i] as f32, 0.0, 0.0, 3.0]);
+                edges.push([locked_indices[j] as f32, 0.0, 0.0, 3.0]);
+                corr_count += 1;
+            }
+        }
+        if corr_count == 0 {
+            for link in base.cached_connectivity.1.iter().take(2) {
+                edges.push([link.comp_a as f32, 0.0, 0.0, 3.0]);
+                edges.push([link.comp_b as f32, 0.0, 0.0, 3.0]);
+            }
+        }
+    }
+
     for tie in ties {
         let pad_p = &board.footprints[tie.passive_idx].pads[tie.passive_pad_idx];
         let pad_a = &board.footprints[tie.anchor_idx].pads[tie.anchor_pad_idx];
@@ -1123,36 +1203,10 @@ fn build_gpu_sa_descriptors(
         ]);
     }
 
-    if config.corridor_congestion_weight > 0.0 {
-        let locked_indices: Vec<usize> = board
-            .footprints
-            .iter()
-            .enumerate()
-            .filter(|(_, fp)| fp.is_locked)
-            .map(|(i, _)| i)
-            .collect();
-        let mut corr_count = 0usize;
-        for i in 0..locked_indices.len() {
-            for j in (i + 1)..locked_indices.len() {
-                if corr_count >= 16 {
-                    break;
-                }
-                edges.push([locked_indices[i] as f32, 0.0, 0.0, 3.0]);
-                edges.push([locked_indices[j] as f32, 0.0, 0.0, 3.0]);
-                corr_count += 1;
-            }
-        }
-        if corr_count == 0 {
-            for link in base.cached_connectivity.1.iter().take(8) {
-                edges.push([link.comp_a as f32, 0.0, 0.0, 3.0]);
-                edges.push([link.comp_b as f32, 0.0, 0.0, 3.0]);
-            }
-        }
-    }
-
     if config.flow_alignment_weight > 0.0 {
-        for link in base.cached_connectivity.1.iter().take(12) {
-            for &(pa_idx, pb_idx) in link.shared_pads.iter().take(4) {
+        let mut flow_count = 0usize;
+        for link in base.cached_connectivity.1.iter().take(2) {
+            if let Some(&(pa_idx, pb_idx)) = link.shared_pads.first() {
                 let pad_a = &board.footprints[link.comp_a].pads[pa_idx];
                 let pad_b = &board.footprints[link.comp_b].pads[pb_idx];
                 edges.push([
@@ -1167,14 +1221,19 @@ fn build_gpu_sa_descriptors(
                     pad_b.offset_y as f32,
                     4.0,
                 ]);
+                flow_count += 1;
             }
         }
-        for cl in &board.clusters {
+        'cl_loop: for cl in &board.clusters {
             if let Some(a_idx) = cl.anchor_idx {
-                for &m_idx in cl.member_indices.iter().take(8) {
+                for &m_idx in cl.member_indices.iter().take(2) {
                     if m_idx != a_idx && !board.footprints[m_idx].is_locked {
                         edges.push([m_idx as f32, 0.0, 0.0, 4.0]);
                         edges.push([a_idx as f32, 0.0, 0.0, 4.0]);
+                        flow_count += 1;
+                        if flow_count >= 3 {
+                            break 'cl_loop;
+                        }
                     }
                 }
             }
@@ -3618,6 +3677,7 @@ pub fn run_auto_placer(
         gpu_done.store(true, Ordering::Relaxed);
     });
 
+    let final_rate = total_evals.load(Ordering::Relaxed) as f64 / start_time.elapsed().as_secs_f64().max(1e-3);
     let mut final_best = global_best.lock().unwrap().clone();
 
     // Final containment verification pass:
@@ -3762,9 +3822,10 @@ pub fn run_auto_placer(
             g.crossings = final_best.crossings;
             g.wirelength_mm = final_best.wirelength;
             g.overlaps = final_best.overlaps;
+            g.evals_per_sec = final_rate;
             g.push_log(format!(
-                "[Auto-Placer] Finished: Crossings={}, Wirelength={:.1}mm, Overlaps={}",
-                final_best.crossings, final_best.wirelength, final_best.overlaps
+                "[Auto-Placer] Finished: Crossings={}, Wirelength={:.1}mm, Overlaps={} ({:.0} evals/s)",
+                final_best.crossings, final_best.wirelength, final_best.overlaps, final_rate
             ));
         }
     }
@@ -6019,6 +6080,101 @@ mod tests {
         let st = PlacementState::from_board(&board, &cfg);
         assert_eq!(st.overlaps, 0);
         assert_eq!(st.boundary_violations, 0);
+    }
+
+    #[test]
+    fn test_gpu_sa_descriptors_edge_ordering_and_centered_rect_flags() {
+        let mut board = Board::default();
+        board.min_x = 0.0;
+        board.min_y = 0.0;
+        board.max_x = 50.0;
+        board.max_y = 40.0;
+        board.nets = vec![
+            "".to_string(),
+            "GND".to_string(),
+            "VCC".to_string(),
+            "SIG1".to_string(),
+            "SIG2".to_string(),
+        ];
+
+        // U1: centered rectangular courtyard -> bit 1 (non-centered-rect) must be 0
+        let u1 = make_test_fp(
+            "U1",
+            15.0,
+            20.0,
+            false,
+            vec![
+                Pad::new("1", -1.5, -1.0, 0.5, 0.5, 2, "VCC", false),
+                Pad::new("2", -1.5, 1.0, 0.5, 0.5, 1, "GND", false),
+                Pad::new("3", 1.5, -1.0, 0.5, 0.5, 3, "SIG1", false),
+                Pad::new("4", 1.5, 1.0, 0.5, 0.5, 4, "SIG2", false),
+            ],
+        );
+
+        // C1: decoupling cap with centered rectangular courtyard -> bit 1 must be 0, bit 0 (is_smd) must be 1
+        let mut c1 = make_test_fp(
+            "C1",
+            22.0,
+            20.0,
+            false,
+            vec![
+                Pad::new("1", -0.5, 0.0, 0.5, 0.5, 2, "VCC", false),
+                Pad::new("2", 0.5, 0.0, 0.5, 0.5, 1, "GND", false),
+            ],
+        );
+        c1.value = "100nF".to_string();
+
+        // J1: non-rectangular / offset courtyard -> bit 1 (2u32) must be set
+        let mut j1 = make_test_fp(
+            "J1",
+            35.0,
+            20.0,
+            false,
+            vec![
+                Pad::new("1", 0.0, -1.0, 0.8, 0.8, 3, "SIG1", true),
+                Pad::new("2", 0.0, 1.0, 0.8, 0.8, 4, "SIG2", true),
+            ],
+        );
+        j1.courtyards = vec![Polygon::new(vec![
+            Point::new(-1.0, -3.0),
+            Point::new(3.0, -3.0),
+            Point::new(3.0, 3.0),
+            Point::new(0.0, 4.0),
+            Point::new(-1.0, 3.0),
+        ])];
+
+        board.footprints = vec![u1, c1, j1];
+        let cfg = PlacementConfig::default();
+        let ties = build_passive_ties(&board);
+        let state = PlacementState::from_board(&board, &cfg);
+        let (_fp_descs, edges, courtyards) = build_gpu_sa_descriptors(&board, &cfg, &ties, &state);
+
+        assert_eq!(courtyards.fp_poly_ranges.len(), 3);
+        // U1 and C1 are SMD (bit 0 = 1) and centered rectangles (bit 1 = 0)
+        assert_eq!(courtyards.fp_poly_ranges[0][2] & 1, 1);
+        assert_eq!(courtyards.fp_poly_ranges[0][2] & 2, 0);
+        assert_eq!(courtyards.fp_poly_ranges[1][2] & 1, 1);
+        assert_eq!(courtyards.fp_poly_ranges[1][2] & 2, 0);
+        // J1 has THT pads (bit 0 = 0) and a 5-vertex non-centered courtyard (bit 1 = 2)
+        assert_eq!(courtyards.fp_poly_ranges[2][2] & 1, 0);
+        assert_eq!(courtyards.fp_poly_ranges[2][2] & 2, 2);
+
+        // Verify edge tag ordering: all tag 0.0 (airwires) and tag 3.0 (corridor cuts)
+        // must precede tag 1.0/2.0 (passive ties) and tag 4.0 (flow edges) so GPU inner loops can break early.
+        let mut seen_non_crossing_tag = false;
+        for pair in edges.chunks_exact(2) {
+            let tag = pair[0][3];
+            let is_airwire_or_corridor = tag < 0.5 || (tag > 2.5 && tag < 3.5);
+            if !is_airwire_or_corridor {
+                seen_non_crossing_tag = true;
+            } else {
+                assert!(
+                    !seen_non_crossing_tag,
+                    "Airwire/corridor edge (tag={}) appeared after passive/flow edge",
+                    tag
+                );
+            }
+        }
     }
 }
 

@@ -257,6 +257,71 @@ impl Polygon {
         if self.is_convex() || self.vertices.len() <= 3 {
             return vec![self.clone()];
         }
+
+        // Fast exact rectilinear decomposition into axis-aligned 4-vertex rectangles
+        let n_orig = self.vertices.len();
+        let is_rectilinear = (0..n_orig).all(|i| {
+            let p1 = self.vertices[i];
+            let p2 = self.vertices[(i + 1) % n_orig];
+            (p2.x - p1.x).abs() <= 1e-4 || (p2.y - p1.y).abs() <= 1e-4
+        });
+        if is_rectilinear {
+            let mut ys: Vec<f64> = self.vertices.iter().map(|v| v.y).collect();
+            ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            ys.dedup_by(|a, b| (*a - *b).abs() <= 1e-4);
+            let mut rects: Vec<(f64, f64, f64, f64)> = Vec::new();
+            for k in 0..ys.len().saturating_sub(1) {
+                let y0 = ys[k];
+                let y1 = ys[k + 1];
+                if y1 - y0 <= 1e-4 {
+                    continue;
+                }
+                let y_mid = 0.5 * (y0 + y1);
+                let mut xs: Vec<f64> = Vec::new();
+                for i in 0..n_orig {
+                    let p1 = self.vertices[i];
+                    let p2 = self.vertices[(i + 1) % n_orig];
+                    if (p2.x - p1.x).abs() <= 1e-4 {
+                        let ymin = p1.y.min(p2.y);
+                        let ymax = p1.y.max(p2.y);
+                        if ymin <= y_mid && ymax >= y_mid && ymax - ymin > 1e-4 {
+                            xs.push(0.5 * (p1.x + p2.x));
+                        }
+                    }
+                }
+                xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                for pair in xs.chunks_exact(2) {
+                    let x0 = pair[0];
+                    let x1 = pair[1];
+                    if x1 - x0 <= 1e-4 {
+                        continue;
+                    }
+                    if let Some(prev) = rects.iter_mut().find(|r| {
+                        (r.0 - x0).abs() <= 1e-4
+                            && (r.2 - x1).abs() <= 1e-4
+                            && (r.3 - y0).abs() <= 1e-4
+                    }) {
+                        prev.3 = y1;
+                    } else {
+                        rects.push((x0, y0, x1, y1));
+                    }
+                }
+            }
+            if !rects.is_empty() {
+                return rects
+                    .into_iter()
+                    .map(|(x0, y0, x1, y1)| {
+                        Polygon::new(vec![
+                            Point::new(x0, y0),
+                            Point::new(x1, y0),
+                            Point::new(x1, y1),
+                            Point::new(x0, y1),
+                        ])
+                    })
+                    .collect();
+            }
+        }
+
         let mut pts = self.vertices.clone();
         if self.signed_area() < 0.0 {
             pts.reverse();
@@ -330,10 +395,51 @@ impl Polygon {
         }
 
         if triangles.is_empty() {
-            vec![self.clone()]
-        } else {
-            triangles
+            return vec![self.clone()];
         }
+
+        // Hertel-Mehlhorn greedy merge of adjacent convex pieces sharing a diagonal
+        let mut merged_any = true;
+        while merged_any {
+            merged_any = false;
+            'outer: for i in 0..triangles.len() {
+                for j in (i + 1)..triangles.len() {
+                    let va = &triangles[i].vertices;
+                    let vb = &triangles[j].vertices;
+                    let na = va.len();
+                    let nb = vb.len();
+                    if na + nb - 2 > 16 {
+                        continue;
+                    }
+                    for ea in 0..na {
+                        let a0 = va[ea];
+                        let a1 = va[(ea + 1) % na];
+                        for eb in 0..nb {
+                            let b0 = vb[eb];
+                            let b1 = vb[(eb + 1) % nb];
+                            if a0.distance_to(&b1) <= 1e-5 && a1.distance_to(&b0) <= 1e-5 {
+                                let mut cand_pts = Vec::with_capacity(na + nb - 2);
+                                for k in 0..na {
+                                    cand_pts.push(va[(ea + 1 + k) % na]);
+                                }
+                                for k in 1..(nb - 1) {
+                                    cand_pts.push(vb[(eb + 1 + k) % nb]);
+                                }
+                                let cand = Polygon::new(cand_pts);
+                                if cand.is_convex() {
+                                    triangles[i] = cand;
+                                    triangles.remove(j);
+                                    merged_any = true;
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        triangles
     }
 
     pub fn convex_hull(&self) -> Polygon {

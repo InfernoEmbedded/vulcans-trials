@@ -358,6 +358,8 @@ struct PersistentDeviceBuffers {
     temp_cap_bytes: usize,
     d_out: CUdeviceptr,
     out_cap_bytes: usize,
+    d_sa: [CUdeviceptr; 7],
+    sa_cap: [usize; 7],
 }
 
 pub struct CachedWavefrontBuffers {
@@ -451,6 +453,13 @@ impl Drop for CudaEngine {
                     let _ = (self.cuda.cuMemFree_v2)(bufs.d_out);
                     bufs.d_out = 0;
                     bufs.out_cap_bytes = 0;
+                }
+                for i in 0..7 {
+                    if bufs.d_sa[i] != 0 {
+                        let _ = (self.cuda.cuMemFree_v2)(bufs.d_sa[i]);
+                        bufs.d_sa[i] = 0;
+                        bufs.sa_cap[i] = 0;
+                    }
                 }
             }
             if let Ok(mut wf_opt) = self.wavefront_buffers.lock() {
@@ -752,6 +761,8 @@ impl CudaEngine {
                     temp_cap_bytes: 0,
                     d_out: 0,
                     out_cap_bytes: 0,
+                    d_sa: [0; 7],
+                    sa_cap: [0; 7],
                 }),
                 wavefront_buffers: Mutex::new(None),
                 compute_busy_ns: Arc::new(AtomicU64::new(0)),
@@ -1725,10 +1736,8 @@ impl CudaEngine {
             let edge_slice: &[[f32; 4]] = if edges.is_empty() { &dummy_edge } else { edges };
             let edges_bytes = edge_slice.len() * std::mem::size_of::<[f32; 4]>();
 
-            let mut full_poses = Vec::with_capacity(nc * nf * 2);
-            full_poses.extend_from_slice(init_poses);
-            full_poses.extend_from_slice(init_poses);
-            let poses_bytes = full_poses.len() * std::mem::size_of::<[f32; 4]>();
+            let half_poses_bytes = nc * nf * std::mem::size_of::<[f32; 4]>();
+            let poses_bytes = half_poses_bytes * 2;
 
             let init_scores = vec![[0.0f32; 4]; nc];
             let scores_bytes = init_scores.len() * std::mem::size_of::<[f32; 4]>();
@@ -1737,74 +1746,53 @@ impl CudaEngine {
             let polys_bytes = cyd.courtyard_polys.len() * std::mem::size_of::<[u32; 4]>();
             let verts_bytes = cyd.courtyard_vertices.len() * std::mem::size_of::<[f32; 2]>();
 
-            let mut d_fp: CUdeviceptr = 0;
-            let mut d_edges: CUdeviceptr = 0;
-            let mut d_poses: CUdeviceptr = 0;
-            let mut d_scores: CUdeviceptr = 0;
-            let mut d_ranges: CUdeviceptr = 0;
-            let mut d_polys: CUdeviceptr = 0;
-            let mut d_verts: CUdeviceptr = 0;
+            let req_bytes = [
+                fp_bytes,
+                edges_bytes,
+                poses_bytes,
+                scores_bytes,
+                ranges_bytes,
+                polys_bytes,
+                verts_bytes,
+            ];
 
-            if (self.cuda.cuMemAlloc_v2)(&mut d_fp, fp_bytes) != CUDA_SUCCESS {
-                return None;
+            let mut bufs = self.persistent_buffers.lock().ok()?;
+            for i in 0..7 {
+                if bufs.d_sa[i] == 0 || bufs.sa_cap[i] < req_bytes[i] {
+                    if bufs.d_sa[i] != 0 {
+                        let _ = (self.cuda.cuMemFree_v2)(bufs.d_sa[i]);
+                        bufs.d_sa[i] = 0;
+                        bufs.sa_cap[i] = 0;
+                    }
+                    let alloc_bytes = req_bytes[i].max(256);
+                    let mut ptr: CUdeviceptr = 0;
+                    if (self.cuda.cuMemAlloc_v2)(&mut ptr, alloc_bytes) != CUDA_SUCCESS {
+                        return None;
+                    }
+                    bufs.d_sa[i] = ptr;
+                    bufs.sa_cap[i] = alloc_bytes;
+                }
             }
-            if (self.cuda.cuMemAlloc_v2)(&mut d_edges, edges_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_fp);
-                return None;
-            }
-            if (self.cuda.cuMemAlloc_v2)(&mut d_poses, poses_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_fp);
-                let _ = (self.cuda.cuMemFree_v2)(d_edges);
-                return None;
-            }
-            if (self.cuda.cuMemAlloc_v2)(&mut d_scores, scores_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_fp);
-                let _ = (self.cuda.cuMemFree_v2)(d_edges);
-                let _ = (self.cuda.cuMemFree_v2)(d_poses);
-                return None;
-            }
-            if (self.cuda.cuMemAlloc_v2)(&mut d_ranges, ranges_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_fp);
-                let _ = (self.cuda.cuMemFree_v2)(d_edges);
-                let _ = (self.cuda.cuMemFree_v2)(d_poses);
-                let _ = (self.cuda.cuMemFree_v2)(d_scores);
-                return None;
-            }
-            if (self.cuda.cuMemAlloc_v2)(&mut d_polys, polys_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_fp);
-                let _ = (self.cuda.cuMemFree_v2)(d_edges);
-                let _ = (self.cuda.cuMemFree_v2)(d_poses);
-                let _ = (self.cuda.cuMemFree_v2)(d_scores);
-                let _ = (self.cuda.cuMemFree_v2)(d_ranges);
-                return None;
-            }
-            if (self.cuda.cuMemAlloc_v2)(&mut d_verts, verts_bytes) != CUDA_SUCCESS {
-                let _ = (self.cuda.cuMemFree_v2)(d_fp);
-                let _ = (self.cuda.cuMemFree_v2)(d_edges);
-                let _ = (self.cuda.cuMemFree_v2)(d_poses);
-                let _ = (self.cuda.cuMemFree_v2)(d_scores);
-                let _ = (self.cuda.cuMemFree_v2)(d_ranges);
-                let _ = (self.cuda.cuMemFree_v2)(d_polys);
-                return None;
-            }
+
+            let mut d_fp = bufs.d_sa[0];
+            let mut d_edges = bufs.d_sa[1];
+            let mut d_poses = bufs.d_sa[2];
+            let mut d_scores = bufs.d_sa[3];
+            let mut d_ranges = bufs.d_sa[4];
+            let mut d_polys = bufs.d_sa[5];
+            let mut d_verts = bufs.d_sa[6];
+            drop(bufs);
 
             let start_t = Instant::now();
 
             if (self.cuda.cuMemcpyHtoD_v2)(d_fp, fp_descs.as_ptr() as *const c_void, fp_bytes) != CUDA_SUCCESS
                 || (self.cuda.cuMemcpyHtoD_v2)(d_edges, edge_slice.as_ptr() as *const c_void, edges_bytes) != CUDA_SUCCESS
-                || (self.cuda.cuMemcpyHtoD_v2)(d_poses, full_poses.as_ptr() as *const c_void, poses_bytes) != CUDA_SUCCESS
+                || (self.cuda.cuMemcpyHtoD_v2)(d_poses, init_poses.as_ptr() as *const c_void, half_poses_bytes) != CUDA_SUCCESS
                 || (self.cuda.cuMemcpyHtoD_v2)(d_scores, init_scores.as_ptr() as *const c_void, scores_bytes) != CUDA_SUCCESS
                 || (self.cuda.cuMemcpyHtoD_v2)(d_ranges, cyd.fp_poly_ranges.as_ptr() as *const c_void, ranges_bytes) != CUDA_SUCCESS
                 || (self.cuda.cuMemcpyHtoD_v2)(d_polys, cyd.courtyard_polys.as_ptr() as *const c_void, polys_bytes) != CUDA_SUCCESS
                 || (self.cuda.cuMemcpyHtoD_v2)(d_verts, cyd.courtyard_vertices.as_ptr() as *const c_void, verts_bytes) != CUDA_SUCCESS
             {
-                let _ = (self.cuda.cuMemFree_v2)(d_fp);
-                let _ = (self.cuda.cuMemFree_v2)(d_edges);
-                let _ = (self.cuda.cuMemFree_v2)(d_poses);
-                let _ = (self.cuda.cuMemFree_v2)(d_scores);
-                let _ = (self.cuda.cuMemFree_v2)(d_ranges);
-                let _ = (self.cuda.cuMemFree_v2)(d_polys);
-                let _ = (self.cuda.cuMemFree_v2)(d_verts);
                 return None;
             }
 
@@ -1840,45 +1828,23 @@ impl CudaEngine {
                 ptr::null_mut(),
             ) != CUDA_SUCCESS
             {
-                let _ = (self.cuda.cuMemFree_v2)(d_fp);
-                let _ = (self.cuda.cuMemFree_v2)(d_edges);
-                let _ = (self.cuda.cuMemFree_v2)(d_poses);
-                let _ = (self.cuda.cuMemFree_v2)(d_scores);
-                let _ = (self.cuda.cuMemFree_v2)(d_ranges);
-                let _ = (self.cuda.cuMemFree_v2)(d_polys);
-                let _ = (self.cuda.cuMemFree_v2)(d_verts);
                 return None;
             }
 
-            let best_offset = (nc * nf * std::mem::size_of::<[f32; 4]>()) as u64;
-            let best_bytes = nc * nf * std::mem::size_of::<[f32; 4]>();
+            let best_offset = half_poses_bytes as u64;
+            let best_bytes = half_poses_bytes;
             let mut best_poses = vec![[0.0f32; 4]; nc * nf];
             let mut final_scores = vec![[0.0f32; 4]; nc];
 
             if (self.cuda.cuMemcpyDtoH_v2)(best_poses.as_mut_ptr() as *mut c_void, d_poses + best_offset, best_bytes) != CUDA_SUCCESS
                 || (self.cuda.cuMemcpyDtoH_v2)(final_scores.as_mut_ptr() as *mut c_void, d_scores, scores_bytes) != CUDA_SUCCESS
             {
-                let _ = (self.cuda.cuMemFree_v2)(d_fp);
-                let _ = (self.cuda.cuMemFree_v2)(d_edges);
-                let _ = (self.cuda.cuMemFree_v2)(d_poses);
-                let _ = (self.cuda.cuMemFree_v2)(d_scores);
-                let _ = (self.cuda.cuMemFree_v2)(d_ranges);
-                let _ = (self.cuda.cuMemFree_v2)(d_polys);
-                let _ = (self.cuda.cuMemFree_v2)(d_verts);
                 return None;
             }
 
             let _ = (self.cuda.cuCtxSynchronize)();
             let elapsed_ns = start_t.elapsed().as_nanos() as u64;
             self.compute_busy_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-
-            let _ = (self.cuda.cuMemFree_v2)(d_fp);
-            let _ = (self.cuda.cuMemFree_v2)(d_edges);
-            let _ = (self.cuda.cuMemFree_v2)(d_poses);
-            let _ = (self.cuda.cuMemFree_v2)(d_scores);
-            let _ = (self.cuda.cuMemFree_v2)(d_ranges);
-            let _ = (self.cuda.cuMemFree_v2)(d_polys);
-            let _ = (self.cuda.cuMemFree_v2)(d_verts);
 
             Some((best_poses, final_scores))
         }

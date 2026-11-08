@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use std::fs;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
@@ -274,15 +274,37 @@ fn get_edge_seg(c_base: u32, e_idx: u32) -> vec4<f32> {
     return vec4<f32>(ax, ay, bx, by);
 }
 
+fn pose_aabb(pose: vec4<f32>, desc: vec4<f32>, s: f32, c: f32) -> vec4<f32> {
+    var px = pose.x;
+    var py = pose.y;
+    if (desc.w > 0.0) {
+        let qx = floor(desc.w * (1.0 / 1024.0));
+        let qy = desc.w - qx * 1024.0;
+        let cx = (qx - 512.0) * 0.05;
+        let cy = (qy - 512.0) * 0.05;
+        px = px + (cx * c + cy * s);
+        py = py + (-cx * s + cy * c);
+    }
+    let ac = abs(c);
+    let as_v = abs(s);
+    let hw = desc.x * ac + desc.y * as_v;
+    let hh = desc.x * as_v + desc.y * ac;
+    return vec4<f32>(px - hw, py - hh, px + hw, py + hh);
+}
+
 fn fp_aabb(c_base: u32, fp_idx: u32) -> vec4<f32> {
     let pose = chain_poses[c_base + fp_idx];
     let desc = fp_descs[fp_idx];
     let rad = pose.z * 0.0174532925;
-    let c = abs(cos(rad));
-    let s = abs(sin(rad));
-    let hw = desc.x * c + desc.y * s;
-    let hh = desc.x * s + desc.y * c;
-    return vec4<f32>(pose.x - hw, pose.y - hh, pose.x + hw, pose.y + hh);
+    return pose_aabb(pose, desc, sin(rad), cos(rad));
+}
+
+fn xform_cyd_vertex(lv: vec2<f32>, pose: vec4<f32>, ca: f32, sa: f32, flip_y: bool) -> vec2<f32> {
+    let ly = select(lv.y, -lv.y, flip_y);
+    return vec2<f32>(
+        pose.x + (lv.x * ca + ly * sa),
+        pose.y + (-lv.x * sa + ly * ca)
+    );
 }
 
 fn sat_polys_intersect(
@@ -306,70 +328,36 @@ fn sat_polys_intersect(
     let ca = cos(rad_a);
     let flip_a = (u32(round(pose_a.w)) != orig_layer_a);
 
-    var va: array<vec2<f32>, 16>;
-    var min_ax: f32 = 1e30;
-    var max_ax: f32 = -1e30;
-    var min_ay: f32 = 1e30;
-    var max_ay: f32 = -1e30;
-    for (var k: u32 = 0u; k < na; k = k + 1u) {
-        let lv = courtyard_vertices[pa.x + k];
-        let ly = select(lv.y, -lv.y, flip_a);
-        let wx = pose_a.x + (lv.x * ca + ly * sa);
-        let wy = pose_a.y + (-lv.x * sa + ly * ca);
-        va[k] = vec2<f32>(wx, wy);
-        min_ax = min(min_ax, wx);
-        max_ax = max(max_ax, wx);
-        min_ay = min(min_ay, wy);
-        max_ay = max(max_ay, wy);
-    }
-
     let rad_b = pose_b.z * 0.0174532925;
     let sb = sin(rad_b);
     let cb = cos(rad_b);
     let flip_b = (u32(round(pose_b.w)) != orig_layer_b);
 
-    var vb: array<vec2<f32>, 16>;
-    var min_bx: f32 = 1e30;
-    var max_bx: f32 = -1e30;
-    var min_by: f32 = 1e30;
-    var max_by: f32 = -1e30;
-    for (var k: u32 = 0u; k < nb; k = k + 1u) {
-        let lv = courtyard_vertices[pb.x + k];
-        let ly = select(lv.y, -lv.y, flip_b);
-        let wx = pose_b.x + (lv.x * cb + ly * sb);
-        let wy = pose_b.y + (-lv.x * sb + ly * cb);
-        vb[k] = vec2<f32>(wx, wy);
-        min_bx = min(min_bx, wx);
-        max_bx = max(max_bx, wx);
-        min_by = min(min_by, wy);
-        max_by = max(max_by, wy);
-    }
-
-    if (max_ax <= min_bx || max_bx <= min_ax || max_ay <= min_by || max_by <= min_ay) {
-        return false;
-    }
-
     for (var i: u32 = 0u; i < na; i = i + 1u) {
-        let p1 = va[i];
-        let p2 = va[(i + 1u) % na];
+        let p1 = xform_cyd_vertex(courtyard_vertices[pa.x + i], pose_a, ca, sa, flip_a);
+        let p2 = xform_cyd_vertex(courtyard_vertices[pa.x + ((i + 1u) % na)], pose_a, ca, sa, flip_a);
         let axis = vec2<f32>(-(p2.y - p1.y), p2.x - p1.x);
         let axis_len_sq = dot(axis, axis);
         if (axis_len_sq < 1e-10) {
             continue;
         }
 
-        var min_a = dot(va[0], axis);
+        let va0 = xform_cyd_vertex(courtyard_vertices[pa.x], pose_a, ca, sa, flip_a);
+        var min_a = dot(va0, axis);
         var max_a = min_a;
         for (var k: u32 = 1u; k < na; k = k + 1u) {
-            let d = dot(va[k], axis);
+            let vak = xform_cyd_vertex(courtyard_vertices[pa.x + k], pose_a, ca, sa, flip_a);
+            let d = dot(vak, axis);
             min_a = min(min_a, d);
             max_a = max(max_a, d);
         }
 
-        var min_b = dot(vb[0], axis);
+        let vb0 = xform_cyd_vertex(courtyard_vertices[pb.x], pose_b, cb, sb, flip_b);
+        var min_b = dot(vb0, axis);
         var max_b = min_b;
         for (var k: u32 = 1u; k < nb; k = k + 1u) {
-            let d = dot(vb[k], axis);
+            let vbk = xform_cyd_vertex(courtyard_vertices[pb.x + k], pose_b, cb, sb, flip_b);
+            let d = dot(vbk, axis);
             min_b = min(min_b, d);
             max_b = max(max_b, d);
         }
@@ -380,26 +368,30 @@ fn sat_polys_intersect(
     }
 
     for (var i: u32 = 0u; i < nb; i = i + 1u) {
-        let p1 = vb[i];
-        let p2 = vb[(i + 1u) % nb];
+        let p1 = xform_cyd_vertex(courtyard_vertices[pb.x + i], pose_b, cb, sb, flip_b);
+        let p2 = xform_cyd_vertex(courtyard_vertices[pb.x + ((i + 1u) % nb)], pose_b, cb, sb, flip_b);
         let axis = vec2<f32>(-(p2.y - p1.y), p2.x - p1.x);
         let axis_len_sq = dot(axis, axis);
         if (axis_len_sq < 1e-10) {
             continue;
         }
 
-        var min_a = dot(va[0], axis);
+        let va0 = xform_cyd_vertex(courtyard_vertices[pa.x], pose_a, ca, sa, flip_a);
+        var min_a = dot(va0, axis);
         var max_a = min_a;
         for (var k: u32 = 1u; k < na; k = k + 1u) {
-            let d = dot(va[k], axis);
+            let vak = xform_cyd_vertex(courtyard_vertices[pa.x + k], pose_a, ca, sa, flip_a);
+            let d = dot(vak, axis);
             min_a = min(min_a, d);
             max_a = max(max_a, d);
         }
 
-        var min_b = dot(vb[0], axis);
+        let vb0 = xform_cyd_vertex(courtyard_vertices[pb.x], pose_b, cb, sb, flip_b);
+        var min_b = dot(vb0, axis);
         var max_b = min_b;
         for (var k: u32 = 1u; k < nb; k = k + 1u) {
-            let d = dot(vb[k], axis);
+            let vbk = xform_cyd_vertex(courtyard_vertices[pb.x + k], pose_b, cb, sb, flip_b);
+            let d = dot(vbk, axis);
             min_b = min(min_b, d);
             max_b = max(max_b, d);
         }
@@ -412,6 +404,11 @@ fn sat_polys_intersect(
     return true;
 }
 
+fn is_ortho_angle(deg: f32) -> bool {
+    let rem = abs(deg - round(deg / 90.0) * 90.0);
+    return rem < 1e-3;
+}
+
 fn footprints_courtyards_intersect(
     i: u32,
     pose_i: vec4<f32>,
@@ -421,8 +418,43 @@ fn footprints_courtyards_intersect(
     let ri = fp_poly_ranges[i];
     let rj = fp_poly_ranges[j];
 
-    if (ri.z > 0u && rj.z > 0u && u32(round(pose_i.w)) != u32(round(pose_j.w))) {
+    if ((ri.z & 1u) != 0u && (rj.z & 1u) != 0u && u32(round(pose_i.w)) != u32(round(pose_j.w))) {
         return false;
+    }
+
+    if (is_ortho_angle(pose_i.z) && is_ortho_angle(pose_j.z)) {
+        if (ri.y == 1u && rj.y == 1u && ((ri.z | rj.z) & 2u) == 0u) {
+            return true;
+        }
+        if ((ri.z & rj.z & 4u) != 0u) {
+            let rad_i = pose_i.z * 0.0174532925;
+            let si = sin(rad_i);
+            let ci = cos(rad_i);
+            let flip_i = (u32(round(pose_i.w)) != ri.w);
+            let rad_j = pose_j.z * 0.0174532925;
+            let sj = sin(rad_j);
+            let cj = cos(rad_j);
+            let flip_j = (u32(round(pose_j.w)) != rj.w);
+            for (var pi: u32 = ri.x; pi < ri.x + ri.y; pi = pi + 1u) {
+                let pa = courtyard_polys[pi];
+                let wa0 = xform_cyd_vertex(courtyard_vertices[pa.x], pose_i, ci, si, flip_i);
+                let wa2 = xform_cyd_vertex(courtyard_vertices[pa.x + 2u], pose_i, ci, si, flip_i);
+                let min_ax = min(wa0.x, wa2.x);
+                let max_ax = max(wa0.x, wa2.x);
+                let min_ay = min(wa0.y, wa2.y);
+                let max_ay = max(wa0.y, wa2.y);
+                for (var pj: u32 = rj.x; pj < rj.x + rj.y; pj = pj + 1u) {
+                    let pb = courtyard_polys[pj];
+                    let wb0 = xform_cyd_vertex(courtyard_vertices[pb.x], pose_j, cj, sj, flip_j);
+                    let wb2 = xform_cyd_vertex(courtyard_vertices[pb.x + 2u], pose_j, cj, sj, flip_j);
+                    if (max_ax > min(wb0.x, wb2.x) && max(wb0.x, wb2.x) > min_ax &&
+                        max_ay > min(wb0.y, wb2.y) && max(wb0.y, wb2.y) > min_ay) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
     }
 
     for (var pi: u32 = ri.x; pi < ri.x + ri.y; pi = pi + 1u) {
@@ -495,20 +527,22 @@ fn evaluate_chain_state(c_base: u32, nf: u32, ne: u32) -> vec2<f32> {
             }
         } else {
             wl = wl + d;
-            for (var e2: u32 = 0u; e2 < ne; e2 = e2 + 1u) {
+            for (var e2: u32 = e1 + 1u; e2 < ne; e2 = e2 + 1u) {
                 let tag2 = edges[e2 * 2u].w;
                 if (tag2 < 0.5) {
-                    if (e2 > e1) {
-                        let s2 = get_edge_seg(c_base, e2);
-                        if (segs_cross_sa(s1, s2)) {
-                            crossings = crossings + 1.0;
-                        }
-                    }
-                } else if (tag2 > 2.5 && tag2 < 3.5 && params.corridor_congestion_weight > 0.0) {
                     let s2 = get_edge_seg(c_base, e2);
                     if (segs_cross_sa(s1, s2)) {
-                        corridor_cost = corridor_cost + params.corridor_congestion_weight;
+                        crossings = crossings + 1.0;
                     }
+                } else if (tag2 > 2.5 && tag2 < 3.5) {
+                    if (params.corridor_congestion_weight > 0.0) {
+                        let s2 = get_edge_seg(c_base, e2);
+                        if (segs_cross_sa(s1, s2)) {
+                            corridor_cost = corridor_cost + params.corridor_congestion_weight;
+                        }
+                    }
+                } else {
+                    break;
                 }
             }
         }
@@ -552,16 +586,12 @@ fn evaluate_chain_delta_e(
     let old_rad = old_pose.z * 0.0174532925;
     let old_cos = cos(old_rad);
     let old_sin = sin(old_rad);
-    let old_hw = desc_i.x * abs(old_cos) + desc_i.y * abs(old_sin);
-    let old_hh = desc_i.x * abs(old_sin) + desc_i.y * abs(old_cos);
-    let old_bi = vec4<f32>(old_pose.x - old_hw, old_pose.y - old_hh, old_pose.x + old_hw, old_pose.y + old_hh);
+    let old_bi = pose_aabb(old_pose, desc_i, old_sin, old_cos);
 
     let new_rad = new_pose.z * 0.0174532925;
     let new_cos = cos(new_rad);
     let new_sin = sin(new_rad);
-    let new_hw = desc_i.x * abs(new_cos) + desc_i.y * abs(new_sin);
-    let new_hh = desc_i.x * abs(new_sin) + desc_i.y * abs(new_cos);
-    let new_bi = vec4<f32>(new_pose.x - new_hw, new_pose.y - new_hh, new_pose.x + new_hw, new_pose.y + new_hh);
+    let new_bi = pose_aabb(new_pose, desc_i, new_sin, new_cos);
 
     var delta_bd: f32 = 0.0;
     if (!i_locked) {
@@ -670,7 +700,7 @@ fn evaluate_chain_delta_e(
                 for (var e2: u32 = 0u; e2 < ne; e2 = e2 + 1u) {
                     let e2a = edges[e2 * 2u];
                     if (e2a.w >= 0.5) {
-                        continue;
+                        break;
                     }
                     let e2b = edges[e2 * 2u + 1u];
                     let f2a = u32(e2a.x);
@@ -711,8 +741,13 @@ fn evaluate_chain_delta_e(
                 }
                 let e2a = edges[e2 * 2u];
                 let is_corr2 = (e2a.w > 2.5 && e2a.w < 3.5);
-                if (e2a.w >= 0.5 && (!is_corr2 || params.corridor_congestion_weight <= 0.0)) {
-                    continue;
+                if (e2a.w >= 0.5) {
+                    if (!is_corr2) {
+                        break;
+                    }
+                    if (params.corridor_congestion_weight <= 0.0) {
+                        continue;
+                    }
                 }
                 let e2b = edges[e2 * 2u + 1u];
                 let f2a = u32(e2a.x);
@@ -1964,7 +1999,9 @@ pub fn hash_lbvh_primitives(primitives: &[([f32; 4], u32, u32)]) -> u64 {
     h
 }
 
-static GLOBAL_LBVH_CACHE: OnceLock<Mutex<Option<(u64, Vec<GpuBvhNode>)>>> = OnceLock::new();
+thread_local! {
+    static THREAD_LBVH_CACHE: std::cell::RefCell<Option<(u64, Vec<GpuBvhNode>)>> = const { std::cell::RefCell::new(None) };
+}
 static GLOBAL_LBVH_BUILDS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_LBVH_HITS: AtomicU64 = AtomicU64::new(0);
 
@@ -1992,14 +2029,16 @@ pub fn build_gpu_lbvh(primitives: &[([f32; 4], u32, u32)]) -> Vec<GpuBvhNode> {
     }
 
     let key = hash_lbvh_primitives(primitives);
-    let cache_mutex = GLOBAL_LBVH_CACHE.get_or_init(|| Mutex::new(None));
-    if let Ok(guard) = cache_mutex.lock() {
-        if let Some((cached_key, ref cached_nodes)) = *guard {
+    if let Some(cached) = THREAD_LBVH_CACHE.with(|cell| {
+        if let Some((cached_key, ref cached_nodes)) = *cell.borrow() {
             if cached_key == key && cached_nodes.len() == primitives.len() * 2 - 1 {
                 GLOBAL_LBVH_HITS.fetch_add(1, Ordering::Relaxed);
-                return cached_nodes.clone();
+                return Some(cached_nodes.clone());
             }
         }
+        None
+    }) {
+        return cached;
     }
 
     GLOBAL_LBVH_BUILDS.fetch_add(1, Ordering::Relaxed);
@@ -2146,9 +2185,9 @@ pub fn build_gpu_lbvh(primitives: &[([f32; 4], u32, u32)]) -> Vec<GpuBvhNode> {
     }
 
     build_slice(&morton_pairs, primitives, 0, &mut nodes);
-    if let Ok(mut guard) = cache_mutex.lock() {
-        *guard = Some((key, nodes.clone()));
-    }
+    THREAD_LBVH_CACHE.with(|cell| {
+        *cell.borrow_mut() = Some((key, nodes.clone()));
+    });
     nodes
 }
 

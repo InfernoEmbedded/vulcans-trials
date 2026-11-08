@@ -924,6 +924,24 @@ __device__ __forceinline__ float4 get_edge_seg(
     return make_float4(ax, ay, bx, by);
 }
 
+__device__ __forceinline__ float4 pose_aabb_fast(float4 pose, float4 desc, float s, float c) {
+    float px = pose.x;
+    float py = pose.y;
+    if (desc.w > 0.0f) {
+        float qx = floorf(desc.w * (1.0f / 1024.0f));
+        float qy = desc.w - qx * 1024.0f;
+        float cx = (qx - 512.0f) * 0.05f;
+        float cy = (qy - 512.0f) * 0.05f;
+        px += cx * c + cy * s;
+        py += -cx * s + cy * c;
+    }
+    float ac = fabsf(c);
+    float as_v = fabsf(s);
+    float hw = desc.x * ac + desc.y * as_v;
+    float hh = desc.x * as_v + desc.y * ac;
+    return make_float4(px - hw, py - hh, px + hw, py + hh);
+}
+
 __device__ __forceinline__ float4 fp_aabb(
     const float4* __restrict__ chain_poses,
     const float4* __restrict__ fp_descs,
@@ -932,12 +950,26 @@ __device__ __forceinline__ float4 fp_aabb(
 ) {
     float4 pose = chain_poses[c_base + fp_idx];
     float4 desc = fp_descs[fp_idx];
-    float rad = pose.z * 0.0174532925f;
-    float c = fabsf(cosf(rad));
-    float s = fabsf(sinf(rad));
-    float hw = desc.x * c + desc.y * s;
-    float hh = desc.x * s + desc.y * c;
-    return make_float4(pose.x - hw, pose.y - hh, pose.x + hw, pose.y + hh);
+    float s, c;
+    __sincosf(pose.z * 0.0174532925f, &s, &c);
+    return pose_aabb_fast(pose, desc, s, c);
+}
+
+__device__ __forceinline__ float2 xform_cyd_pt(
+    float2 lv,
+    float px,
+    float py,
+    float s,
+    float c,
+    float flip_sign
+) {
+    float ly = lv.y * flip_sign;
+    return make_float2(px + (lv.x * c + ly * s), py + (-lv.x * s + ly * c));
+}
+
+__device__ __forceinline__ bool is_ortho_angle(float deg) {
+    float r = fmodf(fabsf(deg), 90.0f);
+    return (r < 1e-2f || r > 89.99f);
 }
 
 __device__ __forceinline__ bool sat_polys_intersect(
@@ -958,69 +990,61 @@ __device__ __forceinline__ bool sat_polys_intersect(
         return false;
     }
 
-    float rad_a = pose_a.z * 0.0174532925f;
     float sa, ca;
-    __sincosf(rad_a, &sa, &ca);
-    bool flip_a = ((unsigned int)roundf(pose_a.w) != orig_layer_a);
+    __sincosf(pose_a.z * 0.0174532925f, &sa, &ca);
+    float flip_a = ((unsigned int)roundf(pose_a.w) != orig_layer_a) ? -1.0f : 1.0f;
 
-    float2 va[16];
     float min_ax = 1e30f, max_ax = -1e30f, min_ay = 1e30f, max_ay = -1e30f;
     for (unsigned int k = 0u; k < na; ++k) {
-        float2 lv = courtyard_vertices[pa.x + k];
-        float ly = flip_a ? -lv.y : lv.y;
-        float wx = pose_a.x + (lv.x * ca + ly * sa);
-        float wy = pose_a.y + (-lv.x * sa + ly * ca);
-        va[k] = make_float2(wx, wy);
-        min_ax = fminf(min_ax, wx);
-        max_ax = fmaxf(max_ax, wx);
-        min_ay = fminf(min_ay, wy);
-        max_ay = fmaxf(max_ay, wy);
+        float2 w = xform_cyd_pt(courtyard_vertices[pa.x + k], pose_a.x, pose_a.y, sa, ca, flip_a);
+        min_ax = fminf(min_ax, w.x);
+        max_ax = fmaxf(max_ax, w.x);
+        min_ay = fminf(min_ay, w.y);
+        max_ay = fmaxf(max_ay, w.y);
     }
 
-    float rad_b = pose_b.z * 0.0174532925f;
     float sb, cb;
-    __sincosf(rad_b, &sb, &cb);
-    bool flip_b = ((unsigned int)roundf(pose_b.w) != orig_layer_b);
+    __sincosf(pose_b.z * 0.0174532925f, &sb, &cb);
+    float flip_b = ((unsigned int)roundf(pose_b.w) != orig_layer_b) ? -1.0f : 1.0f;
 
-    float2 vb[16];
     float min_bx = 1e30f, max_bx = -1e30f, min_by = 1e30f, max_by = -1e30f;
     for (unsigned int k = 0u; k < nb; ++k) {
-        float2 lv = courtyard_vertices[pb.x + k];
-        float ly = flip_b ? -lv.y : lv.y;
-        float wx = pose_b.x + (lv.x * cb + ly * sb);
-        float wy = pose_b.y + (-lv.x * sb + ly * cb);
-        vb[k] = make_float2(wx, wy);
-        min_bx = fminf(min_bx, wx);
-        max_bx = fmaxf(max_bx, wx);
-        min_by = fminf(min_by, wy);
-        max_by = fmaxf(max_by, wy);
+        float2 w = xform_cyd_pt(courtyard_vertices[pb.x + k], pose_b.x, pose_b.y, sb, cb, flip_b);
+        min_bx = fminf(min_bx, w.x);
+        max_bx = fmaxf(max_bx, w.x);
+        min_by = fminf(min_by, w.y);
+        max_by = fmaxf(max_by, w.y);
     }
 
     if (max_ax <= min_bx || max_bx <= min_ax || max_ay <= min_by || max_by <= min_ay) {
         return false;
     }
 
+    float2 va0 = xform_cyd_pt(courtyard_vertices[pa.x], pose_a.x, pose_a.y, sa, ca, flip_a);
+    float2 vb0 = xform_cyd_pt(courtyard_vertices[pb.x], pose_b.x, pose_b.y, sb, cb, flip_b);
+
     for (unsigned int i = 0u; i < na; ++i) {
-        float2 p1 = va[i];
-        float2 p2 = va[(i + 1u) % na];
+        float2 p1 = xform_cyd_pt(courtyard_vertices[pa.x + i], pose_a.x, pose_a.y, sa, ca, flip_a);
+        float2 p2 = xform_cyd_pt(courtyard_vertices[pa.x + ((i + 1u) % na)], pose_a.x, pose_a.y, sa, ca, flip_a);
         float2 axis = make_float2(-(p2.y - p1.y), p2.x - p1.x);
-        float axis_len_sq = axis.x * axis.x + axis.y * axis.y;
-        if (axis_len_sq < 1e-10f) {
+        if (axis.x * axis.x + axis.y * axis.y < 1e-10f) {
             continue;
         }
 
-        float min_a = va[0].x * axis.x + va[0].y * axis.y;
+        float min_a = va0.x * axis.x + va0.y * axis.y;
         float max_a = min_a;
         for (unsigned int k = 1u; k < na; ++k) {
-            float d = va[k].x * axis.x + va[k].y * axis.y;
+            float2 vk = xform_cyd_pt(courtyard_vertices[pa.x + k], pose_a.x, pose_a.y, sa, ca, flip_a);
+            float d = vk.x * axis.x + vk.y * axis.y;
             min_a = fminf(min_a, d);
             max_a = fmaxf(max_a, d);
         }
 
-        float min_b = vb[0].x * axis.x + vb[0].y * axis.y;
+        float min_b = vb0.x * axis.x + vb0.y * axis.y;
         float max_b = min_b;
         for (unsigned int k = 1u; k < nb; ++k) {
-            float d = vb[k].x * axis.x + vb[k].y * axis.y;
+            float2 vk = xform_cyd_pt(courtyard_vertices[pb.x + k], pose_b.x, pose_b.y, sb, cb, flip_b);
+            float d = vk.x * axis.x + vk.y * axis.y;
             min_b = fminf(min_b, d);
             max_b = fmaxf(max_b, d);
         }
@@ -1031,26 +1055,27 @@ __device__ __forceinline__ bool sat_polys_intersect(
     }
 
     for (unsigned int i = 0u; i < nb; ++i) {
-        float2 p1 = vb[i];
-        float2 p2 = vb[(i + 1u) % nb];
+        float2 p1 = xform_cyd_pt(courtyard_vertices[pb.x + i], pose_b.x, pose_b.y, sb, cb, flip_b);
+        float2 p2 = xform_cyd_pt(courtyard_vertices[pb.x + ((i + 1u) % nb)], pose_b.x, pose_b.y, sb, cb, flip_b);
         float2 axis = make_float2(-(p2.y - p1.y), p2.x - p1.x);
-        float axis_len_sq = axis.x * axis.x + axis.y * axis.y;
-        if (axis_len_sq < 1e-10f) {
+        if (axis.x * axis.x + axis.y * axis.y < 1e-10f) {
             continue;
         }
 
-        float min_a = va[0].x * axis.x + va[0].y * axis.y;
+        float min_a = va0.x * axis.x + va0.y * axis.y;
         float max_a = min_a;
         for (unsigned int k = 1u; k < na; ++k) {
-            float d = va[k].x * axis.x + va[k].y * axis.y;
+            float2 vk = xform_cyd_pt(courtyard_vertices[pa.x + k], pose_a.x, pose_a.y, sa, ca, flip_a);
+            float d = vk.x * axis.x + vk.y * axis.y;
             min_a = fminf(min_a, d);
             max_a = fmaxf(max_a, d);
         }
 
-        float min_b = vb[0].x * axis.x + vb[0].y * axis.y;
+        float min_b = vb0.x * axis.x + vb0.y * axis.y;
         float max_b = min_b;
         for (unsigned int k = 1u; k < nb; ++k) {
-            float d = vb[k].x * axis.x + vb[k].y * axis.y;
+            float2 vk = xform_cyd_pt(courtyard_vertices[pb.x + k], pose_b.x, pose_b.y, sb, cb, flip_b);
+            float d = vk.x * axis.x + vk.y * axis.y;
             min_b = fminf(min_b, d);
             max_b = fmaxf(max_b, d);
         }
@@ -1061,6 +1086,24 @@ __device__ __forceinline__ bool sat_polys_intersect(
     }
 
     return true;
+}
+
+__device__ __forceinline__ bool footprints_courtyards_intersect_general(
+    uint4 ri,
+    float4 pose_i,
+    uint4 rj,
+    float4 pose_j,
+    const uint4* __restrict__ courtyard_polys,
+    const float2* __restrict__ courtyard_vertices
+) {
+    for (unsigned int pi = ri.x; pi < ri.x + ri.y; ++pi) {
+        for (unsigned int pj = rj.x; pj < rj.x + rj.y; ++pj) {
+            if (sat_polys_intersect(pi, pose_i, ri.w, pj, pose_j, rj.w, courtyard_polys, courtyard_vertices)) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 __device__ __forceinline__ bool footprints_courtyards_intersect(
@@ -1075,18 +1118,43 @@ __device__ __forceinline__ bool footprints_courtyards_intersect(
     uint4 ri = fp_poly_ranges[i];
     uint4 rj = fp_poly_ranges[j];
 
-    if (ri.z > 0u && rj.z > 0u && (unsigned int)roundf(pose_i.w) != (unsigned int)roundf(pose_j.w)) {
+    if ((ri.z & rj.z & 1u) != 0u && (unsigned int)roundf(pose_i.w) != (unsigned int)roundf(pose_j.w)) {
         return false;
     }
 
-    for (unsigned int pi = ri.x; pi < ri.x + ri.y; ++pi) {
-        for (unsigned int pj = rj.x; pj < rj.x + rj.y; ++pj) {
-            if (sat_polys_intersect(pi, pose_i, ri.w, pj, pose_j, rj.w, courtyard_polys, courtyard_vertices)) {
-                return true;
+    if (is_ortho_angle(pose_i.z) && is_ortho_angle(pose_j.z)) {
+        if (ri.y == 1u && rj.y == 1u && ((ri.z | rj.z) & 2u) == 0u) {
+            return true;
+        }
+        if ((ri.z & rj.z & 4u) != 0u) {
+            float si, ci, sj, cj;
+            __sincosf(pose_i.z * 0.0174532925f, &si, &ci);
+            __sincosf(pose_j.z * 0.0174532925f, &sj, &cj);
+            float flip_i = ((unsigned int)roundf(pose_i.w) != ri.w) ? -1.0f : 1.0f;
+            float flip_j = ((unsigned int)roundf(pose_j.w) != rj.w) ? -1.0f : 1.0f;
+            for (unsigned int pi = ri.x; pi < ri.x + ri.y; ++pi) {
+                uint4 pa = courtyard_polys[pi];
+                float2 wa0 = xform_cyd_pt(courtyard_vertices[pa.x], pose_i.x, pose_i.y, si, ci, flip_i);
+                float2 wa2 = xform_cyd_pt(courtyard_vertices[pa.x + 2u], pose_i.x, pose_i.y, si, ci, flip_i);
+                float min_ax = fminf(wa0.x, wa2.x), max_ax = fmaxf(wa0.x, wa2.x);
+                float min_ay = fminf(wa0.y, wa2.y), max_ay = fmaxf(wa0.y, wa2.y);
+                for (unsigned int pj = rj.x; pj < rj.x + rj.y; ++pj) {
+                    uint4 pb = courtyard_polys[pj];
+                    float2 wb0 = xform_cyd_pt(courtyard_vertices[pb.x], pose_j.x, pose_j.y, sj, cj, flip_j);
+                    float2 wb2 = xform_cyd_pt(courtyard_vertices[pb.x + 2u], pose_j.x, pose_j.y, sj, cj, flip_j);
+                    if (max_ax > fminf(wb0.x, wb2.x) && fmaxf(wb0.x, wb2.x) > min_ax &&
+                        max_ay > fminf(wb0.y, wb2.y) && fmaxf(wb0.y, wb2.y) > min_ay) {
+                        return true;
+                    }
+                }
             }
+            return false;
         }
     }
-    return false;
+
+    return footprints_courtyards_intersect_general(
+        ri, pose_i, rj, pose_j, courtyard_polys, courtyard_vertices
+    );
 }
 
 __device__ float2 evaluate_chain_state_fast(
@@ -1171,20 +1239,22 @@ __device__ float2 evaluate_chain_state_fast(
             }
         } else {
             wl += d;
-            for (unsigned int e2 = 0u; e2 < ne; ++e2) {
+            for (unsigned int e2 = e1 + 1u; e2 < ne; ++e2) {
                 float tag2 = edges[e2 * 2u].w;
                 if (tag2 < 0.5f) {
-                    if (e2 > e1) {
-                        float4 s2 = get_edge_seg(chain_poses, edges, c_base, e2);
-                        if (segs_cross_sa(s1, s2)) {
-                            crossings += 1.0f;
-                        }
-                    }
-                } else if (tag2 > 2.5f && tag2 < 3.5f && corr_weight > 0.0f) {
                     float4 s2 = get_edge_seg(chain_poses, edges, c_base, e2);
                     if (segs_cross_sa(s1, s2)) {
-                        corridor_cost += corr_weight;
+                        crossings += 1.0f;
                     }
+                } else if (tag2 > 2.5f && tag2 < 3.5f) {
+                    if (corr_weight > 0.0f) {
+                        float4 s2 = get_edge_seg(chain_poses, edges, c_base, e2);
+                        if (segs_cross_sa(s1, s2)) {
+                            corridor_cost += corr_weight;
+                        }
+                    }
+                } else {
+                    break;
                 }
             }
         }
@@ -1357,11 +1427,7 @@ __device__ __forceinline__ float4 fp_aabb_fast(
     float4 desc = fp_descs[fp_idx];
     float s, c;
     __sincosf(pose.z * 0.0174532925f, &s, &c);
-    c = fabsf(c);
-    s = fabsf(s);
-    float hw = desc.x * c + desc.y * s;
-    float hh = desc.x * s + desc.y * c;
-    return make_float4(pose.x - hw, pose.y - hh, pose.x + hw, pose.y + hh);
+    return pose_aabb_fast(pose, desc, s, c);
 }
 
 __device__ float2 evaluate_chain_delta_e(
@@ -1395,15 +1461,11 @@ __device__ float2 evaluate_chain_delta_e(
 
     float old_sin, old_cos;
     __sincosf(old_pose.z * 0.0174532925f, &old_sin, &old_cos);
-    float old_hw = desc_i.x * fabsf(old_cos) + desc_i.y * fabsf(old_sin);
-    float old_hh = desc_i.x * fabsf(old_sin) + desc_i.y * fabsf(old_cos);
-    float4 old_bi = make_float4(old_pose.x - old_hw, old_pose.y - old_hh, old_pose.x + old_hw, old_pose.y + old_hh);
+    float4 old_bi = pose_aabb_fast(old_pose, desc_i, old_sin, old_cos);
 
     float new_sin, new_cos;
     __sincosf(new_pose.z * 0.0174532925f, &new_sin, &new_cos);
-    float new_hw = desc_i.x * fabsf(new_cos) + desc_i.y * fabsf(new_sin);
-    float new_hh = desc_i.x * fabsf(new_sin) + desc_i.y * fabsf(new_cos);
-    float4 new_bi = make_float4(new_pose.x - new_hw, new_pose.y - new_hh, new_pose.x + new_hw, new_pose.y + new_hh);
+    float4 new_bi = pose_aabb_fast(new_pose, desc_i, new_sin, new_cos);
 
     // 1. O(1) Boundary violation delta for idx
     float delta_bd = 0.0f;
@@ -1428,22 +1490,23 @@ __device__ float2 evaluate_chain_delta_e(
             continue;
         }
         float4 bj = fp_aabb_fast(chain_poses, fp_descs, c_base, j);
-        float4 pose_j = chain_poses[c_base + j];
-        if (old_bi.z > bj.x && old_bi.x < bj.z && old_bi.w > bj.y && old_bi.y < bj.w) {
-            if (footprints_courtyards_intersect(idx, old_pose, j, pose_j, fp_poly_ranges, courtyard_polys, courtyard_vertices)) {
-                delta_ov -= 1.0f;
-                float ox = fmaxf(fminf(old_bi.z, bj.z) - fmaxf(old_bi.x, bj.x), 0.1f);
-                float oy = fmaxf(fminf(old_bi.w, bj.w) - fmaxf(old_bi.y, bj.y), 0.1f);
-                delta_ov_cost -= ov_penalty * (1.0f + ox * oy);
-            }
+        bool old_hit = (old_bi.z > bj.x && old_bi.x < bj.z && old_bi.w > bj.y && old_bi.y < bj.w);
+        bool new_hit = (new_bi.z > bj.x && new_bi.x < bj.z && new_bi.w > bj.y && new_bi.y < bj.w);
+        if (!old_hit && !new_hit) {
+            continue;
         }
-        if (new_bi.z > bj.x && new_bi.x < bj.z && new_bi.w > bj.y && new_bi.y < bj.w) {
-            if (footprints_courtyards_intersect(idx, new_pose, j, pose_j, fp_poly_ranges, courtyard_polys, courtyard_vertices)) {
-                delta_ov += 1.0f;
-                float ox = fmaxf(fminf(new_bi.z, bj.z) - fmaxf(new_bi.x, bj.x), 0.1f);
-                float oy = fmaxf(fminf(new_bi.w, bj.w) - fmaxf(new_bi.y, bj.y), 0.1f);
-                delta_ov_cost += ov_penalty * (1.0f + ox * oy);
-            }
+        float4 pose_j = chain_poses[c_base + j];
+        if (old_hit && footprints_courtyards_intersect(idx, old_pose, j, pose_j, fp_poly_ranges, courtyard_polys, courtyard_vertices)) {
+            delta_ov -= 1.0f;
+            float ox = fmaxf(fminf(old_bi.z, bj.z) - fmaxf(old_bi.x, bj.x), 0.1f);
+            float oy = fmaxf(fminf(old_bi.w, bj.w) - fmaxf(old_bi.y, bj.y), 0.1f);
+            delta_ov_cost -= ov_penalty * (1.0f + ox * oy);
+        }
+        if (new_hit && footprints_courtyards_intersect(idx, new_pose, j, pose_j, fp_poly_ranges, courtyard_polys, courtyard_vertices)) {
+            delta_ov += 1.0f;
+            float ox = fmaxf(fminf(new_bi.z, bj.z) - fmaxf(new_bi.x, bj.x), 0.1f);
+            float oy = fmaxf(fminf(new_bi.w, bj.w) - fmaxf(new_bi.y, bj.y), 0.1f);
+            delta_ov_cost += ov_penalty * (1.0f + ox * oy);
         }
     }
 
@@ -1512,7 +1575,7 @@ __device__ float2 evaluate_chain_delta_e(
                 for (unsigned int e2 = 0u; e2 < ne; ++e2) {
                     float4 e2a = edges[e2 * 2u];
                     if (e2a.w >= 0.5f) {
-                        continue;
+                        break;
                     }
                     float4 e2b = edges[e2 * 2u + 1u];
                     unsigned int f2a = (unsigned int)e2a.x;
@@ -1566,8 +1629,13 @@ __device__ float2 evaluate_chain_delta_e(
             }
             float4 e2a = edges[e2 * 2u];
             bool is_corr2 = (e2a.w > 2.5f && e2a.w < 3.5f);
-            if (e2a.w >= 0.5f && (!is_corr2 || corr_weight <= 0.0f)) {
-                continue;
+            if (e2a.w >= 0.5f) {
+                if (!is_corr2) {
+                    break;
+                }
+                if (corr_weight <= 0.0f) {
+                    continue;
+                }
             }
             float4 e2b = edges[e2 * 2u + 1u];
             unsigned int f2a = (unsigned int)e2a.x;
@@ -1654,6 +1722,7 @@ __global__ void gpu_sa_placer_delta_e_kernel(
     const float2* __restrict__ courtyard_vertices
 ) {
     __shared__ float4 s_fp_descs[128];
+    __shared__ uint4 s_fp_poly_ranges[128];
     __shared__ float4 s_edges[512];
     __shared__ float4 s_poses[2048];
 
@@ -1665,6 +1734,7 @@ __global__ void gpu_sa_placer_delta_e_kernel(
     if (use_smem) {
         for (unsigned int i = threadIdx.x; i < nf; i += blockDim.x) {
             s_fp_descs[i] = fp_descs[i];
+            s_fp_poly_ranges[i] = fp_poly_ranges[i];
         }
         for (unsigned int i = threadIdx.x; i < ne * 2u; i += blockDim.x) {
             s_edges[i] = edges[i];
@@ -1691,6 +1761,7 @@ __global__ void gpu_sa_placer_delta_e_kernel(
     }
 
     const float4* active_fp_descs = use_smem ? s_fp_descs : fp_descs;
+    const uint4* active_fp_poly_ranges = use_smem ? s_fp_poly_ranges : fp_poly_ranges;
     const float4* active_edges = use_smem ? s_edges : edges;
     float4* active_poses = use_pose_smem ? s_poses : chain_poses;
 
@@ -1717,7 +1788,7 @@ __global__ void gpu_sa_placer_delta_e_kernel(
             b_min_x, b_min_y, b_max_x, b_max_y,
             wl_weight, cr_weight, ov_penalty, bd_penalty,
             pass_aff_weight, pass_max_d, corr_weight, flow_weight,
-            fp_poly_ranges, courtyard_polys, courtyard_vertices
+            active_fp_poly_ranges, courtyard_polys, courtyard_vertices
         );
         score = make_float4(init_ev.x, init_ev.x, init_ev.y, 1.0f);
         for (unsigned int i = 0u; i < nf; ++i) {
@@ -1777,7 +1848,7 @@ __global__ void gpu_sa_placer_delta_e_kernel(
                 b_min_x, b_min_y, b_max_x, b_max_y,
                 wl_weight, cr_weight, ov_penalty, bd_penalty,
                 pass_aff_weight, pass_max_d, corr_weight, flow_weight,
-                fp_poly_ranges, courtyard_polys, courtyard_vertices
+                active_fp_poly_ranges, courtyard_polys, courtyard_vertices
             );
             float delta = d_ev.x;
             float new_cost = score.x + delta;
@@ -1822,6 +1893,7 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
     const float2* __restrict__ courtyard_vertices
 ) {
     __shared__ float4 s_fp_descs[128];
+    __shared__ uint4 s_fp_poly_ranges[128];
     __shared__ float4 s_edges[512];
     __shared__ float4 s_poses[2048];
 
@@ -1833,6 +1905,7 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
     if (use_smem) {
         for (unsigned int i = threadIdx.x; i < nf; i += blockDim.x) {
             s_fp_descs[i] = fp_descs[i];
+            s_fp_poly_ranges[i] = fp_poly_ranges[i];
         }
         for (unsigned int i = threadIdx.x; i < ne * 2u; i += blockDim.x) {
             s_edges[i] = edges[i];
@@ -1855,6 +1928,7 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
     __syncthreads();
 
     const float4* active_fp_descs = use_smem ? s_fp_descs : fp_descs;
+    const uint4* active_fp_poly_ranges = use_smem ? s_fp_poly_ranges : fp_poly_ranges;
     const float4* active_edges = use_smem ? s_edges : edges;
     float4* active_poses = use_pose_smem ? s_poses : chain_poses;
 
@@ -1882,7 +1956,7 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
                 b_min_x, b_min_y, b_max_x, b_max_y,
                 wl_weight, cr_weight, ov_penalty, bd_penalty,
                 pass_aff_weight, pass_max_d, corr_weight, flow_weight,
-                fp_poly_ranges, courtyard_polys, courtyard_vertices
+                active_fp_poly_ranges, courtyard_polys, courtyard_vertices
             );
             score = make_float4(init_ev.x, init_ev.x, init_ev.y, 1.0f);
             for (unsigned int i = 0u; i < nf; ++i) {
@@ -1967,7 +2041,7 @@ __global__ void gpu_sa_placer_tensor_core_kernel(
                     b_min_x, b_min_y, b_max_x, b_max_y,
                     wl_weight, cr_weight, ov_penalty, bd_penalty,
                     pass_aff_weight, pass_max_d, corr_weight, flow_weight,
-                    fp_poly_ranges, courtyard_polys, courtyard_vertices
+                    active_fp_poly_ranges, courtyard_polys, courtyard_vertices
                 );
                 float delta = d_ev.x + (tc_d0 + tc_d1 + tc_d2 + tc_d3) * 0.0f;
                 float new_cost = score.x + delta;

@@ -1571,6 +1571,89 @@ fn test_esphome_1wire_sensor_example_autoplace_and_autoroute() {
         Arc::new(AtomicBool::new(false)),
     );
     assert_eq!(placed.overlaps, 0, "Auto-placed sample board must have 0 courtyard overlaps");
+    assert!(
+        live.lock().unwrap().evals_per_sec > 1_000.0,
+        "Auto-placer must record positive evals/sec telemetry"
+    );
+}
+
+#[test]
+#[ignore]
+fn bench_auto_placer_evals_per_sec() {
+    let vk = VulkanEngine::new();
+    if let Some(ref v) = vk {
+        for dev in v.all_engines() {
+            if let Some(ref c) = dev.cuda_engine {
+                println!(
+                    "[CUDA PROFILE] {} -> best_sa={:?} timings={:?}",
+                    c.device_name, c.dispatch_profile.best_sa_placer, c.dispatch_profile.sa_timings_us
+                );
+            }
+        }
+    }
+    for path in [
+        "examples/esphome_1wire_sensor/esphome_1wire_sensor.kicad_pcb",
+        "/home/deece/src/p1p2esp/p1p2esp.kicad_pcb",
+    ] {
+        if !Path::new(path).exists() {
+            continue;
+        }
+        let mut board = Board::load(path, &HashSet::new()).unwrap();
+        let live = Arc::new(Mutex::new(LiveTrialState::new(board.clone())));
+        let cfg = PlacementConfig {
+            duration_secs: 6,
+            vulkan: vk.clone(),
+            ..PlacementConfig::default()
+        };
+        let placed = run_auto_placer(
+            &mut board,
+            &cfg,
+            Some(Arc::clone(&live)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let rate = live.lock().unwrap().evals_per_sec;
+        println!(
+            "[BENCH] {} -> {:.0} evals/s (crossings={}, wl={:.1}mm, overlaps={})",
+            path, rate, placed.crossings, placed.wirelength, placed.overlaps
+        );
+    }
+}
+
+#[test]
+fn test_rectilinear_courtyard_decomposition_and_gpu_sa_fast_path() {
+    let path = "examples/esphome_1wire_sensor/esphome_1wire_sensor.kicad_pcb";
+    let board = Board::load(path, &HashSet::new()).expect("load esphome_1wire_sensor");
+    let cfg = PlacementConfig::default();
+    let st0 = vulcans_trials::placer::PlacementState::from_board(&board, &cfg);
+    let ties = vulcans_trials::placer::build_passive_ties(&board);
+    let (fp_descs, edges, cyds) =
+        vulcans_trials::placer::build_gpu_sa_descriptors(&board, &cfg, &ties, &st0);
+
+    assert_eq!(fp_descs.len(), board.footprints.len());
+    // Every rectilinear courtyard on esphome_1wire_sensor must decompose into axis-aligned 4-vertex rectangles
+    for (i, r) in cyds.fp_poly_ranges.iter().enumerate() {
+        assert!(
+            (r[2] & 4) != 0,
+            "Footprint {} ({}) courtyard should decompose into axis-aligned rectangles",
+            i,
+            board.footprints[i].reference
+        );
+    }
+    for p in &cyds.courtyard_polys {
+        assert_eq!(p[1], 4, "Each decomposed rectilinear courtyard piece must have 4 vertices");
+        assert_eq!(p[3], 1, "Each decomposed rectilinear courtyard piece must be flagged as axis-aligned rect");
+    }
+    // Verify U3 (ESP32-C3-WROOM-02) encodes its off-center Y offset in fp_descs[i][3]
+    let u3_idx = board
+        .footprints
+        .iter()
+        .position(|f| f.reference == "U3")
+        .expect("U3 present");
+    assert!(
+        fp_descs[u3_idx][3] > 0.0,
+        "Off-center courtyard U3 must encode its local AABB center offset in fp_descs[3]"
+    );
+    assert!(!edges.is_empty());
 }
 
 #[test]
