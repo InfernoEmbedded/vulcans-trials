@@ -325,7 +325,15 @@ impl Polygon {
             return self.clone();
         }
         let aabb = self.aabb();
-        if self.vertices.len() == 4 {
+        let is_axis_aligned_rect = self.vertices.len() == 4
+            && aabb.max_x - aabb.min_x > 1e-6
+            && aabb.max_y - aabb.min_y > 1e-6
+            && (0..4).all(|i| {
+                let p1 = self.vertices[i];
+                let p2 = self.vertices[(i + 1) % 4];
+                (p2.x - p1.x).abs() <= 1e-5 || (p2.y - p1.y).abs() <= 1e-5
+            });
+        if is_axis_aligned_rect {
             return Polygon::new(vec![
                 Point::new(aabb.min_x - offset, aabb.min_y - offset),
                 Point::new(aabb.max_x + offset, aabb.min_y - offset),
@@ -333,7 +341,42 @@ impl Polygon {
                 Point::new(aabb.min_x - offset, aabb.max_y + offset),
             ]);
         }
-        let n = self.vertices.len() as f64;
+        let n_verts = self.vertices.len();
+        let area = self.signed_area();
+        if n_verts >= 3 && area.abs() > 1e-6 && self.is_convex() {
+            let winding = if area >= 0.0 { 1.0 } else { -1.0 };
+            let mut normals = Vec::with_capacity(n_verts);
+            let mut all_valid = true;
+            for i in 0..n_verts {
+                let p1 = self.vertices[i];
+                let p2 = self.vertices[(i + 1) % n_verts];
+                let dx = p2.x - p1.x;
+                let dy = p2.y - p1.y;
+                let len = dx.hypot(dy);
+                if len <= 1e-6 {
+                    all_valid = false;
+                    break;
+                }
+                normals.push(Point::new((dy / len) * winding, (-dx / len) * winding));
+            }
+            if all_valid {
+                let mut out = Vec::with_capacity(n_verts);
+                for i in 0..n_verts {
+                    let n1 = normals[(i + n_verts - 1) % n_verts];
+                    let n2 = normals[i];
+                    let dot = n1.x * n2.x + n1.y * n2.y;
+                    let denom = (1.0 + dot).max(0.15);
+                    let scale = offset / denom;
+                    let v = self.vertices[i];
+                    out.push(Point::new(
+                        v.x + (n1.x + n2.x) * scale,
+                        v.y + (n1.y + n2.y) * scale,
+                    ));
+                }
+                return Polygon::new(out);
+            }
+        }
+        let n = n_verts as f64;
         let cx = self.vertices.iter().map(|v| v.x).sum::<f64>() / n;
         let cy = self.vertices.iter().map(|v| v.y).sum::<f64>() / n;
         Polygon::new(
@@ -10207,4 +10250,85 @@ mod tests {
         let _ = std::fs::remove_file(bak_entry.path());
     }
 
+    #[test]
+    fn test_polygon_expanded_preserves_non_orthogonal_quad_geometry() {
+        let offset = 0.25;
+
+        // 1. Axis-aligned 4-vertex rectangle still expands directly to [min_x - offset, max_x + offset] x [min_y - offset, max_y + offset]
+        let rect = Polygon::from_rect(-5.0, -1.0, 10.0, 2.0);
+        let exp_rect = rect.expanded(offset);
+        assert_eq!(exp_rect.vertices.len(), 4);
+        let exp_rect_aabb = exp_rect.aabb();
+        assert!((exp_rect_aabb.min_x - (-5.25)).abs() < 1e-6);
+        assert!((exp_rect_aabb.max_x - 5.25).abs() < 1e-6);
+        assert!((exp_rect_aabb.min_y - (-1.25)).abs() < 1e-6);
+        assert!((exp_rect_aabb.max_y - 1.25).abs() < 1e-6);
+
+        // 2. Non-orthogonal 4-vertex quad (10 mm x 2 mm rectangle rotated by 45 degrees):
+        // Expanding after rotation must match expanding before rotation and then rotating,
+        // and must NOT collapse into the bloated axis-aligned bounding box of the rotated quad.
+        let rot_rect = rect.transform(Point::new(0.0, 0.0), 45.0);
+        let exp_after_rot = rot_rect.expanded(offset);
+        let exp_before_rot = rect.expanded(offset).transform(Point::new(0.0, 0.0), 45.0);
+        assert_eq!(exp_after_rot.vertices.len(), 4);
+
+        for (va, vb) in exp_after_rot.vertices.iter().zip(exp_before_rot.vertices.iter()) {
+            assert!(
+                va.distance_to(vb) < 1e-6,
+                "Rotated quad expanded vertex {:?} must match expected {:?}",
+                va,
+                vb
+            );
+        }
+
+        // Verify none of the edges of the rotated expanded quad were turned into horizontal/vertical AABB edges
+        for i in 0..4 {
+            let p1 = exp_after_rot.vertices[i];
+            let p2 = exp_after_rot.vertices[(i + 1) % 4];
+            assert!(
+                (p2.x - p1.x).abs() > 0.5 && (p2.y - p1.y).abs() > 0.5,
+                "Rotated quad edge ({:?} -> {:?}) must remain angled, not axis-aligned",
+                p1,
+                p2
+            );
+        }
+
+        // Verify a small probe quad in the empty AABB corner region (e.g. (-3.0, -3.0)) does NOT collide
+        // with the rotated expanded quad (whereas an AABB expansion [-4.49, 4.49]^2 would falsely collide).
+        let corner_probe_neg = Polygon::from_rect(-3.2, -3.2, 0.4, 0.4);
+        let corner_probe_pos = Polygon::from_rect(2.8, 2.8, 0.4, 0.4);
+        let rot_aabb = rot_rect.aabb();
+        let bloated_aabb_poly = Polygon::from_rect(
+            rot_aabb.min_x - offset,
+            rot_aabb.min_y - offset,
+            (rot_aabb.max_x - rot_aabb.min_x) + 2.0 * offset,
+            (rot_aabb.max_y - rot_aabb.min_y) + 2.0 * offset,
+        );
+        assert!(
+            bloated_aabb_poly.intersects_convex(&corner_probe_neg),
+            "Bloated AABB would falsely intersect the empty corner region"
+        );
+        assert!(
+            !exp_after_rot.intersects_convex(&corner_probe_neg),
+            "Expanded rotated quad must NOT intersect empty top-left AABB corner"
+        );
+        assert!(
+            !exp_after_rot.intersects_convex(&corner_probe_pos),
+            "Expanded rotated quad must NOT intersect empty bottom-right AABB corner"
+        );
+
+        // 3. Non-orthogonal trapezoid quad preserves its slanted sides when expanded
+        let trap = Polygon::new(vec![
+            Point::new(-4.0, -1.0),
+            Point::new(4.0, -1.0),
+            Point::new(2.0, 1.0),
+            Point::new(-2.0, 1.0),
+        ]);
+        let exp_trap = trap.expanded(offset);
+        assert_eq!(exp_trap.vertices.len(), 4);
+        assert!(
+            (exp_trap.vertices[1].x - exp_trap.vertices[2].x).abs() > 1.5,
+            "Trapezoid slanted side must remain slanted after expansion"
+        );
+    }
 }
