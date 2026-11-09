@@ -7422,79 +7422,82 @@ mod tests {
 
         board.footprints = vec![j1, d1, d2, u1, c1];
 
-        let vk = VulkanEngine::new().expect("VulkanEngine required for GPU courtyard overlap test");
         let cfg = PlacementConfig {
-            vulkan: Some(vk.clone()),
+            vulkan: VulkanEngine::new(),
             ..PlacementConfig::default()
         };
 
-        // 1. Verify GPU initial courtyard overlap evaluation matches CPU exact SAT overlap count
+        // 1. Verify initial courtyard overlap evaluation (and GPU SAT parity when Vulkan is available)
         let initial = PlacementState::from_board(&board, &cfg);
         assert!(initial.overlaps >= 4, "Expected stacked components to have >= 4 overlaps, got {}", initial.overlaps);
-        let ties = build_passive_ties(&board);
-        let (fp_descs, _edges, courtyards) = build_gpu_sa_descriptors(&board, &cfg, &ties, &initial);
-        let nf = board.footprints.len();
-        let poses: Vec<[f32; 4]> = (0..nf)
-            .map(|i| {
-                [
-                    initial.positions[i].x as f32,
-                    initial.positions[i].y as f32,
-                    initial.rotations[i] as f32,
-                    initial.layers[i] as f32,
-                ]
-            })
-            .collect();
-        let boundary = board.boundary_aabb();
-        let gpu_ov = vk
-            .evaluate_courtyard_overlaps_gpu(
-                &fp_descs,
-                &poses,
-                &courtyards,
-                [
-                    boundary.min_x as f32,
-                    boundary.min_y as f32,
-                    boundary.max_x as f32,
-                    boundary.max_y as f32,
-                ],
-                cfg.overlap_penalty as f32,
-                cfg.boundary_penalty as f32,
+        if let Some(ref vk) = cfg.vulkan {
+            let ties = build_passive_ties(&board);
+            let (fp_descs, _edges, courtyards) = build_gpu_sa_descriptors(&board, &cfg, &ties, &initial);
+            let nf = board.footprints.len();
+            let poses: Vec<[f32; 4]> = (0..nf)
+                .map(|i| {
+                    [
+                        initial.positions[i].x as f32,
+                        initial.positions[i].y as f32,
+                        initial.rotations[i] as f32,
+                        initial.layers[i] as f32,
+                    ]
+                })
+                .collect();
+            let boundary = board.boundary_aabb();
+            let gpu_ov = vk
+                .evaluate_courtyard_overlaps_gpu(
+                    &fp_descs,
+                    &poses,
+                    &courtyards,
+                    [
+                        boundary.min_x as f32,
+                        boundary.min_y as f32,
+                        boundary.max_x as f32,
+                        boundary.max_y as f32,
+                    ],
+                    cfg.overlap_penalty as f32,
+                    cfg.boundary_penalty as f32,
+                )
+                .expect("GPU courtyard overlap evaluation should succeed");
+            assert_eq!(gpu_ov.len(), 1);
+            assert_eq!(gpu_ov[0].0 as usize, initial.overlaps);
+
+            // 2. Verify score_candidate_poses_gpu penalizes candidate poses that overlap placed footprints
+            let cands = vec![
+                (Point::new(55.0, 20.0), 0.0, 0), // directly overlapping locked J1 at (55, 20)
+                (Point::new(10.0, 10.0), 0.0, 0), // clear open space
+            ];
+            let scores = score_candidate_poses_gpu(
+                vk,
+                &board,
+                &board.footprints[1],
+                &cands,
+                &[(0, Point::new(30.0, 20.0), 1.0)],
+                &cfg,
             )
-            .expect("GPU courtyard overlap evaluation should succeed");
-        assert_eq!(gpu_ov.len(), 1);
-        assert_eq!(gpu_ov[0].0 as usize, initial.overlaps);
+            .expect("GPU candidate scoring should succeed");
+            assert!(
+                scores[0] > scores[1] + (cfg.overlap_penalty as f32) * 0.5,
+                "Overlapping candidate pose score ({}) must include overlap penalty vs clear pose ({})",
+                scores[0],
+                scores[1]
+            );
+        }
 
-        // 2. Verify score_candidate_poses_gpu penalizes candidate poses that overlap placed footprints
-        let cands = vec![
-            (Point::new(55.0, 20.0), 0.0, 0), // directly overlapping locked J1 at (55, 20)
-            (Point::new(10.0, 10.0), 0.0, 0), // clear open space
-        ];
-        let scores = score_candidate_poses_gpu(
-            &vk,
-            &board,
-            &board.footprints[1],
-            &cands,
-            &[(0, Point::new(30.0, 20.0), 1.0)],
-            &cfg,
-        )
-        .expect("GPU candidate scoring should succeed");
-        assert!(
-            scores[0] > scores[1] + (cfg.overlap_penalty as f32) * 0.5,
-            "Overlapping candidate pose score ({}) must include overlap penalty vs clear pose ({})",
-            scores[0],
-            scores[1]
-        );
-
-        // 3. Verify GPU legalize_placement resolves all initial overlaps on the GPU
+        // 3. Verify legalize_placement resolves all initial overlaps (on GPU when available, or CPU fallback on headless CI)
         let live = Arc::new(Mutex::new(LiveTrialState::new(board.clone())));
         let legalized = legalize_placement(&board, &cfg, initial, Some(&live));
-        assert_eq!(legalized.overlaps, 0, "GPU legalize_placement must resolve all overlaps");
-        assert_eq!(legalized.boundary_violations, 0, "GPU legalize_placement must have 0 boundary violations");
-        let logs = live.lock().unwrap().log_lines.clone();
-        assert!(
-            logs.iter().any(|l| l.contains("GPU resolved all initial courtyard overlaps")),
-            "Expected GPU legalizer completion log, got: {:?}",
-            logs
-        );
+        assert_eq!(legalized.overlaps, 0, "legalize_placement must resolve all overlaps");
+        assert_eq!(legalized.boundary_violations, 0, "legalize_placement must have 0 boundary violations");
+        if cfg.vulkan.is_some() {
+            let logs = live.lock().unwrap().log_lines.clone();
+            assert!(
+                logs.iter().any(|l| l.contains("GPU resolved all initial courtyard overlaps")),
+                "Expected GPU legalizer completion log, got: {:?}",
+                logs
+            );
+        }
 
         // 4. Verify prioritize_and_position_initial_components places multiple diff-pair components without stacking them
         prioritize_and_position_initial_components(&mut board, &cfg, None);
