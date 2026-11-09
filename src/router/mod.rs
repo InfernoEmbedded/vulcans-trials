@@ -1858,7 +1858,8 @@ impl AutoRouter {
                             }
                             self.rebuild_grid_state(board, grid, &connections, &routed_paths, &escape_stubs);
                             if let Some((pa, pb)) = trial {
-                                let c = path_coupling_mm(grid.res, &pa, &pb);
+                                let c = path_coupling_mm(grid.res, &pa, &pb)
+                                    .max(path_coupling_mm(grid.res, &pb, &pa));
                                 eprintln!(
                                     "  [Router] Diff pair {} -> {}: mean coupling {:.2} mm",
                                     a.net_name, b.net_name, c
@@ -3737,7 +3738,7 @@ impl AutoRouter {
             }
         }
 
-        // Phase 2: Coupled Diff Pair Precision Alignment and Intra-Pair Phase Matching
+        // Phase 2: Coupled Diff Pair Precision Alignment
         for follower_idx in 0..total_conns {
             if let Some(leader_idx) = connections[follower_idx].diff_pair_leader {
                 if routed_paths[leader_idx].is_some() && routed_paths[follower_idx].is_some() {
@@ -3746,6 +3747,9 @@ impl AutoRouter {
                     let diff_w = lc.netclass.diff_pair_width;
                     let diff_gap = lc.netclass.diff_pair_gap;
                     crate::memlog::checkpoint_board("route_all::before_diff_pair_spacing", board);
+                    let snap_tracks = board.tracks.clone();
+                    let pre_c = board_net_coupling_mm(board, lc.net_id, fc.net_id)
+                        .max(board_net_coupling_mm(board, fc.net_id, lc.net_id));
                     enforce_coupled_diff_pair_spacing(
                         board,
                         lc.net_id,
@@ -3757,9 +3761,10 @@ impl AutoRouter {
                         fc.start,
                         fc.end,
                     );
-                    if let (Some(lp), Some(fp)) = (&routed_paths[leader_idx], &routed_paths[follower_idx]) {
-                        let (ll, fl) = (grid_path_length_mm(grid.res, lp), grid_path_length_mm(grid.res, fp));
-                        match_diff_pair_phase_lengths(board, grid, lc.net_id, fc.net_id, ll, fl, 0.05);
+                    let post_c = board_net_coupling_mm(board, lc.net_id, fc.net_id)
+                        .max(board_net_coupling_mm(board, fc.net_id, lc.net_id));
+                    if post_c > DIFF_PAIR_COUPLED_MM && post_c > pre_c + 1e-6 {
+                        board.tracks = snap_tracks;
                     }
                     crate::memlog::checkpoint_board("route_all::after_diff_pair_phase", board);
                 }
@@ -4050,6 +4055,9 @@ impl AutoRouter {
                 if routed_paths[leader_idx].is_some() && routed_paths[follower_idx].is_some() {
                     let lc = &connections[leader_idx];
                     let fc = &connections[follower_idx];
+                    let snap_spacing = board.tracks.clone();
+                    let pre_c = board_net_coupling_mm(board, lc.net_id, fc.net_id)
+                        .max(board_net_coupling_mm(board, fc.net_id, lc.net_id));
                     enforce_coupled_diff_pair_spacing(
                         board,
                         lc.net_id,
@@ -4061,9 +4069,22 @@ impl AutoRouter {
                         fc.start,
                         fc.end,
                     );
+                    let mid_c = board_net_coupling_mm(board, lc.net_id, fc.net_id)
+                        .max(board_net_coupling_mm(board, fc.net_id, lc.net_id));
+                    if mid_c > DIFF_PAIR_COUPLED_MM && mid_c > pre_c + 1e-6 {
+                        board.tracks = snap_spacing;
+                    }
                     if let (Some(lp), Some(fp)) = (&routed_paths[leader_idx], &routed_paths[follower_idx]) {
+                        let snap_phase = board.tracks.clone();
+                        let pre_phase_c = board_net_coupling_mm(board, lc.net_id, fc.net_id)
+                            .max(board_net_coupling_mm(board, fc.net_id, lc.net_id));
                         let (ll, fl) = (grid_path_length_mm(grid.res, lp), grid_path_length_mm(grid.res, fp));
                         match_diff_pair_phase_lengths(board, grid, lc.net_id, fc.net_id, ll, fl, 0.05);
+                        let post_phase_c = board_net_coupling_mm(board, lc.net_id, fc.net_id)
+                            .max(board_net_coupling_mm(board, fc.net_id, lc.net_id));
+                        if post_phase_c > DIFF_PAIR_COUPLED_MM && post_phase_c > pre_phase_c + 1e-6 {
+                            board.tracks = snap_phase;
+                        }
                     }
                 }
             }
@@ -4148,10 +4169,22 @@ impl AutoRouter {
                 fillet_acute_angle_junctions(board, self.config.acid_trap_fillet_radius);
                 widen_tracks_and_arcs_to_netclass(board);
                 prune_dangling_tracks_and_vias(board);
-                let broken: HashSet<usize> = (0..total_conns)
+                let mut broken: HashSet<usize> = (0..total_conns)
                     .filter(|&i| pre[i] && !Self::is_connection_electrically_connected(board, &connections[i]))
                     .map(|i| connections[i].net_id)
                     .collect();
+                for i in 0..total_conns {
+                    if let Some(leader_idx) = connections[i].diff_pair_leader {
+                        let ln = connections[leader_idx].net_id;
+                        let fn_id = connections[i].net_id;
+                        if board_net_coupling_mm(board, ln, fn_id) > DIFF_PAIR_COUPLED_MM
+                            || board_net_coupling_mm(board, fn_id, ln) > DIFF_PAIR_COUPLED_MM
+                        {
+                            broken.insert(ln);
+                            broken.insert(fn_id);
+                        }
+                    }
+                }
                 if !broken.is_empty() {
                     board.tracks.retain(|t| !broken.contains(&t.net_id));
                     board.arcs.retain(|a| !broken.contains(&a.net_id));
@@ -4159,6 +4192,8 @@ impl AutoRouter {
                     board.tracks.extend(snap.0.into_iter().filter(|t| broken.contains(&t.net_id)));
                     board.arcs.extend(snap.1.into_iter().filter(|a| broken.contains(&a.net_id)));
                     board.vias.extend(snap.2.into_iter().filter(|v| broken.contains(&v.net_id)));
+                    widen_tracks_and_arcs_to_netclass(board);
+                    prune_dangling_tracks_and_vias(board);
                 }
             } else {
                 widen_tracks_and_arcs_to_netclass(board);

@@ -2100,13 +2100,18 @@ impl CudaEngine {
         num_passes: u32,
         courtyards: Option<&GpuCourtyardBuffers>,
     ) -> Option<(Vec<[f32; 4]>, Vec<[f32; 4]>)> {
+        let preferred = if params.crossing_weight <= 0.0 {
+            SaPlacerVariant::SimtFullEval
+        } else {
+            self.dispatch_profile.best_sa_placer
+        };
         self.run_gpu_sa_placer_chains_variant(
             fp_descs,
             edges,
             init_poses,
             params,
             num_passes,
-            self.dispatch_profile.best_sa_placer,
+            preferred,
             courtyards,
         )
         .or_else(|| {

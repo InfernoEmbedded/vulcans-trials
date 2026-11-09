@@ -1224,7 +1224,7 @@ __device__ __forceinline__ float4 clamp_pose_to_board_aabb(
     return pose;
 }
 
-__device__ __forceinline__ bool propose_overlap_repulsion_move(
+__device__ __noinline__ bool propose_overlap_repulsion_move(
     const float4* __restrict__ active_poses,
     const float4* __restrict__ active_fp_descs,
     const uint4* __restrict__ active_fp_poly_ranges,
@@ -1862,8 +1862,7 @@ __device__ void gpu_sa_placer_delta_e_device(
     unsigned int rng = params.seed ^ (c * 747796405u + 2891336453u) ^ (unsigned int)(score.w * 1664525.0f);
     pcg_next(&rng);
 
-    float best_ov = score.z;
-    if (score.w <= 0.0f) {
+    if (score.y <= 0.0f) {
         float2 init_ev = evaluate_chain_state_fast(
             active_poses, active_fp_descs, active_edges, active_c_base, nf, ne,
             b_min_x, b_min_y, b_max_x, b_max_y,
@@ -1872,7 +1871,6 @@ __device__ void gpu_sa_placer_delta_e_device(
             active_fp_poly_ranges, courtyard_polys, courtyard_vertices
         );
         score = make_float4(init_ev.x, init_ev.x, init_ev.y, 1.0f);
-        best_ov = init_ev.y;
         for (unsigned int i = 0u; i < nf; ++i) {
             chain_poses[best_base + i] = active_poses[active_c_base + i];
         }
@@ -1885,63 +1883,43 @@ __device__ void gpu_sa_placer_delta_e_device(
 
     for (unsigned int p = 0; p < num_passes; ++p) {
         for (unsigned int step = 0u; step < params.steps_per_pass; ++step) {
-            unsigned int idx = 0u;
-            float4 old_pose;
-            float4 new_pose;
-            bool proposed = false;
-
-            if (score.z > 0.0f && rand_f32(&rng) < 0.88f) {
-                proposed = propose_overlap_repulsion_move(
-                    active_poses, active_fp_descs, active_fp_poly_ranges, courtyard_polys, courtyard_vertices,
-                    active_c_base, nf, b_min_x, b_min_y, b_max_x, b_max_y, params.grid_step,
-                    &rng, &idx, &old_pose, &new_pose
-                );
-            }
-
-            if (!proposed) {
-                // Select a warp-uniform movable footprint index idx so all 32 lanes in the warp
-                // traverse the exact same incident edge list with zero SIMT branch divergence,
-                // while each chain proposes its own independent random displacement and Metropolis test.
-                unsigned int raw_idx = pcg_next(&rng) % nf;
-                idx = (score.z > 0.0f) ? raw_idx : __shfl_sync(0xFFFFFFFFu, raw_idx, 0);
-                for (unsigned int tries = 0u; tries < 8u; ++tries) {
-                    if (active_fp_descs[idx].z < 0.5f) {
-                        break;
-                    }
-                    idx = (idx + 1u) % nf;
-                }
-                if (active_fp_descs[idx].z > 0.5f) {
+            // Select a warp-uniform movable footprint index idx so all 32 lanes in the warp
+            // traverse the exact same incident edge list with zero SIMT branch divergence,
+            // while each chain proposes its own independent random displacement and Metropolis test.
+            unsigned int raw_idx = pcg_next(&rng) % nf;
+            unsigned int idx = __shfl_sync(0xFFFFFFFFu, raw_idx, 0);
+            for (unsigned int tries = 0u; tries < 8u; ++tries) {
+                if (active_fp_descs[idx].z < 0.5f) {
                     break;
                 }
+                idx = (idx + 1u) % nf;
+            }
+            if (active_fp_descs[idx].z > 0.5f) {
+                break;
+            }
 
-                old_pose = active_poses[active_c_base + idx];
-                new_pose = old_pose;
-                float move_r = rand_f32(&rng);
-                if (move_r < 0.72f) {
-                    float shift = fmaxf(temp * 0.15f, params.grid_step * 2.0f);
-                    float dx = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
-                    float dy = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
-                    new_pose.x = snap_grid(
-                        fminf(fmaxf(old_pose.x + dx, b_min_x + 1.2f), b_max_x - 1.2f),
-                        params.grid_step
-                    );
-                    new_pose.y = snap_grid(
-                        fminf(fmaxf(old_pose.y + dy, b_min_y + 1.2f), b_max_y - 1.2f),
-                        params.grid_step
-                    );
-                } else {
-                    float rot_step = (float)((pcg_next(&rng) % 3u) + 1u) * 90.0f;
-                    float nz = old_pose.z + rot_step;
-                    if (nz >= 360.0f) {
-                        nz -= 360.0f;
-                    }
-                    new_pose.z = nz;
+            float4 old_pose = active_poses[active_c_base + idx];
+            float4 new_pose = old_pose;
+            float move_r = rand_f32(&rng);
+            if (move_r < 0.72f) {
+                float shift = fmaxf(temp * 0.15f, params.grid_step * 2.0f);
+                float dx = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
+                float dy = (rand_f32(&rng) * 2.0f - 1.0f) * shift;
+                new_pose.x = snap_grid(
+                    fminf(fmaxf(old_pose.x + dx, b_min_x + 1.2f), b_max_x - 1.2f),
+                    params.grid_step
+                );
+                new_pose.y = snap_grid(
+                    fminf(fmaxf(old_pose.y + dy, b_min_y + 1.2f), b_max_y - 1.2f),
+                    params.grid_step
+                );
+            } else {
+                float rot_step = (float)((pcg_next(&rng) % 3u) + 1u) * 90.0f;
+                float nz = old_pose.z + rot_step;
+                if (nz >= 360.0f) {
+                    nz -= 360.0f;
                 }
-                if (score.z > 0.0f) {
-                    new_pose = clamp_pose_to_board_aabb(
-                        new_pose, active_fp_descs[idx], b_min_x, b_min_y, b_max_x, b_max_y, params.grid_step
-                    );
-                }
+                new_pose.z = nz;
             }
 
             float2 d_ev = evaluate_chain_delta_e(
@@ -1963,9 +1941,8 @@ __device__ void gpu_sa_placer_delta_e_device(
                 active_poses[active_c_base + idx] = new_pose;
                 score.x = new_cost;
                 score.z = new_ov;
-                if (new_ov < best_ov || (new_ov == best_ov && new_cost < score.y)) {
+                if ((new_ov == 0.0f || score.y > ov_penalty) && new_cost < score.y) {
                     score.y = new_cost;
-                    best_ov = new_ov;
                     for (unsigned int i = 0u; i < nf; ++i) {
                         chain_poses[best_base + i] = active_poses[active_c_base + i];
                     }
@@ -1980,7 +1957,6 @@ __device__ void gpu_sa_placer_delta_e_device(
         }
     }
 
-    score.z = best_ov;
     chain_scores[c] = score;
 }
 

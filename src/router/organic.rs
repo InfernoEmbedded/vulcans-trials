@@ -2933,6 +2933,142 @@ pub(crate) fn widen_tracks_and_arcs_to_netclass(board: &mut Board) {
             continue;
         }
 
+        // Diff pairs: one neck at a fanout must not narrow the whole pair; re-widen each
+        // element (including solitary segments between a pad and a via) to the pair width
+        // wherever it is clear and leave genuine necks local.
+        let is_pair_net = board
+            .nets
+            .iter()
+            .any(|o| AutoRouter::are_diff_pair_mates(&board.nets[net_id], o));
+        if is_pair_net {
+            let tw = net_target_width(board, net_id);
+            let pair_clr = board.get_netclass_for_net(net_id).clearance;
+            for &ti in &t_indices {
+                if board.tracks[ti].width >= tw - 1e-3 {
+                    continue;
+                }
+                let t = board.tracks[ti].clone();
+                if is_segment_clear(board, None, t.start, t.end, t.layer, t.net_id, tw) {
+                    board.tracks[ti].width = tw;
+                    continue;
+                }
+                // Try locally necking any encroaching non-pair foreign track on the same layer to its min_track_width
+                let mut narrowed_foreign: Vec<(usize, f64)> = Vec::new();
+                for fk in 0..board.tracks.len() {
+                    let ft = &board.tracks[fk];
+                    if ft.is_locked || ft.net_id == t.net_id || ft.layer != t.layer {
+                        continue;
+                    }
+                    let fk_is_pair = board
+                        .nets
+                        .iter()
+                        .any(|o| AutoRouter::are_diff_pair_mates(&board.nets[ft.net_id], o));
+                    if fk_is_pair {
+                        continue;
+                    }
+                    let fk_clr = board.get_netclass_for_net(ft.net_id).clearance.max(pair_clr);
+                    let req = (tw + ft.width) * 0.5 + fk_clr;
+                    if dist_segment_to_segment(t.start, t.end, ft.start, ft.end) < req - 1e-4 {
+                        let fk_min_w = board.get_netclass_for_net(ft.net_id).min_track_width.max(0.15);
+                        if ft.width > fk_min_w + 1e-3 {
+                            narrowed_foreign.push((fk, ft.width));
+                            board.tracks[fk].width = fk_min_w;
+                        }
+                    }
+                }
+                if !narrowed_foreign.is_empty() {
+                    if is_segment_clear(board, None, t.start, t.end, t.layer, t.net_id, tw) {
+                        board.tracks[ti].width = tw;
+                        continue;
+                    } else {
+                        for (fk, orig_w) in narrowed_foreign {
+                            board.tracks[fk].width = orig_w;
+                        }
+                    }
+                }
+                // Try micro-nudging an unanchored bend endpoint of `ti` (skipping collinear
+                // straight-line midpoints so genuine pad-side fanout necks stay local).
+                for &end_is_end in &[false, true] {
+                    let cur_t = board.tracks[ti].clone();
+                    if cur_t.width >= tw - 1e-3 {
+                        break;
+                    }
+                    let v_pt = if end_is_end { cur_t.end } else { cur_t.start };
+                    if is_anchored(v_pt, cur_t.layer, cur_t.net_id, board) {
+                        continue;
+                    }
+                    let incident: Vec<(usize, bool)> = (0..board.tracks.len())
+                        .filter_map(|k| {
+                            let tk = &board.tracks[k];
+                            if tk.net_id != cur_t.net_id || tk.layer != cur_t.layer || tk.is_locked {
+                                return None;
+                            }
+                            if (tk.start.0 - v_pt.0).hypot(tk.start.1 - v_pt.1) < 1e-3 {
+                                Some((k, false))
+                            } else if (tk.end.0 - v_pt.0).hypot(tk.end.1 - v_pt.1) < 1e-3 {
+                                Some((k, true))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if incident.is_empty() || incident.len() > 3 {
+                        continue;
+                    }
+                    if incident.len() == 2 {
+                        let (k0, e0) = incident[0];
+                        let (k1, e1) = incident[1];
+                        let o0 = if e0 { board.tracks[k0].start } else { board.tracks[k0].end };
+                        let o1 = if e1 { board.tracks[k1].start } else { board.tracks[k1].end };
+                        let v0 = (o0.0 - v_pt.0, o0.1 - v_pt.1);
+                        let v1 = (o1.0 - v_pt.0, o1.1 - v_pt.1);
+                        let l0 = v0.0.hypot(v0.1);
+                        let l1 = v1.0.hypot(v1.1);
+                        if l0 > 1e-4 && l1 > 1e-4 {
+                            let cos_a = (v0.0 * v1.0 + v0.1 * v1.1) / (l0 * l1);
+                            if cos_a < -0.995 {
+                                continue;
+                            }
+                        }
+                    }
+                    'pair_vtx: for &r in &[0.015, 0.03, 0.05, 0.08, 0.12, 0.16, 0.22] {
+                        for &(dx, dy) in &dirs_16 {
+                            let cand = (v_pt.0 + dx * r, v_pt.1 + dy * r);
+                            let all_clear = incident.iter().all(|&(k, is_e)| {
+                                let tk = &board.tracks[k];
+                                let ns = if is_e { tk.start } else { cand };
+                                let ne = if is_e { cand } else { tk.end };
+                                let w_req = if k == ti { tw } else { tk.width };
+                                is_segment_clear(board, None, ns, ne, tk.layer, tk.net_id, w_req)
+                            });
+                            if all_clear {
+                                for &(k, is_e) in &incident {
+                                    if is_e {
+                                        board.tracks[k].end = cand;
+                                    } else {
+                                        board.tracks[k].start = cand;
+                                    }
+                                }
+                                board.tracks[ti].width = tw;
+                                break 'pair_vtx;
+                            }
+                        }
+                    }
+                }
+            }
+            for &ai in &a_indices {
+                if board.arcs[ai].width >= tw - 1e-3 {
+                    continue;
+                }
+                let mut a = board.arcs[ai].clone();
+                a.width = tw;
+                if is_arc_clear(board, &a) {
+                    board.arcs[ai].width = tw;
+                }
+            }
+            continue;
+        }
+
         let mut endpoints: Vec<((f64, f64), (f64, f64))> = Vec::with_capacity(total);
         for &ti in &t_indices {
             endpoints.push((board.tracks[ti].start, board.tracks[ti].end));
@@ -2990,17 +3126,13 @@ pub(crate) fn widen_tracks_and_arcs_to_netclass(board: &mut Board) {
             }
 
             // Identify if an element in `comp` is a short terminal pad-entry stub (< 0.85mm touching a pad).
-            // Diff pairs fan out of fine-pitch connectors with the partner's escape alongside, so their
-            // first segment (< 3mm, starting within 2mm of a pad) may neck without narrowing the whole pair.
-            let is_pair_net = board.nets.iter().any(|o| AutoRouter::are_diff_pair_mates(&board.nets[net_id], o));
             let is_terminal_pad_stub = |k: usize| -> bool {
                 if k >= n_t {
                     return false;
                 }
                 let trk = &board.tracks[t_indices[k]];
                 let len = (trk.end.0 - trk.start.0).hypot(trk.end.1 - trk.start.1);
-                let (max_len, reach) = if is_pair_net { (3.0, 2.0) } else { (0.85, 0.03) };
-                if len > max_len {
+                if len > 0.85 {
                     return false;
                 }
                 board.footprints.iter().any(|fp| {
@@ -3010,8 +3142,8 @@ pub(crate) fn widen_tracks_and_arcs_to_netclass(board: &mut Board) {
                                 return false;
                             }
                             let (px, py) = fp.pad_absolute_position(pad);
-                            (trk.start.0 - px).hypot(trk.start.1 - py) < reach
-                                || (trk.end.0 - px).hypot(trk.end.1 - py) < reach
+                            (trk.start.0 - px).hypot(trk.start.1 - py) < 0.03
+                                || (trk.end.0 - px).hypot(trk.end.1 - py) < 0.03
                         })
                 })
             };
@@ -3024,7 +3156,7 @@ pub(crate) fn widen_tracks_and_arcs_to_netclass(board: &mut Board) {
                 }
             };
 
-            let comp_info: Vec<( usize, bool, f64)> = comp
+            let comp_info: Vec<(usize, bool, f64)> = comp
                 .iter()
                 .map(|&k| (k, is_terminal_pad_stub(k), elem_w(k)))
                 .collect();
@@ -3035,30 +3167,6 @@ pub(crate) fn widen_tracks_and_arcs_to_netclass(board: &mut Board) {
                 .filter(|&&(_, is_stub, _)| !is_stub)
                 .map(|&(_, _, w)| w)
                 .fold(f64::INFINITY, f64::min);
-
-            // Diff pairs: one neck at a fanout must not narrow the whole pair; re-widen each
-            // element to the pair width wherever it is clear and leave genuine necks local.
-            if is_pair_net {
-                let tw = net_target_width(board, net_id);
-                for &(k, _, w) in &comp_info {
-                    if w >= tw - 1e-3 {
-                        continue;
-                    }
-                    if k < n_t {
-                        let t = board.tracks[t_indices[k]].clone();
-                        if is_segment_clear(board, None, t.start, t.end, t.layer, t.net_id, tw) {
-                            board.tracks[t_indices[k]].width = tw;
-                        }
-                    } else {
-                        let mut a = board.arcs[a_indices[k - n_t]].clone();
-                        a.width = tw;
-                        if is_arc_clear(board, &a) {
-                            board.arcs[a_indices[k - n_t]].width = tw;
-                        }
-                    }
-                }
-                continue;
-            }
 
             if min_body_w.is_finite() {
                 for &(k, is_stub, w) in &comp_info {

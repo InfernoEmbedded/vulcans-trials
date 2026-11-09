@@ -2910,7 +2910,10 @@ fn scan_dir_for_socket(dir: &Path) -> Option<PathBuf> {
     for entry in entries.flatten() {
         let p = entry.path();
         let fname = p.file_name().and_then(|f| f.to_str()).unwrap_or("");
-        if fname.ends_with(".sock") {
+        if fname.ends_with(".sock")
+            && !fname.contains("_test_")
+            && !fname.contains("_mock_")
+        {
             if is_kicad_dir || fname.starts_with("kicad_ipc") || fname.contains("kicad") || fname == "api.sock" {
                 return Some(p);
             }
@@ -3383,7 +3386,7 @@ mod tests {
                     let _ = (srv_lib.send)(s, api_resp.as_ptr(), api_resp.len(), 0);
                 }
 
-                if cmd_type_url.ends_with(".RefillZones") {
+                if cmd_type_url.ends_with(".RefreshEditor") {
                     break;
                 }
             }

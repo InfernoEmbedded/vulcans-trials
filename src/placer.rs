@@ -887,6 +887,123 @@ impl PlacementState {
         self.evaluate_cost(board, config, ties);
     }
 
+    /// Fast legality-only evaluator for [`legalize_placement`] that updates `self.overlaps`,
+    /// `self.boundary_violations`, and penalty `self.cost` without building the ratsnest MST or LBVH.
+    ///
+    /// # Arguments
+    /// * `board` - Board geometry, footprints, outline, and keepouts.
+    /// * `config` - Placement configuration specifying overlap and boundary penalty weights.
+    ///
+    /// # Side Effects
+    /// Mutates `self.overlaps`, `self.boundary_violations`, and `self.cost`.
+    fn evaluate_legality_only(&mut self, board: &Board, config: &PlacementConfig) {
+        let n = board.footprints.len();
+        let mut overlaps = 0usize;
+        let mut overlap_area_cost = 0.0;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if board.footprints[i].is_locked && board.footprints[j].is_locked {
+                    continue;
+                }
+                if self.layers[i] != self.layers[j]
+                    && board.footprints[i].is_smd_only()
+                    && board.footprints[j].is_smd_only()
+                {
+                    continue;
+                }
+                if !self.cached_bounds[i].overlaps(&self.cached_bounds[j]) {
+                    continue;
+                }
+                let mut hit = false;
+                'outer: for pa in &self.cached_courtyards[i] {
+                    for pb in &self.cached_courtyards[j] {
+                        if pa.intersects_convex(pb) {
+                            hit = true;
+                            break 'outer;
+                        }
+                    }
+                }
+                if hit {
+                    overlaps += 1;
+                    let ox = (self.cached_bounds[i].max_x.min(self.cached_bounds[j].max_x)
+                        - self.cached_bounds[i].min_x.max(self.cached_bounds[j].min_x))
+                    .max(0.1);
+                    let oy = (self.cached_bounds[i].max_y.min(self.cached_bounds[j].max_y)
+                        - self.cached_bounds[i].min_y.max(self.cached_bounds[j].min_y))
+                    .max(0.1);
+                    overlap_area_cost += config.overlap_penalty * (1.0 + ox * oy);
+                }
+            }
+        }
+
+        let boundary = board.boundary_aabb();
+        let mut boundary_cost = 0.0;
+        let mut boundary_violations = 0usize;
+        let mut flip_cost = 0.0;
+        for i in 0..n {
+            if board.footprints[i].is_locked {
+                continue;
+            }
+            if self.layers[i] != board.footprints[i].orig_layer {
+                flip_cost += 3.5;
+            }
+            let mut fp_violated = false;
+            for poly in &self.cached_courtyards[i] {
+                for v in &poly.vertices {
+                    if !board.contains_point_in_boundary(v) {
+                        let dx = (boundary.min_x - v.x).max(0.0) + (v.x - boundary.max_x).max(0.0);
+                        let dy = (boundary.min_y - v.y).max(0.0) + (v.y - boundary.max_y).max(0.0);
+                        boundary_cost += config.boundary_penalty * (10.0 + dx * 10.0 + dy * 10.0);
+                        fp_violated = true;
+                    }
+                }
+            }
+            for p in &self.cached_pads[i] {
+                if !board.contains_point_in_boundary(p) {
+                    let dx = (boundary.min_x - p.x).max(0.0) + (p.x - boundary.max_x).max(0.0);
+                    let dy = (boundary.min_y - p.y).max(0.0) + (p.y - boundary.max_y).max(0.0);
+                    boundary_cost += config.boundary_penalty * (10.0 + dx * 10.0 + dy * 10.0);
+                    fp_violated = true;
+                }
+            }
+            if !fp_violated {
+                let fp_layer = self.layers[i];
+                for ko in &board.keepouts {
+                    if !ko.layers.contains(&fp_layer) {
+                        continue;
+                    }
+                    let ko_poly = Polygon::from_rect(ko.min_x, ko.min_y, ko.max_x - ko.min_x, ko.max_y - ko.min_y);
+                    for poly in &self.cached_courtyards[i] {
+                        if poly.intersects_convex(&ko_poly) {
+                            boundary_cost += config.boundary_penalty * 20.0;
+                            fp_violated = true;
+                            break;
+                        }
+                    }
+                    if !fp_violated {
+                        for p in &self.cached_pads[i] {
+                            if ko_poly.contains_point(p) {
+                                boundary_cost += config.boundary_penalty * 20.0;
+                                fp_violated = true;
+                                break;
+                            }
+                        }
+                    }
+                    if fp_violated {
+                        break;
+                    }
+                }
+            }
+            if fp_violated {
+                boundary_violations += 1;
+            }
+        }
+
+        self.overlaps = overlaps;
+        self.boundary_violations = boundary_violations;
+        self.cost = overlap_area_cost + boundary_cost + flip_cost;
+    }
+
     /// Computes the composite multi-objective placement energy function and updates all diagnostic counters on `self`.
     ///
     /// # Cost Formulation
@@ -1620,7 +1737,7 @@ pub fn build_gpu_sa_descriptors(
 ///
 /// # Returns
 /// `Some((best_verified_state, total_gpu_evaluations))` if the GPU dispatch succeeded, or `None` if
-/// `movable` is empty or the GPU compute pipeline returned no candidates.
+/// `movable` is empty or the GPU compute pipeline failed.
 fn run_gpu_placement_batch(
     vk: &VulkanEngine,
     board: &Board,
@@ -1633,7 +1750,7 @@ fn run_gpu_placement_batch(
     courtyards: &GpuCourtyardBuffers,
     seed_offset: u64,
     cooling: f64,
-) -> Option<(PlacementState, usize)> {
+) -> Option<(Option<PlacementState>, usize)> {
     if movable.is_empty() || board.footprints.is_empty() {
         return None;
     }
@@ -1647,16 +1764,19 @@ fn run_gpu_placement_batch(
         (128, 6, 2)
     };
 
-    let mut init_poses = Vec::with_capacity((num_chains as usize) * nf);
-    for _ in 0..num_chains {
-        for i in 0..nf {
-            init_poses.push([
+    let base_poses: Vec<[f32; 4]> = (0..nf)
+        .map(|i| {
+            [
                 base.positions[i].x as f32,
                 base.positions[i].y as f32,
                 base.rotations[i] as f32,
                 base.layers[i] as f32,
-            ]);
-        }
+            ]
+        })
+        .collect();
+    let mut init_poses = Vec::with_capacity((num_chains as usize) * nf);
+    for _ in 0..num_chains {
+        init_poses.extend_from_slice(&base_poses);
     }
 
     let seed = (0xA5A5_5A5Au32).wrapping_add((seed_offset as u32).wrapping_mul(0x9E37_79B9));
@@ -1686,25 +1806,58 @@ fn run_gpu_placement_batch(
     let (best_poses, best_scores) =
         vk.run_gpu_sa_placer_chains(fp_descs, edges, &init_poses, &sa_params, num_passes, Some(courtyards))?;
 
-    let mut ranked: Vec<(usize, f32)> = best_scores
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (i, s[1]))
-        .collect();
-    ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut top4 = [(usize::MAX, f32::INFINITY); 4];
+    for (i, s) in best_scores.iter().enumerate() {
+        let cost = s[1];
+        if cost < top4[3].1 {
+            top4[3] = (i, cost);
+            let mut k = 3;
+            while k > 0 && top4[k].1 < top4[k - 1].1 {
+                top4.swap(k, k - 1);
+                k -= 1;
+            }
+        }
+    }
 
     let total_gpu_evals = (num_chains as usize) * (steps_per_pass as usize) * (num_passes as usize);
     let mut best_verified: Option<PlacementState> = None;
 
-    for &(chain_idx, _) in ranked.iter().take(4) {
-        let mut cand = base.clone();
+    for &(chain_idx, _) in &top4 {
+        if chain_idx == usize::MAX {
+            break;
+        }
         let c_base = chain_idx * nf;
+        let has_diff = (0..nf).any(|i| {
+            if board.footprints[i].is_locked {
+                return false;
+            }
+            let p = best_poses[c_base + i];
+            ((p[0] as f64) - base.positions[i].x).abs() > 1e-4
+                || ((p[1] as f64) - base.positions[i].y).abs() > 1e-4
+                || ((p[2] as f64) - base.rotations[i]).abs() > 1e-4
+        });
+        if !has_diff {
+            if best_verified.is_none() {
+                break;
+            }
+            continue;
+        }
+
+        let mut cand = base.clone();
         for i in 0..nf {
             if !board.footprints[i].is_locked {
                 let p = best_poses[c_base + i];
-                cand.positions[i] = Point::new(p[0] as f64, p[1] as f64);
-                cand.rotations[i] = p[2] as f64;
-                cand.update_component(i, board, config);
+                let nx = p[0] as f64;
+                let ny = p[1] as f64;
+                let nrot = p[2] as f64;
+                if (nx - cand.positions[i].x).abs() > 1e-4
+                    || (ny - cand.positions[i].y).abs() > 1e-4
+                    || (nrot - cand.rotations[i]).abs() > 1e-4
+                {
+                    cand.positions[i] = Point::new(nx, ny);
+                    cand.rotations[i] = nrot;
+                    cand.update_component(i, board, config);
+                }
             }
         }
         cand.evaluate(board, config, ties);
@@ -1752,6 +1905,7 @@ fn run_gpu_placement_batch(
                 cand = resolved;
             }
         }
+        let is_clean = cand.overlaps == 0 && cand.boundary_violations == 0;
         if best_verified.as_ref().is_none_or(|b| {
             cand.boundary_violations < b.boundary_violations
                 || (cand.boundary_violations == b.boundary_violations && cand.overlaps < b.overlaps)
@@ -1761,9 +1915,12 @@ fn run_gpu_placement_batch(
         }) {
             best_verified = Some(cand);
         }
+        if is_clean {
+            break;
+        }
     }
 
-    best_verified.map(|c| (c, total_gpu_evals))
+    Some((best_verified, total_gpu_evals))
 }
 
 /// Resolves courtyard overlaps and board outline / keepout violations in `initial` using a
@@ -2130,7 +2287,7 @@ pub fn legalize_placement(
                     cur.positions[idx].y = snap_to_grid(cur.positions[idx].y.clamp(cy_min, cy_max), config.grid_step_mm);
                 }
                 cur.update_component(idx, board, config);
-                cur.evaluate(board, config, &ties);
+                cur.evaluate_legality_only(board, config);
 
                 let accept = (cur.boundary_violations < old_bv)
                     || (cur.boundary_violations == old_bv && (
@@ -2167,7 +2324,7 @@ pub fn legalize_placement(
         })
         .collect();
 
-    results
+    let mut best = results
         .into_iter()
         .min_by(|a, b| {
             a.boundary_violations
@@ -2175,7 +2332,239 @@ pub fn legalize_placement(
                 .then_with(|| a.overlaps.cmp(&b.overlaps))
                 .then_with(|| a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal))
         })
-        .unwrap_or(initial)
+        .unwrap_or(initial);
+
+    // Deterministic fallback: if any residual courtyard overlap remains after stochastic SA,
+    // relocate colliding unlocked footprints to the nearest legal grid pose.
+    if best.overlaps > 0 {
+        for _pass in 0..4 {
+            if best.overlaps == 0 {
+                break;
+            }
+            let mut moved_any = false;
+            let mut order: Vec<usize> = (0..board.footprints.len())
+                .filter(|&i| !board.footprints[i].is_locked)
+                .collect();
+            order.sort_by(|&a, &b| {
+                let ba = &best.cached_bounds[a];
+                let bb = &best.cached_bounds[b];
+                let area_a = (ba.max_x - ba.min_x).max(0.1) * (ba.max_y - ba.min_y).max(0.1);
+                let area_b = (bb.max_x - bb.min_x).max(0.1) * (bb.max_y - bb.min_y).max(0.1);
+                area_a
+                    .partial_cmp(&area_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for i in order {
+                let mut initial_colliders: Vec<usize> = Vec::new();
+                for j in 0..board.footprints.len() {
+                    if i == j {
+                        continue;
+                    }
+                    if board.footprints[i].is_smd_only()
+                        && board.footprints[j].is_smd_only()
+                        && best.layers[i] != best.layers[j]
+                    {
+                        continue;
+                    }
+                    if best.cached_bounds[i].overlaps(&best.cached_bounds[j]) {
+                        'poly_chk: for pa in &best.cached_courtyards[i] {
+                            for pb in &best.cached_courtyards[j] {
+                                if pa.intersects_convex(pb) {
+                                    initial_colliders.push(j);
+                                    break 'poly_chk;
+                                }
+                            }
+                        }
+                    }
+                }
+                if initial_colliders.is_empty() {
+                    continue;
+                }
+                let fp = &board.footprints[i];
+                let layer = best.layers[i];
+                let orig_pos = best.positions[i];
+                let orig_rot = best.rotations[i];
+                let rotations = [orig_rot, 0.0, 90.0, 180.0, 270.0];
+                // Returns Some((unlocked_overlap_count, overlapped_unlocked_area)) if boundary,
+                // keepout, and locked-footprint checks all pass, or None if invalid.
+                let eval_cand = |cand_pt: Point, rot: f64| -> Option<(usize, f64)> {
+                    if !board.contains_point_in_boundary(&cand_pt) {
+                        return None;
+                    }
+                    let spacing = fp.effective_spacing(config);
+                    let cand_polys =
+                        fp.transformed_courtyards_layered(cand_pt, rot, layer, spacing);
+                    for poly in &cand_polys {
+                        for v in &poly.vertices {
+                            if !board.contains_point_in_boundary(v) {
+                                return None;
+                            }
+                        }
+                        for ko in &board.keepouts {
+                            if !ko.layers.contains(&layer) {
+                                continue;
+                            }
+                            let ko_poly = Polygon::from_rect(
+                                ko.min_x,
+                                ko.min_y,
+                                ko.max_x - ko.min_x,
+                                ko.max_y - ko.min_y,
+                            );
+                            if poly.intersects_convex(&ko_poly) {
+                                return None;
+                            }
+                        }
+                    }
+                    for (pidx, _) in fp.pads.iter().enumerate() {
+                        let p = fp.pad_world_point_layered(pidx, cand_pt, rot, layer);
+                        if !board.contains_point_in_boundary(&p) {
+                            return None;
+                        }
+                        for ko in &board.keepouts {
+                            if !ko.layers.contains(&layer) {
+                                continue;
+                            }
+                            let ko_poly = Polygon::from_rect(
+                                ko.min_x,
+                                ko.min_y,
+                                ko.max_x - ko.min_x,
+                                ko.max_y - ko.min_y,
+                            );
+                            if ko_poly.contains_point(&p) {
+                                return None;
+                            }
+                        }
+                    }
+                    let mut unlocked_hits = 0usize;
+                    let mut unlocked_hit_area = 0.0f64;
+                    for j in 0..board.footprints.len() {
+                        if i == j {
+                            continue;
+                        }
+                        if fp.is_smd_only()
+                            && board.footprints[j].is_smd_only()
+                            && layer != best.layers[j]
+                        {
+                            continue;
+                        }
+                        let mut hit_j = false;
+                        'chk_j: for pa in &cand_polys {
+                            if !pa.aabb().overlaps(&best.cached_bounds[j]) {
+                                continue;
+                            }
+                            for pb in &best.cached_courtyards[j] {
+                                if pa.intersects_convex(pb) {
+                                    hit_j = true;
+                                    break 'chk_j;
+                                }
+                            }
+                        }
+                        if hit_j {
+                            if board.footprints[j].is_locked || initial_colliders.contains(&j) {
+                                return None;
+                            }
+                            unlocked_hits += 1;
+                            let b = &best.cached_bounds[j];
+                            unlocked_hit_area += (b.max_x - b.min_x).max(0.1) * (b.max_y - b.min_y).max(0.1);
+                        }
+                    }
+                    Some((unlocked_hits, unlocked_hit_area))
+                };
+                let mut found_pose: Option<(Point, f64)> = None;
+                let mut best_shove_pose: Option<((usize, f64, f64), Point, f64)> = None;
+                'spiral: for r_step in 1..=80 {
+                    let radius = (r_step as f64) * 0.75;
+                    for a_step in 0..24 {
+                        let angle = (a_step as f64) * (std::f64::consts::TAU / 24.0);
+                        for &rot in &rotations {
+                            let (cx_min, cx_max, cy_min, cy_max) = fp.origin_clamp_range(
+                                rot,
+                                layer,
+                                config.min_spacing_mm,
+                                &boundary,
+                            );
+                            let cx = snap_to_grid(
+                                (orig_pos.x + radius * angle.cos()).clamp(cx_min, cx_max),
+                                config.grid_step_mm,
+                            );
+                            let cy = snap_to_grid(
+                                (orig_pos.y + radius * angle.sin()).clamp(cy_min, cy_max),
+                                config.grid_step_mm,
+                            );
+                            let cand_pt = Point::new(cx, cy);
+                            if let Some((uhits, uarea)) = eval_cand(cand_pt, rot) {
+                                if uhits == 0 {
+                                    found_pose = Some((cand_pt, rot));
+                                    break 'spiral;
+                                }
+                                let key = (uhits, uarea, cand_pt.distance_to(&orig_pos));
+                                if best_shove_pose.as_ref().is_none_or(|b| {
+                                    key.0 < b.0 .0
+                                        || (key.0 == b.0 .0 && key.1 < b.0 .1 - 1e-6)
+                                        || (key.0 == b.0 .0 && (key.1 - b.0 .1).abs() <= 1e-6 && key.2 < b.0 .2)
+                                }) {
+                                    best_shove_pose = Some((key, cand_pt, rot));
+                                }
+                            }
+                        }
+                    }
+                }
+                if found_pose.is_none() {
+                    let mut best_dist = f64::INFINITY;
+                    for &rot in &rotations {
+                        let (cx_min, cx_max, cy_min, cy_max) = fp.origin_clamp_range(
+                            rot,
+                            layer,
+                            config.min_spacing_mm,
+                            &boundary,
+                        );
+                        let mut gy = cy_min;
+                        while gy <= cy_max + 1e-6 {
+                            let mut gx = cx_min;
+                            while gx <= cx_max + 1e-6 {
+                                let cand_pt = Point::new(
+                                    snap_to_grid(gx.clamp(cx_min, cx_max), config.grid_step_mm),
+                                    snap_to_grid(gy.clamp(cy_min, cy_max), config.grid_step_mm),
+                                );
+                                let d = cand_pt.distance_to(&orig_pos);
+                                if let Some((uhits, uarea)) = eval_cand(cand_pt, rot) {
+                                    if uhits == 0 && d < best_dist {
+                                        best_dist = d;
+                                        found_pose = Some((cand_pt, rot));
+                                    } else if found_pose.is_none() {
+                                        let key = (uhits, uarea, d);
+                                        if best_shove_pose.as_ref().is_none_or(|b| {
+                                            key.0 < b.0 .0
+                                                || (key.0 == b.0 .0 && key.1 < b.0 .1 - 1e-6)
+                                                || (key.0 == b.0 .0 && (key.1 - b.0 .1).abs() <= 1e-6 && key.2 < b.0 .2)
+                                        }) {
+                                            best_shove_pose = Some((key, cand_pt, rot));
+                                        }
+                                    }
+                                }
+                                gx += 1.0;
+                            }
+                            gy += 1.0;
+                        }
+                    }
+                }
+                if let Some((new_pos, new_rot)) = found_pose.or_else(|| best_shove_pose.map(|(_, p, r)| (p, r))) {
+                    best.positions[i] = new_pos;
+                    best.rotations[i] = new_rot;
+                    best.update_component(i, board, config);
+                    moved_any = true;
+                }
+            }
+            if moved_any {
+                best.evaluate_legality_only(board, config);
+            } else {
+                break;
+            }
+        }
+    }
+
+    best.evaluate(board, config, &ties);
+    best
 }
 
 /// Positions unlocked board components in strict electrical priority order before Simulated Annealing begins.
@@ -2249,8 +2638,6 @@ pub fn prioritize_and_position_initial_components(
         .find(|(i, fp)| placed[*i] && fp.pads.iter().any(|p| diff_nets.contains(&p.net_id)))
         .map(|(i, _)| i);
 
-    let mut spatial_index = PlacedBoardSpatialIndex::from_board(board, config.min_spacing_mm);
-
     for &diff_idx in &diff_pair_fps {
         if placed[diff_idx] {
             continue;
@@ -2262,58 +2649,67 @@ pub fn prioritize_and_position_initial_components(
             } else {
                 (anchor_pos.x + 12.0, anchor_pos.y)
             };
-            let target_pt = Point::new(target_x, target_y);
             let diff_fp = &board.footprints[diff_idx];
             let layer = diff_fp.layer;
-            let rotations = [diff_fp.rotation, 0.0, 90.0, 180.0, 270.0];
-            let offsets_x = [0.0, -2.5, 2.5, -5.0, 5.0, -7.5, 7.5];
+            let rot = diff_fp.rotation;
+            let (cx_min, cx_max, cy_min, cy_max) =
+                diff_fp.origin_clamp_range(rot, layer, config.min_spacing_mm, &boundary);
             let offsets_y = [0.0, -2.5, 2.5, -5.0, 5.0, -7.5, 7.5];
-            let mut legal_cands: Vec<(Point, f64, usize)> = Vec::new();
-            for &dy in &offsets_y {
+            let offsets_x = [0.0, -2.5, 2.5, -5.0, 5.0, -7.5, 7.5];
+            let mut chosen = (
+                snap_to_grid(target_x.clamp(cx_min, cx_max), config.grid_step_mm),
+                snap_to_grid(target_y.clamp(cy_min, cy_max), config.grid_step_mm),
+            );
+            'find_diff_slot: for &dy in &offsets_y {
                 for &dx in &offsets_x {
-                    for &rot in &rotations {
-                        let (cx_min, cx_max, cy_min, cy_max) =
-                            diff_fp.origin_clamp_range(rot, layer, config.min_spacing_mm, &boundary);
-                        let cx = snap_to_grid((target_x + dx).clamp(cx_min, cx_max), config.grid_step_mm);
-                        let cy = snap_to_grid((target_y + dy).clamp(cy_min, cy_max), config.grid_step_mm);
-                        let c_pos = Point::new(cx, cy);
-                        if spatial_index.is_placement_legal(board, diff_fp, c_pos, rot, layer) {
-                            legal_cands.push((c_pos, rot, layer));
+                    let cx = snap_to_grid((target_x + dx).clamp(cx_min, cx_max), config.grid_step_mm);
+                    let cy = snap_to_grid((target_y + dy).clamp(cy_min, cy_max), config.grid_step_mm);
+                    let c_pos = Point::new(cx, cy);
+                    let cand_polys = diff_fp.transformed_courtyards_layered(
+                        c_pos,
+                        rot,
+                        layer,
+                        diff_fp.effective_spacing(config),
+                    );
+                    let mut collides_placed = false;
+                    for (other_idx, other_fp) in board.footprints.iter().enumerate() {
+                        if !placed[other_idx] || other_idx == diff_idx {
+                            continue;
                         }
+                        if diff_fp.is_smd_only() && other_fp.is_smd_only() && layer != other_fp.layer {
+                            continue;
+                        }
+                        let other_polys = other_fp.transformed_courtyards_layered(
+                            Point::new(other_fp.x, other_fp.y),
+                            other_fp.rotation,
+                            other_fp.layer,
+                            other_fp.effective_spacing(config),
+                        );
+                        'poly_pair: for pa in &cand_polys {
+                            for pb in &other_polys {
+                                if pa.intersects_convex(pb) {
+                                    collides_placed = true;
+                                    break 'poly_pair;
+                                }
+                            }
+                        }
+                        if collides_placed {
+                            break;
+                        }
+                    }
+                    if !collides_placed {
+                        chosen = (cx, cy);
+                        break 'find_diff_slot;
                     }
                 }
             }
-            if let Some(&(best_pos, best_rot, _)) = legal_cands
-                .iter()
-                .min_by(|a, b| {
-                    a.0.distance_to(&target_pt)
-                        .partial_cmp(&b.0.distance_to(&target_pt))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            {
-                board.footprints[diff_idx].x = best_pos.x;
-                board.footprints[diff_idx].y = best_pos.y;
-                board.footprints[diff_idx].rotation = best_rot;
-            } else {
-                let (cx_min, cx_max, cy_min, cy_max) = board.footprints[diff_idx].origin_clamp_range(
-                    board.footprints[diff_idx].rotation,
-                    board.footprints[diff_idx].layer,
-                    config.min_spacing_mm,
-                    &boundary,
-                );
-                board.footprints[diff_idx].x = snap_to_grid(
-                    target_x.clamp(cx_min, cx_max),
-                    config.grid_step_mm,
-                );
-                board.footprints[diff_idx].y = snap_to_grid(
-                    target_y.clamp(cy_min, cy_max),
-                    config.grid_step_mm,
-                );
-            }
-            spatial_index.update_footprint(board, diff_idx);
+            board.footprints[diff_idx].x = chosen.0;
+            board.footprints[diff_idx].y = chosen.1;
         }
         placed[diff_idx] = true;
     }
+
+    let mut spatial_index = PlacedBoardSpatialIndex::from_board(board, config.min_spacing_mm);
 
     // 2. Priority 2: Decoupling capacitors — situating them as close to the connected non-ground pin as possible!
     for tie in &ties {
@@ -3921,14 +4317,22 @@ pub fn run_auto_placer(
 
                 scope.spawn(move || {
                     let mut batch_idx = (gpu_idx as u64).wrapping_mul(10_000);
+                    let mut base = global_best_ref.lock().unwrap().clone();
                     while !gpu_done_ref.load(Ordering::Relaxed)
                         && !stop_ref.load(Ordering::Relaxed)
                         && start_time.elapsed() + Duration::from_millis(25) < total_dur
                     {
                         let progress = (start_time.elapsed().as_secs_f64() / total_dur.as_secs_f64()).clamp(0.0, 1.0);
                         let cooling = (1.0 - progress * 0.85).max(0.05);
-                        let base = global_best_ref.lock().unwrap().clone();
-                        if let Some((cand, gpu_evals)) = run_gpu_placement_batch(
+                        if let Ok(g) = global_best_ref.lock() {
+                            if (g.cost - base.cost).abs() > 1e-6
+                                || g.overlaps != base.overlaps
+                                || g.boundary_violations != base.boundary_violations
+                            {
+                                base = g.clone();
+                            }
+                        }
+                        if let Some((cand_opt, gpu_evals)) = run_gpu_placement_batch(
                             &vk_dev,
                             board_ref,
                             config,
@@ -3942,16 +4346,19 @@ pub fn run_auto_placer(
                             cooling,
                         ) {
                             total_evals_ref.fetch_add(gpu_evals, Ordering::Relaxed);
-                            if let Ok(mut g) = global_best_ref.lock() {
-                                let is_better = if cand.boundary_violations != g.boundary_violations {
-                                    cand.boundary_violations < g.boundary_violations
-                                } else if cand.overlaps != g.overlaps {
-                                    cand.overlaps < g.overlaps
-                                } else {
-                                    cand.cost < g.cost
-                                };
-                                if is_better {
-                                    *g = cand;
+                            if let Some(cand) = cand_opt {
+                                if let Ok(mut g) = global_best_ref.lock() {
+                                    let is_better = if cand.boundary_violations != g.boundary_violations {
+                                        cand.boundary_violations < g.boundary_violations
+                                    } else if cand.overlaps != g.overlaps {
+                                        cand.overlaps < g.overlaps
+                                    } else {
+                                        cand.cost < g.cost
+                                    };
+                                    if is_better {
+                                        base = cand.clone();
+                                        *g = cand;
+                                    }
                                 }
                             }
                         }
