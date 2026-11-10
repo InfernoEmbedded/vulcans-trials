@@ -39,7 +39,7 @@ fn test_metadata_json_syntax_and_schema_compliance() {
     assert_eq!(v["name"].as_str(), Some("Vulcan's Trials"));
     assert_eq!(v["identifier"].as_str(), Some("com.infernoembedded.vulcans-trials"));
     assert_eq!(v["type"].as_str(), Some("plugin"));
-    assert_eq!(v["category"].as_str(), Some("Auto-Place & Auto-Route"));
+    assert!(v.get("category").is_none() || v["category"] == "general");
     assert_eq!(v["license"].as_str(), Some("GPL-3.0"));
     assert_eq!(v["author"]["name"].as_str(), Some("InfernoEmbedded"));
     assert_eq!(v["maintainer"]["name"].as_str(), Some("InfernoEmbedded"));
@@ -121,9 +121,9 @@ fn test_build_pcm_produces_valid_zip_archive_and_repo_index() {
     assert!(file_list_str.contains("'plugins/icon.png'"), "Missing plugins/icon.png in zip");
     assert!(file_list_str.contains("'plugins/icon.svg'"), "Missing plugins/icon.svg in zip");
     assert!(file_list_str.contains("'resources/icon.png'"), "Missing resources/icon.png in zip");
-    assert!(file_list_str.contains("'resources/icon_32x32.png'"), "Missing resources/icon_32x32.png in zip");
-    assert!(file_list_str.contains("'resources/icon_64x64.png'"), "Missing resources/icon_64x64.png in zip");
-    assert!(file_list_str.contains("'resources/icon.svg'"), "Missing resources/icon.svg in zip");
+    // Note: Official KiCad PCM repository schema forbids extra files in resources/ (only resources/icon.png allowed)
+    assert!(!file_list_str.contains("'resources/icon_32x32.png'"), "resources/icon_32x32.png must not be inside zip");
+    assert!(!file_list_str.contains("'resources/icon_64x64.png'"), "resources/icon_64x64.png must not be inside zip");
 
     // 3. Verify packages.json repository index
     let pkg_json_path = temp_dir.join("packages.json");

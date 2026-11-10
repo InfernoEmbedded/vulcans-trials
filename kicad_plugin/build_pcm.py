@@ -154,8 +154,20 @@ def build_pcm_package(
     uncompressed_size = 0
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         # 1. metadata.json (at root of ZIP)
-        with open(meta_path, "rb") as f:
-            meta_bytes = f.read()
+        # Note: Package internal metadata must have exactly 1 version object and
+        # must NOT contain download_* or install_size fields.
+        internal_meta = json.loads(json.dumps(meta))
+        internal_meta.pop("$schema", None)
+        v_internal = dict(internal_meta["versions"][0])
+        v_internal["version"] = version
+        v_internal.pop("download_sha256", None)
+        v_internal.pop("download_size", None)
+        v_internal.pop("download_url", None)
+        v_internal.pop("install_size", None)
+        if platform:
+            v_internal["platforms"] = [platform]
+        internal_meta["versions"] = [v_internal]
+        meta_bytes = (json.dumps(internal_meta, indent=4) + "\n").encode("utf-8")
         zf.writestr("metadata.json", meta_bytes)
         uncompressed_size += len(meta_bytes)
 
@@ -186,18 +198,9 @@ def build_pcm_package(
                 zf.writestr(zinfo, bin_bytes)
                 uncompressed_size += len(bin_bytes)
 
-        # 4. resources/ directory (package manager icons)
+        # 4. resources/ directory (official KiCad PCM validator only permits /resources/icon.png)
         zf.writestr("resources/icon.png", icons["pcm_64_png"])
         uncompressed_size += len(icons["pcm_64_png"])
-
-        zf.writestr("resources/icon_32x32.png", icons["pcm_32_png"])
-        uncompressed_size += len(icons["pcm_32_png"])
-
-        zf.writestr("resources/icon_64x64.png", icons["pcm_64_png"])
-        uncompressed_size += len(icons["pcm_64_png"])
-
-        zf.writestr("resources/icon.svg", icons["pcm_svg"])
-        uncompressed_size += len(icons["pcm_svg"])
 
     zip_sha256 = sha256_file(zip_path)
     zip_size = os.path.getsize(zip_path)

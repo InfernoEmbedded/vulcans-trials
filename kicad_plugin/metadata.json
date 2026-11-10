@@ -17,7 +17,6 @@
             "web": "https://github.com/InfernoEmbedded"
         }
     },
-    "category": "Auto-Place & Auto-Route",
     "license": "GPL-3.0",
     "resources": {
         "homepage": "https://github.com/InfernoEmbedded/vulcans-trials"
@@ -35,10 +34,6 @@
             "status": "stable",
             "kicad_version": "8.0",
             "kicad_version_max": "10.0",
-            "download_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-            "download_size": 0,
-            "download_url": "https://github.com/InfernoEmbedded/vulcans-trials/releases/download/v1.0.0/com.infernoembedded.vulcans-trials_v1.0.0_pcm.zip",
-            "install_size": 0,
             "platforms": [
                 "linux",
                 "macos",
