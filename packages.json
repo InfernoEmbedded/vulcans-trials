@@ -18,7 +18,6 @@
                     "web": "https://github.com/InfernoEmbedded"
                 }
             },
-            "category": "Auto-Place & Auto-Route",
             "license": "GPL-3.0",
             "resources": {
                 "homepage": "https://github.com/InfernoEmbedded/vulcans-trials"
@@ -36,54 +35,54 @@
                     "status": "stable",
                     "kicad_version": "8.0",
                     "kicad_version_max": "10.0",
-                    "download_sha256": "e70cb87b0e68d02078d359f5da78bd7e64e0c0e0270602b623d881a1be1e21a7",
-                    "download_size": 17140,
-                    "download_url": "https://github.com/InfernoEmbedded/vulcans-trials/releases/download/v1.0.0/com.infernoembedded.vulcans-trials_v1.0.0_pcm.zip",
-                    "install_size": 31238,
                     "platforms": [
                         "linux",
                         "macos",
                         "windows"
-                    ]
+                    ],
+                    "download_sha256": "9bc666920eebdd26fd1dd61b92dc33c15308d6f364c179893c89b215e7a9bcee",
+                    "download_size": 10758,
+                    "download_url": "https://github.com/InfernoEmbedded/vulcans-trials/releases/download/v1.0.0/com.infernoembedded.vulcans-trials_v1.0.0_pcm.zip",
+                    "install_size": 22719
                 },
                 {
                     "version": "1.0.0",
                     "status": "stable",
                     "kicad_version": "8.0",
                     "kicad_version_max": "10.0",
-                    "download_sha256": "5010742316a9965dd6a366d4aad33b65299e200bb3ec7685da5cf5048613e972",
-                    "download_size": 18829506,
-                    "download_url": "https://github.com/InfernoEmbedded/vulcans-trials/releases/download/v1.0.0/com.infernoembedded.vulcans-trials_v1.0.0_linux_aarch64_pcm.zip",
-                    "install_size": 54231734,
                     "platforms": [
                         "linux"
-                    ]
+                    ],
+                    "download_sha256": "6d08e74a302d41c673cae7a8808547fbd5aff80372b60e102810452ffc823731",
+                    "download_size": 18823110,
+                    "download_url": "https://github.com/InfernoEmbedded/vulcans-trials/releases/download/v1.0.0/com.infernoembedded.vulcans-trials_v1.0.0_linux_aarch64_pcm.zip",
+                    "install_size": 54223163
                 },
                 {
                     "version": "1.0.0",
                     "status": "stable",
                     "kicad_version": "8.0",
                     "kicad_version_max": "10.0",
-                    "download_sha256": "c5ce61bc1030285072e73e4a8344c4ee286b41466cda34317bcfb94f2772b788",
-                    "download_size": 12448768,
-                    "download_url": "https://github.com/InfernoEmbedded/vulcans-trials/releases/download/v1.0.0/com.infernoembedded.vulcans-trials_v1.0.0_windows_x86_64_pcm.zip",
-                    "install_size": 32964102,
                     "platforms": [
                         "windows"
-                    ]
+                    ],
+                    "download_sha256": "5d5d2bf8a7c63d2338454fe8f1beb0bad99bca0f8ff805253c726c8cafb9d211",
+                    "download_size": 12442368,
+                    "download_url": "https://github.com/InfernoEmbedded/vulcans-trials/releases/download/v1.0.0/com.infernoembedded.vulcans-trials_v1.0.0_windows_x86_64_pcm.zip",
+                    "install_size": 32955533
                 },
                 {
                     "version": "1.0.0",
                     "status": "stable",
                     "kicad_version": "8.0",
                     "kicad_version_max": "10.0",
-                    "download_sha256": "fa76ff3d20161d11c1b30416a426433ef1db63983ab937ffdbcf98c028009bfa",
-                    "download_size": 11805990,
-                    "download_url": "https://github.com/InfernoEmbedded/vulcans-trials/releases/download/v1.0.0/com.infernoembedded.vulcans-trials_v1.0.0_macos_aarch64_pcm.zip",
-                    "install_size": 31798086,
                     "platforms": [
                         "macos"
-                    ]
+                    ],
+                    "download_sha256": "485063cc31a3129da624ad2380b116503a634b3dd76c212c85406f238c862538",
+                    "download_size": 11799593,
+                    "download_url": "https://github.com/InfernoEmbedded/vulcans-trials/releases/download/v1.0.0/com.infernoembedded.vulcans-trials_v1.0.0_macos_aarch64_pcm.zip",
+                    "install_size": 31789515
                 }
             ]
         }

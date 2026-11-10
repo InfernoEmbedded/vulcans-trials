@@ -9,14 +9,14 @@
     },
     "packages": {
         "url": "https://raw.githubusercontent.com/InfernoEmbedded/vulcans-trials/gh-pages/packages.json",
-        "sha256": "d1cecd4bb9bdc7c64586c8fa3e83c83fda9545412e1470543242258532c12897",
-        "update_timestamp": 1794306097,
-        "update_time_utc": "2026-11-10 10:21:37"
+        "sha256": "41f427743290cc0736cf3c24aaa3333b59bb4cdbafe4a4b2d927a28dd6a889d9",
+        "update_timestamp": 1794306863,
+        "update_time_utc": "2026-11-10 10:34:23"
     },
     "resources": {
         "url": "https://raw.githubusercontent.com/InfernoEmbedded/vulcans-trials/gh-pages/resources.zip",
-        "sha256": "0bae7c89fe19ad7d22e208803d0193bfff292558d3620d3d92c49c23308b2101",
-        "update_timestamp": 1794306097,
-        "update_time_utc": "2026-11-10 10:21:37"
+        "sha256": "4ca8be838eac8e44ea95ce0e2feec625bed41c46304e8ff5db9db7ceb9c8f95f",
+        "update_timestamp": 1794306863,
+        "update_time_utc": "2026-11-10 10:34:23"
     }
 }
