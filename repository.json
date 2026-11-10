@@ -1,0 +1,22 @@
+{
+    "$schema": "https://go.kicad.org/pcm/schemas/v1",
+    "name": "InfernoEmbedded KiCad PCM Repository",
+    "maintainer": {
+        "name": "InfernoEmbedded",
+        "contact": {
+            "web": "https://github.com/InfernoEmbedded"
+        }
+    },
+    "packages": {
+        "url": "https://raw.githubusercontent.com/InfernoEmbedded/vulcans-trials/gh-pages/packages.json",
+        "sha256": "d1cecd4bb9bdc7c64586c8fa3e83c83fda9545412e1470543242258532c12897",
+        "update_timestamp": 1794306097,
+        "update_time_utc": "2026-11-10 10:21:37"
+    },
+    "resources": {
+        "url": "https://raw.githubusercontent.com/InfernoEmbedded/vulcans-trials/gh-pages/resources.zip",
+        "sha256": "0bae7c89fe19ad7d22e208803d0193bfff292558d3620d3d92c49c23308b2101",
+        "update_timestamp": 1794306097,
+        "update_time_utc": "2026-11-10 10:21:37"
+    }
+}

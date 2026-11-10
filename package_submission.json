@@ -1,0 +1,87 @@
+{
+    "name": "Vulcan's Trials",
+    "description": "Vulkan GPU + Multithreaded CPU Auto-Placer and Auto-Router for KiCad",
+    "description_full": "Vulcan's Trials combines schematic-aware Parallel Tempering Simulated Annealing auto-placement with a Vulkan GPU-accelerated, negotiated-congestion, dynamic-nudge multi-layer autorouter.",
+    "identifier": "com.infernoembedded.vulcans-trials",
+    "type": "plugin",
+    "author": {
+        "name": "InfernoEmbedded",
+        "contact": {
+            "web": "https://github.com/InfernoEmbedded"
+        }
+    },
+    "maintainer": {
+        "name": "InfernoEmbedded",
+        "contact": {
+            "web": "https://github.com/InfernoEmbedded"
+        }
+    },
+    "category": "Auto-Place & Auto-Route",
+    "license": "GPL-3.0",
+    "resources": {
+        "homepage": "https://github.com/InfernoEmbedded/vulcans-trials"
+    },
+    "tags": [
+        "autorouter",
+        "autoplacer",
+        "vulkan",
+        "gpu",
+        "pcbnew"
+    ],
+    "versions": [
+        {
+            "version": "1.0.0",
+            "status": "stable",
+            "kicad_version": "8.0",
+            "kicad_version_max": "10.0",
+            "download_sha256": "e70cb87b0e68d02078d359f5da78bd7e64e0c0e0270602b623d881a1be1e21a7",
+            "download_size": 17140,
+            "download_url": "https://github.com/InfernoEmbedded/vulcans-trials/releases/download/v1.0.0/com.infernoembedded.vulcans-trials_v1.0.0_pcm.zip",
+            "install_size": 31238,
+            "platforms": [
+                "linux",
+                "macos",
+                "windows"
+            ]
+        },
+        {
+            "version": "1.0.0",
+            "status": "stable",
+            "kicad_version": "8.0",
+            "kicad_version_max": "10.0",
+            "download_sha256": "5010742316a9965dd6a366d4aad33b65299e200bb3ec7685da5cf5048613e972",
+            "download_size": 18829506,
+            "download_url": "https://github.com/InfernoEmbedded/vulcans-trials/releases/download/v1.0.0/com.infernoembedded.vulcans-trials_v1.0.0_linux_aarch64_pcm.zip",
+            "install_size": 54231734,
+            "platforms": [
+                "linux"
+            ]
+        },
+        {
+            "version": "1.0.0",
+            "status": "stable",
+            "kicad_version": "8.0",
+            "kicad_version_max": "10.0",
+            "download_sha256": "c5ce61bc1030285072e73e4a8344c4ee286b41466cda34317bcfb94f2772b788",
+            "download_size": 12448768,
+            "download_url": "https://github.com/InfernoEmbedded/vulcans-trials/releases/download/v1.0.0/com.infernoembedded.vulcans-trials_v1.0.0_windows_x86_64_pcm.zip",
+            "install_size": 32964102,
+            "platforms": [
+                "windows"
+            ]
+        },
+        {
+            "version": "1.0.0",
+            "status": "stable",
+            "kicad_version": "8.0",
+            "kicad_version_max": "10.0",
+            "download_sha256": "fa76ff3d20161d11c1b30416a426433ef1db63983ab937ffdbcf98c028009bfa",
+            "download_size": 11805990,
+            "download_url": "https://github.com/InfernoEmbedded/vulcans-trials/releases/download/v1.0.0/com.infernoembedded.vulcans-trials_v1.0.0_macos_aarch64_pcm.zip",
+            "install_size": 31798086,
+            "platforms": [
+                "macos"
+            ]
+        }
+    ]
+}
