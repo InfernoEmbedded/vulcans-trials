@@ -251,6 +251,12 @@ def main() -> int:
         help="Generate placeholder mock binaries for missing targets to test packaging.",
     )
     parser.add_argument(
+        "--generate-repo",
+        action="store_true",
+        default=True,
+        help="Generate repository index (packages.json, repository.json, resources.zip) (default: true).",
+    )
+    parser.add_argument(
         "--include-universal",
         action="store_true",
         default=True,
